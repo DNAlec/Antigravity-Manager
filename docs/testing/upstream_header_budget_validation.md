@@ -97,4 +97,6 @@ cargo +1.96.0 build --manifest-path src-tauri/Cargo.toml --locked --no-default-f
 
 本轮使用 Rust/Cargo 1.96.0、Ubuntu 26.04、2 个编译任务，关闭 dev/test 调试信息和增量编译以降低资源占用。依赖按 `Cargo.lock` 下载后离线构建，未更新依赖版本。后端测试目标和 `src-tauri/target/debug/antigravity-tools` 可执行文件均编译通过，存在仓库既有的未使用代码等警告。`--no-default-features` 用于后端开发构建，不嵌入前端发布资源；桌面应用/发布包仍需另行构建和验证。
 
-已通过上游模块 24 项测试和共享 429/Grace Retry 回归 1 项，共 25 项。3 项本机 HTTP 测试首次因沙箱禁止监听端口失败，在允许 loopback 通信的环境重跑后全部通过。这些测试不能替代真实大工具请求验收；尚未执行生产重放、构建/发布候选镜像或修改生产配置。
+已通过上游模块 24 项测试和共享 429/Grace Retry 回归 1 项，共 25 项。3 项本机 HTTP 测试首次因沙箱禁止监听端口失败，在允许 loopback 通信的环境重跑后全部通过。这些测试不能替代真实大工具请求验收；该次本地测试阶段尚未执行生产重放、构建/发布候选镜像或修改生产配置。
+
+后续已发布公开候选镜像 `ghcr.io/dnalec/antigravity-manager:header-budget-a98deb705c65`（linux/amd64，digest `sha256:2ff0e522a81b911075403af734b611b87919294c5cef8adef68e779a8179f9bf`），并验证匿名拉取。远程合成对照中，30 秒组超时，180 秒组约 44.65 秒收到响应头且完整返回 240 条。这不是原始失败请求的重放；该镜像不包含后续 QoS 自锁或 Docker 健康检查修复。
