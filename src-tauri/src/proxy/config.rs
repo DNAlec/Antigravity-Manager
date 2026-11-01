@@ -953,6 +953,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
 
+    /// 实例级 QoS 阈值、恢复探针和冷却阶梯（支持热更新）
+    #[serde(default)]
+    pub qos: crate::proxy::qos_config::QoSConfig,
+
     /// 实验性功能配置
     #[serde(default)]
     pub experimental: ExperimentalConfig,
@@ -1131,6 +1135,7 @@ impl Default for ProxyConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
+            qos: crate::proxy::qos_config::QoSConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式
@@ -1241,6 +1246,22 @@ pub enum ProxySelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_proxy_config_without_qos_uses_existing_policy() {
+        let mut value = serde_json::to_value(ProxyConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("qos");
+        let config: ProxyConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.qos, crate::proxy::qos_config::QoSConfig::default());
+    }
+
+    #[test]
+    fn proxy_config_rejects_invalid_nested_qos() {
+        let mut value = serde_json::to_value(ProxyConfig::default()).unwrap();
+        value["qos"] = serde_json::json!({"probe_timeout_secs": 0});
+        let error = serde_json::from_value::<ProxyConfig>(value).unwrap_err();
+        assert!(error.to_string().contains("proxy.qos.probe_timeout_secs"));
+    }
 
     #[test]
     fn test_normalize_proxy_url() {

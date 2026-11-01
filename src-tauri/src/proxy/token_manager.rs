@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio_util::sync::CancellationToken;
 
+use crate::proxy::qos_config::QoSConfig;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::server::{ImagePermit, ImageScheduler};
 use crate::proxy::sticky_config::StickySessionConfig;
@@ -5238,14 +5239,21 @@ impl TokenManager {
             .filter_map(|account_id| {
                 // 缺少凭据时保留原状态，避免领取后没有任务能结束 Probing。
                 let token = self.tokens.get(&account_id).map(|r| r.value().clone())?;
+                let config = self.qos_guardian.config_snapshot();
                 // 主动刷新任务会更新凭据；认证过期不应被判为模型响应缓慢。
-                if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
+                if token.timestamp
+                    <= chrono::Utc::now()
+                        .timestamp()
+                        .saturating_add(config.probe_timeout_secs.ceil() as i64)
+                {
                     return None;
                 }
                 // Missing or protected model metadata is not a failed latency probe.
                 // Keep the expired jail available for a later metadata refresh.
                 Self::select_qos_probe_model(&token)?;
-                let claim = self.qos_guardian.try_mark_probing(&account_id)?;
+                let claim = self
+                    .qos_guardian
+                    .try_mark_probing_with_config(&account_id, config)?;
                 Some((token, claim))
             })
             .collect()
@@ -5271,14 +5279,16 @@ impl TokenManager {
                     account_id,
                     claim.level
                 );
-                let probe_res = Self::send_pure_hello_probe_internal(&token, &upstream).await;
+                let probe_res =
+                    Self::send_pure_hello_probe_internal(&token, &upstream, claim.config).await;
                 match probe_res {
-                    Ok(ttft_ms) if ttft_ms < 8000.0 => {
+                    Ok(ttft_ms) if claim.accepts_ttft(ttft_ms) => {
                         if guardian.mark_probe_passed(account_id, claim) {
                             tracing::info!(
-                                "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < 8s)! Moving to Half-Open probation.",
+                                "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < {:.2}s)! Moving to Half-Open probation.",
                                 account_id,
-                                ttft_ms / 1000.0
+                                ttft_ms / 1000.0,
+                                claim.config.probe_success_threshold_secs
                             );
                         }
                     }
@@ -5286,9 +5296,10 @@ impl TokenManager {
                         if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
                         {
                             tracing::warn!(
-                                "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= 8s. Escalated to Level {} (wait {:?})",
+                                "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= {:.2}s. Escalated to Level {} (wait {:?})",
                                 account_id,
                                 ttft_ms / 1000.0,
+                                claim.config.probe_success_threshold_secs,
                                 next_lv,
                                 wait
                             );
@@ -5324,16 +5335,18 @@ impl TokenManager {
             .unwrap_or_else(|e| e.into_inner())
             .upgrade()
             .ok_or_else(|| "QoS probe upstream is not initialized".to_string())?;
-        Self::send_pure_hello_probe_internal(&token, &upstream).await
+        Self::send_pure_hello_probe_internal(&token, &upstream, self.qos_guardian.config_snapshot())
+            .await
     }
 
     async fn send_pure_hello_probe_internal(
         token: &ProxyToken,
         upstream: &crate::proxy::upstream::client::UpstreamClient,
+        config: QoSConfig,
     ) -> Result<f64, String> {
         let endpoint =
             "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
-        Self::send_pure_hello_probe_to_endpoint(token, upstream, endpoint).await
+        Self::send_pure_hello_probe_to_endpoint(token, upstream, endpoint, config).await
     }
 
     fn select_qos_probe_model(token: &ProxyToken) -> Option<&str> {
@@ -5448,37 +5461,50 @@ impl TokenManager {
         token: &ProxyToken,
         upstream: &crate::proxy::upstream::client::UpstreamClient,
         endpoint: &str,
+        config: QoSConfig,
     ) -> Result<f64, String> {
         let start = std::time::Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
-                return Err("QoS probe is waiting for refreshed credentials".to_string());
-            }
-            let model = Self::select_qos_probe_model(token)
-                .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
-            let body = Self::build_qos_probe_request(token, model);
-            let client = upstream.get_client(Some(&token.account_id)).await;
-            let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-            let resp = client
-                .post(endpoint)
-                .bearer_auth(&token.access_token)
-                .header("User-Agent", upstream.get_user_agent().await)
-                .header("Content-Type", "application/json")
-                // Match the shared upstream path's streaming request framing.
-                .body(rquest::Body::wrap_stream(futures::stream::once(
-                    async move { Ok::<_, std::io::Error>(body_bytes) },
-                )))
-                .send()
-                .await
-                .map_err(|e| format!("Probe HTTP error: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("Probe HTTP status: {}", resp.status()));
-            }
-            Self::wait_for_qos_probe_generation(resp).await?;
-            Ok(start.elapsed().as_secs_f64() * 1000.0)
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs_f64(config.probe_timeout_secs),
+            async {
+                if token.timestamp
+                    <= chrono::Utc::now()
+                        .timestamp()
+                        .saturating_add(config.probe_timeout_secs.ceil() as i64)
+                {
+                    return Err("QoS probe is waiting for refreshed credentials".to_string());
+                }
+                let model = Self::select_qos_probe_model(token)
+                    .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
+                let body = Self::build_qos_probe_request(token, model);
+                let client = upstream.get_client(Some(&token.account_id)).await;
+                let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+                let resp = client
+                    .post(endpoint)
+                    .bearer_auth(&token.access_token)
+                    .header("User-Agent", upstream.get_user_agent().await)
+                    .header("Content-Type", "application/json")
+                    // Match the shared upstream path's streaming request framing.
+                    .body(rquest::Body::wrap_stream(futures::stream::once(
+                        async move { Ok::<_, std::io::Error>(body_bytes) },
+                    )))
+                    .send()
+                    .await
+                    .map_err(|e| format!("Probe HTTP error: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Probe HTTP status: {}", resp.status()));
+                }
+                Self::wait_for_qos_probe_generation(resp).await?;
+                Ok(start.elapsed().as_secs_f64() * 1000.0)
+            },
+        )
         .await
-        .map_err(|_| "QoS probe exceeded its 8s deadline".to_string())?
+        .map_err(|_| {
+            format!(
+                "QoS probe exceeded its {}s deadline",
+                config.probe_timeout_secs
+            )
+        })?
     }
 
     async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<(), String> {
@@ -6394,6 +6420,7 @@ mod tests {
             &token,
             &upstream,
             "http://127.0.0.1:9/unused",
+            QoSConfig::default(),
         )
         .await;
         assert_eq!(
@@ -6481,6 +6508,7 @@ mod tests {
             &token,
             &upstream,
             "http://127.0.0.1:9/v1internal:streamGenerateContent?alt=sse",
+            QoSConfig::default(),
         )
         .await;
         server.abort();
@@ -6515,7 +6543,7 @@ mod tests {
         ] {
             let (url, _received, server) = qos_probe_stub(status, chunks, false).await;
             let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-            let result = TokenManager::send_pure_hello_probe_to_endpoint(&qos_probe_test_token(), &upstream, &url).await;
+            let result = TokenManager::send_pure_hello_probe_to_endpoint(&qos_probe_test_token(), &upstream, &url, QoSConfig::default()).await;
             server.abort();
             assert!(result.is_err(), "{result:?}");
         }
@@ -6531,6 +6559,7 @@ mod tests {
             &qos_probe_test_token(),
             &upstream,
             &url,
+            QoSConfig::default(),
         )
         .await;
         server.abort();
@@ -6539,9 +6568,91 @@ mod tests {
     }
 
     #[test]
-    fn qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates() {
+    fn qos_probe_claim_uses_configured_credential_margin() {
+        use crate::proxy::qos_guardian::AccountQoSState;
+        let manager = TokenManager::new(PathBuf::new());
+        let mut token = qos_probe_test_token();
+        token.timestamp = chrono::Utc::now().timestamp() + 30;
+        manager
+            .tokens
+            .insert(token.account_id.clone(), token.clone());
+        let jailed = AccountQoSState::Jailed {
+            level: 0,
+            jailed_at: std::time::Instant::now(),
+            current_wait: Duration::ZERO,
+        };
+        manager
+            .qos_guardian
+            .states
+            .insert(token.account_id.clone(), jailed.clone());
+        manager
+            .qos_guardian
+            .update_config(QoSConfig {
+                probe_timeout_secs: 60.0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(manager.claim_due_qos_probes().is_empty());
+        assert_eq!(manager.qos_guardian.get_state(&token.account_id), jailed);
+
+        manager
+            .qos_guardian
+            .update_config(QoSConfig::default())
+            .unwrap();
+        let claimed = manager.claim_due_qos_probes();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].1.config, QoSConfig::default());
+    }
+
+    #[tokio::test]
+    async fn qos_probe_keeps_claimed_deadline_after_policy_update() {
+        use crate::proxy::qos_guardian::AccountQoSState;
+        let manager = TokenManager::new(PathBuf::new());
+        let token = qos_probe_test_token();
+        manager
+            .tokens
+            .insert(token.account_id.clone(), token.clone());
+        manager.qos_guardian.states.insert(
+            token.account_id.clone(),
+            AccountQoSState::Jailed {
+                level: 0,
+                jailed_at: std::time::Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        manager
+            .qos_guardian
+            .update_config(QoSConfig {
+                probe_timeout_secs: 1.0,
+                probe_success_threshold_secs: 1.0,
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, claim) = manager.claim_due_qos_probes().pop().unwrap();
+        manager
+            .qos_guardian
+            .update_config(QoSConfig {
+                probe_timeout_secs: 5.0,
+                probe_success_threshold_secs: 4.0,
+                ..Default::default()
+            })
+            .unwrap();
+        let (url, _received, server) =
+            qos_probe_stub(axum::http::StatusCode::OK, vec![": keepalive\n\n"], true).await;
+        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+        let started = std::time::Instant::now();
+        let result =
+            TokenManager::send_pure_hello_probe_to_endpoint(&token, &upstream, &url, claim.config)
+                .await;
+        server.abort();
+        assert_eq!(result, Err("QoS probe exceeded its 1s deadline".into()));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn qos_proxy_start_preserves_newer_admin_policy() {
         run_qos_regression_child(
-            "proxy::token_manager::tests::qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates",
+            "proxy::token_manager::tests::qos_proxy_start_preserves_newer_admin_policy",
             || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -6550,7 +6661,150 @@ mod tests {
                     .unwrap();
                 runtime.block_on(async {
                     let data_dir = crate::modules::account::get_data_dir().unwrap();
-                    let manager = Arc::new(TokenManager::new(data_dir));
+                    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = port_reservation.local_addr().unwrap().port();
+                    let mut initial = crate::models::AppConfig::default();
+                    initial.proxy.port = port;
+                    initial.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
+                    initial.proxy.api_key = "qos-stale-start-test".into();
+                    initial.proxy.admin_password = None;
+                    initial.proxy.proxy_pool.enabled = false;
+                    initial.proxy.proxy_pool.proxies.clear();
+                    initial.proxy.upstream_proxy.enabled = false;
+                    crate::modules::config::save_app_config(&initial).unwrap();
+                    let state = crate::commands::proxy::ProxyServiceState::new();
+                    let cloudflared =
+                        Arc::new(crate::commands::cloudflared::CloudflaredState::new());
+                    drop(port_reservation);
+                    crate::commands::proxy::ensure_admin_server(
+                        initial.proxy.clone(),
+                        &state,
+                        crate::modules::integration::SystemManager::Headless,
+                        cloudflared.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    let manager = state
+                        .admin_server
+                        .read()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .axum_server
+                        .token_manager
+                        .clone();
+                    assert!(manager.tokens.is_empty());
+                    assert_eq!(manager.qos_guardian.config_snapshot(), initial.proxy.qos);
+
+                    let client = reqwest::Client::builder()
+                        .no_proxy()
+                        .connect_timeout(Duration::from_secs(2))
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .unwrap();
+                    let base = format!("http://127.0.0.1:{port}");
+                    let mut updated = initial.clone();
+                    updated.proxy.qos.normal_threshold_secs = 32.0;
+                    updated.proxy.qos.deep_thinking_threshold_secs = 47.0;
+                    updated.proxy.qos.jail_ladder_secs = [150, 360, 720, 1080, 1440, 2160];
+                    client
+                        .post(format!("{base}/api/config"))
+                        .bearer_auth(&initial.proxy.api_key)
+                        .json(&serde_json::json!({"config": &updated}))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap();
+                    assert_eq!(manager.qos_guardian.config_snapshot(), updated.proxy.qos);
+                    let saved_bytes = std::fs::read(data_dir.join("gui_config.json")).unwrap();
+
+                    // The desktop startup task still holds A after the HTTP save
+                    // applied B to the resident admin server and released the gate.
+                    let status = crate::commands::proxy::internal_start_proxy_service(
+                        initial.proxy,
+                        &state,
+                        crate::modules::integration::SystemManager::Headless,
+                        cloudflared,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!status.running);
+                    assert_eq!(status.active_accounts, 0);
+                    let reused_manager = state
+                        .admin_server
+                        .read()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .axum_server
+                        .token_manager
+                        .clone();
+                    assert!(Arc::ptr_eq(&manager, &reused_manager));
+                    assert!(manager.tokens.is_empty());
+                    let running = client
+                        .get(format!("{base}/api/proxy/qos/config"))
+                        .bearer_auth(&updated.proxy.api_key)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json::<QoSConfig>()
+                        .await
+                        .unwrap();
+                    assert_eq!(running, updated.proxy.qos);
+                    assert_eq!(
+                        std::fs::read(data_dir.join("gui_config.json")).unwrap(),
+                        saved_bytes
+                    );
+                    assert_eq!(
+                        crate::modules::config::load_app_config().unwrap().proxy.qos,
+                        updated.proxy.qos
+                    );
+
+                    manager.graceful_shutdown(Duration::from_secs(1)).await;
+                    let admin = state.admin_server.write().await.take().unwrap();
+                    admin.stop().await;
+                });
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            },
+        );
+    }
+
+    #[test]
+    fn qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates() {
+        run_qos_regression_child(
+            "proxy::token_manager::tests::qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates",
+            || {
+                use crate::proxy::qos_config::QoSConfig;
+
+                async fn read_running_qos(
+                    client: &reqwest::Client,
+                    base: &str,
+                    api_key: &str,
+                ) -> QoSConfig {
+                    client
+                        .get(format!("{base}/api/proxy/qos/config"))
+                        .bearer_auth(api_key)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json::<QoSConfig>()
+                        .await
+                        .unwrap()
+                }
+
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let data_dir = crate::modules::account::get_data_dir().unwrap();
+                    let manager = Arc::new(TokenManager::new(data_dir.clone()));
                     let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                     let port = port_reservation.local_addr().unwrap().port();
                     let mut config = crate::models::AppConfig::default();
@@ -6581,6 +6835,7 @@ mod tests {
                         config.proxy.proxy_pool.clone(),
                         config.proxy.only_raw_quota_models,
                         config.proxy.image_scheduler.clone(),
+                        config.proxy.qos,
                     )
                     .await
                     .unwrap();
@@ -6595,6 +6850,10 @@ mod tests {
                     let base = format!("http://127.0.0.1:{port}");
                     let health = client.get(format!("{base}/health")).send().await.unwrap();
                     assert_eq!(health.status(), reqwest::StatusCode::OK);
+                    assert_eq!(
+                        read_running_qos(&client, &base, &config.proxy.api_key).await,
+                        QoSConfig::default(),
+                    );
 
                     let jailed = crate::proxy::qos_guardian::AccountQoSState::Jailed {
                         level: 0,
@@ -6602,7 +6861,7 @@ mod tests {
                         current_wait: Duration::ZERO,
                     };
                     manager.qos_guardian.states.insert("missing-token".into(), jailed.clone());
-                    for debug_enabled in [true, false, true] {
+                    for (debug_enabled, normal_threshold_secs) in [(true, 24.0), (false, 28.0), (true, 30.0)] {
                         // No tokens are inserted in this runtime: neither the daemon nor
                         // the request handler can issue an authenticated upstream request.
                         assert!(manager.tokens.is_empty());
@@ -6618,6 +6877,11 @@ mod tests {
                         assert_eq!(unavailable.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 
                         config.proxy.debug_logging.enabled = debug_enabled;
+                        config.proxy.qos.normal_threshold_secs = normal_threshold_secs;
+                        config.proxy.qos.deep_thinking_threshold_secs = normal_threshold_secs + 15.0;
+                        config.proxy.qos.no_peer_grace_secs = 12.0;
+                        config.proxy.qos.probe_timeout_secs = 9.0;
+                        config.proxy.qos.jail_ladder_secs = [150, 360, 720, 1080, 1440, 2160];
                         let saved = client
                             .post(format!("{base}/api/config"))
                             .bearer_auth(&config.proxy.api_key)
@@ -6626,6 +6890,10 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(saved.status(), reqwest::StatusCode::OK);
+                        assert_eq!(
+                            read_running_qos(&client, &base, &config.proxy.api_key).await,
+                            config.proxy.qos,
+                        );
 
                         let tick_manager = manager.clone();
                         tokio::spawn(async move { tick_manager.run_qos_probing_tick().await })
@@ -6657,13 +6925,100 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(reloaded.proxy.debug_logging.enabled, debug_enabled);
+                        assert_eq!(reloaded.proxy.qos, config.proxy.qos);
                     }
+
+                    // A concurrent full save must wait before writing to disk,
+                    // not just before applying the already-persisted policy.
+                    let before_gate = std::fs::read(data_dir.join("gui_config.json")).unwrap();
+                    let old_policy = manager.qos_guardian.config_snapshot();
+                    let apply_guard = crate::modules::config::config_apply_guard().await;
+                    config.proxy.qos.no_peer_grace_secs = 14.0;
+                    let pending_client = client.clone();
+                    let pending_config = config.clone();
+                    let pending_url = format!("{base}/api/config");
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let mut pending_save = tokio::spawn(async move {
+                        started.send(()).unwrap();
+                        pending_client.post(pending_url)
+                            .bearer_auth(&pending_config.proxy.api_key)
+                            .json(&serde_json::json!({"config": pending_config}))
+                            .send().await.unwrap()
+                    });
+                    ready.await.unwrap();
+                    assert!(tokio::time::timeout(Duration::from_millis(100), &mut pending_save).await.is_err());
+                    assert_eq!(std::fs::read(data_dir.join("gui_config.json")).unwrap(), before_gate);
+                    assert_eq!(manager.qos_guardian.config_snapshot(), old_policy);
+                    drop(apply_guard);
+                    assert_eq!(pending_save.await.unwrap().status(), reqwest::StatusCode::OK);
+                    assert_eq!(read_running_qos(&client, &base, &config.proxy.api_key).await, config.proxy.qos);
+                    assert_eq!(crate::modules::config::load_app_config().unwrap().proxy.qos, config.proxy.qos);
+
+                    let saved_bytes = std::fs::read(data_dir.join("gui_config.json")).unwrap();
+                    let mut invalid = config.clone();
+                    invalid.proxy.qos.probe_success_threshold_secs = invalid.proxy.qos.probe_timeout_secs + 1.0;
+                    invalid.proxy.debug_logging.enabled = !config.proxy.debug_logging.enabled;
+                    let rejected = client
+                        .post(format!("{base}/api/config"))
+                        .bearer_auth(&config.proxy.api_key)
+                        .json(&serde_json::json!({"config": &invalid}))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+                    assert_eq!(
+                        read_running_qos(&client, &base, &config.proxy.api_key).await,
+                        config.proxy.qos,
+                    );
+                    assert_eq!(std::fs::read(data_dir.join("gui_config.json")).unwrap(), saved_bytes);
+                    assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
 
                     server.stop();
                     manager.graceful_shutdown(Duration::from_secs(1)).await;
                     tokio::time::timeout(Duration::from_secs(2), server_task)
                         .await
                         .expect("HTTP accept task should stop")
+                        .unwrap();
+                    drop(server);
+
+                    // Reconstruct the server and manager from persisted configuration,
+                    // proving that startup applies the instance policy before probing.
+                    let persisted = crate::modules::config::load_app_config().unwrap();
+                    assert_eq!(persisted.proxy.qos, config.proxy.qos);
+                    let restarted_manager = Arc::new(TokenManager::new(data_dir));
+                    assert_eq!(restarted_manager.qos_guardian.config_snapshot(), QoSConfig::default());
+                    let (restarted_server, restarted_task) = crate::proxy::AxumServer::start(
+                        "127.0.0.1".into(),
+                        persisted.proxy.port,
+                        restarted_manager.clone(),
+                        persisted.proxy.custom_mapping.clone(),
+                        persisted.proxy.request_timeout,
+                        persisted.proxy.upstream_proxy.clone(),
+                        persisted.proxy.user_agent_override.clone(),
+                        crate::proxy::ProxySecurityConfig::from_proxy_config(&persisted.proxy),
+                        Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None)),
+                        persisted.proxy.experimental.clone(),
+                        persisted.proxy.debug_logging.clone(),
+                        crate::modules::integration::SystemManager::Headless,
+                        Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
+                        persisted.proxy.proxy_pool.clone(),
+                        persisted.proxy.only_raw_quota_models,
+                        persisted.proxy.image_scheduler.clone(),
+                        persisted.proxy.qos,
+                    )
+                    .await
+                    .unwrap();
+                    restarted_server.set_running(true).await;
+                    assert!(restarted_manager.tokens.is_empty());
+                    assert_eq!(
+                        read_running_qos(&client, &base, &persisted.proxy.api_key).await,
+                        persisted.proxy.qos,
+                    );
+                    restarted_server.stop();
+                    restarted_manager.graceful_shutdown(Duration::from_secs(1)).await;
+                    tokio::time::timeout(Duration::from_secs(2), restarted_task)
+                        .await
+                        .expect("restarted HTTP accept task should stop")
                         .unwrap();
                 });
                 runtime.shutdown_timeout(Duration::from_secs(2));
