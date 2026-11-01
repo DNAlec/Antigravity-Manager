@@ -104,16 +104,11 @@ pub fn next_rotation_attempt(
     max_attempts: usize,
     retry_same_account: bool,
 ) -> Option<usize> {
-    if retry_same_account {
-        return used_attempts.checked_sub(1);
-    }
-    if *used_attempts >= max_attempts {
-        return None;
-    }
-
-    let attempt = *used_attempts;
-    *used_attempts += 1;
-    Some(attempt)
+    crate::proxy::upstream::request_policy::request_policy().next_rotation_attempt(
+        used_attempts,
+        max_attempts,
+        retry_same_account,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -146,11 +141,12 @@ impl FailureStatusTracker {
 /// - 多账号 (pool_size > 1): 保证整池账号至少能完整轮换 2 轮 (Round 1 闪电快切 + Round 2 退避小等重试)
 ///   最小 4 次，上限 12 次 (既能把 2~6 个账号试满 2 轮，又防止超长等待导致客户端超时)
 pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
-    if pool_size <= 1 {
+    let normal_limit = if pool_size <= 1 {
         3
     } else {
         (pool_size * 2).clamp(4, 12)
-    }
+    };
+    crate::proxy::upstream::request_policy::request_policy().account_attempt_limit(normal_limit)
 }
 
 /// 单次客户端请求在网关内部允许消耗的最大全局时间预算（秒，默认 240s）
@@ -540,6 +536,9 @@ pub async fn apply_retry_strategy(
     status_code: u16,
     trace_id: &str,
 ) -> bool {
+    if crate::proxy::upstream::request_policy::request_policy().single_attempt {
+        return false;
+    }
     match strategy {
         RetryStrategy::NoRetry => {
             debug!(
