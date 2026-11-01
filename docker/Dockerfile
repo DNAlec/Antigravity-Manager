@@ -128,7 +128,7 @@ EXPOSE 8045
 
 # Healthcheck for container orchestration
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://127.0.0.1:8045/health || exit 1
+    CMD ["curl", "-fsS", "--connect-timeout", "2", "--max-time", "4", "http://127.0.0.1:8045/health"]
 
 # Run the application in headless mode
 ENTRYPOINT ["/app/antigravity-tools", "--headless"]
