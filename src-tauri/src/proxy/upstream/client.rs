@@ -9,6 +9,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+use super::request_policy::request_policy;
+
+// The watchdog ends at Response creation; streaming the body retains the
+// client's separate 600-second total timeout.
+async fn send_with_header_timeout(
+    request: rquest::RequestBuilder,
+    timeout: Duration,
+) -> Result<Result<Response, rquest::Error>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, request.send()).await
+}
+
 /// 解析端点易读简称 (Daily, Sandbox, Prod, Custom)
 pub fn parse_endpoint_name(base_url: &str) -> &'static str {
     if base_url.contains("sandbox") {
@@ -434,6 +445,12 @@ impl UpstreamClient {
                 // Try to get per-account proxy
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
+                        if request_policy().is_overridden() {
+                            tracing::info!(
+                                account = acc_id, proxy_id = %proxy_cfg.entry_id,
+                                "Upstream validation selected account proxy"
+                            );
+                        }
                         // Check cache
                         if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
                             return client.clone();
@@ -469,6 +486,9 @@ impl UpstreamClient {
             }
         }
         // Fallback to default client
+        if request_policy().is_overridden() {
+            tracing::info!(account = ?account_id, "Upstream validation selected default client/proxy configuration");
+        }
         self.default_client.read().await.clone()
     }
 
@@ -501,56 +521,6 @@ impl UpstreamClient {
         (status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::GATEWAY_TIMEOUT)
             && (error_body.contains("MODEL_CAPACITY_EXHAUSTED")
                 || error_body.contains("No capacity available for model"))
-    }
-
-    /// 计算上游多端点调用的全链路总超时时间预算（秒）
-    ///
-    /// 流式请求响应头基准保底 30s（超大 payload 弹性放宽至 45s），备用回退预算 25s，
-    /// 全链路总预算由原先的 150s 大幅收敛至 55~70s，杜绝主端点在排队拥塞时漫长挂起 85s~140s。
-    pub fn calculate_total_upstream_budget_secs(method: &str, body_len: usize) -> u64 {
-        let base_watchdog = if method == "streamGenerateContent" {
-            std::cmp::min(45, std::cmp::max(30, (body_len as u64) / (64 * 1024) + 30))
-        } else {
-            std::cmp::min(30, std::cmp::max(15, (body_len as u64) / (256 * 1024) + 15))
-        };
-        let fallback_margin = if method == "streamGenerateContent" {
-            25
-        } else {
-            15
-        };
-        base_watchdog.saturating_add(fallback_margin)
-    }
-
-    /// 动态计算当前端点尝试的看门狗单次超时时长（秒）
-    ///
-    /// 1. 首选端点 (attempt_idx == 0): 分配基准响应头看门狗（流式 30s，超大 payload 弹性放宽至 45s），
-    ///    若已确权容量枯竭则极速收敛至 15s；
-    /// 2. 回退备用端点 (attempt_idx > 0): 采用快探活看门狗（流式上限 25s，非流式 15s，容量枯竭 15s）；
-    /// 3. 受限于全链路剩余时间预算 `remaining_budget_secs`，并设置 5s 终极保底，防止由于网络开销导致为 0。
-    pub fn calculate_endpoint_watchdog_secs(
-        method: &str,
-        body_len: usize,
-        attempt_idx: usize,
-        remaining_budget_secs: u64,
-        is_capacity_exhausted: bool,
-    ) -> u64 {
-        let base_watchdog = if method == "streamGenerateContent" {
-            std::cmp::min(45, std::cmp::max(30, (body_len as u64) / (64 * 1024) + 30))
-        } else {
-            std::cmp::min(30, std::cmp::max(15, (body_len as u64) / (256 * 1024) + 15))
-        };
-
-        let target_secs = if is_capacity_exhausted {
-            15
-        } else if attempt_idx == 0 {
-            base_watchdog
-        } else if method == "streamGenerateContent" {
-            std::cmp::min(base_watchdog, 25)
-        } else {
-            std::cmp::min(base_watchdog, 15)
-        };
-
-        target_secs.min(remaining_budget_secs).max(5)
     }
 
     /// Call v1internal API (Basic Method)
@@ -702,10 +672,14 @@ impl UpstreamClient {
         let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
         let mut last_attempt_failed_at: Option<std::time::Instant> = None;
         let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-        let total_budget_secs =
-            Self::calculate_total_upstream_budget_secs(method, body_bytes.len());
+        let policy = request_policy();
+        let header_budget = policy.header_budget(method, body_bytes.len());
+        let total_budget = header_budget.total();
         let call_overall_start = std::time::Instant::now();
         let mut is_capacity_exhausted = false;
+        let upstream_call_id = uuid::Uuid::new_v4().to_string();
+        let request_id = body.get("requestId").and_then(Value::as_str).unwrap_or("");
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
 
         // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑
         // 我们包装一层循环，以便在检测到特定错误时移除 Header 并重试
@@ -714,21 +688,23 @@ impl UpstreamClient {
             let mut should_retry_without_header = false;
 
             // 动态健康度排序：优先尝试健康端点，跳过处于冷却期的故障端点，避免无状态重复累积 40s 超时
-            let candidate_endpoints = self
+            let mut candidate_endpoints = self
                 .endpoint_health
                 .get_ordered_endpoints(&V1_INTERNAL_BASE_URL_FALLBACKS);
+            if policy.single_attempt {
+                candidate_endpoints.truncate(1);
+            }
 
             // 遍历候选端点，失败时自动切换
             for (idx, base_url) in candidate_endpoints.iter().enumerate() {
                 let url = Self::build_url(base_url, method, query_string);
                 let has_next = idx + 1 < candidate_endpoints.len();
 
-                let elapsed_secs = call_overall_start.elapsed().as_secs();
-                let remaining_budget = total_budget_secs.saturating_sub(elapsed_secs);
-                if remaining_budget == 0 && idx > 0 {
+                let remaining_budget = total_budget.saturating_sub(call_overall_start.elapsed());
+                if remaining_budget.is_zero() {
                     let budget_err = format!(
                         "Total upstream timeout budget ({}s) exhausted before attempting endpoint {} (elapsed={:.1}s), aborting fallback chain",
-                        total_budget_secs, base_url, call_overall_start.elapsed().as_secs_f64()
+                        total_budget.as_secs(), base_url, call_overall_start.elapsed().as_secs_f64()
                     );
                     tracing::warn!(%budget_err);
                     last_err = Some(budget_err);
@@ -752,35 +728,32 @@ impl UpstreamClient {
                 let switch_delay_s = last_attempt_failed_at.map(|t| t.elapsed().as_secs_f64());
                 let attempt_start = std::time::Instant::now();
 
-                // [WATCHDOG] 端点级自适应防假死超时：受限于全链路总超时预算 (Timeout Budget)，
-                // 首选端点享有完整长思维预算 (120s+)，备选端点实施快探活 (30s)，容量枯竭极速探活 (15s)，
-                // 彻底杜绝多候选端点串联超时累加至 4~6 分钟 (Fixes #3506, Ref #3525)
-                let watchdog_secs = Self::calculate_endpoint_watchdog_secs(
-                    method,
-                    body_bytes.len(),
-                    idx,
-                    remaining_budget,
-                    is_capacity_exhausted,
-                );
-                let send_future = req_builder.send();
-                let response = match tokio::time::timeout(
-                    std::time::Duration::from_secs(watchdog_secs),
-                    send_future,
-                )
-                .await
-                {
+                // Header overrides and the fallback-chain budget come from the
+                // same snapshot, so a longer primary wait cannot be capped at 55s.
+                let watchdog =
+                    header_budget.endpoint_timeout(idx, remaining_budget, is_capacity_exhausted);
+                if policy.is_overridden() {
+                    tracing::info!(
+                        call_id = %upstream_call_id, request_id, account = ?account_id,
+                        model, method, endpoint = %base_url, endpoint_attempt = idx + 1,
+                        body_len = body_bytes.len(), watchdog_secs = watchdog.as_secs_f64(),
+                        chain_budget_secs = total_budget.as_secs(), single_attempt = policy.single_attempt,
+                        "Upstream response-header wait started"
+                    );
+                }
+                let response = match send_with_header_timeout(req_builder, watchdog).await {
                     Ok(res) => res,
                     Err(_) => {
                         self.endpoint_health.mark_failure(base_url);
                         last_attempt_failed_at = Some(std::time::Instant::now());
                         let err_msg = format!(
-                            "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={}, total_elapsed={:.1}s)",
-                            watchdog_secs, base_url, method, body_bytes.len(), call_overall_start.elapsed().as_secs_f64()
+                            "HTTP request timed out after {:.3}s waiting for response headers at {} (method={}, body_len={}, total_elapsed={:.1}s)",
+                            watchdog.as_secs_f64(), base_url, method, body_bytes.len(), call_overall_start.elapsed().as_secs_f64()
                         );
                         if has_next {
-                            tracing::warn!(%err_msg, "Upstream candidate endpoint timed out, fast falling back to next endpoint");
+                            tracing::warn!(call_id = %upstream_call_id, request_id, account = ?account_id, %err_msg, "Upstream candidate endpoint timed out, fast falling back to next endpoint");
                         } else {
-                            tracing::warn!(%err_msg, "Terminal upstream endpoint timed out");
+                            tracing::warn!(call_id = %upstream_call_id, request_id, account = ?account_id, %err_msg, "Terminal upstream endpoint timed out");
                         }
                         fallback_attempts.push(FallbackAttemptLog {
                             endpoint_name: parse_endpoint_name(base_url).to_string(),
@@ -803,6 +776,15 @@ impl UpstreamClient {
                 match response {
                     Ok(resp) => {
                         let status = resp.status();
+                        if policy.is_overridden() {
+                            tracing::info!(
+                                call_id = %upstream_call_id, request_id, account = ?account_id,
+                                endpoint = %base_url, status = status.as_u16(),
+                                header_elapsed_secs = duration_s,
+                                chain_elapsed_secs = call_overall_start.elapsed().as_secs_f64(),
+                                "Upstream response headers received"
+                            );
+                        }
                         if status.is_success() {
                             self.endpoint_health.mark_success(base_url);
                             if idx > 0 || has_triggered_downgrade {
@@ -838,6 +820,7 @@ impl UpstreamClient {
                         // [NEW] 检测 403 错误 (Issue #3074)
                         // 只要带有项目 Header 且返回 403，我们就尝试降级重试一次
                         if status == StatusCode::FORBIDDEN
+                            && !policy.single_attempt
                             && !has_triggered_downgrade
                             && headers.contains_key("x-goog-user-project")
                         {
@@ -926,7 +909,7 @@ impl UpstreamClient {
                         self.endpoint_health.mark_failure(base_url);
                         last_attempt_failed_at = Some(std::time::Instant::now());
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
-                        tracing::debug!("{}", msg);
+                        tracing::debug!(call_id = %upstream_call_id, request_id, account = ?account_id, error = %msg, "Upstream send failed");
                         // [NEW] 记录网络错误的降级尝试
                         fallback_attempts.push(FallbackAttemptLog {
                             endpoint_name: parse_endpoint_name(base_url).to_string(),
@@ -962,7 +945,7 @@ impl UpstreamClient {
                 error = %final_err,
                 account = ?account_id,
                 method = %method,
-                "Upstream network request failed across all endpoints (non-server fault)"
+                "Upstream request failed across all permitted endpoints"
             );
             return Err(final_err);
         }
@@ -1358,68 +1341,99 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_calculate_watchdog_and_budget() {
-        // streamGenerateContent primary attempt with ample budget (recalibrated to 30s base, 55s total)
-        let total_budget =
-            UpstreamClient::calculate_total_upstream_budget_secs("streamGenerateContent", 1024);
-        assert_eq!(total_budget, 55); // 30 + 25
+    async fn delayed_header_server(
+        header_delay: Duration,
+        body_delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                tokio::time::sleep(header_delay).await;
+                if socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(body_delay).await;
+                let _ = socket.write_all(b"OK").await;
+            })
+            .await
+            .unwrap();
+        });
+        (url, server)
+    }
 
-        let wd_primary = UpstreamClient::calculate_endpoint_watchdog_secs(
-            "streamGenerateContent",
-            1024,
-            0,
-            55,
-            false,
+    #[tokio::test]
+    async fn header_watchdog_cancels_a_slow_header_response() {
+        let (url, server) = delayed_header_server(Duration::from_millis(150), Duration::ZERO).await;
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url)
+            .body(vec![b'x'; 2016]);
+        let result = send_with_header_timeout(request, Duration::from_millis(25)).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_err(),
+            "delayed headers must exceed the short watchdog"
         );
-        assert_eq!(wd_primary, 30);
+    }
 
-        // Fallback attempt (idx > 0) is capped at 25s
-        let wd_fallback = UpstreamClient::calculate_endpoint_watchdog_secs(
-            "streamGenerateContent",
-            1024,
-            1,
-            25,
-            false,
-        );
-        assert_eq!(wd_fallback, 25);
+    #[tokio::test]
+    async fn header_watchdog_accepts_the_same_delay_with_a_longer_budget() {
+        let (url, server) = delayed_header_server(Duration::from_millis(150), Duration::ZERO).await;
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url)
+            .body(vec![b'x'; 2016]);
+        let response = send_with_header_timeout(request, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(2), response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(body, "OK");
+    }
 
-        // Capacity exhausted attempt is fast-probed at 15s max
-        let wd_exhausted = UpstreamClient::calculate_endpoint_watchdog_secs(
-            "streamGenerateContent",
-            1024,
-            1,
-            25,
-            true,
-        );
-        assert_eq!(wd_exhausted, 15);
-
-        // Clamping to remaining budget
-        let wd_clamped = UpstreamClient::calculate_endpoint_watchdog_secs(
-            "streamGenerateContent",
-            1024,
-            1,
-            10,
-            false,
-        );
-        assert_eq!(wd_clamped, 10);
-
-        // Minimum floor of 5s
-        let wd_min = UpstreamClient::calculate_endpoint_watchdog_secs(
-            "streamGenerateContent",
-            1024,
-            1,
-            2,
-            false,
-        );
-        assert_eq!(wd_min, 5);
-
-        // Non-stream methods have 15s base watchdog and 30s total budget
-        let total_non_stream =
-            UpstreamClient::calculate_total_upstream_budget_secs("generateContent", 1024);
-        assert_eq!(total_non_stream, 30); // 15 + 15
-        let wd_non_stream =
-            UpstreamClient::calculate_endpoint_watchdog_secs("generateContent", 1024, 0, 30, false);
-        assert_eq!(wd_non_stream, 15);
+    #[tokio::test]
+    async fn header_watchdog_does_not_limit_body_streaming_after_headers() {
+        let (url, server) = delayed_header_server(Duration::ZERO, Duration::from_millis(600)).await;
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url)
+            .body(vec![b'x'; 2016]);
+        let response = send_with_header_timeout(request, Duration::from_millis(300))
+            .await
+            .unwrap()
+            .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(2), response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(body, "OK");
     }
 }

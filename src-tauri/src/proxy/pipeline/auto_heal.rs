@@ -184,6 +184,11 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    // Preserve the original stream during single-attempt experiments: a hidden
+    // continuation would generate again and change the request under comparison.
+    if crate::proxy::upstream::request_policy::request_policy().single_attempt {
+        return stream;
+    }
     let stream = async_stream::stream! {
         let mut buffer = BytesMut::new();
         let mut saw_thought = false;
