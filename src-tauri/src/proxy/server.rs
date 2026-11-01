@@ -582,6 +582,7 @@ impl AxumServer {
                 if user_agent_override.is_some() {
                     u.set_user_agent_override(user_agent_override).await;
                 }
+                token_manager.register_qos_upstream(&u);
                 u
             },
             monitor: monitor.clone(),

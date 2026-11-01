@@ -209,6 +209,7 @@ pub struct TokenManager {
     /// [NEW] QoS 智能熔断与阶梯探针守卫
     pub qos_guardian: Arc<crate::proxy::qos_guardian::QoSGuardian>,
     qos_probe_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    qos_upstream: std::sync::RwLock<Weak<crate::proxy::upstream::client::UpstreamClient>>,
 }
 
 impl TokenManager {
@@ -249,6 +250,7 @@ impl TokenManager {
             in_flight_requests: Arc::new(DashMap::new()),
             qos_guardian: Arc::new(crate::proxy::qos_guardian::QoSGuardian::new()),
             qos_probe_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            qos_upstream: std::sync::RwLock::new(Weak::new()),
         }
     }
 
@@ -942,6 +944,13 @@ impl TokenManager {
         if self.tokens.remove(account_id).is_some() {
             tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
         }
+        // Invalidate any in-flight probe before the account can be re-enabled.
+        self.qos_guardian.states.remove(account_id);
+        self.qos_guardian.samples.remove(account_id);
+        self.qos_guardian.penalty_memory.remove(account_id);
+        self.qos_guardian
+            .session_watermarks
+            .retain(|(account, _), _| account != account_id);
         self.health_scores.remove(account_id);
         self.rate_limit_tracker.clear(account_id);
         self.refresh_locks.remove(account_id);
@@ -5167,6 +5176,14 @@ impl TokenManager {
         }
     }
 
+    /// 让后台探针共享业务请求的账号代理及热更新后的客户端。
+    pub(crate) fn register_qos_upstream(
+        &self,
+        upstream: &Arc<crate::proxy::upstream::client::UpstreamClient>,
+    ) {
+        *self.qos_upstream.write().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(upstream);
+    }
+
     /// 启动 QoS 自动阶梯探针巡检协程（每 5 秒扫描一次）
     pub async fn start_qos_probing_daemon(self: &Arc<Self>) {
         let weak_self = Arc::downgrade(self);
@@ -5199,73 +5216,98 @@ impl TokenManager {
         tracing::info!("QoS probing daemon started (interval: 5s)");
     }
 
+    /// 领取可执行的探针，所有状态锁均在返回前释放。
+    fn claim_due_qos_probes(&self) -> Vec<(ProxyToken, crate::proxy::qos_guardian::ProbeClaim)> {
+        // DashMap 的迭代器自身也持有分片读锁；必须先结束整个遍历再修改状态。
+        let due_accounts: Vec<String> = self
+            .qos_guardian
+            .states
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                    jailed_at,
+                    current_wait,
+                    ..
+                } if jailed_at.elapsed() >= *current_wait => Some(entry.key().clone()),
+                _ => None,
+            })
+            .collect();
+
+        due_accounts
+            .into_iter()
+            .filter_map(|account_id| {
+                // 缺少凭据时保留原状态，避免领取后没有任务能结束 Probing。
+                let token = self.tokens.get(&account_id).map(|r| r.value().clone())?;
+                // 主动刷新任务会更新凭据；认证过期不应被判为模型响应缓慢。
+                if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
+                    return None;
+                }
+                // Missing or protected model metadata is not a failed latency probe.
+                // Keep the expired jail available for a later metadata refresh.
+                Self::select_qos_probe_model(&token)?;
+                let claim = self.qos_guardian.try_mark_probing(&account_id)?;
+                Some((token, claim))
+            })
+            .collect()
+    }
+
     /// 执行一次 QoS 阶梯自愈扫描轮次
     async fn run_qos_probing_tick(&self) {
-        for entry in self.qos_guardian.states.iter() {
-            let account_id = entry.key().clone();
-            if let crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                level,
-                jailed_at,
-                current_wait,
-            } = *entry.value()
-            {
-                if jailed_at.elapsed() >= current_wait {
-                    // 标记为探测中
-                    self.qos_guardian.mark_probing(&account_id, level);
-
-                    let guardian = self.qos_guardian.clone();
-                    if let Some(token) = self.tokens.get(&account_id).map(|r| r.value().clone()) {
-                        tokio::spawn(async move {
+        let upstream = self
+            .qos_upstream
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        let Some(upstream) = upstream else {
+            return;
+        };
+        for (token, claim) in self.claim_due_qos_probes() {
+            let guardian = self.qos_guardian.clone();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let account_id = &token.account_id;
+                tracing::info!(
+                    "🔍 [QoS Probe] Sending synthetic 'Hello' probe to account {} (Level {})...",
+                    account_id,
+                    claim.level
+                );
+                let probe_res = Self::send_pure_hello_probe_internal(&token, &upstream).await;
+                match probe_res {
+                    Ok(ttft_ms) if ttft_ms < 8000.0 => {
+                        if guardian.mark_probe_passed(account_id, claim) {
                             tracing::info!(
-                                "🔍 [QoS Probe] Sending synthetic 'Hello' probe to account {} (Level {})...",
+                                "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < 8s)! Moving to Half-Open probation.",
                                 account_id,
-                                level
+                                ttft_ms / 1000.0
                             );
-                            let probe_res = Self::send_pure_hello_probe_internal(&token).await;
-                            match probe_res {
-                                Ok(ttft_ms) if ttft_ms < 8000.0 => {
-                                    tracing::info!(
-                                        "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < 8s)! Moving to Half-Open probation.",
-                                        account_id,
-                                        ttft_ms / 1000.0
-                                    );
-                                    guardian.mark_probe_passed(&account_id, level);
-                                }
-                                Ok(ttft_ms) => {
-                                    tracing::warn!(
-                                        "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= 8s. Escalating jail level.",
-                                        account_id,
-                                        ttft_ms / 1000.0
-                                    );
-                                    let (next_lv, wait) =
-                                        guardian.mark_probe_failed(&account_id, level);
-                                    tracing::warn!(
-                                        "Account {} escalated to Level {} (wait {:?})",
-                                        account_id,
-                                        next_lv,
-                                        wait
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "⏳ [QoS Probe] Account {} probe failed: {}. Escalating jail level.",
-                                        account_id,
-                                        err
-                                    );
-                                    let (next_lv, wait) =
-                                        guardian.mark_probe_failed(&account_id, level);
-                                    tracing::warn!(
-                                        "Account {} escalated to Level {} (wait {:?})",
-                                        account_id,
-                                        next_lv,
-                                        wait
-                                    );
-                                }
-                            }
-                        });
+                        }
+                    }
+                    Ok(ttft_ms) => {
+                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
+                        {
+                            tracing::warn!(
+                                "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= 8s. Escalated to Level {} (wait {:?})",
+                                account_id,
+                                ttft_ms / 1000.0,
+                                next_lv,
+                                wait
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
+                        {
+                            tracing::warn!(
+                                "⏳ [QoS Probe] Account {} probe failed: {}. Escalated to Level {} (wait {:?})",
+                                account_id,
+                                err,
+                                next_lv,
+                                wait
+                            );
+                        }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -5276,58 +5318,234 @@ impl TokenManager {
             .get(account_id)
             .map(|t| t.value().clone())
             .ok_or_else(|| format!("Account {} not found", account_id))?;
-        Self::send_pure_hello_probe_internal(&token).await
+        let upstream = self
+            .qos_upstream
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+            .ok_or_else(|| "QoS probe upstream is not initialized".to_string())?;
+        Self::send_pure_hello_probe_internal(&token, &upstream).await
     }
 
-    async fn send_pure_hello_probe_internal(token: &ProxyToken) -> Result<f64, String> {
-        let body = serde_json::json!({
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{ "text": "你好" }]
-                }
-            ],
-            "generationConfig": {
-                "maxOutputTokens": 10,
-                "temperature": 0.0
-            }
-        });
-
+    async fn send_pure_hello_probe_internal(
+        token: &ProxyToken,
+        upstream: &crate::proxy::upstream::client::UpstreamClient,
+    ) -> Result<f64, String> {
         let endpoint =
             "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+        Self::send_pure_hello_probe_to_endpoint(token, upstream, endpoint).await
+    }
 
-        let client = rquest::Client::builder()
-            .timeout(std::time::Duration::from_millis(8000))
-            .build()
-            .map_err(|e| format!("Client builder error: {}", e))?;
+    fn select_qos_probe_model(token: &ProxyToken) -> Option<&str> {
+        // Use the account's authorized text model IDs and respect both raw model
+        // protection and the normalized quota buckets used by the scheduler.
+        token
+            .available_models
+            .iter()
+            .filter(|model| {
+                let quota_bucket =
+                    crate::proxy::common::model_mapping::normalize_to_standard_id(model);
+                model.starts_with("gemini-")
+                    && !model.contains("image")
+                    && !model.contains("tts")
+                    && !model.contains("audio")
+                    && !token.protected_models.contains(*model)
+                    && !quota_bucket.is_some_and(|bucket| token.protected_models.contains(&bucket))
+            })
+            .min_by_key(|model| {
+                (
+                    if model.contains("flash-lite") {
+                        0
+                    } else if model.contains("flash") {
+                        1
+                    } else {
+                        2
+                    },
+                    model.as_str(),
+                )
+            })
+            .map(String::as_str)
+    }
 
-        let start = std::time::Instant::now();
-        let resp = client
-            .post(endpoint)
-            .header("Authorization", format!("Bearer {}", token.access_token))
-            .header("Content-Type", "application/json")
-            .header(
-                "User-Agent",
-                "antigravity/hub/2.23.1 (Windows NT 10.0; Win64; x64)",
-            )
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Probe HTTP error: {}", e))?;
+    fn build_qos_probe_request(token: &ProxyToken, model: &str) -> serde_json::Value {
+        use crate::proxy::model_specs;
 
-        if !resp.status().is_success() {
-            return Err(format!("Probe HTTP status: {}", resp.status()));
+        // A synthetic health probe must not inherit user prompts or business
+        // thinking settings. Keep only the model's minimum supported thinking
+        // budget and room for the short answer, while using the shared envelope.
+        let official = crate::models::OfficialModelCatalog::get(model);
+        let supports_thinking = !model_specs::is_gemini_under_v3(model)
+            && official
+                .as_ref()
+                .and_then(|info| info.supports_thinking)
+                .unwrap_or_else(|| {
+                    model_specs::is_thinking_model(model)
+                        || (model_specs::is_gemini_v3_or_above(model)
+                            && model_specs::get_thinking_budget(model, Some(token)) > 0)
+                });
+        let thinking_budget = supports_thinking.then(|| {
+            let base = crate::proxy::common::model_mapping::strip_tier_suffix(model);
+            let low_budget = model_specs::get_thinking_budget(&format!("{base}-low"), Some(token));
+            let minimum = official
+                .as_ref()
+                .and_then(|info| info.min_thinking_budget)
+                .and_then(|budget| u64::try_from(budget).ok())
+                .unwrap_or(low_budget);
+            // Gemini 4's validated lower bound is stricter than the generic
+            // minimum advertised by the catalog (see model_specs' low tier).
+            if model_specs::is_gemini_v4_or_above(model) {
+                minimum.max(low_budget)
+            } else {
+                minimum
+            }
+        });
+        let mut generation_config = serde_json::json!({
+            "maxOutputTokens": thinking_budget.unwrap_or(0).saturating_add(10),
+            "temperature": 0.0,
+            "candidateCount": 1,
+        });
+        if let Some(budget) = thinking_budget {
+            generation_config["thinkingConfig"] = serde_json::json!({
+                "thinkingBudget": budget,
+                "includeThoughts": false,
+            });
         }
 
+        // Each probe gets its own upstream session, separate from conversations
+        // and earlier probes so server-side cumulative context cannot grow.
+        let session = format!("qos-probe/{}", uuid::Uuid::new_v4());
+        let request_id =
+            crate::proxy::mappers::common_utils::build_official_request_id(&session, 1);
+        let mut request = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "你好"}]}],
+            "generationConfig": generation_config,
+        });
+        crate::proxy::common::session::apply_upstream_session(
+            &mut request,
+            &token.account_id,
+            &session,
+        );
+        let (user_agent, _) =
+            crate::proxy::mappers::common_utils::resolve_official_fingerprint(Some(token));
+        let project = token
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|project| !project.is_empty())
+            .unwrap_or(DEFAULT_PROJECT_ID);
+        let mut body = serde_json::json!({
+            "project": project,
+            "requestId": request_id,
+            "request": request,
+            "model": model,
+            "userAgent": user_agent,
+        });
+        crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+        body
+    }
+
+    async fn send_pure_hello_probe_to_endpoint(
+        token: &ProxyToken,
+        upstream: &crate::proxy::upstream::client::UpstreamClient,
+        endpoint: &str,
+    ) -> Result<f64, String> {
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
+                return Err("QoS probe is waiting for refreshed credentials".to_string());
+            }
+            let model = Self::select_qos_probe_model(token)
+                .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
+            let body = Self::build_qos_probe_request(token, model);
+            let client = upstream.get_client(Some(&token.account_id)).await;
+            let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+            let resp = client
+                .post(endpoint)
+                .bearer_auth(&token.access_token)
+                .header("User-Agent", upstream.get_user_agent().await)
+                .header("Content-Type", "application/json")
+                // Match the shared upstream path's streaming request framing.
+                .body(rquest::Body::wrap_stream(futures::stream::once(
+                    async move { Ok::<_, std::io::Error>(body_bytes) },
+                )))
+                .send()
+                .await
+                .map_err(|e| format!("Probe HTTP error: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Probe HTTP status: {}", resp.status()));
+            }
+            Self::wait_for_qos_probe_generation(resp).await?;
+            Ok(start.elapsed().as_secs_f64() * 1000.0)
+        })
+        .await
+        .map_err(|_| "QoS probe exceeded its 8s deadline".to_string())?
+    }
+
+    async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<(), String> {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        if let Some(chunk_res) = stream.next().await {
-            let _ = chunk_res.map_err(|e| format!("Probe stream error: {}", e))?;
-            let ttft_ms = start.elapsed().as_micros() as f64 / 1000.0;
-            return Ok(ttft_ms);
+        let mut pending = bytes::BytesMut::new();
+        let mut event_data = String::new();
+        // Keepalive traffic and arbitrary chunk boundaries must not count as tokens.
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Probe stream error: {e}"))?;
+            if pending.len() + event_data.len() + chunk.len() > 64 * 1024 {
+                return Err("QoS probe SSE event exceeded 64 KiB".to_string());
+            }
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|&byte| byte == b'\n') {
+                let line = pending.split_to(end + 1);
+                let line = std::str::from_utf8(&line)
+                    .map_err(|_| "QoS probe received invalid UTF-8".to_string())?
+                    .trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    if Self::qos_probe_event_has_generation(&event_data)? {
+                        return Ok(());
+                    }
+                    event_data.clear();
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    if !event_data.is_empty() {
+                        event_data.push('\n');
+                    }
+                    event_data.push_str(data.strip_prefix(' ').unwrap_or(data));
+                }
+            }
         }
+        Err("QoS probe ended without generated text".to_string())
+    }
 
-        Err("Probe received empty stream".to_string())
+    fn qos_probe_event_has_generation(data: &str) -> Result<bool, String> {
+        if data.trim().is_empty() {
+            return Ok(false);
+        }
+        if data.trim() == "[DONE]" {
+            return Err("QoS probe ended without generated text".to_string());
+        }
+        let event: serde_json::Value = serde_json::from_str(data)
+            .map_err(|_| "QoS probe received invalid SSE JSON".to_string())?;
+        let response = event.get("response").unwrap_or(&event);
+        if event.get("error").is_some() || response.get("error").is_some() {
+            return Err("QoS probe received an upstream error event".to_string());
+        }
+        Ok(response
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate
+                        .pointer("/content/parts")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                !crate::proxy::thinking_store::is_thought_part(part)
+                                    && part
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        })
+                })
+            }))
     }
 
     /// [NEW] 从账号配额信息中提取最近的刷新时间戳
@@ -5815,6 +6033,643 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
     use std::time::Duration;
+
+    // A synchronous DashMap deadlock also blocks Tokio timers. Run the scenario in
+    // a child process so the parent can kill and reap it on a regression.
+    fn run_qos_regression_child(test_name: &str, scenario: impl FnOnce()) {
+        const CHILD_ENV: &str = "ANTIGRAVITY_QOS_REGRESSION_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            scenario();
+            return;
+        }
+
+        let data_dir = tempfile::tempdir().expect("create isolated QoS test data directory");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .env("ABV_DATA_DIR", data_dir.path())
+            .env(
+                "ABV_DATA_DIR_POINTER_FILE",
+                data_dir.path().join("location.json"),
+            )
+            .spawn()
+            .expect("spawn isolated QoS regression");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "QoS regression child failed: {status}");
+                    return;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "QoS regression child exceeded deadline or could not be reaped: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qos_expired_jail_tick_does_not_block_runtime() {
+        run_qos_regression_child(
+            "proxy::token_manager::tests::qos_expired_jail_tick_does_not_block_runtime",
+            || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let manager = Arc::new(TokenManager::new(PathBuf::new()));
+                    let upstream = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
+                        None, None,
+                    ));
+                    manager.register_qos_upstream(&upstream);
+                    let jailed = crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                        level: 0,
+                        jailed_at: std::time::Instant::now(),
+                        current_wait: Duration::ZERO,
+                    };
+                    manager
+                        .qos_guardian
+                        .states
+                        .insert("missing-token".into(), jailed.clone());
+                    let tick_manager = manager.clone();
+                    tokio::spawn(async move { tick_manager.run_qos_probing_tick().await })
+                        .await
+                        .unwrap();
+                    // No credentials: no real upstream probe and no orphan Probing state.
+                    assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
+                    tokio::spawn(async { tokio::task::yield_now().await })
+                        .await
+                        .unwrap();
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn qos_probe_claim_releases_iteration_locks_and_claims_each_due_account_once() {
+        run_qos_regression_child(
+            "proxy::token_manager::tests::qos_probe_claim_releases_iteration_locks_and_claims_each_due_account_once",
+            || {
+                use crate::proxy::qos_guardian::AccountQoSState;
+
+                let manager = TokenManager::new(PathBuf::new());
+                for (account_id, level, wait) in [
+                    ("due-a", 0, Duration::ZERO),
+                    ("due-b", 2, Duration::ZERO),
+                    ("not-due", 1, Duration::from_secs(3600)),
+                ] {
+                    let mut token = qos_probe_test_token();
+                    token.account_id = account_id.into();
+                    manager.tokens.insert(account_id.into(), token);
+                    manager.qos_guardian.states.insert(
+                        account_id.into(),
+                        AccountQoSState::Jailed {
+                            level,
+                            jailed_at: std::time::Instant::now(),
+                            current_wait: wait,
+                        },
+                    );
+                }
+                let waiting = manager.qos_guardian.get_state("not-due");
+
+                // Claiming is synchronous state management: no daemon or network probe runs.
+                let mut claimed: Vec<_> = manager
+                    .claim_due_qos_probes()
+                    .into_iter()
+                    .map(|(token, claim)| (token.account_id, claim.level))
+                    .collect();
+                claimed.sort();
+                assert_eq!(claimed, vec![("due-a".into(), 0), ("due-b".into(), 2)]);
+                for (account_id, level) in &claimed {
+                    assert!(matches!(
+                        manager.qos_guardian.get_state(account_id),
+                        AccountQoSState::Probing { level: actual, .. } if actual == *level
+                    ));
+                }
+                assert_eq!(manager.qos_guardian.get_state("not-due"), waiting);
+                assert!(manager.claim_due_qos_probes().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn qos_probe_claim_waits_for_refreshed_credentials() {
+        use crate::proxy::qos_guardian::AccountQoSState;
+        let manager = TokenManager::new(PathBuf::new());
+        let mut token = qos_probe_test_token();
+        token.account_id = "expired".into();
+        token.timestamp = chrono::Utc::now().timestamp() - 1;
+        manager.tokens.insert(token.account_id.clone(), token);
+        let jailed = AccountQoSState::Jailed {
+            level: 0,
+            jailed_at: std::time::Instant::now(),
+            current_wait: Duration::ZERO,
+        };
+        manager
+            .qos_guardian
+            .states
+            .insert("expired".into(), jailed.clone());
+        assert!(manager.claim_due_qos_probes().is_empty());
+        assert_eq!(manager.qos_guardian.get_state("expired"), jailed);
+    }
+
+    #[test]
+    fn qos_probe_completion_cannot_restore_a_removed_account() {
+        use crate::proxy::qos_guardian::AccountQoSState;
+        let manager = TokenManager::new(PathBuf::new());
+        let account_id = "removed-probe-account";
+        let mut token = qos_probe_test_token();
+        token.account_id = account_id.into();
+        manager.tokens.insert(account_id.into(), token);
+        let guardian = &manager.qos_guardian;
+        let now = std::time::Instant::now();
+        guardian.states.insert(
+            account_id.into(),
+            AccountQoSState::Jailed {
+                level: 1,
+                jailed_at: now,
+                current_wait: Duration::ZERO,
+            },
+        );
+        guardian.penalty_memory.insert(account_id.into(), (1, now));
+        guardian.push_sample(account_id, 1000.0, false, false);
+        guardian
+            .session_watermarks
+            .insert((account_id.into(), "session".into()), (100, now));
+        let (_, claim) = manager.claim_due_qos_probes().pop().unwrap();
+
+        manager.remove_account(account_id);
+
+        assert!(!guardian.mark_probe_passed(account_id, claim));
+        assert_eq!(guardian.mark_probe_failed(account_id, claim), None);
+        assert!(!manager.tokens.contains_key(account_id));
+        assert!(!guardian.states.contains_key(account_id));
+        assert!(!guardian.penalty_memory.contains_key(account_id));
+        assert!(!guardian.samples.contains_key(account_id));
+        assert!(!guardian
+            .session_watermarks
+            .contains_key(&(account_id.into(), "session".into())));
+    }
+
+    fn qos_probe_test_token() -> ProxyToken {
+        let mut token = create_test_token("probe-account", None, 1.0, None, Some(100));
+        token.project_id = Some("probe-project".into());
+        token.available_models = ["gemini-2.5-flash", "gemini-3-pro-image"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        token
+    }
+
+    #[test]
+    fn qos_probe_payload_ignores_business_prompts_and_thinking_settings() {
+        run_qos_regression_child(
+            "proxy::token_manager::tests::qos_probe_payload_ignores_business_prompts_and_thinking_settings",
+            || {
+                use crate::proxy::config::{GlobalSystemPromptConfig, ThinkingBudgetConfig};
+
+                // Global settings are modified only in this isolated child process.
+                crate::proxy::config::update_global_system_prompt_config(GlobalSystemPromptConfig {
+                    enabled: true,
+                    content: "Business-only instruction: write a long analysis before answering.".into(),
+                });
+                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig {
+                    flash_low: 16000,
+                    flash_medium: 16000,
+                    flash_high: 16000,
+                    flash_tiered: 16000,
+                    pro_low: 16000,
+                    pro_high: 16000,
+                    custom_value: 16000,
+                    ..Default::default()
+                });
+                let mut token = qos_probe_test_token();
+                token.email = "probe@example.com".into();
+                let mut sessions = HashSet::new();
+                let mut request_ids = HashSet::new();
+                for (model, budget) in [
+                    ("gemini-2.5-flash", None),
+                    ("gemini-3.1-flash-lite", None),
+                    ("gemini-3.8-flash-low", Some(32_u64)),
+                    ("gemini-3.1-pro-high", Some(128)),
+                    ("gemini-4-argon", Some(1024)),
+                    ("gemini-4-argon-low", Some(1024)),
+                ] {
+                    let body = TokenManager::build_qos_probe_request(&token, model);
+                    assert_eq!(body["project"], "probe-project");
+                    assert_eq!(body["model"], model);
+                    assert_eq!(body["userAgent"], "jetski");
+                    assert!(body.get("requestType").is_none());
+                    let request = &body["request"];
+                    assert!(request.get("systemInstruction").is_none(), "{model}: {body}");
+                    assert!(request.get("tools").is_none());
+                    assert_eq!(
+                        request["contents"],
+                        serde_json::json!([{"role": "user", "parts": [{"text": "你好"}]}])
+                    );
+                    let generation = &request["generationConfig"];
+                    assert_eq!(generation["maxOutputTokens"], budget.unwrap_or(0) + 10);
+                    assert_eq!(generation["temperature"], 0.0);
+                    assert_eq!(generation["candidateCount"], 1);
+                    if let Some(budget) = budget {
+                        assert_eq!(generation["thinkingConfig"], serde_json::json!({
+                            "thinkingBudget": budget,
+                            "includeThoughts": false,
+                        }));
+                    } else {
+                        assert!(generation.get("thinkingConfig").is_none(), "{model}: {body}");
+                    }
+                    let request_id = body["requestId"].as_str().unwrap();
+                    let parts: Vec<_> = request_id.split('/').collect();
+                    assert_eq!(parts.len(), 5);
+                    assert_eq!(parts[0], "agent");
+                    assert_eq!(parts[4], "1");
+                    assert_eq!(request["labels"]["trajectory_id"], parts[3]);
+                    assert!(request_ids.insert(request_id.to_string()));
+                    let session = request["sessionId"].as_str().unwrap();
+                    assert!(session.parse::<i64>().is_ok());
+                    assert!(sessions.insert(session.to_string()));
+                }
+                token.email = "probe@gmail.com".into();
+                let body = TokenManager::build_qos_probe_request(&token, "gemini-3.1-flash-lite");
+                assert_eq!(body["userAgent"], "antigravity");
+            },
+        );
+    }
+
+    #[test]
+    fn qos_probe_model_selection_excludes_non_text_and_protected_models() {
+        let mut token = qos_probe_test_token();
+        token.available_models = [
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash-low",
+            "gemini-4-argon-low",
+            "gemini-3-pro-image",
+            "gemini-3-flash-tts",
+            "gemini-3-flash-audio",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            TokenManager::select_qos_probe_model(&token),
+            Some("gemini-3.1-flash-lite")
+        );
+
+        // Flash Lite is protected through its shared quota bucket, even though
+        // that bucket's name differs from the authorized model ID.
+        token.protected_models.insert("gemini-3-flash".into());
+        assert_eq!(
+            TokenManager::select_qos_probe_model(&token),
+            Some("gemini-3.8-flash-low")
+        );
+        token.protected_models.insert("gemini-3.8-flash-low".into());
+        assert_eq!(
+            TokenManager::select_qos_probe_model(&token),
+            Some("gemini-4-argon-low")
+        );
+        token.protected_models.insert("gemini-4-argon".into());
+        assert_eq!(TokenManager::select_qos_probe_model(&token), None);
+    }
+
+    #[test]
+    fn qos_probe_claim_waits_for_an_authorized_unprotected_text_model() {
+        use crate::proxy::qos_guardian::AccountQoSState;
+        for (models, protected) in [
+            (vec![], vec![]),
+            (vec!["gemini-3-pro-image"], vec![]),
+            (vec!["claude-sonnet-4-6", "gpt-oss-120b"], vec![]),
+            (vec!["gemini-3.1-flash-lite"], vec!["gemini-3-flash"]),
+            (vec!["gemini-3.8-flash-low"], vec!["gemini-3-pro-high"]),
+        ] {
+            let manager = TokenManager::new(PathBuf::new());
+            let mut token = qos_probe_test_token();
+            token.available_models = models.into_iter().map(str::to_string).collect();
+            token.protected_models = protected.into_iter().map(str::to_string).collect();
+            let account_id = token.account_id.clone();
+            let now = std::time::Instant::now();
+            let jailed = AccountQoSState::Jailed {
+                level: 1,
+                jailed_at: now,
+                current_wait: Duration::ZERO,
+            };
+            manager.tokens.insert(account_id.clone(), token);
+            manager
+                .qos_guardian
+                .states
+                .insert(account_id.clone(), jailed.clone());
+            manager
+                .qos_guardian
+                .penalty_memory
+                .insert(account_id.clone(), (1, now));
+
+            assert!(manager.claim_due_qos_probes().is_empty());
+            assert_eq!(manager.qos_guardian.get_state(&account_id), jailed);
+            assert_eq!(
+                *manager
+                    .qos_guardian
+                    .penalty_memory
+                    .get(&account_id)
+                    .unwrap(),
+                (1, now)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qos_manual_probe_reports_missing_text_model_before_sending() {
+        let mut token = qos_probe_test_token();
+        token.available_models.clear();
+        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+        let result = TokenManager::send_pure_hello_probe_to_endpoint(
+            &token,
+            &upstream,
+            "http://127.0.0.1:9/unused",
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("QoS probe has no authorized Gemini text model".into())
+        );
+    }
+
+    async fn qos_probe_stub(
+        status: axum::http::StatusCode,
+        chunks: Vec<&'static str>,
+        stall: bool,
+    ) -> (
+        String,
+        tokio::sync::mpsc::Receiver<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let tx = tx.clone();
+            let chunks = chunks.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                tx.send((
+                    parts.uri,
+                    parts.headers,
+                    serde_json::from_slice(&bytes).unwrap(),
+                ))
+                .await
+                .unwrap();
+                let stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(chunk.as_bytes()))
+                }))
+                .chain(futures::stream::pending().take(usize::from(stall)));
+                axum::http::Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }
+        });
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, rx, handle)
+    }
+
+    #[tokio::test]
+    async fn qos_probe_sends_valid_envelope_through_bound_account_proxy() {
+        use crate::proxy::config::{ProxyEntry, ProxyPoolConfig};
+        let (url, mut received, server) = qos_probe_stub(
+            axum::http::StatusCode::OK,
+            vec![": keepalive\r\n\r\n", "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}}\r\n\r\n"],
+            false,
+        ).await;
+        let proxy = ProxyEntry {
+            id: "bound-proxy".into(),
+            name: "local probe stub".into(),
+            url,
+            auth: None,
+            enabled: true,
+            priority: 0,
+            tags: vec![],
+            max_accounts: None,
+            health_check_url: None,
+            last_check_time: None,
+            is_healthy: true,
+            latency: None,
+        };
+        let config = ProxyPoolConfig {
+            enabled: true,
+            proxies: vec![proxy],
+            account_bindings: HashMap::from([("probe-account".into(), "bound-proxy".into())]),
+            ..Default::default()
+        };
+        let pool = Arc::new(crate::proxy::proxy_pool::ProxyPoolManager::new(Arc::new(
+            tokio::sync::RwLock::new(config),
+        )));
+        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, Some(pool));
+        let mut token = qos_probe_test_token();
+        token.available_models = HashSet::from(["gemini-3.8-flash-low".into()]);
+        let result = TokenManager::send_pure_hello_probe_to_endpoint(
+            &token,
+            &upstream,
+            "http://127.0.0.1:9/v1internal:streamGenerateContent?alt=sse",
+        )
+        .await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let (uri, headers, body) = received.recv().await.unwrap();
+        assert_eq!(uri.path(), "/v1internal:streamGenerateContent");
+        assert_eq!(headers["authorization"], "Bearer test_token");
+        assert_eq!(body["project"], "probe-project");
+        assert_eq!(body["model"], "gemini-3.8-flash-low");
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 42);
+        assert!(body["request"].get("systemInstruction").is_none());
+        assert!(body.get("contents").is_none());
+        assert!(body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|content| {
+                content["parts"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["text"] == "你好"))
+            }));
+    }
+
+    #[tokio::test]
+    async fn qos_probe_rejects_error_empty_and_keepalive_only_streams() {
+        for (status, chunks) in [
+            (axum::http::StatusCode::BAD_REQUEST, vec!["bad request"]),
+            (axum::http::StatusCode::OK, vec!["data: {\"error\":{\"code\":429}}\n\n"]),
+            (axum::http::StatusCode::OK, vec![": keepalive\n\n"]),
+            (axum::http::StatusCode::OK, vec!["data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"thinking\"}]}}]}}\n\n", "data: [DONE]\n\n"]),
+            (axum::http::StatusCode::OK, vec![]),
+        ] {
+            let (url, _received, server) = qos_probe_stub(status, chunks, false).await;
+            let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+            let result = TokenManager::send_pure_hello_probe_to_endpoint(&qos_probe_test_token(), &upstream, &url).await;
+            server.abort();
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qos_probe_keeps_eight_second_deadline_after_keepalive() {
+        let (url, _received, server) =
+            qos_probe_stub(axum::http::StatusCode::OK, vec![": keepalive\n\n"], true).await;
+        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+        let started = std::time::Instant::now();
+        let result = TokenManager::send_pure_hello_probe_to_endpoint(
+            &qos_probe_test_token(),
+            &upstream,
+            &url,
+        )
+        .await;
+        server.abort();
+        assert_eq!(result, Err("QoS probe exceeded its 8s deadline".into()));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates() {
+        run_qos_regression_child(
+            "proxy::token_manager::tests::qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates",
+            || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let data_dir = crate::modules::account::get_data_dir().unwrap();
+                    let manager = Arc::new(TokenManager::new(data_dir));
+                    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = port_reservation.local_addr().unwrap().port();
+                    let mut config = crate::models::AppConfig::default();
+                    config.proxy.port = port;
+                    config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
+                    config.proxy.api_key = "qos-local-liveness-test".into();
+                    config.proxy.admin_password = None;
+                    config.proxy.proxy_pool.enabled = false;
+                    config.proxy.proxy_pool.proxies.clear();
+                    config.proxy.upstream_proxy.enabled = false;
+                    crate::modules::config::save_app_config(&config).unwrap();
+                    let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+                    drop(port_reservation);
+                    let (server, server_task) = crate::proxy::AxumServer::start(
+                        "127.0.0.1".into(),
+                        port,
+                        manager.clone(),
+                        config.proxy.custom_mapping.clone(),
+                        config.proxy.request_timeout,
+                        config.proxy.upstream_proxy.clone(),
+                        config.proxy.user_agent_override.clone(),
+                        crate::proxy::ProxySecurityConfig::from_proxy_config(&config.proxy),
+                        monitor,
+                        config.proxy.experimental.clone(),
+                        config.proxy.debug_logging.clone(),
+                        crate::modules::integration::SystemManager::Headless,
+                        Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
+                        config.proxy.proxy_pool.clone(),
+                        config.proxy.only_raw_quota_models,
+                        config.proxy.image_scheduler.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    server.set_running(true).await;
+                    let client = reqwest::Client::builder()
+                        .no_proxy()
+                        .pool_max_idle_per_host(0)
+                        .connect_timeout(Duration::from_secs(2))
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .unwrap();
+                    let base = format!("http://127.0.0.1:{port}");
+                    let health = client.get(format!("{base}/health")).send().await.unwrap();
+                    assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+                    let jailed = crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                        level: 0,
+                        jailed_at: std::time::Instant::now(),
+                        current_wait: Duration::ZERO,
+                    };
+                    manager.qos_guardian.states.insert("missing-token".into(), jailed.clone());
+                    for debug_enabled in [true, false, true] {
+                        // No tokens are inserted in this runtime: neither the daemon nor
+                        // the request handler can issue an authenticated upstream request.
+                        assert!(manager.tokens.is_empty());
+                        let unavailable = client
+                            .post(format!("{base}/v1beta/models/gemini-4-argon:streamGenerateContent"))
+                            .bearer_auth(&config.proxy.api_key)
+                            .json(&serde_json::json!({
+                                "contents": [{"role": "user", "parts": [{"text": "local test"}]}]
+                            }))
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(unavailable.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+                        config.proxy.debug_logging.enabled = debug_enabled;
+                        let saved = client
+                            .post(format!("{base}/api/config"))
+                            .bearer_auth(&config.proxy.api_key)
+                            .json(&serde_json::json!({"config": &config}))
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(saved.status(), reqwest::StatusCode::OK);
+
+                        let tick_manager = manager.clone();
+                        tokio::spawn(async move { tick_manager.run_qos_probing_tick().await })
+                            .await
+                            .unwrap();
+                        assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
+
+                        // Idle pooling is disabled, so these exercise a new TCP accept.
+                        let health = client
+                            .get(format!("{base}/health"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .error_for_status()
+                            .unwrap()
+                            .json::<serde_json::Value>()
+                            .await
+                            .unwrap();
+                        assert_eq!(health["status"], "ok");
+                        let reloaded = client
+                            .get(format!("{base}/api/config"))
+                            .bearer_auth(&config.proxy.api_key)
+                            .send()
+                            .await
+                            .unwrap()
+                            .error_for_status()
+                            .unwrap()
+                            .json::<crate::models::AppConfig>()
+                            .await
+                            .unwrap();
+                        assert_eq!(reloaded.proxy.debug_logging.enabled, debug_enabled);
+                    }
+
+                    server.stop();
+                    manager.graceful_shutdown(Duration::from_secs(1)).await;
+                    tokio::time::timeout(Duration::from_secs(2), server_task)
+                        .await
+                        .expect("HTTP accept task should stop")
+                        .unwrap();
+                });
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            },
+        );
+    }
 
     fn weekly_quota_account(now: i64) -> serde_json::Value {
         let reset = |seconds| {
