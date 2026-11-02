@@ -514,6 +514,7 @@ pub async fn save_config(
     mut config: AppConfig,
 ) -> Result<(), String> {
     // 确保保存的 User-Agent 满足最低版本要求 (>= 4.3.0) 避免上游拒绝
+    let _config_guard = modules::config::config_apply_guard().await;
     if let Some(ref ua) = config.proxy.user_agent_override {
         config.proxy.user_agent_override = Some(crate::constants::sanitize_egress_user_agent(ua));
     }
@@ -573,6 +574,10 @@ pub async fn save_config(
     // 热更新正在运行的服务
     let instance_lock = proxy_state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
+        instance
+            .token_manager
+            .qos_guardian
+            .update_config(config.proxy.qos)?;
         // 更新模型映射
         instance.axum_server.update_mapping(&config.proxy).await;
         // 更新仅暴露真实配额模型开关
@@ -631,6 +636,11 @@ pub async fn save_config(
     // [FIX #3280, #3285] 同步热更新管理服务 (Admin Server)，确保在仅运行管理端或服务未手动启动时配置立即生效
     let admin_lock = proxy_state.admin_server.read().await;
     if let Some(admin) = admin_lock.as_ref() {
+        admin
+            .axum_server
+            .token_manager
+            .qos_guardian
+            .update_config(config.proxy.qos)?;
         admin.axum_server.update_mapping(&config.proxy).await;
         admin
             .axum_server

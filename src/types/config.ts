@@ -20,6 +20,7 @@ export interface ProxyConfig {
     debug_logging?: DebugLoggingConfig;
     upstream_proxy: UpstreamProxyConfig;
     scheduling?: StickySessionConfig;
+    qos?: QoSConfig;
     experimental?: ExperimentalConfig;
     user_agent_override?: string;
     saved_user_agent?: string;
@@ -38,6 +39,17 @@ export interface StreamTimeoutConfig {
     initial_ttft_secs?: number;
     transition_secs?: number;
     streaming_sliding_secs?: number;
+}
+
+/** Instance QoS policy; omitted fields retain backend defaults. */
+export interface QoSConfig {
+    normal_threshold_secs?: number;
+    deep_thinking_threshold_secs?: number;
+    recovery_threshold_secs?: number;
+    no_peer_grace_secs?: number;
+    probe_timeout_secs?: number;
+    probe_success_threshold_secs?: number;
+    jail_ladder_secs?: [number, number, number, number, number, number];
 }
 
 export interface MultimodalConfig {

@@ -1,11 +1,9 @@
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::proxy::qos_config::QoSConfig;
 use crate::proxy::token_manager::ProxyToken;
-
-/// 阶梯自愈时间表 (单位: 分钟): 2m -> 5m -> 10m -> 15m -> 20m -> 30m
-pub const DEFAULT_QOS_LADDER_MINUTES: [u64; 6] = [2, 5, 10, 15, 20, 30];
 
 /// 账号 QoS 运行时健康状态
 #[derive(Debug, Clone, PartialEq)]
@@ -40,13 +38,18 @@ pub enum AccountQoSState {
 
 /// A probe may complete only the transition that it claimed, even if the account
 /// is reset and reaches the same jail level again before the request finishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProbeClaim {
     pub level: usize,
+    pub config: QoSConfig,
     claim_id: uuid::Uuid,
 }
 
 impl ProbeClaim {
+    pub fn accepts_ttft(self, ttft_ms: f64) -> bool {
+        ttft_ms < self.config.probe_success_threshold_secs * 1000.0
+    }
+
     fn matches(self, state: &AccountQoSState) -> bool {
         matches!(
             state,
@@ -92,8 +95,8 @@ pub struct QoSGuardian {
     pub session_watermarks: Arc<DashMap<(String, String), (u32, Instant)>>,
     /// 惩罚历史记忆: account_id -> (last_level, updated_at)，保留 30 分钟防短时高频复发
     pub penalty_memory: Arc<DashMap<String, (usize, Instant)>>,
-    /// 阶梯冷却时间表
-    pub ladder_intervals: Vec<Duration>,
+    /// Each operation copies this policy before acquiring any account-state lock.
+    config: RwLock<QoSConfig>,
 }
 
 impl Default for QoSGuardian {
@@ -104,18 +107,30 @@ impl Default for QoSGuardian {
 
 impl QoSGuardian {
     pub fn new() -> Self {
-        let ladder = DEFAULT_QOS_LADDER_MINUTES
-            .iter()
-            .map(|&m| Duration::from_secs(m * 60))
-            .collect();
-
         Self {
             states: Arc::new(DashMap::new()),
             samples: Arc::new(DashMap::new()),
             session_watermarks: Arc::new(DashMap::new()),
             penalty_memory: Arc::new(DashMap::new()),
-            ladder_intervals: ladder,
+            config: RwLock::new(QoSConfig::default()),
         }
+    }
+
+    pub fn config_snapshot(&self) -> QoSConfig {
+        *self
+            .config
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Apply a validated policy without rewriting cooldowns or probe claims.
+    pub fn update_config(&self, config: QoSConfig) -> Result<(), String> {
+        config.validate()?;
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = config;
+        Ok(())
     }
 
     /// 获取账号当前 QoS 状态（未记录则默认 Healthy）
@@ -268,6 +283,7 @@ impl QoSGuardian {
     where
         F: Fn(&str) -> bool,
     {
+        let config = self.config_snapshot();
         let ttft_secs = ttft_ms / 1000.0;
         let now = Instant::now();
 
@@ -305,13 +321,17 @@ impl QoSGuardian {
 
         // 2. 动态预算补偿算法：
         // - 每 100K 未缓存 Token 额外补偿 +7.0s 物理 Prefill 计算耗时
-        // - 基础阈值：非深度思考为 20.0s，深度思考上浮至 35.0s
+        // - 基础阈值：按实例策略选择普通或深度思考阈值
         let uncached_bonus_secs = (uncached_tokens as f64 / 100_000.0) * 7.0;
-        let base_threshold_secs = if is_deep_thinking { 35.0 } else { 20.0 };
+        let base_threshold_secs = if is_deep_thinking {
+            config.deep_thinking_threshold_secs
+        } else {
+            config.normal_threshold_secs
+        };
         let threshold_secs = base_threshold_secs + uncached_bonus_secs;
 
-        // 宽限平反阈值：基础为 18.5s，同比例支持未缓存增量补偿
-        let vindicate_threshold_secs = 18.5 + uncached_bonus_secs;
+        // 恢复阈值同样支持未缓存增量补偿
+        let vindicate_threshold_secs = config.recovery_threshold_secs + uncached_bonus_secs;
 
         // 标记是否为大 Token 冷启动 (未缓存 >= 80K)
         let is_cold_start = uncached_tokens >= 80_000;
@@ -320,8 +340,20 @@ impl QoSGuardian {
         let peer_avg_secs = self
             .calculate_pure_peer_avg(account_id, tier, all_accounts, &is_unhealthy_or_limited)
             .map(|ms| ms / 1000.0);
+        let no_peer_grace_secs = if peer_avg_secs.is_none() {
+            config.no_peer_grace_secs
+        } else {
+            0.0
+        };
+        let final_threshold_secs = threshold_secs + no_peer_grace_secs;
+        tracing::debug!(
+            account_id, ttft_secs, is_deep_thinking, base_threshold_secs,
+            uncached_bonus_secs, peer_avg_secs = ?peer_avg_secs, no_peer_grace_secs,
+            final_threshold_secs, recovery_threshold_secs = vindicate_threshold_secs,
+            "Evaluating local QoS latency"
+        );
 
-        // 4. 检查全局雪崩防护：若纯净同行均值本身也 >= 20s，说明上游机房大面积拥堵，刹车不触发单号惩罚
+        // 4. 同侪均值也达到本次阈值时，按全局拥堵豁免单号处罚
         if let Some(peer_avg) = peer_avg_secs {
             if peer_avg >= threshold_secs {
                 tracing::warn!(
@@ -335,12 +367,7 @@ impl QoSGuardian {
         }
 
         // 5. 判定是否构成一次卡顿打击 (Strike)
-        let is_strike = match peer_avg_secs {
-            // 同行健康 (<20s)，唯独当前账号超标
-            Some(_) => ttft_secs > threshold_secs,
-            // 纯净同行不足时，退化为绝对阈值防护 (额外 +10.0s 兜底)
-            None => ttft_secs > (threshold_secs + 10.0),
-        };
+        let is_strike = ttft_secs > final_threshold_secs;
 
         let mut current_state = self
             .states
@@ -355,7 +382,7 @@ impl QoSGuardian {
                         "⚠️ [QoS Guardian] Account {} tagged as SUSPICIOUS (TTFT={:.2}s > {:.2}s, uncached_tokens={}, bonus=+{:.2}s)",
                         account_id,
                         ttft_secs,
-                        threshold_secs,
+                        final_threshold_secs,
                         uncached_tokens,
                         uncached_bonus_secs
                     );
@@ -387,11 +414,11 @@ impl QoSGuardian {
 
                     if strike_count >= 2 {
                         // 5 分钟内累计 2 次超标：坐实被上游降速！关入小黑屋并触发会话解绑
-                        let level = self.resolve_initial_jail_level(account_id);
-                        let wait_duration = self.ladder_intervals[level];
+                        let level = self.resolve_initial_jail_level(account_id, &config);
+                        let wait_duration = Duration::from_secs(config.jail_ladder_secs[level]);
 
                         tracing::error!(
-                            "🚨 [QoS Guardian] Account {} CONFIRMED THROTTLED (2 strikes in window). Jailing Level {} ({:?}) & unbinding session!",
+                            "🚨 [QoS Guardian] Account {} exceeded the local QoS latency threshold twice in the strike window. Jailing Level {} ({:?}) & unbinding session.",
                             account_id, level, wait_duration
                         );
 
@@ -457,8 +484,8 @@ impl QoSGuardian {
             } => {
                 if is_strike {
                     // 缓刑期间真实业务请求再次卡顿：判定假康复，从严惩罚！
-                    let next_level = (level + 1).min(self.ladder_intervals.len() - 1);
-                    let next_wait = self.ladder_intervals[next_level];
+                    let next_level = (level + 1).min(config.jail_ladder_secs.len() - 1);
+                    let next_wait = Duration::from_secs(config.jail_ladder_secs[next_level]);
 
                     tracing::error!(
                         "💥 [QoS Guardian] Account {} FAILED Half-Open probation (TTFT={:.2}s). Escalating to Level {} ({:?})!",
@@ -514,12 +541,12 @@ impl QoSGuardian {
     }
 
     /// 确定入狱初始阶梯：30 分钟内二次复发直接继承并升级阶梯
-    fn resolve_initial_jail_level(&self, account_id: &str) -> usize {
+    fn resolve_initial_jail_level(&self, account_id: &str, config: &QoSConfig) -> usize {
         let memory_ttl = Duration::from_secs(30 * 60);
         if let Some(mem) = self.penalty_memory.get(account_id) {
             let (last_level, recorded_at) = *mem.value();
             if recorded_at.elapsed() <= memory_ttl {
-                let escalated = (last_level + 1).min(self.ladder_intervals.len() - 1);
+                let escalated = (last_level + 1).min(config.jail_ladder_secs.len() - 1);
                 tracing::info!(
                     "🧠 [QoS Guardian] Account {} has recent penalty memory (Lv {}), escalating to Lv {}",
                     account_id, last_level, escalated
@@ -577,8 +604,8 @@ impl QoSGuardian {
             return None;
         }
 
-        let next_level = (claim.level + 1).min(self.ladder_intervals.len() - 1);
-        let next_wait = self.ladder_intervals[next_level];
+        let next_level = (claim.level + 1).min(claim.config.jail_ladder_secs.len() - 1);
+        let next_wait = Duration::from_secs(claim.config.jail_ladder_secs[next_level]);
         let now = Instant::now();
 
         self.penalty_memory
@@ -594,7 +621,16 @@ impl QoSGuardian {
     }
 
     /// 原子领取已到期的隔离账号；候选快照中的状态可能已被重置或重新隔离。
+    #[cfg(test)]
     pub(crate) fn try_mark_probing(&self, account_id: &str) -> Option<ProbeClaim> {
+        self.try_mark_probing_with_config(account_id, self.config_snapshot())
+    }
+
+    pub(crate) fn try_mark_probing_with_config(
+        &self,
+        account_id: &str,
+        config: QoSConfig,
+    ) -> Option<ProbeClaim> {
         let mut state = self.states.get_mut(account_id)?;
         let AccountQoSState::Jailed {
             level,
@@ -610,6 +646,7 @@ impl QoSGuardian {
 
         let claim = ProbeClaim {
             level,
+            config,
             claim_id: uuid::Uuid::new_v4(),
         };
         *state = AccountQoSState::Probing {
@@ -636,6 +673,343 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+
+    fn configurable_policy() -> QoSConfig {
+        QoSConfig {
+            normal_threshold_secs: 12.0,
+            deep_thinking_threshold_secs: 22.0,
+            recovery_threshold_secs: 10.0,
+            no_peer_grace_secs: 3.0,
+            probe_timeout_secs: 3.0,
+            probe_success_threshold_secs: 2.0,
+            jail_ladder_secs: [10, 20, 30, 40, 50, 60],
+        }
+    }
+
+    #[test]
+    fn qos_configured_strike_thresholds_preserve_strict_boundaries_and_input_compensation() {
+        for (thinking, peer, input_tokens, boundary_secs) in [
+            (false, true, 0, 12.0),
+            (true, true, 0, 22.0),
+            (false, false, 0, 15.0),
+            (true, false, 0, 25.0),
+            (false, true, 100_000, 19.0),
+            (true, true, 100_000, 29.0),
+            (false, false, 100_000, 22.0),
+            (true, false, 100_000, 32.0),
+        ] {
+            for (offset_ms, expected) in
+                [(0.0, QoSAction::None), (1.0, QoSAction::TaggedSuspicious)]
+            {
+                let guardian = QoSGuardian::new();
+                guardian.update_config(configurable_policy()).unwrap();
+                let accounts = vec![
+                    create_test_token("account", "PRO"),
+                    create_test_token("peer", "PRO"),
+                ];
+                if peer {
+                    guardian.push_sample("peer", 4000.0, false, false);
+                }
+                let action = guardian.record_and_evaluate(
+                    "account",
+                    None,
+                    "PRO",
+                    boundary_secs * 1000.0 + offset_ms,
+                    thinking,
+                    Some(input_tokens),
+                    &accounts,
+                    |_| false,
+                );
+                assert_eq!(
+                    action, expected,
+                    "thinking={thinking}, peer={peer}, input={input_tokens}, offset={offset_ms}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qos_configured_peer_brake_uses_the_same_request_threshold() {
+        for (thinking, input, threshold) in
+            [(false, 0, 12.0), (true, 0, 22.0), (false, 100_000, 19.0)]
+        {
+            for (peer_offset_ms, expected) in
+                [(0.0, QoSAction::None), (-1.0, QoSAction::TaggedSuspicious)]
+            {
+                let guardian = QoSGuardian::new();
+                guardian.update_config(configurable_policy()).unwrap();
+                let accounts = vec![
+                    create_test_token("account", "PRO"),
+                    create_test_token("peer", "PRO"),
+                ];
+                guardian.push_sample("peer", threshold * 1000.0 + peer_offset_ms, false, false);
+                assert_eq!(
+                    guardian.record_and_evaluate(
+                        "account",
+                        None,
+                        "PRO",
+                        100_000.0,
+                        thinking,
+                        Some(input),
+                        &accounts,
+                        |_| false
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qos_configured_recovery_threshold_preserves_deadband_and_two_pass_rule() {
+        for (half_open, input_tokens, boundary_secs) in [
+            (false, 0, 10.0),
+            (true, 0, 10.0),
+            (false, 100_000, 17.0),
+            (true, 100_000, 17.0),
+        ] {
+            let guardian = QoSGuardian::new();
+            guardian.update_config(configurable_policy()).unwrap();
+            let state = if half_open {
+                AccountQoSState::HalfOpen {
+                    level: 0,
+                    consecutive_healthy: 0,
+                    entered_at: Instant::now(),
+                }
+            } else {
+                AccountQoSState::Suspicious {
+                    first_strike_at: Instant::now(),
+                    strike_count: 1,
+                    consecutive_healthy: 0,
+                }
+            };
+            guardian.states.insert("account".into(), state.clone());
+            let accounts = vec![
+                create_test_token("account", "PRO"),
+                create_test_token("peer", "PRO"),
+            ];
+            guardian.push_sample("peer", 4000.0, false, false);
+            assert_eq!(
+                guardian.record_and_evaluate(
+                    "account",
+                    None,
+                    "PRO",
+                    boundary_secs * 1000.0,
+                    false,
+                    Some(input_tokens),
+                    &accounts,
+                    |_| false
+                ),
+                QoSAction::None
+            );
+            assert_eq!(guardian.get_state("account"), state);
+            assert_eq!(
+                guardian.record_and_evaluate(
+                    "account",
+                    None,
+                    "PRO",
+                    boundary_secs * 1000.0 - 1.0,
+                    false,
+                    Some(input_tokens),
+                    &accounts,
+                    |_| false
+                ),
+                QoSAction::None
+            );
+            assert_eq!(
+                guardian.record_and_evaluate(
+                    "account",
+                    None,
+                    "PRO",
+                    boundary_secs * 1000.0 - 1.0,
+                    false,
+                    Some(input_tokens),
+                    &accounts,
+                    |_| false
+                ),
+                if half_open {
+                    QoSAction::HalfOpenPassed
+                } else {
+                    QoSAction::Vindicated
+                }
+            );
+            assert!(guardian.is_healthy("account"));
+        }
+    }
+
+    #[test]
+    fn qos_config_update_preserves_existing_state_and_is_instance_local() {
+        let guardian = QoSGuardian::new();
+        let other = QoSGuardian::new();
+        let now = Instant::now();
+        let jailed = AccountQoSState::Jailed {
+            level: 3,
+            jailed_at: now,
+            current_wait: Duration::from_secs(900),
+        };
+        guardian.states.insert("account".into(), jailed.clone());
+        guardian.penalty_memory.insert("account".into(), (3, now));
+        guardian.push_sample("account", 4000.0, false, false);
+        guardian
+            .session_watermarks
+            .insert(("account".into(), "session".into()), (100, now));
+
+        guardian.update_config(configurable_policy()).unwrap();
+
+        assert_eq!(guardian.config_snapshot(), configurable_policy());
+        assert_eq!(other.config_snapshot(), QoSConfig::default());
+        let fresh_accounts = vec![create_test_token("fresh", "PRO")];
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "fresh",
+                None,
+                "PRO",
+                20_000.0,
+                false,
+                None,
+                &fresh_accounts,
+                |_| false
+            ),
+            QoSAction::TaggedSuspicious
+        );
+        assert_eq!(
+            other.record_and_evaluate(
+                "fresh",
+                None,
+                "PRO",
+                20_000.0,
+                false,
+                None,
+                &fresh_accounts,
+                |_| false
+            ),
+            QoSAction::None
+        );
+        assert_eq!(guardian.get_state("account"), jailed);
+        assert_eq!(guardian.try_mark_probing("account"), None);
+        assert_eq!(*guardian.penalty_memory.get("account").unwrap(), (3, now));
+        assert_eq!(guardian.samples.get("account").unwrap().len(), 1);
+        assert_eq!(
+            *guardian
+                .session_watermarks
+                .get(&("account".into(), "session".into()))
+                .unwrap(),
+            (100, now)
+        );
+
+        let mut invalid = configurable_policy();
+        invalid.normal_threshold_secs = f64::NAN;
+        assert!(guardian.update_config(invalid).is_err());
+        assert_eq!(guardian.config_snapshot(), configurable_policy());
+        assert_eq!(guardian.get_state("account"), jailed);
+    }
+
+    #[test]
+    fn qos_probe_claim_keeps_policy_and_ladder_until_completion() {
+        for level in 0..6 {
+            let guardian = QoSGuardian::new();
+            let original = configurable_policy();
+            guardian.update_config(original).unwrap();
+            let claim = jail_for_probe(&guardian, level);
+            let mut changed = original;
+            changed.probe_timeout_secs = 5.0;
+            changed.probe_success_threshold_secs = 4.0;
+            changed.jail_ladder_secs = [11, 22, 33, 44, 55, 66];
+            guardian.update_config(changed).unwrap();
+
+            assert_eq!(claim.config, original);
+            assert!(claim.accepts_ttft(1999.0));
+            assert!(!claim.accepts_ttft(2000.0));
+            assert!(!claim.accepts_ttft(3000.0));
+            let next_level = (level + 1).min(5);
+            assert_eq!(
+                guardian.mark_probe_failed("account", claim),
+                Some((
+                    next_level,
+                    Duration::from_secs(original.jail_ladder_secs[next_level])
+                ))
+            );
+            let next_claim = expire_jail_and_claim(&guardian, "account");
+            assert_eq!(next_claim.config, changed);
+            assert!(next_claim.accepts_ttft(3000.0));
+        }
+    }
+
+    #[test]
+    fn qos_configured_ladder_applies_to_new_jail_and_half_open_failure() {
+        let guardian = QoSGuardian::new();
+        guardian.update_config(configurable_policy()).unwrap();
+        let accounts = vec![create_test_token("account", "PRO")];
+        guardian.record_and_evaluate(
+            "account",
+            None,
+            "PRO",
+            30_000.0,
+            false,
+            None,
+            &accounts,
+            |_| false,
+        );
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "account",
+                None,
+                "PRO",
+                30_000.0,
+                false,
+                None,
+                &accounts,
+                |_| false
+            ),
+            QoSAction::TriggerJailedAndUnbind {
+                level: 0,
+                wait_duration: Duration::from_secs(10)
+            }
+        );
+        let claim = expire_jail_and_claim(&guardian, "account");
+        assert!(guardian.mark_probe_passed("account", claim));
+        let mut changed = configurable_policy();
+        changed.jail_ladder_secs = [11, 22, 33, 44, 55, 66];
+        guardian.update_config(changed).unwrap();
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "account",
+                None,
+                "PRO",
+                30_000.0,
+                false,
+                None,
+                &accounts,
+                |_| false
+            ),
+            QoSAction::HalfOpenFailed {
+                escalated_level: 1,
+                wait_duration: Duration::from_secs(22)
+            }
+        );
+    }
+
+    #[test]
+    fn qos_config_updates_do_not_wait_for_account_state_locks() {
+        let guardian = QoSGuardian::new();
+        guardian
+            .states
+            .insert("account".into(), AccountQoSState::Healthy);
+        std::thread::scope(|scope| {
+            let state = guardian.states.get_mut("account").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let guardian_ref = &guardian;
+            scope.spawn(move || {
+                tx.send(guardian_ref.update_config(configurable_policy()))
+                    .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(state);
+            result
+                .expect("config update must not acquire account state locks")
+                .unwrap();
+        });
+    }
 
     #[test]
     fn probe_claim_uses_current_expired_jail_level_once() {
@@ -810,7 +1184,7 @@ mod tests {
         let current = AccountQoSState::Jailed {
             level: 3,
             jailed_at: now,
-            current_wait: guardian.ladder_intervals[3],
+            current_wait: Duration::from_secs(guardian.config_snapshot().jail_ladder_secs[3]),
         };
         guardian.states.insert("account".into(), current.clone());
         guardian.penalty_memory.insert("account".into(), (3, now));

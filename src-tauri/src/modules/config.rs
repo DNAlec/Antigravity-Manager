@@ -6,6 +6,15 @@ use crate::models::AppConfig;
 
 const CONFIG_FILE: &str = "gui_config.json";
 
+// The application has one configuration file. Serialize full saves and service
+// startup through runtime application, so an older save cannot overwrite a newer
+// policy after yielding. The policies themselves remain per TokenManager.
+static CONFIG_APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub async fn config_apply_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    CONFIG_APPLY_LOCK.lock().await
+}
+
 /// Load application configuration
 pub fn load_app_config() -> Result<AppConfig, String> {
     let data_dir = get_data_dir()?;
@@ -236,6 +245,8 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
 
 /// Save application configuration (atomic write)
 pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
+    // Also validate directly constructed Rust configs before touching the file.
+    config.proxy.qos.validate()?;
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
@@ -249,6 +260,15 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qos_invalid_direct_config_is_rejected_before_storage_access() {
+        let mut config = AppConfig::default();
+        config.proxy.qos.probe_timeout_secs = f64::NAN;
+        assert!(save_app_config(&config)
+            .unwrap_err()
+            .contains("proxy.qos.probe_timeout_secs"));
+    }
 
     #[test]
     fn test_parse_and_migrate_empty_or_whitespace_config() {

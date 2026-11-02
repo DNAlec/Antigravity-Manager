@@ -532,7 +532,10 @@ impl AxumServer {
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
         only_raw_quota_models: bool,
         image_scheduler_config: crate::proxy::config::ImageSchedulerConfig,
+        qos_config: crate::proxy::qos_config::QoSConfig,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
+        // Apply before any background task can evaluate requests or claim probes.
+        token_manager.qos_guardian.update_config(qos_config)?;
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
         let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy.clone()));
         let proxy_pool_state = Arc::new(tokio::sync::RwLock::new(proxy_pool_config));
@@ -850,6 +853,7 @@ impl AxumServer {
             .route("/proxy/droid/config", post(admin_get_droid_config_content))
             .route("/proxy/status", get(admin_get_proxy_status))
             .route("/proxy/pool/config", get(admin_get_proxy_pool_config))
+            .route("/proxy/qos/config", get(admin_get_qos_config))
             .route("/proxy/pool/bindings", get(admin_get_all_account_bindings))
             .route("/proxy/pool/bind", post(admin_bind_account_proxy))
             .route("/proxy/pool/unbind", post(admin_unbind_account_proxy))
@@ -1923,6 +1927,12 @@ async fn admin_save_config(
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let new_config = payload.config;
+    new_config
+        .proxy
+        .qos
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
+    let _config_guard = config::config_apply_guard().await;
     // 1. 持久化
     config::save_app_config(&new_config).map_err(|e| {
         (
@@ -1930,6 +1940,12 @@ async fn admin_save_config(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    state
+        .token_manager
+        .qos_guardian
+        .update_config(new_config.proxy.qos)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
 
     // 2. 热更新内存状态
     // 这里我们直接复用内部组件的 update 方法
@@ -2022,6 +2038,11 @@ async fn admin_save_config(
     );
 
     Ok(StatusCode::OK)
+}
+
+/// Read the policy actually used by this server, independently of the disk config.
+async fn admin_get_qos_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.token_manager.qos_guardian.config_snapshot())
 }
 
 // [FIX Web Mode] Get proxy pool config

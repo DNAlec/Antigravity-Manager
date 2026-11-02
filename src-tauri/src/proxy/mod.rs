@@ -25,6 +25,7 @@ pub mod openclaw_sync; // OpenClaw 配置同步
 pub mod opencode_sync; // OpenCode 配置同步
 pub mod payload_audit; // 报文审计：头脱敏 / 简要存储
 pub mod proxy_pool; // 代理池管理器
+pub mod qos_config; // 实例级 QoS 配置与验证
 pub mod qos_guardian; // QoS 智能熔断与阶梯探针守卫
 pub mod rate_limit; // 限流跟踪
 pub mod session_manager; // 会话指纹管理
