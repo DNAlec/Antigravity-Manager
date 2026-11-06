@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "사고 레벨: 게이트웨이 적응형(공식 카탈로그 기반)",
+        "tag": "권장",
+        "desc": "클라이언트 직접 제어와 사용자 지정 토큰 단계는 종료되었습니다. thinkingLevel 을 제공하는 모델은 모델 단계(low / medium / high)로 레벨이 결정되며, 나머지 모델은 공식 thinkingBudget 기본값을 따릅니다. 클라이언트가 보낸 사고 강도는 접미사 없는(베이스) 모델에서 구체적 단계 모델을 고를 때만 사용됩니다."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — 요청이 정상이라면 무시하세요"
+    },
     "common": {
         "loading": "로딩 중...",
         "empty": "없음",
@@ -197,6 +205,13 @@
         "proxy_online_unit": "프록시 온라인",
         "btn_proxy_online": "프록시 온라인 ({{count}})",
         "btn_all_available": "사용 가능 ({{count}})",
+        "qos_auto_jail": "자동 격리",
+        "qos_auto_jail_badge_on": "ON",
+        "qos_auto_jail_badge_off": "OFF",
+        "qos_auto_jail_on": "자동 격리: 켜짐",
+        "qos_auto_jail_off": "자동 격리: 꺼짐",
+        "qos_auto_jail_enabled_tip": "현재: 자동 격리 켜짐. 응답 지연이 과도한 제한 계정을 자동 격리하고 세션을 해제합니다 (클릭하여 비활성화)",
+        "qos_auto_jail_disabled_tip": "현재: 자동 격리 꺼짐. 검증 시간을 무시하며 과도한 TTFT로 인한 격리나 세션 해제를 하지 않습니다 (클릭하여 활성화)",
         "btn_title_proxy_online": "현재: 프록시에 참여 중인 계정만 집계",
         "btn_title_all_available": "현재: 사용 가능한 모든 정상 계정 집계",
         "proxy_joined_pool": "✓ {{count}}개 계정이 프록시 풀에 참여 중",
@@ -380,6 +395,7 @@
                 "copied": "복사됨",
                 "link_label": "인증 URL",
                 "link_click_to_copy": "클릭하여 복사",
+                "remote_hint": "💡 Docker / 원격 서버 안내: Google 인증 완료 후 브라우저가 localhost로 리디렉션되어 연결 거부가 표시되는 것은 정상적인 보안 제한입니다. 브라우저 주소창에서 전체 URL(code 포함)을 복사하여 아래에 붙여넣고 제출해 주세요.",
                 "manual_hint": "브라우저가 리다이렉트되지 않았나요? 여기에 콜백 URL 또는 코드를 붙여넣으세요:",
                 "manual_placeholder": "콜백 URL 또는 코드 붙여넣기...",
                 "error_no_flow": "먼저 'OAuth 인증 시작'을 클릭하세요",
@@ -387,7 +403,9 @@
                 "error_no_url": "OAuth URL을 가져올 수 없습니다",
                 "popup_blocked": "팝업이 차단되었습니다",
                 "manual_submitting": "인증 코드 제출 중...",
-                "manual_submitted": "인증 코드가 제출되었습니다. 백엔드에서 처리 중입니다..."
+                "manual_submitted": "인증 코드가 제출되었습니다. 백엔드에서 처리 중입니다...",
+                "enterprise_title": "Google Cloud / Vertex AI 기업 인증",
+                "enterprise_desc": "공식 GCP 기업 전용 클라이언트로 인증하여 기업 할당량을 유지하고 Vertex AI 프로젝트와 연결합니다"
             },
             "token": {
                 "label": "리프레시 토큰",
@@ -469,7 +487,19 @@
         "client_cli": "CLI",
         "client_cli_tooltip": "현재 Antigravity CLI (agy)에 로그인된 계정",
         "switch_next_short": "다음",
-        "weekly_exhausted_tooltip": "주간 할당량이 소진되어 자동 보호가 실행되었습니다"
+        "weekly_exhausted_tooltip": "주간 할당량이 소진되어 자동 보호가 실행되었습니다",
+        "type": {
+            "personal": "개인 계정 (Personal)",
+            "enterprise": "기업 / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "엔터프라이즈/GCP 계정에 연결된 Google Cloud 프로젝트 ID입니다. 공식 Antigravity 로그인 시 자동으로 연결되거나 기본값이 사용됩니다.",
+        "project_id_placeholder": "예: my-project-id",
+        "project_id_updated": "GCP Project ID가 업데이트되었습니다",
+        "auto_fetch_project_id": "자동 가져오기",
+        "fetching_project_id": "가져오는 중...",
+        "auto_fetch_success": "Project ID를 자동으로 가져왔습니다: {{projectId}}",
+        "auto_fetch_failed": "업스트림에서 연결된 Project ID를 찾을 수 없습니다"
     },
     "settings": {
         "save": "설정 저장",
@@ -488,6 +518,10 @@
             "theme_light": "라이트",
             "theme_dark": "다크",
             "theme_system": "시스템",
+            "ui_zoom": "UI 및 글꼴 배율",
+            "ui_zoom_desc": "전체 인터페이스 및 글꼴 크기를 조절합니다. Cmd/Ctrl + / - / 0 단축키로 언제든 확대/축소할 수 있습니다",
+            "ui_zoom_default": "기본값",
+            "ui_zoom_recommended": "대형 화면 권장",
             "auto_launch": "시작 시 실행",
             "auto_launch_enabled": "활성화됨",
             "auto_launch_disabled": "비활성화됨",
@@ -506,7 +540,13 @@
             "lightweight_mode": "경량 모드 (메모리 해제)",
             "lightweight_mode_desc": "트레이로 닫거나 최소화할 때 WebView 렌더링 프로세스를 종료하여 상주 메모리를 약 35MB로 줄입니다. 창을 다시 열 때 약간의 재구성 시간이 필요합니다.",
             "lightweight_mode_enabled": "경량 모드 활성화됨",
-            "lightweight_mode_disabled": "경량 모드 비활성화됨"
+            "lightweight_mode_disabled": "경량 모드 비활성화됨",
+            "tray_click_action": "트레이 좌클릭 동작",
+            "tray_click_action_desc": "시스템 트레이 또는 메뉴바 아이콘을 클릭할 때의 기본 동작을 선택합니다",
+            "tray_click_action_mini": "Mini 모니터링 창 열기 (권장)",
+            "tray_click_action_main": "메인 콘솔 바로 열기",
+            "tray_click_action_mini_short": "Mini 창",
+            "tray_click_action_main_short": "메인 콘솔"
         },
         "account": {
             "title": "계정 설정",
@@ -975,6 +1015,20 @@
                 },
                 "max_wait": "최대 대기 (초)",
                 "max_wait_tooltip": "'캐시 우선' 모드에서만 사용: 속도 제한 재설정 시간이 이 값보다 작으면 전환하는 대신 대기합니다.",
+                "max_spillover_accounts": "분류 동시 계정 상한",
+                "max_spillover_accounts_tooltip": "여러 서브 에이전트 또는 병렬 세션을 실행할 때 동시에 호출할 수 있는 최대 정상 계정 수입니다. 0으로 설정하면 무제한(사용 가능한 모든 계정 사용); 양의 정수(예: 2)로 설정하면 활성 계정 수를 제한하여 과도한 분산을 방지합니다.",
+                "spillover_unlimited": "무제한 (모두 사용 가능)",
+                "spillover_count": "{{count}}개 계정",
+                "affinity_scope": "어피니티 범위",
+                "affinity_scope_tooltip": "세션: 세션 ID로 바인딩(기본값, 멀티 에이전트 서브태스크 자동 정규화); API 키: 동일한 API 키의 모든 요청을 단일 계정에 고정(멀티 에이전트 프롬프트 캐시 미스 방지).",
+                "affinity_scopes": {
+                    "session": "세션 ID",
+                    "api_key": "API 키"
+                },
+                "affinity_scopes_desc": {
+                    "session": "세션 ID별로 계정을 바인딩하고 멀티 에이전트 파생 접두사(:step:N 등)를 자동으로 정규화합니다.",
+                    "api_key": "동일한 API 키의 모든 요청을 하나의 계정에 고정하여 AutoGPT/Cindy 등의 캐시 적중을 극대화합니다."
+                },
                 "clear_bindings": "세션 바인딩 지우기",
                 "clear_bindings_tooltip": "모든 세션-계정 바인딩을 하드 리셋하여 다음 요청 시 계정이 다시 할당되도록 합니다.",
                 "clear_rate_limits": "속도 제한 기록 지우기",
@@ -1122,6 +1176,18 @@
                 "default_600_tag": "기본 600",
                 "max_memory_turns_desc": "세션별 메모리(RAM)에 상주하는 이전 생각 블록 턴 수를 제어합니다. 턴당 예상 메모리 사용량은 약 1.5KB ~ 2.5KB입니다(600턴당 세션당 약 1.2MB).",
                 "turns_unit": "턴",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "슬라이딩 윈도우 제거 메커니즘 및 동시성 권장 사양 가이드",
                 "window_guide_desc": "설정 턴 수를 초과하면 FIFO 슬라이딩 윈도우가 가장 오래된 생각 블록을 자동으로 제거합니다. 제거된 블록은 로컬 SQLite 인덱스를 통해 나노초 단위로 복원되어 프롬프트 캐시를 완벽히 유지하면서 OOM을 방지합니다.",
                 "tooltip_32768": "32,768 토큰: 복잡한 코딩 및 심층 아키텍처 설계에 적합",
@@ -1170,11 +1236,11 @@
                 "clear_error": "생각 블록 비우기 실패: {{error}}",
                 "gemini_soft_budget_note": "⚠️ 사고 예산 동작 안내: Google Gemini 업스트림은 thinkingBudget을 소프트 타깃(권장치)으로 처리합니다. 긴 프롬프트나 복잡한 코드 추론, 에이전트 작업에서는 모델이 추론을 자율적으로 확장하여 설정값을 초과할 수 있습니다. 0으로 설정하면 사고를 완전히 비활성화합니다."
             },
-            "stream_timeout_settings": {
-                "title": "스트리밍 타임아웃 설정 (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "타임아웃 설정"
             },
             "thinking_settings": {
-                "title": "추론 설정 (Thinking Settings)"
+                "title": "추론 설정"
             },
             "prompt_multimodal": {
                 "title": "글로벌 프롬프트 및 멀티모달 설정"
@@ -1186,7 +1252,7 @@
             "log_retention_current_usage": "현재 DB 용량",
             "log_retention_rows": "최대 로그 행 수",
             "agent_settings": {
-                "title": "특정 Agent 설정 (Specific Agent Settings)"
+                "title": "특정 Agent 설정"
             },
             "hub": {
                 "title": "공식 Hub 클라이언트 지문",
@@ -1205,17 +1271,54 @@
         "stream_timeouts": {
             "banner_title": "3단계 스트리밍 그라디언트 타임아웃 및 연결 유지 메커니즘",
             "banner_desc": "딥 씽킹 모델, 대규모 컨텍스트 Prefill, 긴 대화 압축 요약 및 대용량 파일 생성에 최적화되었습니다. 3단계 독립 타이머와 상시 핑(: ping)을 통해 게이트웨이 끊김, 전환 절벽 오작동, 클라이언트 재시도 루프를 방지합니다.",
-            "ttft_title": "첫 글자 응답 유예 (TTFT)",
+            "ttft_title": "첫 글자 응답 유예",
             "default_badge": "기본값: 180s",
             "ttft_desc": "업스트림 콜드 스타트 대기, 100k+ 토큰 Prefill 및 요약 작업의 최대 허용 시간입니다. 3초마다 연결 유지 핑을 전송합니다.",
             "transition_title": "상태 전환 유예 (타이머 리셋)",
             "transition_desc": "추론 완료 후 첫 본문 또는 도구 호출 토큰이 생성되기까지의 유예 시간입니다. 추론 종료 시 자동으로 타이머를 리셋합니다.",
-            "sliding_title": "스트리밍 슬라이딩 타임아웃 (Streaming)",
+            "sliding_title": "스트리밍 슬라이딩 타임아웃",
             "default_badge_sliding": "기본값: 120s",
             "sliding_desc": "연속 출력 중 인접 토큰 간 최대 허용 침묵 간격입니다. 비정상 단절 시 안전하게 세션을 마감하여 생성된 출력을 보존합니다.",
             "toast_reset": "타임아웃 설정을 기본값으로 복원했습니다",
             "btn_reset": "기본값 복원",
             "btn_save": "타임아웃 설정 저장"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "업로드 시간: 대역폭으로 자동 판정",
+            "min_speed_title": "업로드 대역폭(Mbps)",
+            "min_speed_desc": "VPN은 보통 다운로드가 빠르고 업로드가 느리므로 1~5Mbps를 권장합니다.",
+            "extra_wait_title": "추가 대기 계수",
+            "extra_wait_desc": "이 값은 업로드 최대 대기 시간에 영향을 줍니다.",
+            "formula_title": "최대 대기 시간 = 요청 본문 크기 ÷ 업로드 대역폭 × (1 + 추가 대기 계수)",
+            "stall_title": "정체 타임아웃(초)",
+            "stall_desc": "업로드 중 데이터 전송이 완전히 멈춘 경우의 판정 타임아웃입니다. 핸드셰이크 오작동을 방지하기 위해 연결 타임아웃보다 작아지지 않도록 자동 보호됩니다.",
+            "header_wait_title": "첫 헤더 대기 타임아웃(초)",
+            "header_wait_desc": "0 = 내장 값 사용: 기본 엔드포인트 30초 / 대체 엔드포인트 25초. 0이 아니면 하한만 올립니다.",
+            "large_body_desc": "임계값을 넘는 파일은 기본적으로 한 번만 전송하여 반복 재전송으로 업로드 대역폭이 포화되는 것을 막습니다.",
+            "large_body_threshold_title": "대용량 파일 임계값(MB)",
+            "endpoint_attempts_title": "최대 시도 횟수",
+            "toast_reset": "타임아웃 설정을 기본값으로 복원했습니다",
+            "btn_reset": "기본값 복원",
+            "btn_save": "타임아웃 설정 저장"
+        },
+        "timeouts": {
+            "banner_title": "타임아웃 설정",
+            "banner_desc": "요청 한 건의 전체 타임아웃 경로: ① 엔드포인트 연결 수립 → ② 본문 업로드 → ③ 첫 글자 응답 및 연속 출력.",
+            "section_connect": "① 엔드포인트 연결(자동 장애 조치)",
+            "connect_label": "연결 타임아웃(초)",
+            "connect_desc": "엔드포인트와의 TCP 연결 수립 타임아웃입니다. 보통 매우 빠릅니다.",
+            "connect_restart": "변경 후 프록시 서비스를 재시작해야 합니다.",
+            "section_upload": "② 업로드(요청 본문 전송)",
+            "section_large_body": "대용량 파일 재시도",
+            "section_header": "③ 첫 응답 헤더(자동 장애 조치)",
+            "header_primary_title": "기본 엔드포인트:",
+            "header_primary_items": "일반: TTFT　이미지: TTFT+45　동영상: TTFT+60　보조: TTFT−30",
+            "header_fallback_title": "대체 엔드포인트:",
+            "header_fallback_items": "동일 증가분의 절반 (음수 증가분은 유지)",
+            "first_byte_effective": "현재 적용: 일반 {{text}}s　이미지 {{image}}s　동영상 {{video}}s　보조 {{aux}}s",
+            "section_stream": "③ 첫 글자와 연속 출력",
+            "stream_desc": "응답 헤더 대기와 첫 토큰이 하나의 첫 바이트 지연으로 통합되었습니다. HTTP 200 이전에는 엔드포인트 전환이 가능하고, 이후에는 안전하게 마무리만 합니다.",
+            "auto_summary": "예: 최대 대기 = 47MB ÷ 2Mbps × 1.4 ≈ {{big}}초;"
         },
         "cloudflared": {
             "title": "공개 액세스 (Cloudflared)",
@@ -1479,7 +1582,8 @@
             "sync_confirm_title": "동기화 확인",
             "sync_confirm_message": "{{name}} 구성을 동기화할 준비가 되었습니다. ⚠️ 경고: 이 작업은 기존 로컬 구성 파일(예: 로그인 토큰, API 키)을 덮어씁니다. 계속하시겠습니까?",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "agent_settings": {
@@ -1637,7 +1741,7 @@
             "out_tokens_title": "출력 토큰",
             "ttft_prefix": "첫 글자:",
             "total_duration_title": "총 소요 시간",
-            "ttft_title": "첫 글자 지연 시간 (TTFT)"
+            "ttft_title": "첫 글자 지연 시간"
         },
         "details": {
             "title": "요청 상세",
@@ -1660,10 +1764,47 @@
             "search_placeholder_with_shortcut": "페이로드 검색... (Enter 다음, Shift+Enter 이전)",
             "case_sensitive": "대소문자 구분",
             "wrap_lines": "자동 줄 바꿈",
-            "no_wrap": "줄 바꿈 안 함",
+            "no_wrap": "한 줄",
             "no_matches": "일치 없음",
             "no_upstream_payload": "전달 페이로드 없음",
-            "headers": "헤더 (Headers)"
+            "headers": "헤더 (Headers)",
+            "layout_3col": "3단 비교",
+            "layout_3col_title": "3단 가로 비교 뷰",
+            "layout_postman": "Postman 스타일",
+            "layout_postman_title": "Postman 스타일 상하 분할 뷰",
+            "export_menu": "내보내기 / 복사",
+            "export_menu_title": "HAR 내보내기, cURL 또는 전체 진단 JSON 복사",
+            "copy_har": "HAR 페이로드 복사",
+            "download_har": ".har 파일 다운로드",
+            "copy_curl": "cURL 명령으로 복사",
+            "copy_full_json": "전체 진단 JSON 복사",
+            "copied_har": "HAR 복사됨",
+            "exported_har": ".har 내보냄",
+            "copied_curl": "cURL 복사됨",
+            "copied_full_json": "전체 JSON 복사됨",
+            "collapse_metadata": "메타데이터 접기",
+            "expand_metadata": "메타데이터 펼치기",
+            "collapse_metadata_title": "메타데이터를 접어 페이로드 영역 확장",
+            "expand_metadata_title": "메타데이터 정보 펼치기",
+            "wrap": "줄바꿈",
+            "wrap_on_title": "현재: 자동 줄바꿈 (클릭하여 단일 줄 전환)",
+            "wrap_off_title": "현재: 단일 줄 스크롤 (클릭하여 줄바꿈 전환)",
+            "case_sensitive_on": "대소문자 구분 켜짐",
+            "case_sensitive_off": "대소문자 구분 켜기",
+            "clear_search": "검색 지우기",
+            "no_match": "일치 항목 없음",
+            "prev_match": "이전 일치 (Shift+Enter)",
+            "next_match": "다음 일치 (Enter)",
+            "lines_count": "줄",
+            "expand": "펼치기",
+            "collapse": "접기",
+            "req_headers": "요청 헤더",
+            "upstream_headers": "전달 헤더",
+            "resp_headers": "응답 헤더",
+            "param_key": "매개변수 키 (Key)",
+            "param_value": "매개변수 값 (Value)",
+            "header_key": "헤더 키 (Header)",
+            "header_value": "헤더 값 (Value)"
         },
         "dialog": {
             "clear_title": "프록시 로그 지우기",
@@ -1720,14 +1861,19 @@
             "norm_desc": "모델 라우팅 / 계정 스케줄링 / Gemini 형식 변환",
             "thinking": "생각 블록 및 서명 보완",
             "thinking_desc": "ThinkingStore 복원 / 생각 체인 및 센티널 서명 주입",
-            "ttft": "첫 토큰 대기 시간 (TTFT)",
+            "ttft": "첫 토큰 대기 시간",
             "ttft_desc": "게이트웨이 요청부터 첫 유효 데이터 수신까지",
             "stream": "스트림 전송 시간",
             "stream_desc": "첫 번째 청크 도착부터 스트림 완료까지",
             "total": "총 소요 시간",
             "copy_timing": "시간 진단 복사",
             "copied_timing": "복사됨",
-            "legacy_hint": "이전 기록에는 세부 단계별 시간이 기록되지 않았습니다."
+            "legacy_hint": "이전 기록에는 세부 단계별 시간이 기록되지 않았습니다.",
+            "collapse": "소요 시간 진단 접기",
+            "expand": "소요 시간 진단 펼치기",
+            "endpoint_label": "엔드포인트",
+            "status_label": "상태",
+            "network_timeout_or_error": "네트워크 타임아웃 / 오류"
         }
     },
     "update_notification": {
@@ -1749,6 +1895,7 @@
         "title": "안전한 액세스 제어",
         "desc": "현재 Web 모드에서 실행 중입니다. 관리 비밀번호 또는 API 키를 입력하여 액세스하십시오.",
         "placeholder": "관리 비밀번호 또는 API 키를 입력하십시오",
+        "remember_me": "로그인 정보 기억",
         "btn_login": "인증 및 입장",
         "btn_verifying": "인증 중...",
         "error_invalid_key": "비밀번호 또는 API 키가 잘못되었습니다. 다시 시도하십시오",
@@ -1773,6 +1920,10 @@
         "by_account": "계정별",
         "by_model": "모델별",
         "by_account_view": "계정별",
+        "perspective_routed": "라우팅된 모델",
+        "perspective_requested": "요청된 모델",
+        "perspective_routed_tip": "실제 라우팅 및 호출된 모델 기준으로 통계 집계",
+        "perspective_requested_tip": "클라이언트가 요청한 원본 모델명 기준으로 통계 집계",
         "model_details": "모델 분석",
         "account_details": "계정 분석",
         "model": "모델",
@@ -1917,7 +2068,10 @@
         "cockpit_view_detail": "세부정보",
         "cockpit_tab_accounts": "계정",
         "cockpit_tab_models": "모델",
-        "cockpit_tab_users": "사용자"
+        "cockpit_tab_users": "사용자",
+        "avg_ttft": "첫 글자 지연",
+        "ttft": "첫 글자 소요",
+        "avg_ttft_tip": "평균 첫 번째 토큰 응답 시간 (TTFT)"
     },
     "errors": {
         "stream": {

@@ -187,7 +187,7 @@ async fn fetch_project_id(
             .header(rquest::header::CONTENT_TYPE, "application/json")
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&meta)
             .send()
@@ -345,7 +345,7 @@ pub async fn fetch_quota_with_cache(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&payload)
             .send()
@@ -467,9 +467,8 @@ pub async fn fetch_quota_with_cache(
                         }
                     }
                 }
-                if !official_supported_ids.is_empty() {
-                    official_supported_ids.insert("gemini-3.1-flash-lite".to_string());
-                }
+                // [2026-10-29] 不再向官方可用集合里注入任何“字典存在但未开通”的模型（如 gemini-3.1-flash-lite），
+                // 对外模型列表严格等于 fetchAvailableModels 的可用集合。
 
                 // Parse deprecated model routing rules
                 if let Some(deprecated) = quota_response.deprecated_model_ids {
@@ -485,12 +484,13 @@ pub async fn fetch_quota_with_cache(
                 // （fetchAvailableModels 对免费号和 Pro 号返回完全相同的全量目录）。
                 let final_tier =
                     crate::models::quota::resolve_subscription_tier(subscription_tier.as_deref());
-                quota_data.subscription_tier = Some(final_tier);
+                quota_data.subscription_tier = Some(final_tier.clone());
+                let is_ultra = final_tier == "ULTRA";
 
                 // Best-effort: 先行获取分组配额摘要 (weekly + 5h windows)。
                 // 这样在解析模型列表时，对于上游不再返回 quotaInfo 的 Gemini/Argon 系模型，
                 // 可以直接提取并绑定其所属分组的真实配额，杜绝模型被误丢弃导致调度器 503 (Issue #3737)。
-                let quota_groups =
+                let mut quota_groups =
                     fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
                         .await;
 
@@ -538,54 +538,92 @@ pub async fn fetch_quota_with_cache(
                         let is_argon = name_lower.contains("argon");
                         let is_claude_or_gpt = !is_argon
                             && (name_lower.starts_with("claude") || name_lower.starts_with("gpt"));
-                        let is_gemini = !is_argon && name_lower.starts_with("gemini");
 
-                        // 查找匹配的配额组：Argon 优先专属组，未命中时回退 Gemini；Claude/GPT 找 3P；Gemini 找常规 Gemini 组
-                        let matched_group = groups
-                            .iter()
-                            .find(|g| {
+                        // 查找匹配的配额组：Argon 优先专属组；若是 Ultra 账号，无专属组时允许回退继承通用 Gemini 分组；
+                        // Claude/GPT 找 3P；Gemini 找常规 Gemini 组
+                        let mut matched_group = groups.iter().find(|g| {
+                            let gname = g.display_name.to_lowercase();
+                            let is_argon_group = gname.contains("argon")
+                                || g.buckets.iter().any(|b| {
+                                    let bid = b.bucket_id.to_lowercase();
+                                    let bname =
+                                        b.display_name.as_deref().unwrap_or("").to_lowercase();
+                                    bid.contains("argon") || bname.contains("argon")
+                                });
+                            if is_argon {
+                                return is_argon_group;
+                            }
+                            if is_argon_group {
+                                return false;
+                            }
+                            let is_claude_group = gname.contains("claude")
+                                || gname.contains("gpt")
+                                || gname.contains("3p");
+                            if is_claude_or_gpt {
+                                return is_claude_group;
+                            }
+                            // standard gemini
+                            !is_claude_group
+                                && (gname.contains("gemini")
+                                    || (!gname.contains("claude")
+                                        && !gname.contains("gpt")
+                                        && !gname.contains("3p")))
+                        });
+
+                        // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
+                        if is_argon && matched_group.is_none() && is_ultra {
+                            matched_group = groups.iter().find(|g| {
                                 let gname = g.display_name.to_lowercase();
-                                let is_argon_group = gname.contains("argon")
-                                    || g.buckets.iter().any(|b| {
-                                        let bid = b.bucket_id.to_lowercase();
-                                        let bname =
-                                            b.display_name.as_deref().unwrap_or("").to_lowercase();
-                                        bid.contains("argon") || bname.contains("argon")
-                                    });
-                                if is_argon {
-                                    return is_argon_group;
-                                }
-                                if is_argon_group {
-                                    return false;
-                                }
-                                let is_claude_group = gname.contains("claude")
-                                    || gname.contains("gpt")
-                                    || gname.contains("3p");
-                                if is_claude_or_gpt {
-                                    return is_claude_group;
-                                }
-                                // standard gemini
-                                !is_claude_group
-                                    && (gname.contains("gemini")
-                                        || (!gname.contains("claude")
-                                            && !gname.contains("gpt")
-                                            && !gname.contains("3p")))
-                            })
-                            .or_else(|| {
-                                // Argon 没有独立分组时的优雅降级：回退到通用 Gemini 分组
-                                if is_argon {
-                                    groups.iter().find(|g| {
-                                        let gname = g.display_name.to_lowercase();
-                                        !gname.contains("claude")
-                                            && !gname.contains("gpt")
-                                            && !gname.contains("3p")
-                                    })
-                                } else {
-                                    None
-                                }
+                                !gname.contains("claude")
+                                    && !gname.contains("gpt")
+                                    && !gname.contains("3p")
                             });
+                        }
+
+                        // 非 Ultra 账号若未命中独立 Argon 分组，判定为未获灰度授权，拦截防呆 (Fixes #3745)
+                        if is_argon && matched_group.is_none() {
+                            continue;
+                        }
 
                         if let Some(group) = matched_group {
+                            // ================================================================
+                            // 【临时观测结论 · 2026-11-05】Argon 各档位的配额桶归属
+                            // ================================================================
+                            // 以下结论来自当日对真实账号的直连上游对照实验（非官方文档，
+                            // 通过“发请求 + 前后快照 remainingFraction + 用 tokens/Δ 反推桶容量”得出）：
+                            //
+                            //   argon-high   : 计量走 gemini-5h + gemini-weekly（通用高算力池，
+                            //                  反推容量约 1.04M tokens）；
+                            //                  但**准入前提仍是 argon 桶 > 0** ——
+                            //                  实测 argon=0 时，5h 即使有 78% 余量，三档依旧全部 429。
+                            //   argon-medium : 计量走 gemini-argon-wtu-weekly（反推容量约 1.55M tokens）。
+                            //   argon-low    : 与 medium 共享同一个 argon 周桶（两者余量同步变动）。
+                            //
+                            // 【当下结论】用 argon 桶判定可用性是**对的**（它同时是 high 的准入闸门）。
+                            // 【重要警告】切勿“优化”成按档位绑定不同桶 —— 那会让 argon=0 但 5h 健康的
+                            //   账号被误判为可用，制造假阳性并触发上游 429。
+                            //
+                            // 【关于 quotaInfo 的坑】上游对 argon-high 下发的 quotaInfo 是“多桶最小值”
+                            //   （当时多为 5h 的值），与 argon 桶余量不一致，属展示口径差异，
+                            //   **不可作为准入判据**，也不建议据此修改展示逻辑。
+                            //
+                            // 【为何暂不动调度算法】
+                            //   1. 观测期间上游行为正在变动：同一账号 argon-high 的 quotaInfo 在
+                            //      十几分钟内从“等于 5h”变成“不等于任一边”，说明官方可能正在调整该字段；
+                            //   2. 现有逻辑在“可用性判定”上是自洽的（argon 桶既是准入也是门禁）；
+                            //   3. 上游未做请求前容量预估（实测允许单次请求超额吃穿最后一点余量，
+                            //      归零后下一次才 429），因此网关侧无论怎么建桶映射都无法完全预判；
+                            //   4. 此映射属易变的“上游内部实现细节”，固化它违背本项目
+                            //      “避免脆弱硬编码、优先通用解法”的约定。
+                            //
+                            // 【后人须知】若未来出现“argon 额度充足但 argon-high 持续 429”或
+                            //   “argon 已归零但 high 仍可用”的现象，请**先重新实测**（切勿直接改代码）：
+                            //   a) 直连 daily-cloudcode-pa 发三档各 2~3 次，记录每次前后
+                            //      retrieveUserQuotaSummary 的每个桶 remainingFraction；
+                            //   b) 用 tokens ÷ ΔremainingFraction 反推桶容量，容量相同则同桶；
+                            //   c) 特别验证 argon=0 时 high 是否仍被拒（这一步能确认准入闸门是否还在）；
+                            //   d) 若上游已改变归属，再同步更新本注释与判定逻辑。
+                            // ================================================================
                             let bucket_5h = group.buckets.iter().find(|b| {
                                 let win = b.window.to_lowercase();
                                 let bid = b.bucket_id.to_lowercase();
@@ -673,7 +711,7 @@ pub async fn fetch_quota_with_cache(
                     quota_data.add_model(model_quota);
                 }
 
-                // [NEW] 若上游下发了 Argon 专属配额组，但 models 中未显式拆分条目时，为该账号注入 Argon 官方权威模型条目
+                // [NEW] 若上游下发了 Argon 专属配额组（如 Pro），或当前账号为官方 Ultra 旗舰账号，但 models 中未显式拆分条目时，为该账号注入 Argon 官方权威模型条目
                 if let Some(ref groups) = quota_groups {
                     let has_argon_group = groups.iter().any(|g| {
                         let gname = g.display_name.to_lowercase();
@@ -684,23 +722,41 @@ pub async fn fetch_quota_with_cache(
                                 bid.contains("argon") || bname.contains("argon")
                             })
                     });
-                    if has_argon_group
+                    if (has_argon_group || is_ultra)
                         && !quota_data
                             .models
                             .iter()
                             .any(|m| m.name.to_lowercase().contains("argon"))
                     {
-                        let argon_b = groups.iter().find_map(|g| {
-                            let gname = g.display_name.to_lowercase();
-                            if gname.contains("argon") {
-                                return g.buckets.first();
-                            }
-                            g.buckets.iter().find(|b| {
-                                let bid = b.bucket_id.to_lowercase();
-                                let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
-                                bid.contains("argon") || bname.contains("argon")
+                        let argon_b = groups
+                            .iter()
+                            .find_map(|g| {
+                                let gname = g.display_name.to_lowercase();
+                                if gname.contains("argon") {
+                                    return g.buckets.first();
+                                }
+                                g.buckets.iter().find(|b| {
+                                    let bid = b.bucket_id.to_lowercase();
+                                    let bname =
+                                        b.display_name.as_deref().unwrap_or("").to_lowercase();
+                                    bid.contains("argon") || bname.contains("argon")
+                                })
                             })
-                        });
+                            .or_else(|| {
+                                if is_ultra {
+                                    groups
+                                        .iter()
+                                        .find(|g| {
+                                            let gname = g.display_name.to_lowercase();
+                                            !gname.contains("claude")
+                                                && !gname.contains("gpt")
+                                                && !gname.contains("3p")
+                                        })
+                                        .and_then(|g| g.buckets.first())
+                                } else {
+                                    None
+                                }
+                            });
                         let pct = argon_b
                             .map(|b| (b.remaining_fraction * 100.0).round() as i32)
                             .unwrap_or(100);
@@ -732,6 +788,23 @@ pub async fn fetch_quota_with_cache(
                                 supported_mime_types: None,
                             });
                         }
+                    }
+                }
+
+                // [3P ISOLATION] 若账号实际可用模型中没有任何 Claude 或 GPT 模型（如不支持 Opus 5.5 且 4.6/GPT 已下线），
+                // 剔除 upstream 统一返回的虚假 3P 配额分组，防止号池与展示层误判
+                if let Some(ref mut groups) = quota_groups {
+                    let has_claude_or_gpt = quota_data.models.iter().any(|m| {
+                        let n = m.name.to_lowercase();
+                        n.starts_with("claude") || n.starts_with("gpt")
+                    });
+                    if !has_claude_or_gpt {
+                        groups.retain(|g| {
+                            let gname = g.display_name.to_lowercase();
+                            !gname.contains("claude")
+                                && !gname.contains("gpt")
+                                && !gname.contains("3p")
+                        });
                     }
                 }
 
@@ -785,7 +858,7 @@ async fn fetch_quota_summary(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&payload)
             .send()

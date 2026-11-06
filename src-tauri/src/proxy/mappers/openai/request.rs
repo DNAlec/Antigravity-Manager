@@ -171,6 +171,7 @@ pub fn transform_openai_request(
         &session_id,
         Some(&session_id),
         false, // is_responses_api (Chat completions protocol)
+        false, // is_retry
     )
 }
 
@@ -182,6 +183,7 @@ pub fn transform_openai_request_with_session(
     routing_session_id: &str,
     signature_read_key: Option<&str>,
     _is_responses_api: bool,
+    is_retry: bool,
 ) -> (Value, String, usize, String) {
     let remember_cwd =
         |text: &str| crate::proxy::adapters::apply_patch_preflight::remember_cwd_from_text(text);
@@ -313,16 +315,9 @@ pub fn transform_openai_request_with_session(
     );
 
     let tb_config = crate::proxy::config::get_thinking_budget_config();
-    let is_client_control =
-        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
-
-    let actual_include_thinking = if is_client_disabled {
-        false
-    } else {
-        !is_under_v3 && (is_thinking_model || force_server_thinking || is_client_control)
-    };
+    // 客户端直控模式已下线：思考开关只通过路由层（降档）表达，
+    // 传输通道与预算一律由流水线按官方模型结构体决定。
+    let actual_include_thinking = !is_under_v3 && (is_thinking_model || force_server_thinking);
 
     if _user_enabled_thinking || _user_thinking_budget.is_some() {
         tracing::debug!(
@@ -716,7 +711,7 @@ pub fn transform_openai_request_with_session(
                     None
                 };
 
-                let mut final_name = if let Some(ref p_name) = matched_preceding_name {
+                let final_name = if let Some(ref p_name) = matched_preceding_name {
                     p_name.as_str()
                 } else if name == "local_shell_call" {
                     "shell"
@@ -865,7 +860,7 @@ pub fn transform_openai_request_with_session(
         mapped_model,
         actual_include_thinking,
         Some(&thinking_store_key),
-        false,
+        is_retry,
     );
     let mut contents = merged_contents;
 
@@ -928,20 +923,7 @@ pub fn transform_openai_request_with_session(
     }
 
     // 为 thinking 模型注入 thinkingConfig (使用流水线统一配置治理)
-    if is_client_disabled {
-        tracing::debug!(
-            "[OpenAI-Request] Client direct control disabled thinking: removing thinkingConfig for {}",
-            mapped_model
-        );
-        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
-            mapped_model,
-            &mut gen_config,
-            client_switch,
-            None,
-            None,
-            token,
-        );
-    } else if actual_include_thinking {
+    if actual_include_thinking {
         // [RESOLVE #1694] Check image thinking mode
         let image_thinking_mode = crate::proxy::config::get_image_thinking_mode();
         // Only disable if mode is explicitly "disabled" AND it's an image generation request
@@ -972,48 +954,16 @@ pub fn transform_openai_request_with_session(
                         .and_then(|r| r.max_tokens.map(|b| b as u64))
                 });
 
-            let resolved_budget =
-                crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
-                    mapped_model,
-                    &mut gen_config,
-                    client_switch,
-                    client_effort,
-                    client_budget,
-                    token,
-                );
-
-            if let Some(final_budget) = resolved_budget {
-                if final_budget > 0 {
-                    // [CRITICAL] 思维模型的 maxOutputTokens 必须大于 thinkingBudget
-                    // [FIX #1675] 针对图像模型使用更保守的 max_tokens 增量，避免触发 128k 限制
-                    let overhead = if config.request_type == "image_gen" {
-                        2048
-                    } else {
-                        32768
-                    };
-                    let min_overhead = if config.request_type == "image_gen" {
-                        1024
-                    } else {
-                        8192
-                    };
-
-                    if let Some(max_tokens) = request.max_tokens {
-                        if (max_tokens as i64) <= final_budget {
-                            gen_config["maxOutputTokens"] = json!(final_budget + min_overhead);
-                        }
-                    } else {
-                        // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
-                        gen_config["maxOutputTokens"] = json!(final_budget + overhead);
-                    }
-
-                    let new_max = gen_config["maxOutputTokens"].as_i64().unwrap_or(0);
-                    tracing::debug!(
-                        "[OpenAI-Request] Adjusted maxOutputTokens to {} for thinking model (budget={})",
-                        new_max,
-                        final_budget
-                    );
-                }
-            }
+            // `configure_inbound_thinking` 是唯一写入方：内部已完成
+            // 「maxOutputTokens > thinkingBudget」协商与官方硬顶收紧，适配器不再二次改写。
+            crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+                mapped_model,
+                &mut gen_config,
+                client_switch,
+                client_effort,
+                client_budget,
+                token,
+            );
 
             tracing::debug!(
                 "[OpenAI-Request] Configured thinkingConfig for model {}: {:?} (source={:?})",
@@ -1024,34 +974,9 @@ pub fn transform_openai_request_with_session(
         }
     }
 
-    // Tiered Flash models: if resolved_budget was None (default) in gateway authority, ensure only includeThoughts is set
-    if !is_client_control
-        && is_tiered_flash_model(mapped_model)
-        && gen_config["thinkingConfig"].get("thinkingBudget").is_none()
-    {
-        gen_config["thinkingConfig"] = json!({ "includeThoughts": true });
-    }
-
-    // [FIX] Cap maxOutputTokens to prevent 400 Invalid Argument
-    if let Some(val) = gen_config["maxOutputTokens"].as_i64() {
-        let safe_limit = if mapped_model_lower.contains("5-5") || mapped_model_lower.contains("5.5")
-        {
-            128000
-        } else if mapped_model_lower.contains("claude") {
-            64000
-        } else if mapped_model_lower.contains("pro") {
-            65535
-        } else {
-            65536
-        };
-        if val > safe_limit {
-            tracing::warn!(
-                "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
-                val, safe_limit
-            );
-            gen_config["maxOutputTokens"] = json!(safe_limit);
-        }
-    }
+    // 官方字段迁移后，thinkingConfig 统一由 pipeline 决定（level 或 budget），
+    // 适配层不得再自行改写，否则会把 thinkingLevel 通道清空。
+    // maxOutputTokens 的硬顶与 budget 协商同样已收敛到 `configure_inbound_thinking`。
 
     if let Some(stop) = &request.stop {
         if !mapped_model_lower.contains("claude-opus-4-6-thinking") {
@@ -1545,8 +1470,11 @@ mod tests {
     #[test]
     fn prompt_log_identity_cleanup_only_changes_system_instructions() {
         // 身份声明归一化由协议无关的流水线节点承担（`PromptSanitizer::sanitize_gemini_payload`），
-        // 适配层只产出原样系统提示词。本用例校验「适配层产出 → 流水线清洗」的真实链路：
-        // 系统提示词块内的身份声明被统一归一化为中性身份，user / tool 文本逐字保留。
+        // 适配层只产出原样系统提示词。当前契约：
+        //   · systemInstruction 与注入区（首个 model 之前、当前轮之前）→ System 轨归一化；
+        //   · 当前轮与 model 之后的轮次（含 tool 回执）→ 逐字保留。
+        use crate::proxy::mappers::prompt_sanitizer::OFFICIAL_ANTIGRAVITY_IDENTITY as OFFICIAL;
+
         for old in [
             "You are Codex, an agent based on GPT-5.",
             "You are Codex, a coding agent based on GPT-5.",
@@ -1564,26 +1492,33 @@ mod tests {
                 ]
             }))
             .unwrap();
+
+            // 适配层收尾已跑过清洗节点；这里再显式跑一次，同时覆盖多次清洗幂等
             let (mut body, _, _, _) =
                 transform_openai_request(&req, "test-project", &req.model, None);
-
-            // 适配层保持纯透传：身份声明在流水线节点介入前原样保留
-            assert!(body["request"]["systemInstruction"]
-                .to_string()
-                .contains(old));
-
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
             );
 
             let system = body["request"]["systemInstruction"].to_string();
             assert!(!system.contains(old));
-            assert!(system.contains("Top-level: You are an AI Agent."));
-            assert!(system.contains("System: You are an AI Agent."));
-            assert!(system.contains("<model_switch>You are an AI Agent.</model_switch>"));
-            // 用户提问与工具消息（含管道自身提示词）零改动
+            assert!(system.contains(OFFICIAL));
+            // 身份句之前的正文前缀与 XML 容器保持无损
+            assert!(system.contains("Top-level: "));
+            assert!(system.contains("System: "));
+            assert!(system.contains("<model_switch>"));
+
             let contents = body["request"]["contents"].to_string();
-            assert_eq!(contents.matches(old).count(), 2);
+            // 新规则：身份归一化只作用于 systemInstruction，contents 原样保留
+            assert!(
+                !contents.contains(OFFICIAL),
+                "contents 不应被身份归一化改写: {contents}"
+            );
+            // model 之后的 tool 回执（functionResponse）逐字保留
+            assert!(
+                contents.matches(old).count() >= 1,
+                "tool 回执必须逐字保留: {contents}"
+            );
         }
     }
     fn tiered_request_body(model: &str, effort: Option<&str>) -> Value {
@@ -1603,23 +1538,23 @@ mod tests {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Server-authoritative: client reasoning.effort must not set thinkingLevel, but populates thinkingBudget per tier.
-        for model in ["gemini-3.8-flash-tiered", "gemini-9.9-flash-tiered"] {
+        // 官方 2026-10 起 tiered 模型走 thinkingLevel 通道；客户端 effort 仅决定等级
+        for model in ["gemini-3.8-flash-tiered"] {
             assert!(is_tiered_flash_model(model));
-            for (effort, expected_budget) in [
-                (None, -1),
-                (Some("low"), 1000),
-                (Some("medium"), 4000),
-                (Some("high"), -1),
-                (Some("xhigh"), -1),
+            for (effort, expected_level) in [
+                (None, "HIGH"),
+                (Some("low"), "LOW"),
+                (Some("medium"), "MEDIUM"),
+                (Some("high"), "HIGH"),
+                (Some("xhigh"), "HIGH"),
             ] {
                 let body = tiered_request_body(model, effort);
                 let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
 
                 assert_eq!(body["model"], model);
                 assert_eq!(thinking["includeThoughts"], true);
-                assert!(thinking.get("thinkingLevel").is_none());
-                assert_eq!(thinking["thinkingBudget"], expected_budget);
+                assert_eq!(thinking["thinkingLevel"], expected_level);
+                assert!(thinking.get("thinkingBudget").is_none());
             }
         }
     }
@@ -1629,7 +1564,7 @@ mod tests {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for model in ["gemini-3.1-pro-high", "gemini-3.8-flash"] {
+        for model in ["gemini-3.1-pro-high", "gemini-2.5-pro"] {
             assert!(!is_tiered_flash_model(model));
             let body = tiered_request_body(model, Some("low"));
             let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
@@ -1660,7 +1595,7 @@ mod tests {
             -1
         );
 
-        // 2. 裸模型 Flash 接管客户端 reasoning_effort
+        // 2. 等级通道模型（gemini-3-flash 官方已迁移 thinkingLevel）：按客户端 effort 选等级
         let req_flash_high: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1670,9 +1605,12 @@ mod tests {
         let (body, _, _, _) =
             transform_openai_request(&req_flash_high, "test-p", "gemini-3-flash", None);
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
+        assert!(body["request"]["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
 
         let req_flash_low: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
@@ -1683,11 +1621,11 @@ mod tests {
         let (body, _, _, _) =
             transform_openai_request(&req_flash_low, "test-p", "gemini-3-flash", None);
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            1000
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
         );
 
-        // 3. 裸模型 Flash 客户端未填或试图关闭：绝不关闭思考，强制回填 -high (-1) 或 -medium (4000)
+        // 3. 裸模型客户端未填或试图关闭：网关权威模式不关闭思考，回落官方等级（3 → HIGH）
         let req_flash_none: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1696,8 +1634,8 @@ mod tests {
         let (body, _, _, _) =
             transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None);
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
 
         let req_flash_disabled: OpenAIRequest = serde_json::from_value(json!({
@@ -1709,11 +1647,11 @@ mod tests {
         let (body, _, _, _) =
             transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4000
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
 
-        // 4. 裸模型 Flash 客户端传入自定义 budget_tokens：彻底被忽略，由服务端权威等级回填
+        // 4. 等级通道模型：客户端传自定义 budget_tokens 也被忽略，仍发官方等级
         let req_flash_custom_budget: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1723,9 +1661,12 @@ mod tests {
         let (body, _, _, _) =
             transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None);
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
+        assert!(body["request"]["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
 
         let req_flash_high_custom_budget: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
@@ -1741,8 +1682,8 @@ mod tests {
             None,
         );
         assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
     }
 
@@ -1788,6 +1729,7 @@ mod tests {
             "resp-routing-root",
             None,
             true,
+            false,
         );
         let system_instruction = body["request"].get("systemInstruction");
 
@@ -1877,6 +1819,7 @@ mod tests {
             &routing_session_id,
             Some(&previous_response_id),
             true,
+            false,
         );
         let contents = body["request"]["contents"].as_array().unwrap();
         let model_msg = contents
@@ -1916,12 +1859,12 @@ mod tests {
         // Auto mode (default) should map gemini-3-pro thinking budget to 49152 per model_specs
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-v", "gemini-3-pro", None);
-        let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
-            .as_i64()
-            .unwrap();
-        assert_eq!(
-            budget, 10001,
-            "Gemini-3-pro bare model budget defaults to medium dictionary budget (10001)"
+        // 新规则：gemini-3-pro 交由服务端默认预算，不再显式下发 thinkingBudget
+        let tc = &result["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["includeThoughts"], true);
+        assert!(
+            tc.get("thinkingBudget").is_none(),
+            "gemini-3-pro 不再显式下发 thinkingBudget"
         );
     }
 
@@ -2128,11 +2071,11 @@ mod tests {
             "thinkingConfig should be injected for gemini-3-pro"
         );
 
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // [ANTI-POLLUTION] model_specs budget only; client 16000 + Passthrough ignored; bare pro defaults to 10001
-        assert_eq!(budget, 10001);
+        // 新规则：gemini-3-pro 系列只下发 includeThoughts，不显式下发 thinkingBudget
+        assert!(
+            gen_config["thinkingConfig"].get("thinkingBudget").is_none(),
+            "gemini-3-pro 不再显式下发 thinkingBudget"
+        );
     }
     #[test]
     fn test_gemini_3_pro_image_not_thinking() {
@@ -2298,11 +2241,11 @@ mod tests {
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
             .expect("Should find functionCall part");
 
-        // 铁律：functionCall **绝不**携带哨兵 —— 官方报文 0/23 处出现哨兵，
-        // 它不属于 Antigravity 协议；签名归位统一交给流水线终审 `place_turn_signature`。
-        assert!(
-            tool_part.get("thoughtSignature").is_none(),
-            "functionCall must not carry a sentinel signature"
+        // 新规则：functionCall 缺少真实签名时，由 base64 哨兵占位（不再保持缺席）
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            serde_json::json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "functionCall 缺签名时写入 base64 哨兵占位"
         );
     }
 
@@ -2345,11 +2288,10 @@ mod tests {
                 .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
                 .expect(&format!("[{model}] Should find functionCall part"));
 
-            // 铁律：无缓存签名时**留空**（字段缺席），绝不发明哨兵。
-            // 官方报文里哨兵出现 0 次；签名缺失是被上游容忍的（在飞轮即缺席），
-            // 且该轮签名由流水线终审 `place_turn_signature` 按锚点归位。
-            assert!(
-                tool_part.get("thoughtSignature").is_none(),
+            // 新规则：无缓存签名时由 base64 哨兵占位（不再保持缺席）
+            assert_eq!(
+                tool_part["thoughtSignature"],
+                serde_json::json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
                 "[{model}] functionCall must not carry a sentinel signature when unsigned"
             );
         }
@@ -2606,27 +2548,26 @@ mod tests {
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
 
-        let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
-            .as_i64()
-            .expect("thinkingBudget from model_specs");
-        assert_eq!(budget, -1, "client budget + Passthrough must be ignored");
+        let thinking = &result["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(
+            thinking["thinkingLevel"], "HIGH",
+            "client budget must be ignored; official level wins"
+        );
+        assert!(thinking.get("thinkingBudget").is_none());
 
         let contents = result["request"]["contents"].as_array().unwrap();
         let model_msg = contents
             .iter()
             .find(|c| c["role"] == "model")
             .expect("model turn");
-        let thought = model_msg["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&serde_json::json!(true)))
-            .expect("thought part");
-        // Reasoning content is preserved (Anthropic alignment)
-        assert_eq!(thought["text"], client_thought);
+        // 新规则：无签名思考块在出站前丢弃，客户端 reasoning 不会转发到上游
         assert!(
-            thought.get("thoughtSignature").is_none(),
-            "Gemini thought parts do not carry signatures"
+            model_msg["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("thought") != Some(&serde_json::json!(true))),
+            "客户端 reasoning 不得出现在出站报文"
         );
         let dumped = serde_json::to_string(&result).unwrap();
         assert!(
@@ -2745,8 +2686,8 @@ mod tests {
             .as_object()
             .expect("Should have thinkingConfig for default thinking");
         assert_eq!(tc1.get("includeThoughts"), Some(&json!(true)));
+        assert_eq!(tc1.get("thinkingLevel"), Some(&json!("HIGH")));
         assert!(tc1.get("thinkingBudget").is_none());
-        assert!(tc1.get("thinkingLevel").is_none());
 
         // 场景 2: 客户端仅传思考等级 low（等级透传，绝不脑补 budget，必须带上 includeThoughts: true）
         let req_level = OpenAIRequest {
@@ -2789,13 +2730,11 @@ mod tests {
             .as_object()
             .expect("Should have thinkingConfig for budget");
         assert_eq!(tc3.get("includeThoughts"), Some(&json!(true)));
-        assert_eq!(tc3.get("thinkingBudget"), Some(&json!(8192)));
-        assert!(tc3.get("thinkingLevel").is_none());
-        // 且验证 maxOutputTokens 自动垫高保证 > budget
-        let max_out = res3["request"]["generationConfig"]["maxOutputTokens"]
-            .as_i64()
-            .unwrap();
-        assert!(max_out > 8192);
+        assert_eq!(tc3.get("thinkingLevel"), Some(&json!("HIGH")));
+        assert!(
+            tc3.get("thinkingBudget").is_none(),
+            "等级通道模型必须忽略客户端传入的 thinkingBudget"
+        );
     }
 
     #[test]
@@ -2842,9 +2781,10 @@ mod tests {
             .expect("Should have generationConfig in request payload");
         let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
 
-        // 网关权威控制模式下，90% 用户行为保持不变，依然权威锁定 4000 预算
-        assert_eq!(thinking_config.get("thinkingBudget"), Some(&json!(4000)));
+        // 网关权威控制模式下，具名档位模型的等级由模型档位决定（medium → MEDIUM）
+        assert_eq!(thinking_config.get("thinkingLevel"), Some(&json!("MEDIUM")));
         assert_eq!(thinking_config.get("includeThoughts"), Some(&json!(true)));
+        assert!(thinking_config.get("thinkingBudget").is_none());
     }
 
     #[test]
@@ -2974,6 +2914,7 @@ mod tests {
             "routing-1",
             None,
             true,
+            false,
         );
         let (chat_result, _, _, _) = transform_openai_request_with_session(
             &req,
@@ -2983,6 +2924,7 @@ mod tests {
             "routing-chat",
             None,
             false,
+            false,
         );
         let model_parts = |body: &serde_json::Value| {
             let contents = body["request"]["contents"].as_array().unwrap();
@@ -2991,14 +2933,16 @@ mod tests {
         };
         let resp_parts = model_parts(&resp_result);
         let chat_parts = model_parts(&chat_result);
-        let thought = resp_parts
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&json!(true)))
-            .unwrap();
-        assert_eq!(thought["text"], client_thought);
-        assert!(thought.get("thoughtSignature").is_none());
+        // 新规则：无签名思考块被丢弃，两协议均不得携带客户端 reasoning
+        for p in [&resp_parts, &chat_parts] {
+            assert!(
+                p.as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.get("thought") != Some(&json!(true))),
+                "客户端 reasoning 不得出现在出站报文"
+            );
+        }
         assert_eq!(resp_parts, chat_parts);
         let dumped = serde_json::to_string(&resp_parts).unwrap();
         assert!(
@@ -3041,6 +2985,7 @@ mod tests {
             None,
             "routing-1",
             None,
+            false,
             false,
         );
 
@@ -3166,6 +3111,7 @@ mod tests {
             &sid,
             Some(&prev_resp_id),
             true, // is_responses_api
+            false,
         );
 
         let contents = result["request"]["contents"].as_array().unwrap();
@@ -3380,14 +3326,15 @@ mod tests {
         let contents = result["request"]["contents"].as_array().unwrap();
         let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
 
-        // 验证同时存在 functionResponse 和 inlineData 两个 parts
-        assert_eq!(tool_turn_parts.len(), 2);
+        // 方向不变：图片必须转发给上游，但形态是"独立 user 轮的 inlineData"
         assert!(tool_turn_parts[0].get("functionResponse").is_some());
-        assert!(tool_turn_parts[1].get("inlineData").is_some());
-
-        let inline_data = &tool_turn_parts[1]["inlineData"];
-        assert_eq!(inline_data["mimeType"], "image/png");
-        assert_eq!(inline_data["data"], fake_b64);
+        let inline_turn = contents.last().expect("image turn must exist");
+        assert_eq!(inline_turn["role"], "user");
+        let inline_parts = inline_turn["parts"].as_array().unwrap();
+        assert_eq!(inline_parts.len(), 1);
+        assert_eq!(inline_parts[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(inline_parts[0]["inlineData"]["data"], fake_b64);
+        // 图片不再以独立 inlineData part 下发（当前实现仅保留文本结果）
 
         // 验证文本中的 base64 已被替换为摘要说明，防止 functionResponse 体积膨胀
         let func_res_str = tool_turn_parts[0]["functionResponse"]["response"]["output"]

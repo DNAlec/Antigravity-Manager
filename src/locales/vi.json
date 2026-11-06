@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "Mức suy nghĩ: thích ứng qua gateway (theo catalog chính thức)",
+        "tag": "Khuyến nghị",
+        "desc": "Chế độ khách hàng điều khiển trực tiếp và các mức token tùy chỉnh đã bị gỡ bỏ: các mô hình có thinkingLevel lấy mức từ phân hạng của mô hình (low / medium / high), các mô hình còn lại dùng thinkingBudget mặc định chính thức. Mức suy nghĩ do client gửi chỉ áp dụng cho mô hình không có hậu tố để chọn đúng mô hình phân hạng."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — bỏ qua nếu các yêu cầu vẫn hoạt động bình thường"
+    },
     "common": {
         "empty": "Trống",
         "loading": "Đang tải...",
@@ -196,6 +204,13 @@
         "proxy_online_unit": "Proxy trực tuyến",
         "btn_proxy_online": "Proxy trực tuyến ({{count}})",
         "btn_all_available": "Khả dụng ({{count}})",
+        "qos_auto_jail": "Tự động cách ly",
+        "qos_auto_jail_badge_on": "BẬT",
+        "qos_auto_jail_badge_off": "TẮT",
+        "qos_auto_jail_on": "Cách ly: BẬT",
+        "qos_auto_jail_off": "Cách ly: TẮT",
+        "qos_auto_jail_enabled_tip": "Hiện tại: Đã bật tự động cách ly tài khoản bị bóp băng thông và hủy liên kết phiên (Nhấn để tắt)",
+        "qos_auto_jail_disabled_tip": "Hiện tại: Đã tắt tự động cách ly. Bỏ qua kiểm tra thời gian TTFT và không cách ly tài khoản (Nhấn để bật)",
         "btn_title_proxy_online": "Hiện chỉ thống kê tài khoản tham gia proxy",
         "btn_title_all_available": "Hiện thống kê tất cả tài khoản hoạt động",
         "proxy_joined_pool": "✓ {{count}} tài khoản trong nhóm proxy",
@@ -354,6 +369,7 @@
                 "copied": "Đã sao chép",
                 "link_label": "URL Xác thực",
                 "link_click_to_copy": "Nhấn để sao chép",
+                "remote_hint": "💡 Gợi ý cho Docker / Máy chủ từ xa: việc trình duyệt hiển thị từ chối kết nối khi chuyển hướng đến localhost sau khi cấp quyền Google là giới hạn bảo mật bình thường. Bạn chỉ cần sao chép toàn bộ URL (chứa code) từ thanh địa chỉ trình duyệt và dán vào bên dưới.",
                 "manual_hint": "Trình duyệt không tự động chuyển hướng? Vui lòng dán liên kết phản hồi hoặc Mã xác thực tại đây:",
                 "manual_placeholder": "Dán liên kết hoặc mã tại đây...",
                 "error_no_flow": "Không tìm thấy luồng xác thực hoạt động. Vui lòng bắt đầu lại OAuth.",
@@ -361,7 +377,9 @@
                 "error_no_url": "Không thể lấy URL OAuth",
                 "popup_blocked": "Cửa sổ bật lên bị chặn",
                 "manual_submitting": "Đang gửi mã xác thực...",
-                "manual_submitted": "Mã xác thực đã gửi, đang xử lý ngầm..."
+                "manual_submitted": "Mã xác thực đã gửi, đang xử lý ngầm...",
+                "enterprise_title": "Ủy quyền doanh nghiệp Google Cloud / Vertex AI",
+                "enterprise_desc": "Ủy quyền bằng ứng dụng khách GCP doanh nghiệp chính thức để giữ hạn ngạch doanh nghiệp và liên kết dự án Vertex AI"
             },
             "token": {
                 "label": "Refresh Token",
@@ -469,7 +487,19 @@
         "client_cli": "CLI",
         "client_cli_tooltip": "Tài khoản đăng nhập Antigravity CLI (agy) hiện tại",
         "switch_next_short": "Tiếp",
-        "weekly_exhausted_tooltip": "Hạn mức tuần đã cạn, đã kích hoạt bảo vệ"
+        "weekly_exhausted_tooltip": "Hạn mức tuần đã cạn, đã kích hoạt bảo vệ",
+        "type": {
+            "personal": "Tài khoản cá nhân",
+            "enterprise": "Doanh nghiệp / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "ID dự án Google Cloud được liên kết với tài khoản doanh nghiệp/GCP. Antigravity gốc sẽ tự động liên kết hoặc dùng mặc định khi đăng nhập.",
+        "project_id_placeholder": "vd: my-project-id",
+        "project_id_updated": "Đã cập nhật GCP Project ID",
+        "auto_fetch_project_id": "Tự động lấy",
+        "fetching_project_id": "Đang lấy...",
+        "auto_fetch_success": "Đã tự động lấy Project ID thành công: {{projectId}}",
+        "auto_fetch_failed": "Không tìm thấy Project ID liên kết trên máy chủ"
     },
     "settings": {
         "save": "Lưu Cài đặt",
@@ -488,6 +518,10 @@
             "theme_light": "Sáng",
             "theme_dark": "Tối",
             "theme_system": "Hệ thống",
+            "ui_zoom": "Thu phóng giao diện & phông chữ",
+            "ui_zoom_desc": "Điều chỉnh kích thước giao diện và phông chữ tổng thể. Nhấn Cmd/Ctrl + / - / 0 bất kỳ lúc nào để thu phóng",
+            "ui_zoom_default": "Mặc định",
+            "ui_zoom_recommended": "Khuyên dùng cho màn hình lớn",
             "auto_launch": "Mở khi đăng nhập",
             "auto_launch_enabled": "Đã bật",
             "auto_launch_disabled": "Đã tắt",
@@ -506,7 +540,13 @@
             "lightweight_mode": "Chế độ nhẹ (Giải phóng bộ nhớ)",
             "lightweight_mode_desc": "Hủy tiến trình render WebView khi đóng hoặc thu nhỏ xuống khay hệ thống, giảm RAM xuống ~35MB. Cần vài mili-giây để dựng lại cửa sổ khi mở lại.",
             "lightweight_mode_enabled": "Đã bật chế độ nhẹ",
-            "lightweight_mode_disabled": "Đã tắt chế độ nhẹ"
+            "lightweight_mode_disabled": "Đã tắt chế độ nhẹ",
+            "tray_click_action": "Hành động khi nhấp chuột trái vào khay",
+            "tray_click_action_desc": "Chọn hành động mặc định khi nhấp vào biểu tượng trên khay hệ thống",
+            "tray_click_action_mini": "Mở cửa sổ giám sát Mini (Khuyên dùng)",
+            "tray_click_action_main": "Mở trực tiếp bảng điều khiển chính",
+            "tray_click_action_mini_short": "Cửa sổ Mini",
+            "tray_click_action_main_short": "Bảng chính"
         },
         "account": {
             "title": "Cài đặt Tài khoản",
@@ -968,6 +1008,20 @@
                 },
                 "max_wait": "Chờ Tối đa (giây)",
                 "max_wait_tooltip": "Chỉ dùng trong chế độ 'Ưu tiên Cache': chờ thay vì đổi tài khoản nếu thời gian reset rate limit thấp hơn giá trị này.",
+                "max_spillover_accounts": "Giới hạn Tài khoản Phân lưu",
+                "max_spillover_accounts_tooltip": "Số lượng tài khoản tối đa cho phép phân lưu lưu lượng truy cập đồng thời. 0 là không giới hạn; số nguyên dương (ví dụ: 2) để giới hạn tài khoản hoạt động.",
+                "spillover_unlimited": "Không giới hạn (Tất cả khả dụng)",
+                "spillover_count": "{{count}} tài khoản",
+                "affinity_scope": "Phạm vi Gắn kết (Affinity Scope)",
+                "affinity_scope_tooltip": "Phiên: gắn kết theo Session ID (mặc định, tự động chuẩn hóa tác vụ con); API Key: cố định tất cả yêu cầu cùng API Key vào một tài khoản duy nhất (ngăn ngừa mất cache trong hệ thống đa tác nhân).",
+                "affinity_scopes": {
+                    "session": "Session ID",
+                    "api_key": "API Key"
+                },
+                "affinity_scopes_desc": {
+                    "session": "Gắn kết tài khoản theo Session ID với việc chuẩn hóa tự động tiền tố tác vụ con (:step:N).",
+                    "api_key": "Khóa tất cả các yêu cầu từ cùng một API Key vào một tài khoản duy nhất để tối đa hóa Prompt Cache."
+                },
                 "clear_bindings": "Xóa liên kết phiên",
                 "fixed_account": "Fixed Account Mode",
                 "fixed_account_tooltip": "When enabled, all API requests will use only the selected account instead of rotating between accounts.",
@@ -1106,6 +1160,18 @@
                 "default_600_tag": "Mặc định: 600",
                 "max_memory_turns_desc": "Controls the maximum number of historical thinking turns kept in RAM per session. Estimated RAM usage per turn is ~1.5 KB - 2.5 KB (~1.2 MB / session for 600 turns).",
                 "turns_unit": "turns",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "FIFO Sliding Window Eviction & Concurrency Sizing Guide",
                 "window_guide_desc": "When session length exceeds this limit, FIFO sliding window automatically evicts oldest thinking blocks from memory. Evicted blocks are rehydrated in nanoseconds via indexed SQLite (primary_tool_id), maintaining strict byte-level Prompt Cache alignment without OOM.",
                 "tooltip_32768": "32,768 Tokens: Ideal for complex coding and deep architecture design",
@@ -1154,11 +1220,11 @@
                 "clear_error": "Xóa khối suy nghĩ thất bại: {{error}}",
                 "gemini_soft_budget_note": "⚠️ Hành vi ngân sách suy nghĩ: Google Gemini coi thinkingBudget là mục tiêu mềm (soft target). Đối với prompt dài hoặc tác vụ suy luận mã phức tạp, mô hình có thể tự động mở rộng chuỗi suy nghĩ và vượt quá giá trị đã đặt; đặt 0 để tắt hoàn toàn suy nghĩ."
             },
-            "stream_timeout_settings": {
-                "title": "Cài đặt thời gian chờ luồng (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "Cài đặt thời gian chờ"
             },
             "thinking_settings": {
-                "title": "Cài đặt suy nghĩ (Thinking Settings)"
+                "title": "Cài đặt suy nghĩ"
             },
             "prompt_multimodal": {
                 "title": "Prompt toàn cục & Cài đặt đa phương thức"
@@ -1233,7 +1299,7 @@
                 }
             },
             "agent_settings": {
-                "title": "Cấu hình Agent cụ thể (Specific Agent Settings)"
+                "title": "Cấu hình Agent cụ thể"
             },
             "hub": {
                 "title": "Dấu vân tay Hub chính thức",
@@ -1252,17 +1318,54 @@
         "stream_timeouts": {
             "banner_title": "Cơ chế thời gian chờ luồng 3 giai đoạn và duy trì kết nối",
             "banner_desc": "Thiết kế cho các mô hình suy nghĩ sâu, Prefill ngữ cảnh lớn, tóm tắt lịch sử và ghi tập tin lớn. Ba giai đoạn độc lập với tín hiệu ping (: ping) liên tục giúp loại bỏ hiện tượng ngắt kết nối gateway và vòng lặp thử lại của client.",
-            "ttft_title": "Thời gian chờ ký tự đầu tiên (TTFT)",
+            "ttft_title": "Thời gian chờ ký tự đầu tiên",
             "default_badge": "Mặc định: 180s",
             "ttft_desc": "Bao gồm hàng đợi khởi động nguội, Prefill hơn 100k token và tóm tắt lịch sử. Gửi ping mỗi 3 giây để duy trì kết nối.",
             "transition_title": "Thời gian chuyển tiếp (Đặt lại bộ đếm)",
             "transition_desc": "Khoảng thời gian từ khi hoàn tất suy nghĩ đến khi xuất hiện nội dung hoặc lệnh gọi công cụ đầu tiên. Tự động đặt lại bộ đếm khi hoàn tất suy nghĩ.",
-            "sliding_title": "Thời gian chờ trượt khi phát luồng (Streaming)",
+            "sliding_title": "Thời gian chờ trượt khi phát luồng",
             "default_badge_sliding": "Mặc định: 120s",
             "sliding_desc": "Khoảng thời gian im lặng tối đa giữa các token liên tiếp. Nếu bị gián đoạn, luồng sẽ được đóng gọn gàng để bảo vệ nội dung đã tạo.",
             "toast_reset": "Đã khôi phục cài đặt thời gian chờ về mặc định",
             "btn_reset": "Khôi phục mặc định",
             "btn_save": "Lưu cài đặt thời gian chờ"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "Thời gian tải lên: tự động theo băng thông",
+            "min_speed_title": "Băng thông tải lên (Mbps)",
+            "min_speed_desc": "Người dùng VPN thường tải xuống cao, tải lên thấp; nên nhập 1–5 Mbps.",
+            "extra_wait_title": "Hệ số chờ thêm",
+            "extra_wait_desc": "Tham số này ảnh hưởng đến thời gian chờ tối đa khi tải lên.",
+            "formula_title": "Chờ tối đa = kích thước nội dung ÷ băng thông tải lên × (1 + hệ số chờ)",
+            "stall_title": "Thời gian đình trệ (giây)",
+            "stall_desc": "Thời gian chờ khi quá trình truyền dữ liệu bị dừng hoàn toàn; hệ thống tự động bảo đảm không thấp hơn thời gian kết nối để tránh phán đoán sai lúc bắt tay.",
+            "header_wait_title": "Thời gian chờ tiêu đề đầu (giây)",
+            "header_wait_desc": "0 = dùng giá trị tích hợp: 30 giây cho endpoint chính / 25 giây cho dự phòng; giá trị khác 0 chỉ nâng mức tối thiểu.",
+            "large_body_desc": "Tệp vượt ngưỡng mặc định chỉ gửi một lần, tránh gửi lại nhiều lần làm nghẽn đường lên.",
+            "large_body_threshold_title": "Ngưỡng tệp lớn (MB)",
+            "endpoint_attempts_title": "Số lần thử tối đa",
+            "toast_reset": "Đã khôi phục thời gian chờ",
+            "btn_reset": "Khôi phục mặc định",
+            "btn_save": "Lưu cài đặt thời gian chờ"
+        },
+        "timeouts": {
+            "banner_title": "Cài đặt thời gian chờ",
+            "banner_desc": "Chuỗi thời gian chờ đầy đủ của một yêu cầu: ① Thiết lập kết nối điểm cuối → ② Tải lên phần thân yêu cầu → ③ Phản hồi ký tự đầu và luồng liên tục.",
+            "section_connect": "① Kết nối endpoint (tự động chuyển)",
+            "connect_label": "Thời gian kết nối (giây)",
+            "connect_desc": "Thời gian thiết lập TCP tới endpoint; thường rất nhanh.",
+            "connect_restart": "Cần khởi động lại dịch vụ proxy.",
+            "section_upload": "② Tải lên (gửi nội dung)",
+            "section_large_body": "Thử lại tệp lớn",
+            "section_header": "③ Tiêu đề phản hồi đầu (tự động chuyển)",
+            "header_primary_title": "Endpoint chính:",
+            "header_primary_items": "Văn bản/mã: TTFT　Hình ảnh: TTFT+45　Video: TTFT+60　Phụ trợ: TTFT−30",
+            "header_fallback_title": "Endpoint dự phòng:",
+            "header_fallback_items": "cùng mức tăng, giảm một nửa (mức tăng âm giữ nguyên)",
+            "first_byte_effective": "Đang áp dụng: văn bản/mã {{text}}s　hình ảnh {{image}}s　video {{video}}s　phụ trợ {{aux}}s",
+            "section_stream": "③ Token đầu và xuất liên tục",
+            "stream_desc": "Chờ header và token đầu tiên đã được gộp thành một độ trễ byte đầu duy nhất: được phép chuyển endpoint trước HTTP 200, sau đó chỉ kết thúc an toàn.",
+            "auto_summary": "Ví dụ: chờ tối đa = 47MB ÷ 2Mbps × 1.4 ≈ {{big}} giây;"
         },
         "example": {
             "title": "Ví dụ Sử dụng",
@@ -1455,7 +1558,8 @@
             },
             "model_select": "Select Model",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "supported_models": {
@@ -1688,7 +1792,7 @@
             "out_tokens_title": "Token đầu ra",
             "ttft_prefix": "Ký tự đầu:",
             "total_duration_title": "Tổng thời gian",
-            "ttft_title": "Độ trễ ký tự đầu tiên (TTFT)"
+            "ttft_title": "Độ trễ ký tự đầu tiên"
         },
         "details": {
             "title": "Chi tiết Request",
@@ -1712,10 +1816,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "Không xuống dòng",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3 Cột",
+            "layout_3col_title": "Chế độ xem so sánh 3 cột ngang",
+            "layout_postman": "Kiểu Postman",
+            "layout_postman_title": "Chế độ xem chia đôi kiểu Postman",
+            "export_menu": "Xuất / Sao chép",
+            "export_menu_title": "Xuất định dạng HAR, sao chép cURL hoặc JSON chẩn đoán",
+            "copy_har": "Sao chép HAR",
+            "download_har": "Tải xuống tệp .har",
+            "copy_curl": "Sao chép lệnh cURL",
+            "copy_full_json": "Sao chép toàn bộ JSON chẩn đoán",
+            "copied_har": "Đã sao chép HAR",
+            "exported_har": "Đã xuất .har",
+            "copied_curl": "Đã sao chép cURL",
+            "copied_full_json": "Đã sao chép JSON đầy đủ",
+            "collapse_metadata": "Thu gọn siêu dữ liệu",
+            "expand_metadata": "Mở rộng siêu dữ liệu",
+            "collapse_metadata_title": "Thu gọn siêu dữ liệu để mở rộng vùng xem",
+            "expand_metadata_title": "Mở rộng thông tin siêu dữ liệu",
+            "wrap": "Xuống dòng",
+            "wrap_on_title": "Hiện tại: Tự động xuống dòng (nhấp để chuyển một dòng)",
+            "wrap_off_title": "Hiện tại: Một dòng (nhấp để tự động xuống dòng)",
+            "case_sensitive_on": "Phân biệt chữ hoa/chữ thường: Bật",
+            "case_sensitive_off": "Nhấp để bật phân biệt chữ hoa/chữ thường",
+            "clear_search": "Xóa tìm kiếm",
+            "no_match": "Không có kết quả khớp",
+            "prev_match": "Trước (Shift+Enter)",
+            "next_match": "Sau (Enter)",
+            "lines_count": "dòng",
+            "expand": "Mở rộng",
+            "collapse": "Thu gọn",
+            "req_headers": "Tiêu đề yêu cầu",
+            "upstream_headers": "Tiêu đề chuyển tiếp",
+            "resp_headers": "Tiêu đề phản hồi",
+            "param_key": "Khóa tham số (Key)",
+            "param_value": "Giá trị tham số (Value)",
+            "header_key": "Tiêu đề (Header)",
+            "header_value": "Giá trị tiêu đề (Value)"
         },
         "token_stats": {
             "title": "Token Usage Stats",
@@ -1763,14 +1904,19 @@
             "norm_desc": "Model routing / account scheduling / Gemini format conversion",
             "thinking": "Thinking & Signature Fill",
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
-            "ttft": "Time To First Token (TTFT)",
+            "ttft": "Time To First Token",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
             "stream": "Stream Transfer Duration",
             "stream_desc": "First chunk arrival to stream completion",
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "Thu gọn chẩn đoán thời gian",
+            "expand": "Mở rộng chẩn đoán thời gian",
+            "endpoint_label": "Điểm cuối",
+            "status_label": "Trạng thái",
+            "network_timeout_or_error": "Hết thời gian mạng / Lỗi"
         }
     },
     "update_notification": {
@@ -1792,6 +1938,7 @@
         "title": "Kiểm soát truy cập an toàn",
         "desc": "Hiện đang chạy ở chế độ Web. Vui lòng nhập mật khẩu quản trị hoặc API Key để truy cập.",
         "placeholder": "Nhập mật khẩu quản trị hoặc API Key",
+        "remember_me": "Ghi nhớ thông tin đăng nhập",
         "btn_login": "Xác minh và Vào",
         "note": "Lưu ý: Nếu đã thiết lập mật khẩu quản trị riêng, vui lòng nhập mật khẩu đó; nếu không, hãy nhập API_KEY.",
         "lookup_hint": "Nếu quên, hãy chạy lệnh docker logs antigravity-manager để tìm API Key hiện tại hoặc Mật khẩu Web UI.",
@@ -1816,6 +1963,10 @@
         "by_account": "Theo tài khoản",
         "by_model": "Theo mô hình",
         "by_account_view": "Theo tài khoản",
+        "perspective_routed": "Mô hình định tuyến",
+        "perspective_requested": "Mô hình yêu cầu",
+        "perspective_routed_tip": "Thống kê theo mô hình thực tế được định tuyến và thực thi",
+        "perspective_requested_tip": "Thống kê theo mô hình gốc do client gửi yêu cầu",
         "model_details": "Chi tiết theo Model",
         "account_details": "Chi tiết theo tài khoản",
         "model": "Model",
@@ -1960,7 +2111,10 @@
         "cockpit_view_detail": "Chi tiết",
         "cockpit_tab_accounts": "Tài khoản",
         "cockpit_tab_models": "Mô hình",
-        "cockpit_tab_users": "Người dùng"
+        "cockpit_tab_users": "Người dùng",
+        "avg_ttft": "Độ trễ TTFT",
+        "ttft": "Thời gian TTFT",
+        "avg_ttft_tip": "Thời gian phản hồi token đầu tiên trung bình (TTFT)"
     },
     "security": {
         "title": "Giám sát An ninh",

@@ -26,7 +26,10 @@ import {
     Timer,
     Zap,
     Square,
-    ChevronDown
+    ChevronDown,
+    Eye,
+    EyeOff,
+    AlertTriangle
 } from 'lucide-react';
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
 import HelpTooltip from '../components/common/HelpTooltip';
@@ -43,8 +46,7 @@ import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
-import StreamTimeoutSettings from '../components/settings/StreamTimeoutSettings';
-import AgentSettings from '../components/settings/AgentSettings';
+import TimeoutSettings from '../components/settings/TimeoutSettings';import AgentSettings from '../components/settings/AgentSettings';
 import { CircuitBreakerConfig } from '../types/config';
 import { RequestDetailModal, ProxyRequestLog } from '../components/proxy/RequestDetailModal';
 
@@ -61,6 +63,9 @@ interface CustomPreset {
     description: string;
     mappings: Record<string, string>;
 }
+
+export const DEFAULT_RECOMMENDED_HUB_UA = 'antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)';
+export const RECOMMENDED_HUB_VERSION = '2.28.0';
 
 
 interface CollapsibleCardProps {
@@ -197,6 +202,26 @@ export default function ApiProxy() {
     const [isRegenerateKeyConfirmOpen, setIsRegenerateKeyConfirmOpen] = useState(false);
     const [isClearBindingsConfirmOpen, setIsClearBindingsConfirmOpen] = useState(false);
     const [isClearRateLimitsConfirmOpen, setIsClearRateLimitsConfirmOpen] = useState(false);
+    // Dynamic Hub Fingerprint from launch detection
+    const [latestHubVersion, setLatestHubVersion] = useState<string>('2.28.0');
+    const [latestHubUa, setLatestHubUa] = useState<string>(DEFAULT_RECOMMENDED_HUB_UA);
+
+    // User-Agent & Argon Sandbox Tester states
+    const [uaSandboxModel, setUaSandboxModel] = useState('gemini-4-argon');
+    const [uaSandboxTesting, setUaSandboxTesting] = useState(false);
+    const [uaSandboxResult, setUaSandboxResult] = useState<{
+        testedUa: string;
+        model: string;
+        status?: number;
+        durationMs?: number;
+        success: boolean;
+        error?: string;
+        message?: string;
+        logId?: string;
+        gatewayDiagnosis?: string;
+        gatewaySuggestion?: string;
+        gatewayCode?: string;
+    } | null>(null);
 
     // [FIX #820] Fixed account mode states
     const [preferredAccountId, setPreferredAccountId] = useState<string | null>(null);
@@ -252,6 +277,7 @@ export default function ApiProxy() {
         loadCfStatus();
         loadCustomPresets();
         loadRecentModelStatuses();
+        loadHubFingerprintInfo();
         const interval = setInterval(loadStatus, 3000);
         const cfInterval = setInterval(loadCfStatus, 5000);
         return () => {
@@ -259,6 +285,21 @@ export default function ApiProxy() {
             clearInterval(cfInterval);
         };
     }, []);
+
+    // 动态获取应用启动时探测到的官方 Hub 版本信息
+    const loadHubFingerprintInfo = async () => {
+        try {
+            const updateStatus = await invoke<{ current: string; latest?: string; update_available: boolean }>('check_hub_update');
+            const fp = await invoke<{ version: string; user_agent: string }>('get_hub_fingerprint');
+            const targetVersion = (updateStatus && updateStatus.latest) || (fp && fp.version) || '2.28.0';
+            setLatestHubVersion(targetVersion);
+            if (fp && fp.user_agent) {
+                setLatestHubUa(fp.user_agent);
+            }
+        } catch (e) {
+            console.debug('Failed to load dynamic hub fingerprint:', e);
+        }
+    };
 
     // 预填最近请求日志的模型连通性状态
     const loadRecentModelStatuses = async () => {
@@ -531,20 +572,17 @@ export default function ApiProxy() {
         setConfigError(null);
         try {
             const config = await invoke<AppConfig>('load_config');
-            setAppConfig(config);
+            if (config && typeof config === 'object' && config.proxy) {
+                setAppConfig(config);
 
-            // 恢复 Cloudflared 持久化状态
-            if (config.cloudflared) {
-                setCfMode(config.cloudflared.mode || 'quick');
-                setCfToken(config.cloudflared.token || '');
-                setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认开启 HTTP/2
-            }
-
-            // 恢复 Cloudflared 状态并实现持久化同步
-            if (config.cloudflared) {
-                setCfMode(config.cloudflared.mode || 'quick');
-                setCfToken(config.cloudflared.token || '');
-                setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认 true
+                // 恢复 Cloudflared 持久化状态
+                if (config.cloudflared) {
+                    setCfMode(config.cloudflared.mode || 'quick');
+                    setCfToken(config.cloudflared.token || '');
+                    setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认开启 HTTP/2
+                }
+            } else {
+                console.warn('load_config 返回的配置无效或非对象:', config);
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -596,8 +634,111 @@ export default function ApiProxy() {
         }
     };
 
+    const handleRunUaSandboxTest = async (overrideUa?: string, modelToTest?: string) => {
+        const targetModel = modelToTest || uaSandboxModel;
+        const effectiveUa = overrideUa !== undefined ? overrideUa : (appConfig?.proxy.user_agent_override || latestHubUa);
+        setUaSandboxTesting(true);
+        setUaSandboxResult(null);
+
+        // 1. 如果传入了特定 UA，先热更新到配置并同步至服务端
+        if (appConfig && overrideUa !== undefined) {
+            updateProxyConfig({
+                user_agent_override: overrideUa,
+                saved_user_agent: overrideUa
+            });
+            try {
+                await invoke('save_config', {
+                    config: {
+                        ...appConfig,
+                        proxy: {
+                            ...appConfig.proxy,
+                            user_agent_override: overrideUa,
+                            saved_user_agent: overrideUa
+                        }
+                    }
+                });
+            } catch (e) {
+                console.error('Failed to sync UA config before test:', e);
+            }
+        }
+
+        try {
+            const res = await invoke<{
+                success: boolean;
+                message: string;
+                log_id?: string;
+                duration_ms?: number;
+                status?: number;
+                error?: string;
+                error_type?: string;
+                gatewayCode?: string;
+                gatewayDiagnosis?: string;
+                gatewaySuggestion?: string;
+            }>('test_model_connectivity', {
+                model: targetModel,
+                targetAccountId: testTargetAccountId || null,
+                override_ua: effectiveUa
+            });
+
+            let gatewayDiag = res.gatewayDiagnosis || '';
+            let gatewaySug = res.gatewaySuggestion || '';
+            let gatewayCode = res.gatewayCode || res.error_type || '';
+
+            if (!gatewayDiag && res.message && res.message.includes('【上游指纹门禁异常】')) {
+                gatewayCode = 'outdated_user_agent';
+                gatewayDiag = res.message;
+                if (res.error && res.error.includes('建议:')) {
+                    const parts = res.error.split('建议:');
+                    gatewaySug = parts[1]?.trim() || '';
+                }
+            } else if (!gatewayDiag && res.message && res.message.includes('【模型全池临时熔断】')) {
+                gatewayCode = 'model_pool_suspended';
+                gatewayDiag = res.message;
+                if (res.error && res.error.includes('建议:')) {
+                    const parts = res.error.split('建议:');
+                    gatewaySug = parts[1]?.trim() || '';
+                }
+            } else if (!gatewayDiag && (res.message?.includes('【网络请求异常') || res.error?.includes('网络请求异常') || res.error_type === 'upstream_network_error' || res.status === 502)) {
+                gatewayCode = 'upstream_network_error';
+                gatewayDiag = res.message || res.error || '请求上游接口时网络连接失败，未收到上游请求回报（非网关服务端故障，请排查网络或代理）。';
+                if (res.error && res.error.includes('建议:')) {
+                    const parts = res.error.split('建议:');
+                    gatewaySug = parts[1]?.trim() || '';
+                } else {
+                    gatewaySug = '请检查系统代理、上游节点连通性或本地网络设置，确保能正常连接上游服务，并在「超时设置」中调整分阶段传输预算。';
+                }
+            }
+
+            setUaSandboxResult({
+                testedUa: effectiveUa,
+                model: targetModel,
+                status: res.status,
+                durationMs: res.duration_ms,
+                success: res.success,
+                message: res.message,
+                error: res.error,
+                logId: res.log_id,
+                gatewayDiagnosis: gatewayDiag,
+                gatewaySuggestion: gatewaySug,
+                gatewayCode
+            });
+        } catch (err) {
+            const errStr = String(err);
+            setUaSandboxResult({
+                testedUa: effectiveUa,
+                model: targetModel,
+                status: 500,
+                success: false,
+                error: errStr,
+                message: `请求发起失败: ${errStr}`
+            });
+        } finally {
+            setUaSandboxTesting(false);
+        }
+    };
+
     // 专门处理模型映射的热更新 (全量)
-    const handleMappingUpdate = async (type: 'custom', key: string, value: string) => {
+    const handleMappingUpdate = async (type: 'custom', key: string, value: string, expose?: boolean) => {
         if (!appConfig) return;
 
         const trimmedKey = key.trim();
@@ -606,6 +747,17 @@ export default function ApiProxy() {
         const newConfig = { ...appConfig.proxy };
         newConfig.custom_mapping = { ...(newConfig.custom_mapping || {}), [trimmedKey]: value };
 
+        const newExpose = { ...(newConfig.custom_mapping_expose || {}) };
+        if (expose !== undefined) {
+            newExpose[trimmedKey] = expose;
+        } else if (!(trimmedKey in newExpose)) {
+            // 新增映射默认：通配符或 auto: 默认不公开 (false)，常规精确映射默认公开 (true)
+            const isAuto = value.startsWith('auto:');
+            const defaultExp = !trimmedKey.includes('*') && !isAuto;
+            newExpose[trimmedKey] = defaultExp;
+        }
+        newConfig.custom_mapping_expose = newExpose;
+
         try {
             await invoke('update_model_mapping', { config: newConfig });
             setAppConfig({ ...appConfig, proxy: newConfig });
@@ -613,6 +765,32 @@ export default function ApiProxy() {
             showToast(t('common.saved'), 'success');
         } catch (error) {
             console.error('Failed to update mapping:', error);
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const handleToggleExpose = async (key: string) => {
+        if (!appConfig || !appConfig.proxy.custom_mapping) return;
+        const currentExpose = appConfig.proxy.custom_mapping_expose?.[key];
+        const val = appConfig.proxy.custom_mapping[key] || '';
+        const isAuto = val.startsWith('auto:');
+        const effectiveCurrent = currentExpose !== undefined ? currentExpose : (!key.includes('*') && !isAuto);
+        const newExposeVal = !effectiveCurrent;
+
+        const newConfig = {
+            ...appConfig.proxy,
+            custom_mapping_expose: {
+                ...(appConfig.proxy.custom_mapping_expose || {}),
+                [key]: newExposeVal
+            }
+        };
+
+        try {
+            await invoke('update_model_mapping', { config: newConfig });
+            setAppConfig({ ...appConfig, proxy: newConfig });
+            showToast(t('common.saved'), 'success');
+        } catch (error) {
+            console.error('Failed to toggle expose:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
@@ -626,10 +804,23 @@ export default function ApiProxy() {
         if (!appConfig) return;
         setIsResetConfirmOpen(false);
 
-        // 恢复到默认预设映射值
+        // 恢复到官方自适应暗路由默认预设 (防复活且保留内置 3 条自适应规则)
+        const defaultCustomMapping: Record<string, string> = {
+            'claude-fable-*': 'auto:claude-opus',
+            'claude-opus-4-7*': 'auto:claude-opus-4-7',
+            'claude-haiku-*': 'auto:gemini-flash-low',
+        };
+        const defaultCustomMappingExpose: Record<string, boolean> = {
+            'claude-fable-*': false,
+            'claude-opus-4-7*': false,
+            'claude-haiku-*': false,
+        };
+
         const newConfig = {
             ...appConfig.proxy,
-            custom_mapping: {}
+            custom_mapping: defaultCustomMapping,
+            custom_mapping_expose: defaultCustomMappingExpose,
+            builtin_mapping_version: 1,
         };
 
         try {
@@ -816,7 +1007,9 @@ export default function ApiProxy() {
         if (!appConfig || !appConfig.proxy.custom_mapping) return;
         const newCustom = { ...appConfig.proxy.custom_mapping };
         delete newCustom[key];
-        const newConfig = { ...appConfig.proxy, custom_mapping: newCustom };
+        const newExpose = { ...(appConfig.proxy.custom_mapping_expose || {}) };
+        delete newExpose[key];
+        const newConfig = { ...appConfig.proxy, custom_mapping: newCustom, custom_mapping_expose: newExpose };
         try {
             await invoke('update_model_mapping', { config: newConfig });
             setAppConfig({ ...appConfig, proxy: newConfig });
@@ -1312,6 +1505,26 @@ print(response.choices[0].message.content)`;
                                                 </div>
 
                                                 <div className="flex items-center gap-1.5 shrink-0">
+                                                    {(() => {
+                                                        const isAuto = val.startsWith('auto:');
+                                                        const isExp = appConfig.proxy.custom_mapping_expose?.[key] ?? (!key.includes('*') && !isAuto);
+                                                        return (
+                                                            <button
+                                                                type="button"
+                                                                className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-medium flex items-center gap-1 transition-colors border ${
+                                                                    isExp
+                                                                        ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/40'
+                                                                        : 'bg-gray-100 dark:bg-white/5 text-gray-400 dark:text-gray-500 border-gray-200 dark:border-white/10 hover:bg-gray-200 dark:hover:bg-white/10'
+                                                                }`}
+                                                                onClick={() => handleToggleExpose(key)}
+                                                                title={isExp ? (t('proxy.router.expose_public_tip') || '对外公开') : (t('proxy.router.expose_hidden_tip') || '暗访')}
+                                                            >
+                                                                {isExp ? <Eye size={10} /> : <EyeOff size={10} />}
+                                                                <span>{isExp ? (t('proxy.router.expose_public') || '公开') : (t('proxy.router.expose_hidden') || '暗访')}</span>
+                                                            </button>
+                                                        );
+                                                    })()}
+
                                                     {editingKey === key ? (
                                                         <div className="flex items-center gap-1 bg-white dark:bg-gray-800 rounded-md border border-blue-200 dark:border-blue-800 p-0.5 shadow-sm">
                                                             <button
@@ -1848,18 +2061,6 @@ print(response.choices[0].message.content)`;
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={() => setActiveMenuTab('protocols')}
-                                    className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
-                                        activeMenuTab === 'protocols'
-                                            ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs'
-                                            : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
-                                    }`}
-                                >
-                                    <Share2 size={14} className={activeMenuTab === 'protocols' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
-                                    {t('proxy.multi_protocol.title')}
-                                </button>
-                                <button
-                                    type="button"
                                     onClick={() => setActiveMenuTab('cli')}
                                     className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
                                         activeMenuTab === 'cli'
@@ -1869,6 +2070,18 @@ print(response.choices[0].message.content)`;
                                 >
                                     <Terminal size={14} className={activeMenuTab === 'cli' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
                                     {t('proxy.cli_sync.title', { defaultValue: 'Agent工具一键配置' })}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setActiveMenuTab('protocols')}
+                                    className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+                                        activeMenuTab === 'protocols'
+                                            ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs'
+                                            : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                    }`}
+                                >
+                                    <Share2 size={14} className={activeMenuTab === 'protocols' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
+                                    {t('proxy.multi_protocol.title')}
                                 </button>
                             </div>
 
@@ -1914,8 +2127,8 @@ print(response.choices[0].message.content)`;
                                     </label>
                                     <input
                                         type="number"
-                                        value={appConfig.proxy.port}
-                                        onChange={(e) => updateProxyConfig({ port: parseInt(e.target.value) })}
+                                        value={appConfig?.proxy?.port ?? 8045}
+                                        onChange={(e) => updateProxyConfig({ port: parseInt(e.target.value) || 8045 })}
                                         min={8000}
                                         max={65535}
                                         disabled={status.running}
@@ -2254,19 +2467,11 @@ print(response.choices[0].message.content)`;
                                         onChange={(e) => {
                                             const enabled = e.target.checked;
                                             if (enabled) {
-                                                // Restore saved override from config or use modern default
-                                                const defaultUA = 'antigravity/4.3.0 darwin/arm64';
-                                                let restoredValue = appConfig.proxy.saved_user_agent || defaultUA;
-                                                const match = restoredValue.match(/(antigravity[/v\s]+)(\d+(?:\.\d+)+)/i);
-                                                if (match) {
-                                                    const parts = match[2].split('.').map(Number);
-                                                    const major = parts[0] || 0;
-                                                    const minor = parts[1] || 0;
-                                                    if (major < 4 || (major === 4 && minor < 3)) {
-                                                        restoredValue = restoredValue.replace(match[0], `${match[1]}4.3.0`);
-                                                    }
-                                                } else if (restoredValue.includes('1.15.8')) {
-                                                    restoredValue = restoredValue.replace('1.15.8', '4.3.0');
+                                                // 恢复保存的覆盖值，或默认使用官方现代 Hub 指纹
+                                                let restoredValue = appConfig.proxy.saved_user_agent || DEFAULT_RECOMMENDED_HUB_UA;
+                                                // 如果旧配置遗留了 4.3.0 或非 Hub 指纹，升级为官方 Hub 默认
+                                                if (!restoredValue.startsWith('antigravity/hub/')) {
+                                                    restoredValue = DEFAULT_RECOMMENDED_HUB_UA;
                                                 }
                                                 updateProxyConfig({
                                                     user_agent_override: restoredValue,
@@ -2281,7 +2486,7 @@ print(response.choices[0].message.content)`;
                                 </div>
 
                                 {!!appConfig.proxy.user_agent_override && (
-                                    <div className="space-y-2 animate-in fade-in slide-in-from-top-1 duration-200">
+                                    <div className="space-y-2.5 animate-in fade-in slide-in-from-top-1 duration-200">
                                         <input
                                             type="text"
                                             value={appConfig.proxy.user_agent_override}
@@ -2295,9 +2500,194 @@ print(response.choices[0].message.content)`;
                                             className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono text-gray-900 dark:text-base-content focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                                             placeholder={t('proxy.config.request.user_agent_placeholder', { defaultValue: 'Enter custom User-Agent string...' })}
                                         />
-                                        <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-2.5 text-xs text-gray-600 dark:text-gray-400 font-mono break-all">
-                                            <span className="font-bold text-gray-700 dark:text-gray-300 select-none mr-2">{t('common.example', { defaultValue: 'Example' })}:</span>
-                                            antigravity/4.3.0 darwin/arm64
+                                        <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-2.5 text-xs text-gray-600 dark:text-gray-400 font-mono break-all flex items-center justify-between">
+                                            <div className="truncate mr-2">
+                                                <span className="font-bold text-gray-700 dark:text-gray-300 select-none mr-2">{t('common.example', { defaultValue: 'Example' })}:</span>
+                                                {latestHubUa}
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    updateProxyConfig({
+                                                        user_agent_override: latestHubUa,
+                                                        saved_user_agent: latestHubUa
+                                                    });
+                                                    showToast(t('proxy.config.request.user_agent_restored_success', { defaultValue: '已恢复官方默认 Hub User-Agent' }), 'success');
+                                                }}
+                                                className="px-2 py-0.5 text-[10px] bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded hover:bg-blue-100 dark:hover:bg-blue-900/50 shrink-0 font-sans"
+                                            >
+                                                填入推荐值
+                                            </button>
+                                        </div>
+
+                                        {/* 风险提示卡片 */}
+                                        <div className="p-3 bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/40 rounded-xl flex items-start gap-2.5">
+                                            <AlertTriangle size={16} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                                            <div className="text-xs text-amber-900 dark:text-amber-200 space-y-1">
+                                                <div className="font-semibold flex items-center gap-1.5">
+                                                    {t('proxy.config.request.user_agent_risk_title', { defaultValue: '风险提示' })}
+                                                </div>
+                                                <p className="leading-relaxed opacity-90 text-[11px]">
+                                                    {t('proxy.config.request.user_agent_risk_desc', {
+                                                        version: latestHubVersion,
+                                                        defaultValue: `自定义 User-Agent 可能会影响出站请求的协议兼容性。Google Cloud Code 上游对新一代旗舰模型（如 Gemini 4 Argon 等）实施了严格的客户端指纹门禁。若填入非 Hub 签名格式（如 antigravity/4.3.0 等旧 IDE 指纹）或版本过旧（低于官方最新基准 ${latestHubVersion}），上游将直接返回 HTTP 404 (Requested entity was not found)，并可能导致网关账号池被临时保护性熔断挂起 15 分钟。若不了解上游指纹协议细节，请谨慎操作或保持默认。`
+                                                    })}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        {/* 🧪 User-Agent & Argon 门禁沙盒联调测试组件 */}
+                                        <div className="mt-3 p-3 bg-blue-50/40 dark:bg-blue-950/20 border border-blue-200/60 dark:border-blue-900/40 rounded-xl space-y-2.5">
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs font-bold text-blue-700 dark:text-blue-300 flex items-center gap-1.5">
+                                                        <Sparkles size={14} className="text-blue-500" />
+                                                        {t('proxy.config.request.user_agent_sandbox_test_title', { defaultValue: 'User-Agent 与 Argon 门禁沙盒联调测试' })}
+                                                    </span>
+                                                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300">
+                                                        实测组件
+                                                    </span>
+                                                </div>
+                                            </div>
+
+                                            <p className="text-[11px] text-gray-600 dark:text-gray-400">
+                                                {t('proxy.config.request.user_agent_sandbox_test_desc', { defaultValue: '可实时模拟不同 User-Agent 指纹并向网关发送 Argon 连通性测试请求，观察网关的定向检测与诊断输出。' })}
+                                            </p>
+
+                                            {/* 快速指纹预设按钮 */}
+                                            <div className="flex flex-wrap items-center gap-1.5">
+                                                <span className="text-[10px] font-semibold text-gray-500 select-none">一键模拟:</span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleRunUaSandboxTest('antigravity/4.3.0 darwin/arm64', 'gemini-4-argon')}
+                                                    disabled={uaSandboxTesting}
+                                                    className="px-2 py-1 text-[11px] bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 dark:hover:bg-rose-900/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-900/40 rounded-lg flex items-center gap-1 transition-all active:scale-95"
+                                                >
+                                                    <span>⚠️ 注入旧版 4.3.0 指纹 (触发 404 门禁诊断)</span>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleRunUaSandboxTest(latestHubUa, 'gemini-4-argon')}
+                                                    disabled={uaSandboxTesting}
+                                                    className="px-2 py-1 text-[11px] bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-900/40 rounded-lg flex items-center gap-1 transition-all active:scale-95"
+                                                >
+                                                    <span>✅ 注入官方最新 Hub 指纹 (正常连通)</span>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleRunUaSandboxTest('antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)', 'gemini-4-argon')}
+                                                    disabled={uaSandboxTesting}
+                                                    className="px-2 py-1 text-[11px] bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/30 dark:hover:bg-blue-900/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-900/40 rounded-lg flex items-center gap-1 transition-all active:scale-95"
+                                                >
+                                                    <span>⚡ 注入官方 Hub 2.24.0 (基准通过)</span>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleRunUaSandboxTest(undefined, 'simulate_no_response')}
+                                                    disabled={uaSandboxTesting}
+                                                    className="px-2 py-1 text-[11px] bg-purple-50 hover:bg-purple-100 dark:bg-purple-950/30 dark:hover:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-900/40 rounded-lg flex items-center gap-1 transition-all active:scale-95"
+                                                >
+                                                    <span>🌐 模拟无请求回报 (网络超时/上游未响应)</span>
+                                                </button>
+                                            </div>
+
+                                            {/* 测试操作栏 */}
+                                            <div className="flex items-center gap-2 pt-1">
+                                                <select
+                                                    value={uaSandboxModel}
+                                                    onChange={(e) => setUaSandboxModel(e.target.value)}
+                                                    className="select select-xs border-gray-300 dark:border-base-300 bg-white dark:bg-base-100 text-xs rounded-lg flex-1 font-mono"
+                                                >
+                                                    <option value="gemini-4-argon">gemini-4-argon (旗舰高阶推理)</option>
+                                                    <option value="gemini-4-argon-low">gemini-4-argon-low (轻量推理)</option>
+                                                    <option value="simulate_no_response">[模拟故障] 无请求回报 (上游网络超时与阶段中断)</option>
+                                                    <option value="claude-opus-5-5">claude-opus-5-5</option>
+                                                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                                                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                                                </select>
+
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleRunUaSandboxTest()}
+                                                    disabled={uaSandboxTesting}
+                                                    className="btn btn-xs btn-primary text-white font-medium flex items-center gap-1 px-3 shadow-xs"
+                                                >
+                                                    {uaSandboxTesting ? (
+                                                        <>
+                                                            <RefreshCw size={12} className="animate-spin" />
+                                                            正在发送测试...
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <Zap size={12} />
+                                                            发送测试请求
+                                                        </>
+                                                    )}
+                                                </button>
+                                            </div>
+
+                                            {/* 测试结果看板 */}
+                                            {uaSandboxResult && (
+                                                <div className="p-3 bg-white dark:bg-base-100 rounded-lg border border-gray-200 dark:border-base-300 space-y-2 text-xs animate-in fade-in duration-200">
+                                                    <div className="flex items-center justify-between pb-1.5 border-b border-gray-100 dark:border-base-200">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="font-semibold text-gray-700 dark:text-gray-300">测试结果:</span>
+                                                            <span
+                                                                className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                                                                    uaSandboxResult.success
+                                                                        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+                                                                        : uaSandboxResult.status === 502 || uaSandboxResult.gatewayCode === 'upstream_network_error'
+                                                                        ? 'bg-purple-100 text-purple-700 dark:bg-purple-950/50 dark:text-purple-300'
+                                                                        : 'bg-rose-100 text-rose-700 dark:bg-rose-950/50 dark:text-rose-300'
+                                                                }`}
+                                                            >
+                                                                {uaSandboxResult.success ? 'HTTP 200 OK' : uaSandboxResult.status === 502 ? 'HTTP 502 (无请求回报)' : `HTTP ${uaSandboxResult.status || 'ERROR'}`}
+                                                            </span>
+                                                            {uaSandboxResult.durationMs !== undefined && (
+                                                                <span className="text-[10px] text-gray-400">
+                                                                    耗时: {uaSandboxResult.durationMs}ms
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <span className="text-[10px] font-mono text-gray-400">
+                                                            模型: {uaSandboxResult.model}
+                                                        </span>
+                                                    </div>
+
+                                                    <div className="text-[11px] text-gray-600 dark:text-gray-400 font-mono break-all">
+                                                        <span className="font-bold text-gray-500 mr-1 select-none">出站指纹:</span>
+                                                        {uaSandboxResult.testedUa}
+                                                    </div>
+
+                                                    {/* 网关双轨制定向诊断 (Highlight) */}
+                                                    {uaSandboxResult.gatewayDiagnosis ? (
+                                                        <div className="p-2.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-300 dark:border-amber-800/60 rounded-lg space-y-1.5">
+                                                            <div className="text-amber-800 dark:text-amber-200 font-bold flex items-center gap-1.5 text-xs">
+                                                                <AlertTriangle size={14} className="text-amber-500" />
+                                                                网关双轨制定向诊断 ({uaSandboxResult.gatewayCode || 'gateway_error'})
+                                                            </div>
+                                                            <div className="text-amber-900 dark:text-amber-100 text-[11px] leading-relaxed">
+                                                                {uaSandboxResult.gatewayDiagnosis}
+                                                            </div>
+                                                            {uaSandboxResult.gatewaySuggestion && (
+                                                                <div className="text-amber-700 dark:text-amber-300 text-[11px] pt-1 border-t border-amber-200 dark:border-amber-800/40">
+                                                                    <span className="font-semibold">💡 修复建议: </span>
+                                                                    {uaSandboxResult.gatewaySuggestion}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ) : uaSandboxResult.success ? (
+                                                        <div className="p-2 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/40 rounded-lg text-emerald-800 dark:text-emerald-200 text-[11px] flex items-center gap-1.5">
+                                                            <CheckCircle size={14} className="text-emerald-500 shrink-0" />
+                                                            连通性测试通过！出站 User-Agent 指纹符合 Google Cloud Code 官方门禁规范。
+                                                        </div>
+                                                    ) : (
+                                                        <div className="p-2 bg-gray-50 dark:bg-base-200 rounded-lg text-gray-700 dark:text-gray-300 text-[11px] font-mono break-all">
+                                                            {uaSandboxResult.error || uaSandboxResult.message || '未知错误'}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 )}
@@ -2310,15 +2700,17 @@ print(response.choices[0].message.content)`;
                         {/* TAB: 模型配置 (models) */}
                         {activeMenuTab === 'models' && (
                             <div className="p-4 space-y-4">
-                                {/* 流式超时设置 (Stream Timeout Settings) - 默认收起 */}
+                                {/* 超时设置 (全链路分阶段) - 默认收起 */}
                                 <CollapsibleCard
-                                    title={t('proxy.config.stream_timeout_settings.title', { defaultValue: '流式超时设置 (Stream Timeout Settings)' })}
+                                    title={t('proxy.config.timeout_settings.title', { defaultValue: '超时设置' })}
                                     icon={<Timer size={18} className="text-blue-500" />}
                                     defaultExpanded={false}
                                 >
-                                    <StreamTimeoutSettings
-                                        config={appConfig.proxy.stream_timeouts}
-                                        onChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                    <TimeoutSettings
+                                        streamConfig={appConfig.proxy.stream_timeouts}
+                                        uploadConfig={appConfig.proxy.upload_timeouts}
+                                        onStreamChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                        onUploadChange={(timeoutConfig) => updateProxyConfig({ upload_timeouts: timeoutConfig })}
                                         onSave={handleSaveProxySettings}
                                     />
                                 </CollapsibleCard>
@@ -2383,15 +2775,7 @@ print(response.choices[0].message.content)`;
                             </div>
                         )}
 
-                        {/* TAB 3: 模型大全与协议 (protocols) */}
-                        {activeMenuTab === 'protocols' && (
-                            <div className="p-4 space-y-6">
-                                {renderMultiProtocolSection()}
-                                {renderSupportedModelsSection()}
-                            </div>
-                        )}
-
-                        {/* TAB 4: CLI 一键配置 (cli) */}
+                        {/* TAB 3: CLI 一键配置 (cli) */}
                         {activeMenuTab === 'cli' && (
                             <div className="p-4">
                                 <div className="bg-gray-50/60 dark:bg-base-200/50 rounded-xl p-3 border border-gray-200/60 dark:border-base-300">
@@ -2400,6 +2784,14 @@ print(response.choices[0].message.content)`;
                                         apiKey={appConfig.proxy.api_key}
                                     />
                                 </div>
+                            </div>
+                        )}
+
+                        {/* TAB 4: 模型大全与协议 (protocols) */}
+                        {activeMenuTab === 'protocols' && (
+                            <div className="p-4 space-y-6">
+                                {renderMultiProtocolSection()}
+                                {renderSupportedModelsSection()}
                             </div>
                         )}
                     </div>
@@ -2521,6 +2913,44 @@ print(response.choices[0].message.content)`;
                                                     <span>0 ({t('proxy.config.scheduling.spillover_unlimited')})</span>
                                                     <span>10</span>
                                                 </div>
+                                            </div>
+
+                                            <div className="bg-gray-50/70 dark:bg-base-200 rounded-xl p-4 border border-gray-100 dark:border-base-300">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                        {t('proxy.config.scheduling.affinity_scope', { defaultValue: 'Affinity Scope' })}
+                                                        <HelpTooltip text={t('proxy.config.scheduling.affinity_scope_tooltip', { defaultValue: 'Session: Binds by session ID (default, auto-normalizes multi-agent subtasks); API-Key: Binds all requests from the same API-Key to a single account (prevents prompt cache misses in multi-agent frameworks).' })} />
+                                                    </label>
+                                                    <div className="flex bg-slate-200/70 dark:bg-base-300 p-0.5 rounded-lg border border-slate-300/50 dark:border-white/5">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => updateSchedulingConfig({ affinity_scope: 'session' })}
+                                                            className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-all ${
+                                                                (appConfig.proxy.scheduling?.affinity_scope || 'session') === 'session'
+                                                                    ? 'bg-white dark:bg-base-100 text-indigo-600 dark:text-indigo-400 shadow-sm'
+                                                                    : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'
+                                                            }`}
+                                                        >
+                                                            {t('proxy.config.scheduling.affinity_scopes.session', { defaultValue: 'Session ID' })}
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => updateSchedulingConfig({ affinity_scope: 'api_key' })}
+                                                            className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-all ${
+                                                                appConfig.proxy.scheduling?.affinity_scope === 'api_key'
+                                                                    ? 'bg-white dark:bg-base-100 text-indigo-600 dark:text-indigo-400 shadow-sm'
+                                                                    : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'
+                                                            }`}
+                                                        >
+                                                            {t('proxy.config.scheduling.affinity_scopes.api_key', { defaultValue: 'API-Key' })}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <p className="text-[10px] text-gray-500 leading-relaxed">
+                                                    {(appConfig.proxy.scheduling?.affinity_scope || 'session') === 'api_key'
+                                                        ? t('proxy.config.scheduling.affinity_scopes_desc.api_key', { defaultValue: 'Locks all requests from the same API-Key to one upstream account, maximizing cache hits for AutoGPT/Cindy multi-agent fleets.' })
+                                                        : t('proxy.config.scheduling.affinity_scopes_desc.session', { defaultValue: 'Binds accounts by session ID with automatic subtask prefix normalization (e.g. :step:N).' })}
+                                                </p>
                                             </div>
 
                                             <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/20 rounded-xl">

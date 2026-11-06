@@ -1,6 +1,6 @@
 //! 出站流生命周期通用驱动器（模板方法模式）
 //!
-//! 统一接管所有出站协议（Claude、OpenAI 等）的通用流式生命周期：
+//! 统一接管所有出站协议（Claude、OpenAI、Gemini）的通用流式生命周期：
 //! 1. 3s 细粒度保活心跳（`: ping\n\n`）；
 //! 2. 120s 空闲静默安全熔断（`streaming_sliding_secs = 120`）；
 //! 3. 网络中断统一拦截与状态判断（`has_content` / `has_thinking`）；
@@ -45,9 +45,45 @@ pub trait ProtocolStreamHandler: Send + 'static {
     /// （Claude 下发 message_delta(end_turn) + message_stop，OpenAI 下发 [DONE] 及可选 usage chunk）
     fn emit_finalize(&mut self) -> Vec<Bytes>;
 
+    /// [黄金三元组异常截断收尾契约] 上游异常中断/超时且已有正文/工具调用输出（has_content == true）时调用：
+    /// 此时为了避免客户端抛出 StreamTruncatedError 丢弃已生成的成千上万 token，必须优雅收尾；
+    /// 但与正常 EOF (emit_finalize) 不同，异常收尾遵循零正文篡改原则：
+    /// 1. 绝不向模型正文注入任何假横幅或篡改已有文本；
+    /// 2. 若存在工具调用，严格优先保持 tool_use (Claude) / tool_calls (OpenAI) / STOP (Gemini)；
+    /// 3. 仅当纯文本生成中途断流时，设置截断型终止原因（Claude 下发 max_tokens，OpenAI 下发 length，Gemini 下发 MAX_TOKENS）。
+    ///
+    /// 默认实现回退至普通 emit_finalize()。
+    fn emit_abnormal_finalize(&mut self, _error_report: &StreamErrorReport) -> Vec<Bytes> {
+        self.emit_finalize()
+    }
+
     /// 首包发生致命错误/超时且 has_content() == false && has_thinking() == false 时调用
     /// 返回协议专属的非重试终端错误帧（Claude 下发 api_error，OpenAI 下发 error frame）
     fn emit_initial_error(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes>;
+
+    /// 可选：上游在产生正文/工具调用前失败时，协议自行下发终结错误帧。
+    ///
+    /// 返回 `(frames, handled)`：
+    /// - `frames`：在透传底层错误前下发的协议帧（如 Responses 的 `error` + `response.failed`）；
+    /// - `handled == true`：协议已用独立终结帧表达错误，生命周期无需再向客户端透传底层 `Err`。
+    ///
+    /// 默认不发送任何帧，交由客户端感知流中断并原生重试。
+    fn emit_error_finalize(&mut self, _error_report: &StreamErrorReport) -> (Vec<Bytes>, bool) {
+        (Vec::new(), false)
+    }
+
+    /// 可选：上游在未产生正文/工具调用时正常 EOF，协议是否仍能下发语义完整的终结帧
+    /// （如 Responses 的 `response.incomplete` / 空 text_completion 的 `[DONE]`）。
+    /// 默认 false：由生命周期透传中断错误，促使客户端原生重试。
+    fn finalize_without_content(&self) -> bool {
+        false
+    }
+
+    /// 可选：终结帧下发前的异步屏障（例如等待会话落盘确认）。
+    /// 返回 false 表示放弃本次终结帧，避免向客户端谎报完成。
+    fn finalize_barrier(&mut self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(std::future::ready(true))
+    }
 
     /// 可选：检查当前是否正处于思考块输出中（例如 Claude 的 Thinking block 处于打开状态）
     fn is_thinking_active(&self) -> bool {
@@ -85,11 +121,27 @@ impl StreamLifecycleConfig {
         trace_info: String,
     ) -> Self {
         let timeouts = crate::proxy::get_stream_timeout_config();
+        // 首字阶段与上游首字节预算同源：
+        // - 同一 15..MAX_FIRST_BYTE_CEILING_SECS(270) 上限，避免前端配置 > 上限时两段行为不一致；
+        // - 再用全局剩余预算封顶，避免“响应头已耗时 + 又等满 180s”超出 270s。
+        let mut initial_ttft_secs = timeouts.initial_ttft_secs.clamp(
+            15,
+            crate::proxy::upstream::client::MAX_FIRST_BYTE_CEILING_SECS,
+        );
+        let mut transition_secs = timeouts.transition_secs;
+        let mut streaming_sliding_secs = timeouts.streaming_sliding_secs;
+
+        if let Some(remaining) = crate::proxy::pipeline::budget::remaining_secs() {
+            let rem = remaining.max(3);
+            initial_ttft_secs = initial_ttft_secs.min(rem);
+            transition_secs = transition_secs.min(rem);
+            streaming_sliding_secs = streaming_sliding_secs.min(rem);
+        }
         Self {
             heartbeat_secs: 3,
-            initial_ttft_secs: timeouts.initial_ttft_secs,
-            transition_secs: timeouts.transition_secs,
-            streaming_sliding_secs: timeouts.streaming_sliding_secs,
+            initial_ttft_secs,
+            transition_secs,
+            streaming_sliding_secs,
             adapter_name,
             function_name,
             trace_info,
@@ -156,6 +208,7 @@ where
         let mut phase = StreamPhase::InitialTtft;
         let mut last_activity = tokio::time::Instant::now();
         let mut error_emitted = false;
+        let mut abnormal_error_report: Option<crate::proxy::mappers::error_classifier::StreamErrorReport> = None;
 
         loop {
             tokio::select! {
@@ -248,9 +301,8 @@ where
                                     // 发生上游网络断开（如 TCP RST、连接重置或中断）时，严禁透传底层 Err 截断连接！
                                     // 透传底层 Err 会导致客户端未闭合块抛出 StreamTruncatedError，
                                     // 丢弃所有已生成的成千上万 token 并反复无限重思考重置当前 turn。
-                                    // 此时应优雅跳出循环，交由尾部逻辑冲刷缓冲区并调用 emit_finalize()，
-                                    // 产出合法的 content_block_stop + message_delta(stop_reason: end_turn) + message_stop，
-                                    // 促使 Claude Code 等客户端命中 keepPartial 豁免模型，保全已生成内容。
+                                    // 此时应优雅跳出循环，记录异常原因并交由尾部逻辑冲刷缓冲区后调用 emit_abnormal_finalize()，
+                                    // 纯净收尾，绝不篡改模型正文，产出优雅终结帧保全已生成内容。
                                     if handler.has_content() {
                                         tracing::warn!(
                                             "[{}] {} upstream stream chunk error after content emitted, gracefully finalizing: {}",
@@ -258,6 +310,7 @@ where
                                             config.function_name,
                                             report.client_message()
                                         );
+                                        abnormal_error_report = Some(report);
                                         break;
                                     }
 
@@ -275,8 +328,16 @@ where
                                             yield Ok(c);
                                         }
                                     }
+                                    // 协议可选择自行下发终结错误帧并吞掉底层 Err（如 Responses 的 error + response.failed）
+                                    let (error_frames, error_handled) =
+                                        handler.emit_error_finalize(&report);
+                                    for c in error_frames {
+                                        yield Ok(c);
+                                    }
                                     error_emitted = true;
-                                    yield Err(report.client_message());
+                                    if !error_handled {
+                                        yield Err(report.client_message());
+                                    }
                                     break;
                                 }
                             }
@@ -285,7 +346,10 @@ where
                             // [关键契约守卫] 若上游到达 EOF 时未处于终止态，且从未产生任何正文或工具调用（无论是否产生了思考）：
                             // 严禁作为正常 EOF 终结或伪造收尾帧！如实作为 Err 透传底层中断，
                             // 促使 Claude Code 等客户端状态机捕获 ConnectionLost 并自动触发原生重试。
-                            if !handler.is_terminal() && !handler.has_content() {
+                            if !handler.is_terminal()
+                                && !handler.has_content()
+                                && !handler.finalize_without_content()
+                            {
                                 let reason = if handler.has_thinking() {
                                     "upstream stream ended after thinking without content"
                                 } else {
@@ -353,7 +417,8 @@ where
 
                         // [黄金三元组收尾契约] 若已有正文/工具调用输出（has_content == true）：
                         // 发生空闲静默超时时，严禁透传底层 Err 截断连接导致客户端丢弃全部内容重置！
-                        // 优雅跳出循环执行尾部收尾与 emit_finalize()，保全已有生成内容并满足客户端三元组闭合契约。
+                        // 记录超时错误报告并优雅跳出循环，由尾部执行异常收尾与 emit_abnormal_finalize()，
+                        // 零正文篡改保全已有生成内容并标记截断终止原因。
                         if handler.has_content() {
                             tracing::warn!(
                                 "[{}] {} stream idle timeout after {}s in phase {:?} after content emitted, gracefully finalizing",
@@ -362,6 +427,7 @@ where
                                 phase_timeout_secs,
                                 phase
                             );
+                            abnormal_error_report = Some(report);
                             break;
                         }
 
@@ -380,8 +446,16 @@ where
                                 yield Ok(c);
                             }
                         }
+                        // 协议可选择自行下发终结错误帧并吞掉底层 Err
+                        let (error_frames, error_handled) =
+                            handler.emit_error_finalize(&report);
+                        for c in error_frames {
+                            yield Ok(c);
+                        }
                         error_emitted = true;
-                        yield Err(report.client_message());
+                        if !error_handled {
+                            yield Err(report.client_message());
+                        }
                         break;
                     }
                     yield Ok(handler.heartbeat_frame());
@@ -397,7 +471,7 @@ where
 
         // [关键契约守卫] 若流结束时未处于终止态且未产生任何正文/工具调用（无论是否产生了思考）：
         // 严禁下发伪造终结帧，如实透传 Err 促使客户端原生重试
-        if !handler.is_terminal() && !handler.has_content() {
+        if !handler.is_terminal() && !handler.has_content() && !handler.finalize_without_content() {
             let reason = if handler.has_thinking() {
                 "upstream stream ended after thinking without content"
             } else {
@@ -443,11 +517,18 @@ where
 
         // [Double-Finalization Guard]
         // 若尾部冲刷使得 handler 已经进入终结态（例如 process_line 接收到了 [DONE] 或终结事件），
-        // 严禁二次调用 emit_finalize()，防止向客户端发射重复的 [DONE] 帧或 message_stop 事件导致客户端协议报错
+        // 严禁二次调用 finalize，防止向客户端发射重复的 [DONE] 帧或 message_stop 事件导致客户端协议报错
         if !handler.is_terminal() {
-            let final_chunks = handler.emit_finalize();
-            for c in final_chunks {
-                yield Ok(c);
+            let final_chunks = if let Some(ref report) = abnormal_error_report {
+                handler.emit_abnormal_finalize(report)
+            } else {
+                handler.emit_finalize()
+            };
+            // 终结屏障：允许协议在真正下发终结帧前完成异步确认（如会话落盘）
+            if handler.finalize_barrier().await {
+                for c in final_chunks {
+                    yield Ok(c);
+                }
             }
         }
 
@@ -465,6 +546,7 @@ mod tests {
         has_thinking: bool,
         is_thinking_active: bool,
         finalized: bool,
+        abnormal_finalized: bool,
         initial_error_emitted: bool,
         is_terminal: bool,
     }
@@ -477,6 +559,7 @@ mod tests {
                 has_thinking,
                 is_thinking_active: false,
                 finalized: false,
+                abnormal_finalized: false,
                 initial_error_emitted: false,
                 is_terminal: false,
             }
@@ -520,6 +603,11 @@ mod tests {
         fn emit_finalize(&mut self) -> Vec<Bytes> {
             self.finalized = true;
             vec![Bytes::from("[finalized]\n")]
+        }
+
+        fn emit_abnormal_finalize(&mut self, _report: &StreamErrorReport) -> Vec<Bytes> {
+            self.abnormal_finalized = true;
+            vec![Bytes::from("[abnormal_finalized]\n")]
         }
 
         fn emit_initial_error(&mut self, _report: &StreamErrorReport) -> Vec<Bytes> {
@@ -604,8 +692,12 @@ mod tests {
         let full_output = output.join("");
         assert!(full_output.contains("processed:data: partial content"));
         assert!(
-            full_output.contains("[finalized]"),
-            "Must finalize when error occurs after content emitted to fulfill terminal triad contract"
+            full_output.contains("[abnormal_finalized]"),
+            "Must abnormal_finalize when error occurs after content emitted to fulfill terminal triad contract"
+        );
+        assert!(
+            !full_output.contains("[finalized]"),
+            "Must NOT call regular finalize on abnormal error"
         );
         assert!(
             !full_output.contains("[initial_error]"),
@@ -647,8 +739,12 @@ mod tests {
         let full_output = output.join("");
         assert!(full_output.contains("processed:data: partial content"));
         assert!(
-            full_output.contains("[finalized]"),
-            "Must finalize when idle timeout occurs after content emitted"
+            full_output.contains("[abnormal_finalized]"),
+            "Must abnormal_finalize when idle timeout occurs after content emitted"
+        );
+        assert!(
+            !full_output.contains("[finalized]"),
+            "Must NOT call regular finalize on idle timeout"
         );
         assert!(
             !error_received,

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::proxy::pipeline::inbound::InboundThinkingPipeline;
 use crate::proxy::upstream::client::UpstreamClient;
 
 /// 思考空回复自愈上下文
@@ -33,6 +34,12 @@ pub struct ThinkingAutoHealContext {
     pub extra_headers: HashMap<String, String>,
     pub account_id: Option<String>,
     pub trace_id: String,
+    /// 请求级预算上下文（构造时捕获）
+    ///
+    /// 续跑发生在 `Body::from_stream` 被 poll 时，此时入口中间件的
+    /// `task_local` 已经失效；必须显式恢复，否则续跑不受全局预算与
+    /// 大 body 重放护栏约束。
+    pub budget: Option<Arc<crate::proxy::pipeline::budget::RequestContext>>,
 }
 
 /// 根据历史上下文的用户语言偏好，解析最自然的续跑提示词
@@ -132,6 +139,140 @@ pub fn create_auto_heal_continuation_body(
     }
 
     new_body
+}
+
+/// 统一的「原地自愈」请求状态（每个请求一份）
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AutoHealFlags {
+    /// 已因 tool_choice/thinking 冲突剥离过 thinkingConfig
+    pub retried_tool_choice_conflict: bool,
+    /// 已因 503/过载降级过思考预算
+    pub retried_with_budget_degraded: bool,
+    /// 已因 503 容量枯竭 (MODEL_CAPACITY_EXHAUSTED) 原地升档为 High
+    pub retried_with_capacity_promoted: bool,
+    /// 已因 400 图像解码失败剔除过损坏图片
+    pub retried_with_image_omitted: bool,
+}
+
+/// 一次自愈的执行结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoHealOutcome {
+    /// 诊断用短标签（写入日志/阶段时间线）
+    pub kind: &'static str,
+    /// 同账号重试前的等待时长
+    pub delay_ms: u64,
+}
+
+/// 通用原地自愈执行器（协议无关，操作的是已转换的 Gemini Canonical IR）
+///
+/// 四个适配器过去各写一份同样的判断与改写：
+/// 1. 503/529 过载 → 降级思考预算（保住 prefix cache）；
+/// 2. 400 tool_choice/thinking 冲突 → 剥离 thinkingConfig；
+/// 3. 400 图像解码失败 → 剔除损坏图片并降级为文本占位。
+///
+/// 三者的共同点：**都是对已转换完成的 Gemini 报文做原地修复，且必须在同账号重试**
+/// （换号只会让同一份坏载荷再失败一次，并浪费轮换预算）。
+///
+/// 返回 `Some` 表示已在同一账号上完成修复，调用方应 `continue` 重试；
+/// `None` 表示本次不需要 / 无法自愈，继续走既有错误策略。
+pub fn try_auto_heal(
+    classification: &crate::proxy::pipeline::UpstreamClassification,
+    status_code: u16,
+    error_text: &str,
+    body: &mut Value,
+    degraded: &mut Option<Value>,
+    flags: &mut AutoHealFlags,
+) -> Option<AutoHealOutcome> {
+    // 0. 上游容量枯竭 (MODEL_CAPACITY_EXHAUSTED / 503)：原地将 medium/low/tiered 升档为 high 算力通道
+    if crate::proxy::upstream::client::UpstreamClient::is_model_capacity_exhausted(
+        rquest::StatusCode::from_u16(status_code)
+            .unwrap_or(rquest::StatusCode::SERVICE_UNAVAILABLE),
+        error_text,
+    ) && !flags.retried_with_capacity_promoted
+    {
+        if InboundThinkingPipeline::try_promote_to_high_capacity(body) {
+            flags.retried_with_capacity_promoted = true;
+            *degraded = Some(body.clone());
+            tracing::warn!(
+                "[AutoHeal] Upstream 503 MODEL_CAPACITY_EXHAUSTED: promoted tier to HIGH and retrying on same account"
+            );
+            return Some(AutoHealOutcome {
+                kind: "promote_tier_to_high_capacity",
+                delay_ms: 50,
+            });
+        }
+    }
+
+    // 1. 上游过载：降级思考预算，避免被调度到高算力集群继续排队
+    if crate::proxy::pipeline::UpstreamClassification::is_server_overloaded(status_code, error_text)
+        && !flags.retried_with_budget_degraded
+        && InboundThinkingPipeline::try_degrade_thinking_budget(body)
+    {
+        flags.retried_with_budget_degraded = true;
+        *degraded = Some(body.clone());
+        tracing::warn!(
+            "[AutoHeal] upstream {}/overloaded: degraded thinking budget to 4000 (preserving prefix cache) err={}",
+            status_code,
+            crate::proxy::upstream::client::strip_internal_markers(error_text)
+        );
+        return Some(AutoHealOutcome {
+            kind: "degrade_thinking_budget",
+            delay_ms: 150,
+        });
+    }
+
+    // 2. 强制工具调用与思考冲突：剥离 thinkingConfig 后重试
+    if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
+        status_code,
+        error_text,
+    ) && !flags.retried_tool_choice_conflict
+    {
+        flags.retried_tool_choice_conflict = true;
+        if let Some(gc) = body
+            .get_mut("request")
+            .and_then(|r| r.get_mut("generationConfig"))
+            .and_then(Value::as_object_mut)
+        {
+            gc.remove("thinkingConfig");
+        } else if let Some(gc) = body
+            .get_mut("generationConfig")
+            .and_then(Value::as_object_mut)
+        {
+            gc.remove("thinkingConfig");
+        }
+        *degraded = Some(body.clone());
+        tracing::warn!(
+            "[AutoHeal] upstream 400 tool_choice/thinking conflict: stripped thinkingConfig and retrying on same account"
+        );
+        return Some(AutoHealOutcome {
+            kind: "strip_thinking_on_tool_choice_conflict",
+            delay_ms: 50,
+        });
+    }
+
+    // 3. 图像解码/处理失败：剔除损坏图片（降级为文本占位）后重试
+    if classification.is_image_processing_error() && !flags.retried_with_image_omitted {
+        let purged =
+            crate::proxy::mappers::common_utils::purge_corrupted_images_from_gemini_payload(body);
+        if purged == 0 {
+            tracing::warn!(
+                "[AutoHeal] upstream 400 unable to process input image, but no inline image was purged; skipping retry to prevent duplicate 400"
+            );
+            return None;
+        }
+        flags.retried_with_image_omitted = true;
+        *degraded = Some(body.clone());
+        tracing::warn!(
+            "[AutoHeal] upstream 400 unable to process image: purged {} image(s) to text placeholders, retrying on same account",
+            purged
+        );
+        return Some(AutoHealOutcome {
+            kind: "purge_corrupted_images",
+            delay_ms: 50,
+        });
+    }
+
+    None
 }
 
 /// 检查 Gemini candidate 中的部件类型分布
@@ -327,14 +468,18 @@ where
             let prompt = resolve_continuation_prompt(&ctx.original_body);
             let heal_body = create_auto_heal_continuation_body(&ctx.original_body, prompt);
 
-            let call_res = ctx.upstream.call_v1_internal_with_headers(
-                ctx.method,
-                &ctx.access_token,
-                heal_body,
-                ctx.query_string,
-                ctx.extra_headers.clone(),
-                ctx.account_id.as_deref(),
-            ).await;
+            let call_res = crate::proxy::pipeline::budget::scope_optional(
+                ctx.budget.clone(),
+                ctx.upstream.call_v1_internal_with_headers(
+                    ctx.method,
+                    &ctx.access_token,
+                    heal_body,
+                    ctx.query_string,
+                    ctx.extra_headers.clone(),
+                    ctx.account_id.as_deref(),
+                ),
+            )
+            .await;
 
             match call_res {
                 Ok(call_success) if call_success.response.status().is_success() => {
@@ -643,5 +788,88 @@ mod tests {
             }
         });
         assert_eq!(resolve_continuation_prompt(&body), "Continue.");
+    }
+
+    #[test]
+    fn test_auto_heal_strips_thinking_on_tool_choice_conflict() {
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            400,
+            "thinking may not be enabled when tool_choice forces tool use",
+            None,
+        );
+        let mut body = json!({
+            "request": {
+                "generationConfig": { "thinkingConfig": { "includeThoughts": true } }
+            }
+        });
+        let mut degraded = None;
+        let mut flags = AutoHealFlags::default();
+        let out = try_auto_heal(
+            &classification,
+            400,
+            "thinking may not be enabled when tool_choice forces tool use",
+            &mut body,
+            &mut degraded,
+            &mut flags,
+        );
+        assert_eq!(
+            out.map(|o| o.kind),
+            Some("strip_thinking_on_tool_choice_conflict")
+        );
+        assert!(flags.retried_tool_choice_conflict);
+        assert!(body["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_none());
+        assert!(degraded.is_some());
+
+        // 第二次不再自愈（单次上限）
+        let again = try_auto_heal(
+            &classification,
+            400,
+            "thinking may not be enabled when tool_choice forces tool use",
+            &mut body,
+            &mut degraded,
+            &mut flags,
+        );
+        assert!(again.is_none());
+    }
+
+    #[test]
+    fn test_auto_heal_purges_corrupted_images_once() {
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            400,
+            "unable to process input image",
+            None,
+        );
+        let mut body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "inlineData": { "mimeType": "image/png", "data": "!!!!not-base64!!!!" }
+                }]
+            }]
+        });
+        let mut degraded = None;
+        let mut flags = AutoHealFlags::default();
+        let out = try_auto_heal(
+            &classification,
+            400,
+            "unable to process input image",
+            &mut body,
+            &mut degraded,
+            &mut flags,
+        );
+        // 损坏图片被剔除（或占位）；关键是不再重试第二次
+        assert!(out.is_some());
+        assert!(flags.retried_with_image_omitted);
+        let again = try_auto_heal(
+            &classification,
+            400,
+            "unable to process input image",
+            &mut body,
+            &mut degraded,
+            &mut flags,
+        );
+        assert!(again.is_none());
     }
 }

@@ -8,6 +8,9 @@ use tokio::sync::{RwLock, Semaphore};
 // Admission happens before spawn_blocking, so queued tasks cannot retain unlimited bodies.
 static LOG_WRITERS: Semaphore = Semaphore::const_new(4);
 
+/// 因写盘闸门繁忙而丢弃的请求日志计数（仅用于限流上报，不影响业务）
+static LOG_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
     pub id: String,
@@ -40,6 +43,30 @@ pub struct ProxyRequestLog {
     pub username: Option<String>, // User token username
     #[serde(default)]
     pub session_id: Option<String>, // 会话标识 (如 sess-xxx)
+}
+
+impl ProxyRequestLog {
+    /// 获取从响应头或显式字段提取的首字延迟 (毫秒)
+    pub fn ttft_ms(&self) -> Option<f64> {
+        self.response_headers
+            .as_deref()
+            .and_then(|h| serde_json::from_str::<serde_json::Value>(h).ok())
+            .and_then(|val| {
+                val.get("x-timing-ttft-ms")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&n| n > 0.0)
+            })
+    }
+
+    /// 获取实际消耗配额/生效的模型名称（优先实际路由/上游模型，退化至原始请求模型）
+    pub fn effective_model(&self) -> &str {
+        self.mapped_model
+            .as_deref()
+            .or(self.upstream_model.as_deref())
+            .or(self.model.as_deref())
+            .unwrap_or("unknown")
+    }
 }
 
 #[cfg(test)]
@@ -463,13 +490,22 @@ impl ProxyMonitor {
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
-            let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
+            let model = log.effective_model().to_string();
+            let requested_model = log.model.clone();
             let account = account.clone();
             let cached = log.cached_tokens.unwrap_or(0);
             let reasoning = log.reasoning_tokens.unwrap_or(0);
+            let ttft_ms = log.ttft_ms();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached, reasoning,
+                    &account,
+                    &model,
+                    requested_model.as_deref(),
+                    input,
+                    output,
+                    cached,
+                    reasoning,
+                    ttft_ms,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }
@@ -506,7 +542,16 @@ impl ProxyMonitor {
         }
 
         let Ok(permit) = LOG_WRITERS.try_acquire() else {
-            tracing::debug!("Skipping proxy log persistence: writers busy");
+            // 日志写盘繁忙时会被丢弃：这直接解释了“后台查不到这次请求”。
+            // 用计数限流上报，避免日志风暴，但保证这种“静默丢日志”可见。
+            let dropped = LOG_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped % 100 == 1 {
+                // ERROR 级：丢弃请求日志 = 事后无法回溯，必须进 error.log
+                tracing::error!(
+                    "[Monitor] 日志落库繁忙，已丢弃 {} 条请求日志（不会出现在 proxy_logs.db）",
+                    dropped
+                );
+            }
             return;
         };
         // Save to DB (respect server-side simple/full storage mode)

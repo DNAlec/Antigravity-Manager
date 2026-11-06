@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "Düşünme seviyesi: ağ geçidi uyarlamalı (resmi katalog temelli)",
+        "tag": "Önerilen",
+        "desc": "İstemci doğrudan kontrolü ve özel token kademeleri kaldırıldı: thinkingLevel sunan modeller seviyeyi kendi kademesinden (low / medium / high) alır, diğerleri resmi thinkingBudget varsayılanını kullanır. İstemciden gelen düşünme gücü yalnızca sonek almayan (çıplak) modellerde kademe modelini seçmek için uygulanır."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — istekler normal çalışıyorsa yok sayın"
+    },
     "common": {
         "empty": "Boş",
         "loading": "Yükleniyor...",
@@ -196,6 +204,13 @@
         "proxy_online_unit": "Proxy çevrimiçi",
         "btn_proxy_online": "Proxy Çevrimiçi ({{count}})",
         "btn_all_available": "Kullanılabilir ({{count}})",
+        "qos_auto_jail": "Oto Karantina",
+        "qos_auto_jail_badge_on": "AÇIK",
+        "qos_auto_jail_badge_off": "KAPALI",
+        "qos_auto_jail_on": "Karantina: AÇIK",
+        "qos_auto_jail_off": "Karantina: KAPALI",
+        "qos_auto_jail_enabled_tip": "Geçerli: Otomatik karantina etkin. Aşırı TTFT gecikmesi olan hesaplar izole edilir ve oturumları ayrılır (Kapatmak için tıklayın)",
+        "qos_auto_jail_disabled_tip": "Geçerli: Otomatik karantina devre dışı. Doğrulama süresi yok sayılır, izole etme ve oturum ayırma yapılmaz (Açmak için tıklayın)",
         "btn_title_proxy_online": "Şu anda yalnızca proxy dağıtımındaki hesaplar sayılıyor",
         "btn_title_all_available": "Şu anda tüm etkin hesaplar sayılıyor",
         "proxy_joined_pool": "✓ {{count}} hesap proxy havuzunda",
@@ -349,6 +364,7 @@
                 "copied": "Kopyalandı",
                 "link_label": "Yetkilendirme URL'si",
                 "link_click_to_copy": "Kopyalamak için tıklayın",
+                "remote_hint": "💡 Docker / Uzak Sunucu İpucu: Google yetkilendirmesinden sonra tarayıcının localhost'a yönlendirilirken bağlantı reddedildi hatası vermesi normal bir güvenlik sınırlamasıdır. Tarayıcınızın adres çubuğundaki tam URL'yi (kod dahil) kopyalayıp aşağıya yapıştırmanız yeterlidir.",
                 "manual_hint": "Tarayıcı otomatik olarak yönlendirilmedi mi? Lütfen geri dönüş bağlantısını veya Yetkilendirme Kodunu buraya yapıştırın:",
                 "manual_placeholder": "Bağlantıyı veya kodu buraya yapıştırın...",
                 "error_no_flow": "Aktif kimlik doğrulama akışı bulunamadı. Lütfen OAuth'u yeniden başlatın.",
@@ -356,7 +372,9 @@
                 "error_no_url": "OAuth URL'si alınamadı",
                 "popup_blocked": "Açılır pencere engellendi",
                 "manual_submitting": "Yetkilendirme kodu gönderiliyor...",
-                "manual_submitted": "Yetkilendirme kodu gönderildi, arka planda işleniyor..."
+                "manual_submitted": "Yetkilendirme kodu gönderildi, arka planda işleniyor...",
+                "enterprise_title": "Google Cloud / Vertex AI Kurumsal Yetkilendirme",
+                "enterprise_desc": "Kurumsal kotayı korumak ve Vertex AI projesini bağlamak için resmi GCP kurumsal istemcisiyle yetkilendirin"
             },
             "token": {
                 "label": "Refresh Token",
@@ -469,7 +487,19 @@
         "client_cli": "CLI",
         "client_cli_tooltip": "Mevcut Antigravity CLI (agy) oturumu açık hesap",
         "switch_next_short": "Sonraki",
-        "weekly_exhausted_tooltip": "Haftalık kota tükendi, otomatik koruma devrede"
+        "weekly_exhausted_tooltip": "Haftalık kota tükendi, otomatik koruma devrede",
+        "type": {
+            "personal": "Kişisel Hesap",
+            "enterprise": "Kurumsal / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "Kurumsal/GCP hesabıyla ilişkili Google Cloud Proje Kimliği. Yerel Antigravity, oturum açıldığında bunu otomatik olarak bağlar veya varsayılanı kullanır.",
+        "project_id_placeholder": "ör: my-project-id",
+        "project_id_updated": "GCP Project ID başarıyla güncellendi",
+        "auto_fetch_project_id": "Otomatik Al",
+        "fetching_project_id": "Alınıyor...",
+        "auto_fetch_success": "Project ID başarıyla alındı: {{projectId}}",
+        "auto_fetch_failed": "Yukarı akışta ilişkili bir Project ID bulunamadı"
     },
     "settings": {
         "save": "Ayarları Kaydet",
@@ -488,6 +518,10 @@
             "theme_light": "Aydınlık",
             "theme_dark": "Karanlık",
             "theme_system": "Sistem",
+            "ui_zoom": "Arayüz ve Yazı Tipi Ölçeği",
+            "ui_zoom_desc": "Genel arayüz ve yazı tipi boyutunu ayarlayın. İstediğiniz zaman Cmd/Ctrl + / - / 0 kısayollarını kullanarak ölçeklendirebilirsiniz",
+            "ui_zoom_default": "Varsayılan",
+            "ui_zoom_recommended": "Büyük ekran için önerilir",
             "auto_launch": "Başlangıçta Çalıştır",
             "auto_launch_enabled": "Etkin",
             "auto_launch_disabled": "Devre Dışı",
@@ -506,7 +540,13 @@
             "lightweight_mode": "Hafif Mod (Bellek Boşaltma)",
             "lightweight_mode_desc": "Tepsiye küçültüldüğünde veya kapatıldığında WebView işleme sürecini sonlandırarak bellek kullanımını ~35MB'a düşürür. Pencereyi yeniden açarken birkaç milisaniyelik yeniden oluşturma süresi gerekir.",
             "lightweight_mode_enabled": "Hafif mod etkinleştirildi",
-            "lightweight_mode_disabled": "Hafif mod devre dışı bırakıldı"
+            "lightweight_mode_disabled": "Hafif mod devre dışı bırakıldı",
+            "tray_click_action": "Tepsi Sol Tıklama Eylemi",
+            "tray_click_action_desc": "Sistem tepsisi simgesine tıklandığında gerçekleşecek varsayılan eylemi seçin",
+            "tray_click_action_mini": "Mini İzleme Penceresini Aç (Önerilen)",
+            "tray_click_action_main": "Doğrudan Ana Konsolu Aç",
+            "tray_click_action_mini_short": "Mini Görünüm",
+            "tray_click_action_main_short": "Ana Konsol"
         },
         "account": {
             "title": "Hesap Ayarları",
@@ -970,6 +1010,20 @@
                 },
                 "max_wait": "Maks Bekleme (sn)",
                 "max_wait_tooltip": "Yalnızca 'Önbellek Öncelikli' modunda kullanılır: oran limiti sıfırlama zamanı bu değerin altındaysa geçiş yapmak yerine bekle.",
+                "max_spillover_accounts": "Taşma Hesap Sınırı",
+                "max_spillover_accounts_tooltip": "Eşzamanlı trafik taşması için izin verilen maksimum hesap sayısı. 0 sınırsız demektir; pozitif bir tamsayı (örn. 2) aktif hesapları sınırlar.",
+                "spillover_unlimited": "Sınırsız (Tümü kullanılabilir)",
+                "spillover_count": "{{count}} hesap",
+                "affinity_scope": "Bağlılık Kapsamı",
+                "affinity_scope_tooltip": "Oturum: Oturum kimliğine göre bağlar (varsayılan, çoklu ajan alt görevlerini otomatik normalleştirir); API Anahtarı: Aynı API anahtarından gelen tüm istekleri tek bir hesaba kilitler.",
+                "affinity_scopes": {
+                    "session": "Oturum Kimliği",
+                    "api_key": "API Anahtarı"
+                },
+                "affinity_scopes_desc": {
+                    "session": "Oturum kimliğine göre bağlar ve çoklu ajan türetilmiş öneklerini (:step:N) otomatik olarak normalleştirir.",
+                    "api_key": "Aynı API anahtarından gelen tüm istekleri tek bir hesaba kilitler, önbellek isabetini maksimize eder."
+                },
                 "clear_bindings": "Oturum Bağlantılarını Temizle",
                 "clear_bindings_tooltip": "Tüm oturum ve hesap bağlantılarını hemen kesin, bir sonraki istekte hesapları yeniden atanmaya zorlayın.",
                 "fixed_account": "Fixed Account Mode",
@@ -1108,6 +1162,18 @@
                 "default_600_tag": "Varsayılan: 600",
                 "max_memory_turns_desc": "Controls the maximum number of historical thinking turns kept in RAM per session. Estimated RAM usage per turn is ~1.5 KB - 2.5 KB (~1.2 MB / session for 600 turns).",
                 "turns_unit": "turns",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "FIFO Sliding Window Eviction & Concurrency Sizing Guide",
                 "window_guide_desc": "When session length exceeds this limit, FIFO sliding window automatically evicts oldest thinking blocks from memory. Evicted blocks are rehydrated in nanoseconds via indexed SQLite (primary_tool_id), maintaining strict byte-level Prompt Cache alignment without OOM.",
                 "tooltip_32768": "32,768 Tokens: Ideal for complex coding and deep architecture design",
@@ -1156,11 +1222,11 @@
                 "clear_error": "Düşünce blokları temizlenemedi: {{error}}",
                 "gemini_soft_budget_note": "⚠️ Düşünme Bütçesi Davranışı: Google Gemini upstream, thinkingBudget'ı esnek bir hedef (soft target) olarak kabul eder. Uzun komutlar veya karmaşık kod muhakemesi görevlerinde model düşünme zincirini genişleterek yapılandırılan değeri aşabilir; düşünmeyi tamamen kapatmak için 0 ayarlayın."
             },
-            "stream_timeout_settings": {
-                "title": "Akış Zaman Aşımı Ayarları (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "Zaman Aşımı Ayarları"
             },
             "thinking_settings": {
-                "title": "Düşünme Ayarları (Thinking Settings)"
+                "title": "Düşünme Ayarları"
             },
             "prompt_multimodal": {
                 "title": "Genel İstem ve Çok Modlu Ayarlar"
@@ -1235,7 +1301,7 @@
                 }
             },
             "agent_settings": {
-                "title": "Özel Agent Ayarları (Specific Agent Settings)"
+                "title": "Özel Agent Ayarları"
             },
             "hub": {
                 "title": "Resmi Hub İstemci Parmak İzi",
@@ -1254,17 +1320,54 @@
         "stream_timeouts": {
             "banner_title": "3 Kademeli Akış Zaman Aşımı ve Canlı Tutma Mekanizması",
             "banner_desc": "Derin düşünme modelleri, büyük bağlamlı Prefill'ler, geçmiş sıkıştırma ve büyük dosya yazımı için tasarlanmıştır. Üç bağımsız aşama ve kesintisiz arka plan sinyali (: ping) ile ağ geçidi kopmalarını ve yeniden deneme döngülerini önler.",
-            "ttft_title": "İlk Yanıt Toleransı (TTFT)",
+            "ttft_title": "İlk Yanıt Toleransı",
             "default_badge": "Varsayılan: 180s",
             "ttft_desc": "Soğuk başlatma kuyruğu, 100k+ belirteç Prefill ve sıkıştırma özetleme görevlerini kapsar. Bağlantıyı korumak için 3 saniyede bir ping gönderir.",
             "transition_title": "Geçiş Toleransı (Zamanlayıcı Sıfırlama)",
             "transition_desc": "Düşünmenin bitişi ile ilk içerik veya araç çağrısı belirtecinin çıkışı arasındaki süre. Düşünme bittiğinde zamanlayıcıyı otomatik olarak sıfırlar.",
-            "sliding_title": "Kayan Akış Zaman Aşımı (Streaming)",
+            "sliding_title": "Kayan Akış Zaman Aşımı",
             "default_badge_sliding": "Varsayılan: 120s",
             "sliding_desc": "Ardışık belirteçler arasında izin verilen maksimum sessizlik aralığı. Kesinti durumunda oluşturulan çıktıyı koruyarak akışı güvenle tamamlar.",
             "toast_reset": "Akış zaman aşımı ayarları varsayılanlara sıfırlandı",
             "btn_reset": "Varsayılana Sıfırla",
             "btn_save": "Zaman Aşımı Ayarlarını Kaydet"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "Yükleme zaman aşımı: bant genişliğinden otomatik belirlenir",
+            "min_speed_title": "Yükleme bant genişliği (Mbps)",
+            "min_speed_desc": "VPN kullanıcılarında indirme yüksek, yükleme düşüktür; 1–5 Mbps önerilir.",
+            "extra_wait_title": "Ek bekleme katsayısı",
+            "extra_wait_desc": "Bu parametre maksimum yükleme bekleme süresini etkiler.",
+            "formula_title": "Maks. bekleme = gövde boyutu ÷ yükleme hızı × (1 + ek bekleme katsayısı)",
+            "stall_title": "Takılma zaman aşımı (saniye)",
+            "stall_desc": "Yükleme sırasında aktarım ilerlemesinin durması için zaman aşımı süresi; el sıkışma hatalarını önlemek için bağlantı zaman aşımının altına inmeyecek şekilde korunur.",
+            "header_wait_title": "İlk başlık zaman aşımı (saniye)",
+            "header_wait_desc": "0 = yerleşik değerler: birincil uç nokta 30 sn / yedek 25 sn; 0 dışı değer yalnızca alt sınırı yükseltir.",
+            "large_body_desc": "Eşiği aşan dosyalar varsayılan olarak bir kez gönderilir; tekrarların hattı doldurması önlenir.",
+            "large_body_threshold_title": "Büyük dosya eşiği (MB)",
+            "endpoint_attempts_title": "Maksimum deneme",
+            "toast_reset": "Zaman aşımı ayarları sıfırlandı",
+            "btn_reset": "Varsayılana sıfırla",
+            "btn_save": "Zaman aşımı ayarlarını kaydet"
+        },
+        "timeouts": {
+            "banner_title": "Zaman Aşımı Ayarları",
+            "banner_desc": "Bir isteğin tam zaman aşımı zinciri: ① Uç Nokta Bağlantısı → ② Gövde Yükleme → ③ İlk Belirteç Yanıtı ve Kesintisiz Akış.",
+            "section_connect": "① Uç nokta bağlantısı (otomatik yedekleme)",
+            "connect_label": "Bağlantı zaman aşımı (saniye)",
+            "connect_desc": "Uç noktaya TCP bağlantısı kurma zaman aşımı; genellikle çok hızlıdır.",
+            "connect_restart": "Proxy hizmetini yeniden başlatın.",
+            "section_upload": "② Yükleme (gövdeyi gönder)",
+            "section_large_body": "Büyük dosya yeniden deneme",
+            "section_header": "③ İlk yanıt başlığı (otomatik yedekleme)",
+            "header_primary_title": "Birincil uç nokta:",
+            "header_primary_items": "Metin/kod: TTFT　Görsel: TTFT+45　Video: TTFT+60　Yardımcı: TTFT−30",
+            "header_fallback_title": "Yedek uç nokta:",
+            "header_fallback_items": "aynı artışların yarısı (negatif artışlar değişmez)",
+            "first_byte_effective": "Şu anda geçerli: metin/kod {{text}}s　görsel {{image}}s　video {{video}}s　yardımcı {{aux}}s",
+            "section_stream": "③ İlk token ve sürekli çıktı",
+            "stream_desc": "Başlık bekleme ve ilk token tek bir ilk-bayt gecikmesinde birleştirildi: HTTP 200 öncesi uç nokta değişimi serbest, sonrasında yalnızca güvenli kapatma yapılır.",
+            "auto_summary": "Örn.: maks. bekleme = 47MB ÷ 2Mbps × 1.4 ≈ {{big}} sn;"
         },
         "example": {
             "title": "Kullanım Örnekleri",
@@ -1457,7 +1560,8 @@
             },
             "model_select": "Select Model",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "supported_models": {
@@ -1690,7 +1794,7 @@
             "out_tokens_title": "Çıkış Belirteçleri",
             "ttft_prefix": "TTFT:",
             "total_duration_title": "Toplam Gecikme",
-            "ttft_title": "İlk Belirteç Gecikmesi (TTFT)"
+            "ttft_title": "İlk Belirteç Gecikmesi"
         },
         "details": {
             "title": "İstek Detayları",
@@ -1715,10 +1819,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "Kaydırma Yok",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3 Sütun",
+            "layout_3col_title": "3 Sütunlu yatay karşılaştırma görünümü",
+            "layout_postman": "Postman Stili",
+            "layout_postman_title": "Postman stili bölünmüş görünüm",
+            "export_menu": "Dışa Aktar / Kopyala",
+            "export_menu_title": "HAR olarak dışa aktar, cURL veya tanılama JSON'u olarak kopyala",
+            "copy_har": "HAR Yükünü Kopyala",
+            "download_har": ".har Dosyasını İndir",
+            "copy_curl": "cURL Komutu Olarak Kopyala",
+            "copy_full_json": "Tam Tanılama JSON'unu Kopyala",
+            "copied_har": "HAR Kopyalandı",
+            "exported_har": ".har Dışa Aktarıldı",
+            "copied_curl": "cURL Kopyalandı",
+            "copied_full_json": "Tam JSON Kopyalandı",
+            "collapse_metadata": "Meta Verileri Gizle",
+            "expand_metadata": "Meta Verileri Göster",
+            "collapse_metadata_title": "Görünümü genişletmek için meta verileri gizle",
+            "expand_metadata_title": "Meta veri bilgilerini göster",
+            "wrap": "Kaydır",
+            "wrap_on_title": "Geçerli: Otomatik kaydır (tek satır için tıklayın)",
+            "wrap_off_title": "Geçerli: Tek satır (otomatik kaydırmak için tıklayın)",
+            "case_sensitive_on": "Büyük/küçük harf duyarlı açık",
+            "case_sensitive_off": "Büyük/küçük harf duyarlılığını aç",
+            "clear_search": "Aramayı temizle",
+            "no_match": "Eşleşme yok",
+            "prev_match": "Önceki (Shift+Enter)",
+            "next_match": "Sonraki (Enter)",
+            "lines_count": "satır",
+            "expand": "Genişlet",
+            "collapse": "Daralt",
+            "req_headers": "İstek Başlıkları",
+            "upstream_headers": "İletilen Başlıklar",
+            "resp_headers": "Yanıt Başlıkları",
+            "param_key": "Parametre Anahtarı (Key)",
+            "param_value": "Parametre Değeri (Value)",
+            "header_key": "Başlık (Header)",
+            "header_value": "Başlık Değeri (Value)"
         },
         "dialog": {
             "clear_title": "Proxy Loglarını Temizle",
@@ -1747,14 +1888,19 @@
             "norm_desc": "Model routing / account scheduling / Gemini format conversion",
             "thinking": "Thinking & Signature Fill",
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
-            "ttft": "Time To First Token (TTFT)",
+            "ttft": "Time To First Token",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
             "stream": "Stream Transfer Duration",
             "stream_desc": "First chunk arrival to stream completion",
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "Zaman Tanılamasını Daralt",
+            "expand": "Zaman Tanılamasını Genişlet",
+            "endpoint_label": "Uç Nokta",
+            "status_label": "Durum",
+            "network_timeout_or_error": "Ağ Zaman Aşımı / Hata"
         }
     },
     "update_notification": {
@@ -1776,6 +1922,7 @@
         "title": "Güvenli Erişim Kontrolü",
         "desc": "Şu anda Web modunda çalışıyor. Erişmek için lütfen yönetici parolasını veya API Anahtarını girin.",
         "placeholder": "Yönetici parolasını veya API Anahtarını girin",
+        "remember_me": "Giriş kimlik bilgilerini hatırla",
         "btn_login": "Doğrula ve Gir",
         "note": "Not: Ayarlanmış ayrı bir yönetici parolası varsa, lütfen onu girin; aksi takdirde API_KEY girin.",
         "lookup_hint": "Unuttuysanız, Mevcut API Anahtarını veya Web Kullanıcı Arayüzü Parolasını bulmak için docker logs antigravity-manager komutunu çalıştırın.",
@@ -1800,6 +1947,10 @@
         "by_account": "Hesaba Göre",
         "by_model": "Modele Göre",
         "by_account_view": "Hesaba Göre",
+        "perspective_routed": "Yönlendirilen Model",
+        "perspective_requested": "İstenen Model",
+        "perspective_routed_tip": "İstatistikleri fiilen yönlendirilen ve çalıştırılan modele göre toplayın",
+        "perspective_requested_tip": "İstatistikleri istemci tarafından talep edilen orijinal modele göre toplayın",
         "model_details": "Model Detayları",
         "account_details": "Hesap Detayları",
         "model": "Model",
@@ -1944,7 +2095,10 @@
         "cockpit_view_detail": "Ayrıntılar",
         "cockpit_tab_accounts": "Hesaplar",
         "cockpit_tab_models": "Modeller",
-        "cockpit_tab_users": "Kullanıcılar"
+        "cockpit_tab_users": "Kullanıcılar",
+        "avg_ttft": "İlk Yanıt (TTFT)",
+        "ttft": "TTFT Süresi",
+        "avg_ttft_tip": "Ortalama İlk Belirteç Yanıt Süresi (TTFT)"
     },
     "security": {
         "title": "Güvenlik İzleme",

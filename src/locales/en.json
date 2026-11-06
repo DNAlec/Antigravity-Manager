@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "Thinking level: gateway adaptive (official catalog driven)",
+        "tag": "Recommended",
+        "desc": "Client-direct control and custom token tiers are retired: models exposing thinkingLevel take their level from the model tier (low / medium / high), while other models follow the official thinkingBudget default. Client-provided effort only applies to bare (suffix-less) models to pick the concrete tier model."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — ignore if requests are working normally"
+    },
     "common": {
         "loading": "Loading...",
         "empty": "Empty",
@@ -154,6 +162,13 @@
         "btn_include_disabled": "Include Disabled ({{count}})",
         "btn_proxy_online": "Proxy Online ({{count}})",
         "btn_all_available": "Available ({{count}})",
+        "qos_auto_jail": "Auto Quarantine",
+        "qos_auto_jail_badge_on": "ON",
+        "qos_auto_jail_badge_off": "OFF",
+        "qos_auto_jail_on": "Auto Jail: ON",
+        "qos_auto_jail_off": "Auto Jail: OFF",
+        "qos_auto_jail_enabled_tip": "Current: Auto quarantine enabled. Throttled accounts with excessive TTFT will be quarantined and have sessions unbound (Click to disable)",
+        "qos_auto_jail_disabled_tip": "Current: Auto quarantine disabled. TTFT duration checks are ignored without tagging suspicious or unbinding sessions (Click to enable)",
         "btn_title_proxy_online": "Currently counting only proxy-participating accounts",
         "btn_title_all_available": "Currently counting all active accounts",
         "btn_title_only_available": "Current: Active accounts only (click to include disabled)",
@@ -397,6 +412,10 @@
             "proxy_enabled": "Enabled proxy for {{count}} accounts",
             "proxy_disabled": "Disabled proxy for {{count}} accounts"
         },
+        "type": {
+            "personal": "Personal Account",
+            "enterprise": "Enterprise / GCP (Vertex AI)"
+        },
         "add": {
             "title": "Add Account",
             "tabs": {
@@ -405,6 +424,8 @@
                 "import": "Import DB"
             },
             "oauth": {
+                "enterprise_title": "Google Cloud / Vertex AI Authorization",
+                "enterprise_desc": "Authorize with official GCP enterprise client to retain enterprise quota and link Vertex AI project",
                 "recommend": "Recommended",
                 "desc": "Opens default browser for Google login to auto-fetch and save Token.",
                 "btn_start": "Start OAuth",
@@ -414,6 +435,7 @@
                 "copied": "Copied",
                 "link_label": "Authorization URL",
                 "link_click_to_copy": "Click to copy",
+                "remote_hint": "💡 Docker / Remote Server Tip: It is normal for the browser to show connection refused when redirecting to localhost after Google authorization. Simply copy the full URL (containing the code) from your browser address bar and paste it below.",
                 "manual_hint": "Browser didn't redirect? Paste the full callback URL or raw Code here:",
                 "manual_placeholder": "Paste callback URL or code...",
                 "error_no_flow": "Please click 'Start OAuth' first",
@@ -485,7 +507,15 @@
             "batch_warmup_msg": "Are you sure you want to trigger warmup for the selected {{count}} accounts immediately?"
         },
         "switch_to_agy": "Switch to Antigravity CLI (agy)",
-        "switch_next_short": "Next"
+        "switch_next_short": "Next",
+        "project_id": "GCP Project ID",
+        "project_id_hint": "Google Cloud Project ID associated with the enterprise/GCP account. Native Antigravity associates or defaults this upon sign-in.",
+        "project_id_placeholder": "e.g. my-project-id",
+        "project_id_updated": "GCP Project ID updated successfully",
+        "auto_fetch_project_id": "Auto Fetch",
+        "fetching_project_id": "Fetching...",
+        "auto_fetch_success": "Successfully fetched Project ID: {{projectId}}",
+        "auto_fetch_failed": "No associated Project ID found on upstream"
     },
     "settings": {
         "save": "Save Settings",
@@ -504,6 +534,10 @@
             "theme_light": "Light",
             "theme_dark": "Dark",
             "theme_system": "System",
+            "ui_zoom": "Interface & Font Scale",
+            "ui_zoom_desc": "Adjust GUI scale and font size. You can also press Cmd/Ctrl + / - / 0 anytime to zoom",
+            "ui_zoom_default": "Default",
+            "ui_zoom_recommended": "Recommended for high-res",
             "auto_launch": "Launch at Startup",
             "auto_launch_enabled": "Enabled",
             "auto_launch_disabled": "Disabled",
@@ -522,7 +556,13 @@
             "lightweight_mode": "Lightweight Mode (Release RAM)",
             "lightweight_mode_desc": "Destroy the webview renderer process when minimized or closed to tray. Reduces memory to ~35MB, with a slight delay when reopening the window.",
             "lightweight_mode_enabled": "Lightweight mode enabled",
-            "lightweight_mode_disabled": "Lightweight mode disabled"
+            "lightweight_mode_disabled": "Lightweight mode disabled",
+            "tray_click_action": "Tray Left-Click Action",
+            "tray_click_action_desc": "Choose the default response when clicking the system tray or menu bar icon",
+            "tray_click_action_mini": "Open Mini Floating Monitor (Recommended)",
+            "tray_click_action_main": "Open Main Console Directly",
+            "tray_click_action_mini_short": "Mini View",
+            "tray_click_action_main_short": "Main Console"
         },
         "account": {
             "title": "Account Settings",
@@ -856,8 +896,13 @@
             "request": {
                 "user_agent": "User-Agent Override",
                 "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",
-                "user_agent_hint": "Current Default: antigravity/<version> <os>/<arch>",
-                "user_agent_placeholder": "Enter custom User-Agent string..."
+                "user_agent_hint": "Current Default: antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)",
+                "user_agent_placeholder": "Enter custom User-Agent string...",
+                "user_agent_risk_title": "Risk Warning",
+                "user_agent_risk_desc": "Custom User-Agent strings may break upstream protocol compatibility. Google Cloud Code upstream strictly enforces client fingerprint version gating on flagship reasoning models like Gemini 4 Argon. If a non-Hub signature format (such as legacy IDE antigravity/4.3.0) or an outdated version (below official latest baseline {{version}}) is configured, upstream will immediately reject requests with HTTP 404 (Requested entity was not found) and trigger a 15-minute protective circuit break for the entire account pool. If unfamiliar with upstream fingerprint requirements, please proceed with caution or keep default settings.",
+                "user_agent_restored_success": "Restored official default Hub User-Agent",
+                "user_agent_sandbox_test_title": "User-Agent & Argon Gate Sandbox Test",
+                "user_agent_sandbox_test_desc": "Simulate different User-Agent fingerprints and send Argon connectivity test requests to verify gateway detection and diagnostics."
             },
             "port": "Listen Port",
             "port_tooltip": "TCP port the local API Proxy listens on. Stop the service to change it, then restart to apply.",
@@ -1006,6 +1051,16 @@
                 "max_wait_tooltip": "Only used in 'Cache First' mode: wait instead of switching if the rate limit reset time is below this value.",
                 "max_spillover_accounts": "Spillover Account Cap",
                 "max_spillover_accounts_tooltip": "Maximum number of accounts allowed for concurrent traffic spillover when running multiple sub-agents or parallel sessions. Set to 0 for unlimited (all healthy accounts available); set to a positive integer (e.g. 2) to cap active accounts and prevent excessive spillover across accounts.",
+                "affinity_scope": "Affinity Scope",
+                "affinity_scope_tooltip": "Session: Binds by session ID (default, auto-normalizes multi-agent subtasks); API-Key: Locks all requests from the same API Key to a single account (prevents prompt cache misses in multi-agent frameworks).",
+                "affinity_scopes": {
+                    "session": "Session ID",
+                    "api_key": "API-Key"
+                },
+                "affinity_scopes_desc": {
+                    "session": "Binds accounts by session ID with automatic subtask prefix normalization (e.g. :step:N).",
+                    "api_key": "Locks all requests from the same API Key to one upstream account, maximizing cache hits for AutoGPT/Cindy multi-agent fleets."
+                },
                 "spillover_unlimited": "Unlimited (All available)",
                 "spillover_count": "{{count}} accounts",
                 "clear_bindings": "Clear Session Bindings",
@@ -1159,6 +1214,18 @@
                 "default_600_tag": "Default: 600",
                 "max_memory_turns_desc": "Controls the maximum number of historical thinking turns kept in RAM per session. Estimated RAM usage per turn is ~1.5 KB - 2.5 KB (~1.2 MB / session for 600 turns).",
                 "turns_unit": "turns",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "FIFO Sliding Window Eviction & Concurrency Sizing Guide",
                 "window_guide_desc": "When session length exceeds this limit, FIFO sliding window automatically evicts oldest thinking blocks from memory. Evicted blocks are rehydrated in nanoseconds via indexed SQLite (primary_tool_id), maintaining strict byte-level Prompt Cache alignment without OOM.",
                 "tooltip_32768": "32,768 Tokens: Ideal for complex coding and deep architecture design",
@@ -1207,8 +1274,8 @@
                 "guide_preset_cluster_desc": "Recommended: <1>50 ~ 100 turns</1>. Effortlessly sustains tens of thousands of concurrent sessions; lock-free WAL index ensures sub-second responses.",
                 "gemini_soft_budget_note": "⚠️ Thinking Budget Behavior: Google Gemini upstream treats thinkingBudget as a heuristic soft target. For long prompts, complex code reasoning, or agent tasks, upstream models dynamically expand their chain-of-thought and may exceed configured budgets; set to 0 to completely disable thinking."
             },
-            "stream_timeout_settings": {
-                "title": "Stream Timeout Settings"
+            "timeout_settings": {
+                "title": "Timeout Settings"
             },
             "thinking_settings": {
                 "title": "Thinking Settings"
@@ -1239,7 +1306,7 @@
         "stream_timeouts": {
             "banner_title": "Three-Stage Gradient Stream Timeout & Keepalive",
             "banner_desc": "Designed for deep thinking models, massive context Prefills, long history compaction, and heavy file writing. Provides three independent timing epochs with continuous background keepalive (: ping) to eliminate gateway drops, transition cliff timeouts, and client retry storms.",
-            "ttft_title": "Initial Response Grace (TTFT)",
+            "ttft_title": "Initial Response Grace",
             "default_badge": "Default: 180s",
             "ttft_desc": "Covers cold-start queueing, 100k+ token Prefill, and compaction summarization. Pings every 3s to keep connections alive.",
             "transition_title": "Transition Grace (Epoch Reset)",
@@ -1250,6 +1317,43 @@
             "toast_reset": "Stream timeout settings restored to defaults",
             "btn_reset": "Reset to Defaults",
             "btn_save": "Save Timeout Settings"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "Upload timeout: determined automatically from bandwidth",
+            "min_speed_title": "Upload bandwidth (Mbps)",
+            "min_speed_desc": "VPN users usually have high download and low upload; 1–5 Mbps is recommended.",
+            "extra_wait_title": "Extra wait factor",
+            "extra_wait_desc": "This parameter affects the maximum upload wait time.",
+            "formula_title": "Max wait = request body size ÷ upload bandwidth × (1 + extra wait factor)",
+            "stall_title": "Stall timeout (seconds)",
+            "stall_desc": "Timeout for sustained zero-progress stalls during upload; guaranteed not to fall below connect timeout to prevent premature aborts during handshakes.",
+            "header_wait_title": "First header timeout (seconds)",
+            "header_wait_desc": "0 = use built-in values: 30s for the primary endpoint / 25s for the fallback; a non-zero value only raises the lower bound.",
+            "large_body_desc": "Files above the threshold are sent only once by default, avoiding repeated retries that saturate the uplink.",
+            "large_body_threshold_title": "Large file threshold (MB)",
+            "endpoint_attempts_title": "Max attempts",
+            "toast_reset": "Timeout settings restored to defaults",
+            "btn_reset": "Reset to defaults",
+            "btn_save": "Save timeout settings"
+        },
+        "timeouts": {
+            "banner_title": "Timeout Settings",
+            "banner_desc": "The full timeout chain for one request: ① Endpoint Connection → ② Payload Upload → ③ First-Token Response & Continuous Stream.",
+            "section_connect": "① Endpoint connection (auto failover)",
+            "connect_label": "Connect timeout (seconds)",
+            "connect_desc": "TCP connection establishment timeout to the endpoint; usually very fast.",
+            "connect_restart": "Restart the proxy service to apply.",
+            "section_upload": "② Upload (send the request body)",
+            "section_large_body": "Large file retry",
+            "section_header": "③ First response header (auto failover)",
+            "header_primary_title": "Primary endpoint:",
+            "header_primary_items": "Text/code: TTFT　Image: TTFT+45　Video: TTFT+60　Auxiliary: TTFT−30",
+            "header_fallback_title": "Fallback endpoint:",
+            "header_fallback_items": "same offsets, halved (negative offsets unchanged)",
+            "first_byte_effective": "Effective now (base cap {{cap}}s): text/code {{text}}s　image {{image}}s　video {{video}}s　auxiliary {{aux}}s",
+            "section_stream": "③ First token and continuous output",
+            "stream_desc": "Header wait and first token are merged into one first-byte delay: endpoint failover is allowed before HTTP 200, and only a safe finalize after it.",
+            "auto_summary": "e.g. max wait = 47MB ÷ 2Mbps × 1.4 ≈ {{big}}s;"
         },
         "cloudflared": {
             "title": "Public Access (Cloudflared)",
@@ -1441,6 +1545,10 @@
             "reset_mapping": "Reset Mapping",
             "add_mapping": "Add Mapping",
             "current_list": "Custom List",
+            "expose_public": "Public",
+            "expose_hidden": "Internal",
+            "expose_public_tip": "Publicly exposed to /v1/models and agent menus (click to switch to internal)",
+            "expose_hidden_tip": "Dark route: internally forwarded, hidden from model listings (click to expose)",
             "no_custom_mapping": "No custom mappings yet",
             "gemini3_only_warning": "⚠️ Gemini 3 series only",
             "default_suffix": " (Default)",
@@ -1523,7 +1631,8 @@
             "sync_confirm_title": "Sync Confirmation",
             "sync_confirm_message": "Ready to sync {{name}} configuration. ⚠️ Warning: This will overwrite your existing local configuration files (e.g. login tokens, API Keys). Are you sure you want to continue?",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "hermes_sync": {
@@ -1757,7 +1866,7 @@
             "out_tokens_title": "Output Tokens",
             "ttft_prefix": "TTFT:",
             "total_duration_title": "Total Latency",
-            "ttft_title": "Time to First Token (TTFT)"
+            "ttft_title": "Time to First Token"
         },
         "details": {
             "title": "Request Details",
@@ -1781,10 +1890,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "No Wrap",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3-Column",
+            "layout_3col_title": "3-Column horizontal side-by-side view",
+            "layout_postman": "Postman Style",
+            "layout_postman_title": "Postman style split view",
+            "export_menu": "Export / Copy",
+            "export_menu_title": "Export HAR, copy as cURL or full diagnostic JSON",
+            "copy_har": "Copy HAR Payload",
+            "download_har": "Download .har File",
+            "copy_curl": "Copy as cURL Command",
+            "copy_full_json": "Copy Full Diagnostic JSON",
+            "copied_har": "Copied HAR",
+            "exported_har": "Exported .har",
+            "copied_curl": "Copied cURL",
+            "copied_full_json": "Copied Full JSON",
+            "collapse_metadata": "Collapse Metadata",
+            "expand_metadata": "Expand Metadata",
+            "collapse_metadata_title": "Collapse metadata to expand payload viewport",
+            "expand_metadata_title": "Expand metadata information",
+            "wrap": "Wrap",
+            "wrap_on_title": "Current: Auto wrap (click for single line)",
+            "wrap_off_title": "Current: Single line (click for auto wrap)",
+            "case_sensitive_on": "Case-sensitive enabled",
+            "case_sensitive_off": "Click to enable case-sensitive",
+            "clear_search": "Clear search",
+            "no_match": "No matches",
+            "prev_match": "Previous (Shift+Enter)",
+            "next_match": "Next (Enter)",
+            "lines_count": "lines",
+            "expand": "Expand",
+            "collapse": "Collapse",
+            "req_headers": "Request Headers",
+            "upstream_headers": "Forwarded Headers",
+            "resp_headers": "Response Headers",
+            "param_key": "Param Key",
+            "param_value": "Param Value",
+            "header_key": "Header Key",
+            "header_value": "Header Value"
         },
         "timing": {
             "title": "Stage Timing Diagnostics",
@@ -1794,7 +1940,7 @@
             "norm_desc": "Model routing / account scheduling / Gemini format conversion",
             "thinking": "Thinking & Signature Fill",
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
-            "ttft": "Time To First Token (TTFT)",
+            "ttft": "Time To First Token",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
             "ttft_pure": "Time To First Token (Pure TTFT)",
             "ttft_pure_desc": "Effective endpoint request dispatch to first SSE token chunk arrival",
@@ -1814,7 +1960,12 @@
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "Collapse Timing Diagnostics",
+            "expand": "Expand Timing Diagnostics",
+            "endpoint_label": "Endpoint",
+            "status_label": "Status",
+            "network_timeout_or_error": "Network Timeout / Error"
         },
         "dialog": {
             "clear_title": "Clear Proxy Logs",
@@ -1883,6 +2034,7 @@
         "title": "Secure Access Control",
         "desc": "Running in Web mode. Please enter management password or API Key to access.",
         "placeholder": "Enter management password or API Key",
+        "remember_me": "Remember login credentials",
         "btn_login": "Verify and Enter",
         "btn_verifying": "Verifying...",
         "error_invalid_key": "Invalid password or API Key, please try again",
@@ -1914,6 +2066,10 @@
         "by_account": "By Account",
         "by_model": "By Model",
         "by_account_view": "By Account",
+        "perspective_routed": "Routed Model",
+        "perspective_requested": "Requested Model",
+        "perspective_routed_tip": "Aggregate stats by actually executed/routed model",
+        "perspective_requested_tip": "Aggregate stats by original client requested model",
         "model_details": "Model Breakdown",
         "account_details": "Account Breakdown",
         "model": "Model",
@@ -2060,7 +2216,10 @@
         "cockpit_view_detail": "Details",
         "cockpit_tab_accounts": "Accounts",
         "cockpit_tab_models": "Models",
-        "cockpit_tab_users": "Users"
+        "cockpit_tab_users": "Users",
+        "avg_ttft": "TTFT",
+        "ttft": "TTFT",
+        "avg_ttft_tip": "Average Time To First Token"
     },
     "errors": {
         "stream": {
@@ -2227,6 +2386,7 @@
     "apiKeyFun": {
         "title": "APIKEY.FUN Hub",
         "eyebrow": "Hub",
+        "double11Badge": "Double 11 Promo",
         "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
         "viewNow": "View Now",
         "usage": {
@@ -2289,5 +2449,18 @@
         "confirm": "Clear Now",
         "cancel": "Cancel",
         "success": "Thinking block cache cleared successfully and will rebuild automatically."
+    },
+    "pedal": {
+        "notice_title": "{{model}} Weekly Quota Resetting Soon!",
+        "notice_desc": "The following accounts have weekly quota resetting within 24 hours. Activate Pedal Quota Mode to prioritize burning them before expiration:",
+        "mode_explanation": "Activating will set these accounts to the highest scheduling priority while keeping other accounts available for session affinity and concurrency spillover. Default priority will be restored automatically once all target quotas reach 0% or reset.",
+        "suppress_button": "Do not prompt again for {{model}}",
+        "activate_button": "Activate Pedal Quota Mode",
+        "banner_running": "🚴 Pedal Quota Mode Running ({{model}})",
+        "banner_priority_badge": "Highest Priority",
+        "banner_suspended_count": "{{count}} accounts suspended",
+        "banner_active_count": "{{count}} accounts to exhaust",
+        "banner_subtext": "Prioritizing imminent accounts with top scheduling priority while keeping others standby for session affinity and concurrency resilience. Default scheduling restores once quotas hit 0% or reset.",
+        "exit_button": "Manual Exit & Restore"
     }
 }

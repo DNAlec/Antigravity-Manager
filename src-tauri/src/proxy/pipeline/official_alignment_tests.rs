@@ -316,7 +316,7 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         update_thinking_budget_config(ThinkingBudgetConfig::default());
 
         struct ResetGuard;
@@ -327,7 +327,7 @@ mod tests {
         }
         let _guard = ResetGuard;
 
-        // 1. Gemini 3.8 Flash High -> official default thinking_budget is -1
+        // 1. Gemini 3.8 Flash High -> 官方已迁移至 thinkingLevel=3（预算字段不再生效）
         let mut gc_high = json!({});
         InboundThinkingPipeline::configure_inbound_thinking(
             "gemini-3.8-flash-high",
@@ -339,9 +339,10 @@ mod tests {
         );
         let tc_high = gc_high.get("thinkingConfig").unwrap();
         assert_eq!(tc_high["includeThoughts"], true);
-        assert_eq!(tc_high["thinkingBudget"], -1);
+        assert_eq!(tc_high["thinkingLevel"], "HIGH");
+        assert!(tc_high.get("thinkingBudget").is_none());
 
-        // 2. Gemini 3.8 Flash Low -> official default thinking_budget is 1000
+        // 2. Gemini 3.8 Flash Low -> thinkingLevel=1 -> LOW
         let mut gc_low = json!({});
         InboundThinkingPipeline::configure_inbound_thinking(
             "gemini-3.8-flash-low",
@@ -353,9 +354,10 @@ mod tests {
         );
         let tc_low = gc_low.get("thinkingConfig").unwrap();
         assert_eq!(tc_low["includeThoughts"], true);
-        assert_eq!(tc_low["thinkingBudget"], 1000);
+        assert_eq!(tc_low["thinkingLevel"], "LOW");
+        assert!(tc_low.get("thinkingBudget").is_none());
 
-        // 3. Gemini 3.8 Flash Medium -> official default thinking_budget is 4000
+        // 3. Gemini 3.8 Flash Medium -> thinkingLevel=2 -> MEDIUM
         let mut gc_med = json!({});
         InboundThinkingPipeline::configure_inbound_thinking(
             "gemini-3.8-flash-medium",
@@ -367,7 +369,8 @@ mod tests {
         );
         let tc_med = gc_med.get("thinkingConfig").unwrap();
         assert_eq!(tc_med["includeThoughts"], true);
-        assert_eq!(tc_med["thinkingBudget"], 4000);
+        assert_eq!(tc_med["thinkingLevel"], "MEDIUM");
+        assert!(tc_med.get("thinkingBudget").is_none());
 
         // 4. Claude Sonnet 4.6 -> official default thinking_budget is 1024
         let mut gc_claude = json!({});
@@ -457,148 +460,98 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_flash_and_tiered_budget_resolution() {
+    fn test_unknown_model_budget_and_official_channels() {
         use crate::proxy::config::{
-            ThinkingBudgetConfig, ThinkingBudgetMode, ThinkingControlSource, TEST_CONFIG_LOCK,
+            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
+            ThinkingControlSource, TEST_CONFIG_LOCK,
         };
         use crate::proxy::model_specs::resolve_custom_budget;
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let mut tb_default = ThinkingBudgetConfig::default();
-        tb_default.control_source = ThinkingControlSource::Gateway;
-        tb_default.flash_mode = ThinkingBudgetMode::Custom;
-        tb_default.flash_high = -1;
-        tb_default.flash_medium = -1;
-        tb_default.flash_low = -1;
-        tb_default.flash_tiered = -1;
+        // 官方已收录模型不再经过 resolve_custom_budget；这里只覆盖“未收录模型”的配置驱动兜底。
+        let mut tb = ThinkingBudgetConfig::default();
+        tb.control_source = ThinkingControlSource::Gateway;
+        tb.mode = ThinkingBudgetMode::Custom;
+        tb.custom_value = 0;
+        tb.flash_high = 16000;
+        tb.flash_medium = 8000;
+        tb.flash_low = 2000;
 
-        // 1. Non-tiered Flash High: 默认 -1
+        // 1. 模型名后缀绝对优先（即使客户端传了相反的 effort）
         assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-high", None, None, &tb_default, None),
-            Some(-1)
-        );
-
-        // 2. Non-tiered Flash Low: 默认 1000
-        assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-low", None, None, &tb_default, None),
-            Some(1000)
-        );
-
-        // 3. Non-tiered Flash Medium: 默认 4000
-        assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-medium", None, None, &tb_default, None),
-            Some(4000)
-        );
-
-        // 4. 用户配置自定义预算时的优先级生效
-        let mut tb_custom = tb_default.clone();
-        tb_custom.flash_high = 16000;
-        tb_custom.flash_low = 2000;
-        tb_custom.flash_medium = 8000;
-        assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-high", None, None, &tb_custom, None),
+            resolve_custom_budget("gemini-9.9-flash-high", None, None, &tb, None),
             Some(16000)
         );
         assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-low", None, None, &tb_custom, None),
+            resolve_custom_budget("gemini-9.9-flash-low", Some("high"), None, &tb, None),
             Some(2000)
         );
         assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-medium", None, None, &tb_custom, None),
+            resolve_custom_budget("gemini-9.9-flash-medium", None, None, &tb, None),
             Some(8000)
         );
 
-        // 5. Tiered 模型：严格按照 client effort (low/med/high) 填充预算
+        // 2. 无后缀时按客户端 effort
         assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-tiered",
-                Some("low"),
-                None,
-                &tb_default,
-                None
-            ),
-            Some(1000)
-        );
-        assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-tiered",
-                Some("medium"),
-                None,
-                &tb_default,
-                None
-            ),
-            Some(4000)
-        );
-        assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-tiered",
-                Some("high"),
-                None,
-                &tb_default,
-                None
-            ),
-            Some(-1)
-        );
-        assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-tiered", None, None, &tb_default, None),
-            Some(-1)
+            resolve_custom_budget("gemini-9.9-flash", Some("high"), None, &tb, None),
+            Some(16000)
         );
 
-        // 5.1 具名后缀绝对优先级测试：
-        // 即使用户/客户端传入了 client_effort = "high"，具名模型 gemini-3.8-flash-medium 也必须返回 medium (4000) 或用户配的 medium！
+        // 3. 客户端数字预算永远不直控（只按配置档位取值）
         assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-medium",
-                Some("high"),
-                None,
-                &tb_default,
-                None
-            ),
-            Some(4000)
-        );
-        assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-low",
-                Some("high"),
-                None,
-                &tb_default,
-                None
-            ),
-            Some(1000)
+            resolve_custom_budget("gemini-9.9-flash", Some("low"), Some(9999), &tb, None),
+            Some(2000)
         );
 
-        // 5.2 具名模型的 Default 模式回退测试：
-        // 当 flash_mode 为 Default 时，resolve_custom_budget 必须返回 None，以便回落至官方模型目录
-        let mut tb_system_default = tb_default.clone();
-        tb_system_default.flash_mode = ThinkingBudgetMode::Default;
+        // 4. 非 Custom 模式：自适应，不伪造数字
+        let mut tb_default = tb.clone();
+        tb_default.mode = ThinkingBudgetMode::Default;
         assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-medium",
-                None,
-                None,
-                &tb_system_default,
-                None
-            ),
-            None
-        );
-        assert_eq!(
-            resolve_custom_budget("gemini-3.8-flash-low", None, None, &tb_system_default, None),
-            None
-        );
-        assert_eq!(
-            resolve_custom_budget(
-                "gemini-3.8-flash-high",
-                None,
-                None,
-                &tb_system_default,
-                None
-            ),
+            resolve_custom_budget("gemini-9.9-flash", None, None, &tb_default, None),
             None
         );
 
-        // 6. Inbound pipeline 配置测试：-1 预算正确注入且 maxOutputTokens 不被截断
+        // 5. Custom + 单值：直接使用用户配置
+        let mut tb_single = tb.clone();
+        tb_single.custom_value = 7777;
+        assert_eq!(
+            resolve_custom_budget("gemini-9.9-flash", None, None, &tb_single, None),
+            Some(7777)
+        );
+
+        // 6. 官方预算通道端到端：只发 thinkingBudget，不发等级
+        let mut gc_budget = json!({});
+        let resolved_budget = InboundThinkingPipeline::configure_inbound_thinking(
+            "gpt-oss-120b-medium",
+            &mut gc_budget,
+            ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(resolved_budget, Some(8192));
+        assert_eq!(gc_budget["thinkingConfig"]["thinkingBudget"], 8192);
+        assert!(gc_budget["thinkingConfig"].get("thinkingLevel").is_none());
+
+        // 7. 官方未收录 + Custom：使用用户配置值
+        update_thinking_budget_config(tb_single.clone());
+        let mut gc_custom = json!({});
+        let resolved_custom = InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-9.9-flash",
+            &mut gc_custom,
+            ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(resolved_custom, Some(7777));
+        assert_eq!(gc_custom["thinkingConfig"]["thinkingBudget"], 7777);
+        assert!(gc_custom["thinkingConfig"].get("thinkingLevel").is_none());
+        update_thinking_budget_config(ThinkingBudgetConfig::default());
+
+        // 8. Inbound pipeline：具名档位模型走等级通道，且等级由模型档位决定（不受 client effort 影响）
         let mut gc = json!({});
         InboundThinkingPipeline::configure_inbound_thinking(
             "gemini-3.8-flash-high",
@@ -608,9 +561,9 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(gc["thinkingConfig"]["thinkingBudget"], -1);
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "HIGH");
         assert_eq!(gc["thinkingConfig"]["includeThoughts"], true);
-        assert!(gc["thinkingConfig"].get("thinkingLevel").is_none());
+        assert!(gc["thinkingConfig"].get("thinkingBudget").is_none());
 
         // 7. Argon 系列必须输出 thinkingLevel，严禁输出 thinkingBudget！
         let mut gc_argon = json!({});
@@ -635,7 +588,7 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Client;
         update_thinking_budget_config(config);
@@ -706,7 +659,7 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Client;
         update_thinking_budget_config(config);
@@ -780,7 +733,7 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Client;
         update_thinking_budget_config(config);
@@ -867,7 +820,7 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut tb = ThinkingBudgetConfig::default();
         tb.flash_mode = ThinkingBudgetMode::Custom;
         tb.flash_low = 0;

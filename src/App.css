@@ -30,13 +30,15 @@ body,
   border: none;
 }
 
-/* Mini 悬浮窗强制全透明，彻底消除直角白边/黑边，透出真实桌面圆角与阴影 */
+/* Mini 悬浮窗强制全透明，彻底消除直角白边/黑边与滚动条直角，透出真实桌面圆角与阴影 */
 html.mini-window,
 html.mini-window body,
 body.mini-window,
-#root.mini-root {
+#root.mini-root,
+html.mini-window #root {
   background: transparent !important;
   background-color: transparent !important;
+  overflow: hidden !important;
 }
 
 /* 主窗口浅色与暗色默认背景 */
@@ -76,7 +78,7 @@ body:not(.mini-window) {
 }
 
 /* Dark mode override for body strictly */
-.dark body {
+.dark body:not(.mini-window) {
   background-color: #0f172a;
   color: #f8fafc;
 }
@@ -99,67 +101,79 @@ a {
   text-decoration: none;
 }
 
-/* 滚动条优化 - 彻底隐藏但保留功能 */
-::-webkit-scrollbar {
-  width: 0px;
-  background: transparent;
-}
+/* ==================== 滚动条体系极简美化 (Issue #3768) ==================== */
+/* 
+ * 1. 4px 极细微轮廓，不占内容空间
+ * 2. 默认不滚动时 100% 透明隐藏（不遮挡视线、不碍眼）
+ * 3. 仅在滚动发生时 (data-scrolling="true") 平滑淡入，停止滚动 1s 后平滑淡出
+ * 4. 鼠标直接触碰或拖拽滑块时高亮显示
+ */
 
-::-webkit-scrollbar-track {
-  background-color: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background-color: rgba(0, 0, 0, 0.1);
-  border-radius: 99px;
-  border: 3px solid transparent;
-  background-clip: content-box;
-  transition: background-color 0.2s;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(0, 0, 0, 0.3);
-}
-
-/* 日志报文虚拟滚动条 - 高性能高对比度响应式滚动条 */
-.payload-viewer-scroll {
-  scroll-behavior: auto !important;
-  overflow-anchor: none;
+* {
   scrollbar-width: thin;
-  scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+  scrollbar-color: transparent transparent;
 }
 
-.payload-viewer-scroll::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+*[data-scrolling="true"] {
+  scrollbar-color: rgba(148, 163, 184, 0.45) transparent;
 }
 
-.payload-viewer-scroll::-webkit-scrollbar-track {
+.dark *[data-scrolling="true"] {
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+
+/* 全局统一接管 WebKit 滚动条（4px 极细胶囊） */
+*::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
   background-color: transparent;
 }
 
-.payload-viewer-scroll::-webkit-scrollbar-thumb {
-  background-color: rgba(156, 163, 175, 0.45);
-  border-radius: 99px;
-  border: 2px solid transparent;
-  background-clip: content-box;
-  transition: background-color 0.15s;
+*::-webkit-scrollbar-track {
+  background-color: transparent;
 }
 
-.payload-viewer-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(107, 114, 128, 0.75);
+*::-webkit-scrollbar-corner {
+  background: transparent !important;
 }
 
-.dark .payload-viewer-scroll {
-  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+/* 常态（不滚动、未触碰）：完全透明，默认不显示 */
+*::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 9999px;
+  transition: background-color 0.3s ease;
 }
 
-.dark .payload-viewer-scroll::-webkit-scrollbar-thumb {
-  background-color: rgba(148, 163, 184, 0.4);
+/* 仅在滚动时显示滑块 (通过全局 capture scroll 事件注入 data-scrolling) */
+*[data-scrolling="true"]::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.45);
 }
 
-.dark .payload-viewer-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(148, 163, 184, 0.7);
+.dark *[data-scrolling="true"]::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
+/* 鼠标直接悬停在滑块或拖拽滑块时高亮 */
+*::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:active {
+  background-color: rgba(100, 116, 139, 0.8) !important;
+}
+
+.dark *::-webkit-scrollbar-thumb:hover,
+.dark *::-webkit-scrollbar-thumb:active {
+  background-color: rgba(255, 255, 255, 0.5) !important;
+}
+
+/* 纯粹隐藏滚动条实用类 */
+.scrollbar-none {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
 
 /* View Transitions API 主题切换动画 */

@@ -353,6 +353,9 @@ pub struct GeminiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<Candidate>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "promptFeedback")]
+    pub prompt_feedback: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<UsageMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]

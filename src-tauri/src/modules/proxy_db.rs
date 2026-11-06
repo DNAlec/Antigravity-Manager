@@ -1,15 +1,38 @@
 use crate::proxy::config::LogRetentionConfig;
 use crate::proxy::monitor::ProxyRequestLog;
+use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rusqlite::{params, Connection, OpenFlags};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+struct ToolSignatureWriteDb {
+    path: PathBuf,
+    conn: Connection,
+    writes_since_prune: usize,
+    last_prune_ms: i64,
+}
 
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
-static TOOL_SIGNATURE_DB: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = OnceLock::new();
+struct ToolSigReadPool {
+    path: PathBuf,
+    conns: Vec<Arc<Mutex<Connection>>>,
+    next: AtomicUsize,
+}
+
+static TOOL_SIGNATURE_DB: OnceLock<Mutex<Option<Arc<ToolSigReadPool>>>> = OnceLock::new();
+static TOOL_SIGNATURE_WRITE_DB: OnceLock<Mutex<Option<ToolSignatureWriteDb>>> = OnceLock::new();
+static TOOL_SIG_GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+static TOOL_SIG_KEY_EPOCH_SEQ: AtomicU64 = AtomicU64::new(1);
+static TOOL_SIG_KEY_EPOCHS: OnceLock<DashMap<String, u64>> = OnceLock::new();
+
+const TOOL_SIG_PRUNE_WRITE_INTERVAL: usize = 128;
+const TOOL_SIG_PRUNE_TIME_INTERVAL_MS: i64 = 5 * 60 * 1000;
 
 const THOUGHT_RAW_MAGIC: &[u8] = b"RAW1";
 const THOUGHT_GZIP_MAGIC: &[u8] = b"AGZ1";
@@ -501,6 +524,8 @@ pub fn init_db() -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS idx_tool_sig_created ON tool_signatures (created_at DESC)",
         [],
     );
+    let profile = crate::proxy::cache_profile();
+    let _ = prune_tool_signatures(&conn, profile.max_rows, profile.retention_days);
 
     drop(conn);
     migrate_thinking_from_logs()?;
@@ -542,48 +567,132 @@ fn map_request_log_row(row: &rusqlite::Row) -> rusqlite::Result<ProxyRequestLog>
 }
 
 pub const MAX_TOOL_SIGNATURES_ROWS: usize = 10_000;
-pub const TOOL_SIGNATURES_TTL_DAYS: i64 = 7;
+pub const TOOL_SIGNATURES_TTL_DAYS: i64 = 10;
 
-/// 淘汰与修剪 tool_signatures 表（Defect 12: 限制 10,000 行上限与 7 天 TTL 淘汰）
+/// 淘汰与修剪 tool_signatures 表（限制 10,000 行与 10 天滑动 TTL 淘汰）
 pub fn prune_tool_signatures(
     conn: &Connection,
     max_rows: usize,
     ttl_days: i64,
 ) -> Result<usize, String> {
+    const PRUNE_BATCH: i64 = 1000;
+    const MAX_PRUNE_BATCHES: usize = 20;
     let mut total_deleted = 0;
 
-    // 1. TTL 淘汰：删除超过 ttl_days (默认 7 天) 的陈旧工具签名
+    // 1. TTL 淘汰：按“最后使用时间”（created_at 现在表示 last-used）分批清理，避免长事务阻塞写锁
     if ttl_days > 0 {
         let cutoff = chrono::Utc::now().timestamp_millis() - (ttl_days * 24 * 3600 * 1000);
-        let deleted = conn
-            .execute(
-                "DELETE FROM tool_signatures WHERE created_at < ?1",
-                params![cutoff],
-            )
-            .map_err(|e| e.to_string())?;
-        total_deleted += deleted;
+        for _ in 0..MAX_PRUNE_BATCHES {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM tool_signatures WHERE tool_id IN (
+                        SELECT tool_id FROM tool_signatures WHERE created_at < ?1 LIMIT ?2
+                    )",
+                    params![cutoff, PRUNE_BATCH],
+                )
+                .map_err(|e| e.to_string())?;
+            total_deleted += deleted;
+            if (deleted as i64) < PRUNE_BATCH {
+                break;
+            }
+        }
     }
 
-    // 2. 数量上限淘汰：若总行数超出 max_rows (默认 10,000)，淘汰 created_at 最早的超额行
+    // 2. 数量上限淘汰：按最后使用时间最旧的分批淘汰，保留热/活跃签名
     if max_rows > 0 {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tool_signatures", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         if count > max_rows as i64 {
-            let excess = count - max_rows as i64;
-            let deleted = conn
-                .execute(
-                    "DELETE FROM tool_signatures WHERE tool_id IN (
-                        SELECT tool_id FROM tool_signatures ORDER BY created_at ASC LIMIT ?1
-                    )",
-                    params![excess],
-                )
-                .map_err(|e| e.to_string())?;
-            total_deleted += deleted;
+            let mut excess = count - max_rows as i64;
+            for _ in 0..MAX_PRUNE_BATCHES {
+                let batch = excess.min(PRUNE_BATCH);
+                let deleted = conn
+                    .execute(
+                        "DELETE FROM tool_signatures WHERE tool_id IN (
+                            SELECT tool_id FROM tool_signatures ORDER BY created_at ASC LIMIT ?1
+                        )",
+                        params![batch],
+                    )
+                    .map_err(|e| e.to_string())?;
+                total_deleted += deleted;
+                excess -= deleted as i64;
+                if deleted == 0 || excess <= 0 {
+                    break;
+                }
+            }
         }
     }
 
     Ok(total_deleted)
+}
+
+#[inline]
+pub(crate) fn current_tool_sig_epochs(tool_id: &str) -> (u64, u64) {
+    let global_epoch = TOOL_SIG_GLOBAL_EPOCH.load(Ordering::Acquire);
+    let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id);
+    let key_epoch = TOOL_SIG_KEY_EPOCHS
+        .get()
+        .and_then(|map| map.get(norm_id.as_ref()).map(|v| *v))
+        .unwrap_or(0);
+    (global_epoch, key_epoch)
+}
+
+#[inline]
+fn bump_tool_sig_global_epoch() {
+    if let Some(map) = TOOL_SIG_KEY_EPOCHS.get() {
+        map.clear();
+    }
+    TOOL_SIG_GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn bump_tool_sig_key_epoch(norm_id: &str) {
+    let next_epoch = TOOL_SIG_KEY_EPOCH_SEQ.fetch_add(1, Ordering::AcqRel);
+    let map = TOOL_SIG_KEY_EPOCHS.get_or_init(DashMap::new);
+    if map.len() >= MAX_TOOL_SIGNATURES_ROWS * 2 && !map.contains_key(norm_id) {
+        map.clear();
+        TOOL_SIG_GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+    map.insert(norm_id.to_string(), next_epoch);
+}
+
+fn with_tool_signature_write_db<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut ToolSignatureWriteDb) -> Result<T, String>,
+{
+    let db_path = get_proxy_db_path()?;
+    let mut guard = TOOL_SIGNATURE_WRITE_DB
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().map(|s| &s.path) != Some(&db_path) {
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        apply_fast_pragmas(&conn)?;
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1);
+        *guard = Some(ToolSignatureWriteDb {
+            path: db_path,
+            conn,
+            writes_since_prune: 0,
+            last_prune_ms: now_ms,
+        });
+    }
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "tool signature write db was not initialized".to_string())?;
+    f(state)
+}
+
+fn maybe_prune_tool_signatures(state: &mut ToolSignatureWriteDb, added_writes: usize, now_ms: i64) {
+    state.writes_since_prune = state.writes_since_prune.saturating_add(added_writes);
+    let should_prune = state.last_prune_ms == 0
+        || state.writes_since_prune >= TOOL_SIG_PRUNE_WRITE_INTERVAL
+        || now_ms.saturating_sub(state.last_prune_ms) >= TOOL_SIG_PRUNE_TIME_INTERVAL_MS;
+    if should_prune {
+        let profile = crate::proxy::cache_profile();
+        let _ = prune_tool_signatures(&state.conn, profile.max_rows, profile.retention_days);
+        state.writes_since_prune = 0;
+        state.last_prune_ms = now_ms.max(1);
+    }
 }
 
 pub fn save_tool_signature(tool_id: &str, signature: &str) -> Result<(), String> {
@@ -595,16 +704,174 @@ pub fn save_tool_signature(tool_id: &str, signature: &str) -> Result<(), String>
         Some(s) => s,
         None => return Ok(()),
     };
-    let conn = connect_db()?;
     let now = chrono::Utc::now().timestamp_millis();
-    conn.execute(
-        "INSERT OR REPLACE INTO tool_signatures (tool_id, signature, created_at) VALUES (?1, ?2, ?3)",
-        params![norm_id.as_ref(), healed_sig, now],
-    )
-    .map_err(|e| e.to_string())?;
+    with_tool_signature_write_db(|state| {
+        {
+            let mut stmt = state
+                .conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO tool_signatures (tool_id, signature, created_at) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.execute(params![norm_id.as_ref(), healed_sig, now])
+                .map_err(|e| e.to_string())?;
+        }
+        bump_tool_sig_key_epoch(norm_id.as_ref());
+        maybe_prune_tool_signatures(state, 1, now);
+        Ok(())
+    })
+}
 
-    let _ = prune_tool_signatures(&conn, MAX_TOOL_SIGNATURES_ROWS, TOOL_SIGNATURES_TTL_DAYS);
-    Ok(())
+pub fn save_tool_signatures_batch_if_current(
+    entries: &[(String, String, u64)],
+) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut normalized = Vec::with_capacity(entries.len());
+    for (tool_id, signature, seq) in entries {
+        if tool_id.is_empty() || signature.is_empty() {
+            continue;
+        }
+        if !crate::proxy::SignatureCache::is_persist_entry_current(tool_id, *seq) {
+            continue;
+        }
+        if let Some(healed_sig) = normalize_and_heal_signature(signature) {
+            let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id).into_owned();
+            normalized.push((norm_id, healed_sig, *seq));
+        }
+    }
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    with_tool_signature_write_db(|state| {
+        let mut written_ids = Vec::with_capacity(normalized.len());
+        {
+            let tx = state
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO tool_signatures (tool_id, signature, created_at) VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for (id, sig, seq) in &normalized {
+                    if crate::proxy::SignatureCache::is_persist_entry_current(id, *seq) {
+                        stmt.execute(params![id, sig, now])
+                            .map_err(|e| e.to_string())?;
+                        written_ids.push(id.as_str());
+                    }
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        let count = written_ids.len();
+        if count > 0 {
+            for id in written_ids {
+                bump_tool_sig_key_epoch(id);
+            }
+            maybe_prune_tool_signatures(state, count, now);
+        }
+        Ok(count)
+    })
+}
+
+#[cfg(test)]
+pub fn save_tool_signatures_batch(entries: &[(String, String)]) -> Result<usize, String> {
+    let tagged: Vec<(String, String, u64)> = entries
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.clone(),
+                crate::proxy::SignatureCache::allocate_persist_seq_for_test(),
+            )
+        })
+        .collect();
+    save_tool_signatures_batch_if_current(&tagged)
+}
+
+/// 滑动续期：仅当最后使用时间超过 24h 时更新，避免每次使用都产生写放大。
+pub fn touch_tool_signature(tool_id: &str, now_ms: i64) -> Result<usize, String> {
+    if tool_id.is_empty() {
+        return Ok(0);
+    }
+    let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id);
+    let threshold = now_ms.saturating_sub(24 * 3600 * 1000);
+    with_tool_signature_write_db(|state| {
+        let mut stmt = state
+            .conn
+            .prepare_cached(
+                "UPDATE tool_signatures SET created_at = ?1 WHERE tool_id = ?2 AND created_at < ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.execute(params![now_ms, norm_id.as_ref(), threshold])
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub fn touch_tool_signatures_batch(entries: &[(String, i64)]) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    with_tool_signature_write_db(|state| {
+        let tx = state
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut updated = 0usize;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "UPDATE tool_signatures SET created_at = ?1 WHERE tool_id = ?2 AND created_at < ?3",
+                )
+                .map_err(|e| e.to_string())?;
+            for (tool_id, at) in entries {
+                if tool_id.is_empty() {
+                    continue;
+                }
+                let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id);
+                let threshold = at.saturating_sub(24 * 3600 * 1000);
+                updated += stmt
+                    .execute(params![at, norm_id.as_ref(), threshold])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(updated)
+    })
+}
+
+fn tool_sig_read_pool(db_path: &PathBuf) -> Result<Arc<ToolSigReadPool>, String> {
+    let pool_size = crate::proxy::cache_profile().read_pool_size.max(1);
+    let mut guard = TOOL_SIGNATURE_DB
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().map(|p| &p.path) != Some(db_path) {
+        let mut conns = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+            let _ = conn.pragma_update(None, "cache_size", -8000);
+            conns.push(Arc::new(Mutex::new(conn)));
+        }
+        *guard = Some(Arc::new(ToolSigReadPool {
+            path: db_path.clone(),
+            conns,
+            next: AtomicUsize::new(0),
+        }));
+    }
+    Ok(guard
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "tool signature read pool was not initialized".to_string())?)
 }
 
 pub fn load_tool_signature(tool_id: &str) -> Result<Option<String>, String> {
@@ -613,50 +880,35 @@ pub fn load_tool_signature(tool_id: &str) -> Result<Option<String>, String> {
     }
     let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id);
     let db_path = get_proxy_db_path()?;
-    let found = {
-        let mut db = TOOL_SIGNATURE_DB
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .map_err(|e| format!("tool signature db lock: {e}"))?;
-        if db.as_ref().map(|(path, _)| path) != Some(&db_path) {
-            let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| e.to_string())?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| e.to_string())?;
-            *db = Some((db_path, conn));
-        }
-        let conn = &db
-            .as_ref()
-            .ok_or("tool signature db was not initialized")?
-            .1;
-        let mut stmt = conn
-            .prepare_cached("SELECT signature FROM tool_signatures WHERE tool_id = ?1 LIMIT 1")
+    let pool = tool_sig_read_pool(&db_path)?;
+    let idx = pool.next.fetch_add(1, Ordering::Relaxed) % pool.conns.len();
+    let conn = pool.conns[idx].lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt = conn
+        .prepare_cached("SELECT signature FROM tool_signatures WHERE tool_id = ?1 LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    let found: Option<String> = {
+        let mut rows = stmt
+            .query(params![norm_id.as_ref()])
             .map_err(|e| e.to_string())?;
-        let res: Option<String> = {
-            let mut rows = stmt
-                .query(params![norm_id.as_ref()])
-                .map_err(|e| e.to_string())?;
-            if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                let sig: String = row.get(0).map_err(|e| e.to_string())?;
-                Some(sig)
-            } else {
-                None
-            }
-        };
-        if res.is_some() {
-            res
-        } else if norm_id.as_ref() != tool_id {
-            let mut rows = stmt.query(params![tool_id]).map_err(|e| e.to_string())?;
-            if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                let sig: String = row.get(0).map_err(|e| e.to_string())?;
-                Some(sig)
-            } else {
-                None
-            }
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            Some(row.get(0).map_err(|e| e.to_string())?)
         } else {
             None
         }
     };
+    let found = if found.is_some() {
+        found
+    } else if norm_id.as_ref() != tool_id {
+        let mut rows = stmt.query(params![tool_id]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            Some(row.get(0).map_err(|e| e.to_string())?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if let Some(sig) = found {
         if let Some(healed) = normalize_and_heal_signature(&sig) {
             if healed != sig {
@@ -666,6 +918,43 @@ pub fn load_tool_signature(tool_id: &str) -> Result<Option<String>, String> {
         }
     }
     Ok(None)
+}
+
+/// 批量读取签名：一个请求一次 IN 查询，避免逐工具点查 SQLite。
+pub fn load_tool_signatures_batch(tool_ids: &[String]) -> Result<HashMap<String, String>, String> {
+    if tool_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let db_path = get_proxy_db_path()?;
+    let pool = tool_sig_read_pool(&db_path)?;
+    let idx = pool.next.fetch_add(1, Ordering::Relaxed) % pool.conns.len();
+    let conn = pool.conns[idx].lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut out = HashMap::new();
+    for chunk in tool_ids.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT tool_id, signature FROM tool_signatures WHERE tool_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str())),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, sig) = row.map_err(|e| e.to_string())?;
+            if let Some(healed) = normalize_and_heal_signature(&sig) {
+                out.insert(id, healed);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -1296,14 +1585,37 @@ pub fn delete_tool_signatures_for_session(session_key: &str) -> Result<usize, St
     if clean_key.is_empty() {
         return Ok(0);
     }
-    let conn = connect_db()?;
     let p1 = format!("{clean_key}\u{1f}%");
     let p2 = format!("%:{clean_key}\u{1f}%");
-    conn.execute(
-        "DELETE FROM tool_signatures WHERE tool_id LIKE ?1 OR tool_id LIKE ?2",
-        params![p1, p2],
-    )
-    .map_err(|e| e.to_string())
+    with_tool_signature_write_db(|state| {
+        let _ = crate::proxy::SignatureCache::bump_session_persist_floor(clean_key);
+        let deleted = {
+            let mut stmt = state
+                .conn
+                .prepare_cached(
+                    "DELETE FROM tool_signatures WHERE tool_id LIKE ?1 OR tool_id LIKE ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.execute(params![p1, p2]).map_err(|e| e.to_string())?
+        };
+        if deleted > 0 {
+            bump_tool_sig_global_epoch();
+        }
+        Ok(deleted)
+    })
+}
+
+pub fn clear_tool_signatures() -> Result<usize, String> {
+    with_tool_signature_write_db(|state| {
+        let _ = crate::proxy::SignatureCache::bump_global_persist_floor();
+        let deleted = state
+            .conn
+            .execute("DELETE FROM tool_signatures", [])
+            .map_err(|e| e.to_string())?;
+        state.writes_since_prune = 0;
+        bump_tool_sig_global_epoch();
+        Ok(deleted)
+    })
 }
 
 pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
@@ -1383,6 +1695,21 @@ pub fn purge_foreign_signatures_for_session(session_key: &str) -> Result<usize, 
     purge_foreign_signatures_for_session_with_model(session_key, "gemini")
 }
 
+/// [Signature-Retry] 让一个会话的全部签名失效（保留思考文本），用于上游 400 签名错误后的重试。
+pub fn clear_thinking_signatures_for_session(session_key: &str) -> Result<usize, String> {
+    if session_key.is_empty() {
+        return Ok(0);
+    }
+    let conn = thinking_db()?;
+    let updated = conn
+        .execute(
+            "UPDATE thinking_records SET signature = NULL WHERE session_key = ?1 AND signature IS NOT NULL",
+            params![session_key],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
 /// 全量清空思考块数据库 (仅清空 thinking_records / thinking_sessions / tool_signatures，绝不触碰 request_logs 日志)
 pub fn clear_all_thinking_data() -> Result<usize, String> {
     let mut total_deleted = 0;
@@ -1396,11 +1723,16 @@ pub fn clear_all_thinking_data() -> Result<usize, String> {
     let _ = conn.execute("VACUUM", []);
 
     // 2. 清空 proxy_logs.db 中残留的历史工具签名表与陈旧思考表 (绝不触碰 request_logs)
-    if let Ok(log_conn) = connect_db() {
-        let _ = log_conn.execute("DELETE FROM tool_signatures", []);
-        let _ = log_conn.execute("DELETE FROM thinking_records", []);
-        let _ = log_conn.execute("DELETE FROM thinking_sessions", []);
-    }
+    // 与后台批量写线程复用同一写连接锁，并在锁内提升全局持久化代际水位，保证单调防复活
+    let _ = with_tool_signature_write_db(|state| {
+        let _ = crate::proxy::SignatureCache::bump_global_persist_floor();
+        let _ = state.conn.execute("DELETE FROM tool_signatures", []);
+        let _ = state.conn.execute("DELETE FROM thinking_records", []);
+        let _ = state.conn.execute("DELETE FROM thinking_sessions", []);
+        state.writes_since_prune = 0;
+        bump_tool_sig_global_epoch();
+        Ok(())
+    });
 
     Ok(total_deleted)
 }
@@ -1925,7 +2257,7 @@ mod tool_signature_tests {
         assert_eq!(load_tool_signature("missing").unwrap(), None);
         {
             let db = TOOL_SIGNATURE_DB.get().unwrap().lock().unwrap();
-            let conn = &db.as_ref().unwrap().1;
+            let conn = db.as_ref().unwrap().conns[0].lock().unwrap();
             assert!(conn.is_readonly(rusqlite::DatabaseName::Main).unwrap());
             // A connection-local setting detects accidental reopening on a miss.
             conn.pragma_update(None, "cache_size", -1234).unwrap();
@@ -1935,7 +2267,7 @@ mod tool_signature_tests {
         }
         {
             let db = TOOL_SIGNATURE_DB.get().unwrap().lock().unwrap();
-            let conn = &db.as_ref().unwrap().1;
+            let conn = db.as_ref().unwrap().conns[0].lock().unwrap();
             assert_eq!(
                 conn.pragma_query_value::<i64, _>(None, "cache_size", |r| r.get(0))
                     .unwrap(),
@@ -1976,9 +2308,15 @@ mod tool_signature_tests {
             save_tool_signature("tool", &signature).unwrap();
             assert_eq!(load_tool_signature("tool").unwrap(), Some(signature));
             TOOL_SIGNATURE_DB.get().unwrap().lock().unwrap().take();
+            if let Some(w) = TOOL_SIGNATURE_WRITE_DB.get() {
+                w.lock().unwrap().take();
+            }
         }
         assert_eq!(load_tool_signature("tool").unwrap(), Some(replacement));
         TOOL_SIGNATURE_DB.get().unwrap().lock().unwrap().take();
+        if let Some(w) = TOOL_SIGNATURE_WRITE_DB.get() {
+            w.lock().unwrap().take();
+        }
     }
 
     #[test]
@@ -2091,21 +2429,137 @@ mod tool_signature_tests {
             .unwrap();
         assert_eq!(count, 1);
 
-        // Now calling save_tool_signature should automatically trigger pruning of expired entries
+        // Reaching the amortized write threshold triggers pruning of expired entries
         let sig = "s".repeat(60);
+        for i in 1..TOOL_SIG_PRUNE_WRITE_INTERVAL {
+            save_tool_signature(&format!("warmup_tool_{i}"), &sig).unwrap();
+        }
         save_tool_signature("new_tool", &sig).unwrap();
 
-        // Expired signature must have been pruned, only new_tool remains
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tool_signatures", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, 1);
+        // Expired signature must have been pruned, while fresh entries remain
+        let expired_found = load_tool_signature("expired_tool").unwrap();
+        assert_eq!(expired_found, None);
 
         let new_found = load_tool_signature("new_tool").unwrap();
         assert_eq!(new_found, Some(sig));
+        if let Some(r) = TOOL_SIGNATURE_DB.get() {
+            r.lock().unwrap().take();
+        }
+        if let Some(w) = TOOL_SIGNATURE_WRITE_DB.get() {
+            w.lock().unwrap().take();
+        }
+    }
 
-        let expired_found = load_tool_signature("expired_tool").unwrap();
-        assert_eq!(expired_found, None);
+    #[test]
+    fn test_save_tool_signature_reuses_write_connection_and_throttles_pruning() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let sig = "s".repeat(60);
+
+        // 1. First write initializes persistent write connection without synchronous full-table prune
+        save_tool_signature("tool_init", &sig).unwrap();
+        let (writes_after_init, last_prune_after_init) = {
+            let guard = TOOL_SIGNATURE_WRITE_DB
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = guard.as_ref().unwrap();
+            // Sentinel connection-local pragma detects accidental connection reopening
+            state.conn.pragma_update(None, "cache_size", -2345).unwrap();
+            (state.writes_since_prune, state.last_prune_ms)
+        };
+        assert_eq!(writes_after_init, 1);
+        assert!(last_prune_after_init > 0);
+
+        // 2. Insert an expired row out-of-band; subsequent writes below threshold must NOT scan/prune
+        let inspect_conn = connect_db().unwrap();
+        let expired = chrono::Utc::now().timestamp_millis() - (15 * 24 * 3600 * 1000);
+        inspect_conn
+            .execute(
+                "INSERT INTO tool_signatures (tool_id, signature, created_at) VALUES (?1, ?2, ?3)",
+                params!["out_of_band_expired", &sig, expired],
+            )
+            .unwrap();
+
+        for i in 2..TOOL_SIG_PRUNE_WRITE_INTERVAL {
+            save_tool_signature(&format!("tool_fast_{i}"), &sig).unwrap();
+        }
+
+        // Write connection was reused (sentinel cache_size preserved) and prune was throttled
+        let (reused_cache_size, writes_before_threshold) = {
+            let guard = TOOL_SIGNATURE_WRITE_DB
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = guard.as_ref().unwrap();
+            let cs = state
+                .conn
+                .pragma_query_value::<i64, _>(None, "cache_size", |r| r.get(0))
+                .unwrap();
+            (cs, state.writes_since_prune)
+        };
+        assert_eq!(reused_cache_size, -2345);
+        assert_eq!(writes_before_threshold, TOOL_SIG_PRUNE_WRITE_INTERVAL - 1);
+        let still_present: i64 = inspect_conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_signatures WHERE tool_id = 'out_of_band_expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_present, 1);
+
+        // 3. Hitting TOOL_SIG_PRUNE_WRITE_INTERVAL triggers amortized prune automatically
+        save_tool_signature("tool_trigger_prune", &sig).unwrap();
+        let after_prune: i64 = inspect_conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_signatures WHERE tool_id = 'out_of_band_expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_prune, 0);
+
+        if let Some(r) = TOOL_SIGNATURE_DB.get() {
+            r.lock().unwrap().take();
+        }
+        if let Some(w) = TOOL_SIGNATURE_WRITE_DB.get() {
+            w.lock().unwrap().take();
+        }
+    }
+
+    #[test]
+    fn test_save_tool_signatures_batch_persists_atomically() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let (_, key0_epoch_before) = current_tool_sig_epochs("sess\u{1f}call_0");
+        let (_, untouched_epoch_before) = current_tool_sig_epochs("sess\u{1f}untouched");
+        let sig = "b".repeat(60);
+
+        let batch: Vec<(String, String)> = (0..50)
+            .map(|i| (format!("sess\u{1f}call_{i}"), sig.clone()))
+            .collect();
+        let written = save_tool_signatures_batch(&batch).unwrap();
+        assert_eq!(written, 50);
+        let (_, key0_epoch_after) = current_tool_sig_epochs("sess\u{1f}call_0");
+        let (_, untouched_epoch_after) = current_tool_sig_epochs("sess\u{1f}untouched");
+        assert!(key0_epoch_after > key0_epoch_before);
+        assert_eq!(untouched_epoch_after, untouched_epoch_before);
+
+        assert_eq!(
+            load_tool_signature("sess\u{1f}call_0").unwrap(),
+            Some(sig.clone())
+        );
+        assert_eq!(load_tool_signature("sess\u{1f}call_49").unwrap(), Some(sig));
+
+        if let Some(r) = TOOL_SIGNATURE_DB.get() {
+            r.lock().unwrap().take();
+        }
+        if let Some(w) = TOOL_SIGNATURE_WRITE_DB.get() {
+            w.lock().unwrap().take();
+        }
     }
 }
 

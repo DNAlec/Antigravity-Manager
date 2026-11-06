@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,18 @@ pub struct TtftSample {
     pub timestamp: Instant,
     pub is_thinking: bool,
     pub is_cold_start: bool,
+    /// 未缓存 token 的分桶（桶宽 20K），用于同规模对比，避免拿热缓存小请求当基准
+    pub uncached_bucket: u8,
+}
+
+/// 冷启动样本分桶宽度（未缓存 token）
+const COLD_BUCKET_TOKENS: u32 = 20_000;
+
+/// 判定冷启动是否违规所需的最少同桶基线样本数（低于它只记样本、不判罚）
+const MIN_COLD_PEER_SAMPLES: usize = 3;
+
+fn cold_bucket_of(uncached_tokens: u32) -> u8 {
+    ((uncached_tokens / COLD_BUCKET_TOKENS).min(15)) as u8
 }
 
 /// 裁决动作
@@ -97,6 +110,7 @@ pub struct QoSGuardian {
     pub penalty_memory: Arc<DashMap<String, (usize, Instant)>>,
     /// Each operation copies this policy before acquiring any account-state lock.
     config: RwLock<QoSConfig>,
+    pub auto_jail_enabled: Arc<AtomicBool>,
 }
 
 impl Default for QoSGuardian {
@@ -112,6 +126,7 @@ impl QoSGuardian {
             samples: Arc::new(DashMap::new()),
             session_watermarks: Arc::new(DashMap::new()),
             penalty_memory: Arc::new(DashMap::new()),
+            auto_jail_enabled: Arc::new(AtomicBool::new(false)),
             config: RwLock::new(QoSConfig::default()),
         }
     }
@@ -133,8 +148,34 @@ impl QoSGuardian {
         Ok(())
     }
 
-    /// 获取账号当前 QoS 状态（未记录则默认 Healthy）
+    /// 查询自动限流进小黑屋机制是否启用
+    pub fn is_auto_jail_enabled(&self) -> bool {
+        self.auto_jail_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 设置自动限流进小黑屋机制开关
+    pub fn set_auto_jail_enabled(&self, enabled: bool) {
+        let prev = self.auto_jail_enabled.swap(enabled, Ordering::SeqCst);
+        if prev && !enabled {
+            // 当开关从开启转为关闭时，立即解封清空所有小黑屋与惩罚记忆
+            self.release_all();
+            tracing::info!("🔓 [QoS Guardian] 自动限流进小黑屋已关闭，已清空并解封所有受限账号");
+        } else if !prev && enabled {
+            tracing::info!("🔒 [QoS Guardian] 自动限流进小黑屋已开启");
+        }
+    }
+
+    /// 解封清空所有小黑屋隔离与惩罚记忆，使全池账号恢复为 Healthy
+    pub fn release_all(&self) {
+        self.states.clear();
+        self.penalty_memory.clear();
+    }
+
+    /// 获取账号当前 QoS 状态（未记录或未启用小黑屋则默认 Healthy）
     pub fn get_state(&self, account_id: &str) -> AccountQoSState {
+        if !self.is_auto_jail_enabled() {
+            return AccountQoSState::Healthy;
+        }
         self.states
             .get(account_id)
             .map(|r| r.value().clone())
@@ -143,6 +184,9 @@ impl QoSGuardian {
 
     /// 判断账号是否处于小黑屋或探针探测中（完全不可用于业务调度）
     pub fn is_jailed_or_probing(&self, account_id: &str) -> bool {
+        if !self.is_auto_jail_enabled() {
+            return false;
+        }
         matches!(
             self.get_state(account_id),
             AccountQoSState::Jailed { .. } | AccountQoSState::Probing { .. }
@@ -151,6 +195,9 @@ impl QoSGuardian {
 
     /// 判断账号是否处于瞬态可疑状态（开启只出不进）
     pub fn is_suspicious(&self, account_id: &str) -> bool {
+        if !self.is_auto_jail_enabled() {
+            return false;
+        }
         matches!(
             self.get_state(account_id),
             AccountQoSState::Suspicious { .. }
@@ -159,11 +206,17 @@ impl QoSGuardian {
 
     /// 判断账号是否处于缓刑期（HalfOpen）
     pub fn is_half_open(&self, account_id: &str) -> bool {
+        if !self.is_auto_jail_enabled() {
+            return false;
+        }
         matches!(self.get_state(account_id), AccountQoSState::HalfOpen { .. })
     }
 
     /// 获取账号当前小黑屋冷却剩余时长 (单位: 秒)
     pub fn get_jailed_remaining_seconds(&self, account_id: &str) -> Option<u64> {
+        if !self.is_auto_jail_enabled() {
+            return None;
+        }
         if let Some(state) = self.states.get(account_id) {
             if let AccountQoSState::Jailed {
                 jailed_at,
@@ -191,6 +244,9 @@ impl QoSGuardian {
 
     /// 判断账号是否处于纯健康状态
     pub fn is_healthy(&self, account_id: &str) -> bool {
+        if !self.is_auto_jail_enabled() {
+            return true;
+        }
         matches!(self.get_state(account_id), AccountQoSState::Healthy)
     }
 
@@ -268,6 +324,63 @@ impl QoSGuardian {
         }
     }
 
+    /// 冷启动同桶基线均值（毫秒）
+    ///
+    /// 只采纳：同 Tier、纯 Healthy、`is_cold_start` 且未缓存桶相差 ±1 的样本。
+    /// 样本数不足 [`MIN_COLD_PEER_SAMPLES`] 时返回 None（上层据此“只采样不判罚”）。
+    fn calculate_cold_peer_avg<F>(
+        &self,
+        target_account_id: &str,
+        target_tier: &str,
+        target_bucket: u8,
+        all_accounts: &[ProxyToken],
+        is_unhealthy_or_limited: F,
+    ) -> Option<f64>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let now = Instant::now();
+        let sample_ttl = Duration::from_secs(15 * 60);
+        let norm_target_tier = target_tier.trim().to_uppercase();
+        let mut values: Vec<f64> = Vec::new();
+
+        for acc in all_accounts {
+            let acc_tier = acc
+                .subscription_tier
+                .as_deref()
+                .unwrap_or("FREE")
+                .trim()
+                .to_uppercase();
+            if acc_tier != norm_target_tier || acc.account_id == target_account_id {
+                continue;
+            }
+            if is_unhealthy_or_limited(&acc.account_id) {
+                continue;
+            }
+            if let Some(state) = self.states.get(&acc.account_id) {
+                if !matches!(state.value(), AccountQoSState::Healthy) {
+                    continue;
+                }
+            }
+            if let Some(samples) = self.samples.get(&acc.account_id) {
+                for s in samples.iter() {
+                    if now.duration_since(s.timestamp) > sample_ttl
+                        || !s.is_cold_start
+                        || s.uncached_bucket.abs_diff(target_bucket) > 1
+                    {
+                        continue;
+                    }
+                    values.push(s.ttft_ms);
+                }
+            }
+        }
+
+        if values.len() < MIN_COLD_PEER_SAMPLES {
+            return None;
+        }
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+
     /// 评估单次请求的 TTFT 并流转状态机
     pub fn record_and_evaluate<F>(
         &self,
@@ -283,6 +396,11 @@ impl QoSGuardian {
     where
         F: Fn(&str) -> bool,
     {
+        // 若未启用自动限流进小黑屋机制，直接忽略校验时长，不标记疑似限速，不进小黑屋，不解绑会话
+        if !self.is_auto_jail_enabled() {
+            return QoSAction::None;
+        }
+
         let config = self.config_snapshot();
         let ttft_secs = ttft_ms / 1000.0;
         let now = Instant::now();
@@ -320,9 +438,9 @@ impl QoSGuardian {
         }
 
         // 2. 动态预算补偿算法：
-        // - 每 100K 未缓存 Token 额外补偿 +7.0s 物理 Prefill 计算耗时
+        // - 每 100K 未缓存 Token 额外补偿 +15.0s 物理 Prefill 计算耗时
         // - 基础阈值：按实例策略选择普通或深度思考阈值
-        let uncached_bonus_secs = (uncached_tokens as f64 / 100_000.0) * 7.0;
+        let uncached_bonus_secs = (uncached_tokens as f64 / 100_000.0) * 15.0;
         let base_threshold_secs = if is_deep_thinking {
             config.deep_thinking_threshold_secs
         } else {
@@ -333,13 +451,52 @@ impl QoSGuardian {
         // 恢复阈值同样支持未缓存增量补偿
         let vindicate_threshold_secs = config.recovery_threshold_secs + uncached_bonus_secs;
 
-        // 标记是否为大 Token 冷启动 (未缓存 >= 80K)
-        let is_cold_start = uncached_tokens >= 80_000;
+        // 标记是否为大 Token 冷启动 (未缓存 >= 60K)
+        let is_cold_start = uncached_tokens >= 60_000;
+        let bucket = cold_bucket_of(uncached_tokens);
 
-        // 3. 提取纯净同侪均值 (秒)
-        let peer_avg_secs = self
-            .calculate_pure_peer_avg(account_id, tier, all_accounts, &is_unhealthy_or_limited)
-            .map(|ms| ms / 1000.0);
+        // 冷启动不搞“一刀切豁免”（真被限速也测不出来），而是**只和同桶冷启动样本比**：
+        // - 有 ≥3 个同桶基线 → 正常参与 strike 判定；
+        // - 没有基线 → 只记样本、不判罚（首次遇到该规模时绝不误杀）。
+        let cold_peer_avg = if is_cold_start {
+            self.calculate_cold_peer_avg(
+                account_id,
+                tier,
+                bucket,
+                all_accounts,
+                &is_unhealthy_or_limited,
+            )
+        } else {
+            None
+        };
+
+        if is_cold_start && cold_peer_avg.is_none() {
+            tracing::debug!(
+                "[QoS] cold-start without same-bucket baseline | account={} ttft={:.2}s uncached={} bucket={} strike_threshold={:.1}s",
+                account_id,
+                ttft_secs,
+                uncached_tokens,
+                bucket,
+                threshold_secs
+            );
+            self.push_sample_with_bucket(account_id, ttft_ms, is_deep_thinking, true, bucket);
+            return QoSAction::None;
+        }
+
+        // 3. 提取同侪均值 (秒)：冷启动对比同桶冷启动，常规对比热缓存样本
+        let peer_avg_secs = if is_cold_start {
+            cold_peer_avg
+        } else {
+            self.calculate_pure_peer_avg(account_id, tier, all_accounts, &is_unhealthy_or_limited)
+        }
+        .map(|ms| ms / 1000.0);
+
+        // 3.1 冷启动的相对阈值：有同桶基线时，拿“同桶均值的 1.5 倍”与绝对阈值取大。
+        // 否则 150K 冷启动的 42.5s 绝对线会卡在实测 36~44s 的抖动区间，依旧可能误杀。
+        let threshold_secs = match (is_cold_start, peer_avg_secs) {
+            (true, Some(peer_avg)) => threshold_secs.max(peer_avg * 1.5),
+            _ => threshold_secs,
+        };
         let no_peer_grace_secs = if peer_avg_secs.is_none() {
             config.no_peer_grace_secs
         } else {
@@ -361,7 +518,13 @@ impl QoSGuardian {
                     peer_avg, threshold_secs, account_id
                 );
                 // 记录采样后退出
-                self.push_sample(account_id, ttft_ms, is_deep_thinking, is_cold_start);
+                self.push_sample_with_bucket(
+                    account_id,
+                    ttft_ms,
+                    is_deep_thinking,
+                    is_cold_start,
+                    bucket,
+                );
                 return QoSAction::None;
             }
         }
@@ -534,8 +697,8 @@ impl QoSGuardian {
             }
         };
 
-        // 记录采样 (大 Token 冷启动样本在基线计算中隔离)
-        self.push_sample(account_id, ttft_ms, is_deep_thinking, is_cold_start);
+        // 记录采样 (冷启动样本同时记入其规模桶，供后续同桶对比)
+        self.push_sample_with_bucket(account_id, ttft_ms, is_deep_thinking, is_cold_start, bucket);
 
         action
     }
@@ -565,12 +728,25 @@ impl QoSGuardian {
         is_thinking: bool,
         is_cold_start: bool,
     ) {
+        self.push_sample_with_bucket(account_id, ttft_ms, is_thinking, is_cold_start, 0);
+    }
+
+    /// 带分桶的采样入口
+    fn push_sample_with_bucket(
+        &self,
+        account_id: &str,
+        ttft_ms: f64,
+        is_thinking: bool,
+        is_cold_start: bool,
+        uncached_bucket: u8,
+    ) {
         let mut entry = self.samples.entry(account_id.to_string()).or_default();
         entry.push(TtftSample {
             ttft_ms,
             timestamp: Instant::now(),
             is_thinking,
             is_cold_start,
+            uncached_bucket,
         });
         let ttl = Duration::from_secs(15 * 60);
         entry.retain(|s| s.timestamp.elapsed() <= ttl);
@@ -631,6 +807,9 @@ impl QoSGuardian {
         account_id: &str,
         config: QoSConfig,
     ) -> Option<ProbeClaim> {
+        if !self.is_auto_jail_enabled() {
+            return None;
+        }
         let mut state = self.states.get_mut(account_id)?;
         let AccountQoSState::Jailed {
             level,
@@ -655,6 +834,40 @@ impl QoSGuardian {
             claim_id: claim.claim_id,
         };
         Some(claim)
+    }
+
+    /// Collect a snapshot before writing to DashMap (upstream Fixes #3749).
+    /// Prepare credentials without state guards, then atomically claim the current
+    /// expired jail. Claims retain the local policy and reject stale completions.
+    pub(crate) fn take_expired_jails_for_probing<T>(
+        &self,
+        mut prepare: impl FnMut(&str, QoSConfig) -> Option<T>,
+    ) -> Vec<(T, ProbeClaim)> {
+        if !self.is_auto_jail_enabled() {
+            return Vec::new();
+        }
+        let candidates: Vec<String> = self
+            .states
+            .iter()
+            .filter_map(|entry| match *entry.value() {
+                AccountQoSState::Jailed {
+                    jailed_at,
+                    current_wait,
+                    ..
+                } if jailed_at.elapsed() >= current_wait => Some(entry.key().clone()),
+                _ => None,
+            })
+            .collect();
+        let mut expired = Vec::with_capacity(candidates.len());
+        for account_id in candidates {
+            let config = self.config_snapshot();
+            if let Some(prepared) = prepare(&account_id, config) {
+                if let Some(claim) = self.try_mark_probing_with_config(&account_id, config) {
+                    expired.push((prepared, claim));
+                }
+            }
+        }
+        expired
     }
 
     /// 强制恢复健康 (如在 UI 上手动重置)
@@ -687,21 +900,98 @@ mod tests {
     }
 
     #[test]
+    fn qos_cold_start_requires_bucket_baseline_and_keeps_configured_threshold() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        guardian.update_config(configurable_policy()).unwrap();
+        let accounts = vec![
+            create_test_token("account", "PRO"),
+            create_test_token("peer", "PRO"),
+        ];
+        // A hot-cache peer must not cause a cold-start false positive.
+        guardian.push_sample("peer", 4000.0, false, false);
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "account",
+                None,
+                "PRO",
+                100_000.0,
+                false,
+                Some(100_000),
+                &accounts,
+                |_| false
+            ),
+            QoSAction::None
+        );
+        for _ in 0..3 {
+            guardian.push_sample_with_bucket("peer", 4000.0, false, true, cold_bucket_of(100_000));
+        }
+        // Local base 12s + upstream prefill compensation 15s = 27s.
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "account",
+                None,
+                "PRO",
+                27_000.0,
+                false,
+                Some(100_000),
+                &accounts,
+                |_| false
+            ),
+            QoSAction::None
+        );
+        assert_eq!(
+            guardian.record_and_evaluate(
+                "account",
+                None,
+                "PRO",
+                27_001.0,
+                false,
+                Some(100_000),
+                &accounts,
+                |_| false
+            ),
+            QoSAction::TaggedSuspicious
+        );
+    }
+
+    #[test]
+    fn qos_snapshot_claim_preserves_reset_during_credential_preparation() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level: 0,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        let claims = guardian.take_expired_jails_for_probing(|id, _| {
+            guardian.reset_account(id);
+            Some(id.to_string())
+        });
+        assert!(claims.is_empty());
+        assert_eq!(guardian.get_state("account"), AccountQoSState::Healthy);
+    }
+
+    #[test]
     fn qos_configured_strike_thresholds_preserve_strict_boundaries_and_input_compensation() {
         for (thinking, peer, input_tokens, boundary_secs) in [
             (false, true, 0, 12.0),
             (true, true, 0, 22.0),
             (false, false, 0, 15.0),
             (true, false, 0, 25.0),
-            (false, true, 100_000, 19.0),
-            (true, true, 100_000, 29.0),
-            (false, false, 100_000, 22.0),
-            (true, false, 100_000, 32.0),
+            (false, true, 40_000, 18.0),
+            (true, true, 40_000, 28.0),
+            (false, false, 40_000, 21.0),
+            (true, false, 40_000, 31.0),
         ] {
             for (offset_ms, expected) in
                 [(0.0, QoSAction::None), (1.0, QoSAction::TaggedSuspicious)]
             {
                 let guardian = QoSGuardian::new();
+                guardian.set_auto_jail_enabled(true);
                 guardian.update_config(configurable_policy()).unwrap();
                 let accounts = vec![
                     create_test_token("account", "PRO"),
@@ -731,12 +1021,13 @@ mod tests {
     #[test]
     fn qos_configured_peer_brake_uses_the_same_request_threshold() {
         for (thinking, input, threshold) in
-            [(false, 0, 12.0), (true, 0, 22.0), (false, 100_000, 19.0)]
+            [(false, 0, 12.0), (true, 0, 22.0), (false, 40_000, 18.0)]
         {
             for (peer_offset_ms, expected) in
                 [(0.0, QoSAction::None), (-1.0, QoSAction::TaggedSuspicious)]
             {
                 let guardian = QoSGuardian::new();
+                guardian.set_auto_jail_enabled(true);
                 guardian.update_config(configurable_policy()).unwrap();
                 let accounts = vec![
                     create_test_token("account", "PRO"),
@@ -765,10 +1056,11 @@ mod tests {
         for (half_open, input_tokens, boundary_secs) in [
             (false, 0, 10.0),
             (true, 0, 10.0),
-            (false, 100_000, 17.0),
-            (true, 100_000, 17.0),
+            (false, 40_000, 16.0),
+            (true, 40_000, 16.0),
         ] {
             let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
             guardian.update_config(configurable_policy()).unwrap();
             let state = if half_open {
                 AccountQoSState::HalfOpen {
@@ -840,6 +1132,7 @@ mod tests {
     #[test]
     fn qos_config_update_preserves_existing_state_and_is_instance_local() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let other = QoSGuardian::new();
         let now = Instant::now();
         let jailed = AccountQoSState::Jailed {
@@ -908,6 +1201,7 @@ mod tests {
     fn qos_probe_claim_keeps_policy_and_ladder_until_completion() {
         for level in 0..6 {
             let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
             let original = configurable_policy();
             guardian.update_config(original).unwrap();
             let claim = jail_for_probe(&guardian, level);
@@ -938,6 +1232,7 @@ mod tests {
     #[test]
     fn qos_configured_ladder_applies_to_new_jail_and_half_open_failure() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         guardian.update_config(configurable_policy()).unwrap();
         let accounts = vec![create_test_token("account", "PRO")];
         guardian.record_and_evaluate(
@@ -992,6 +1287,7 @@ mod tests {
     #[test]
     fn qos_config_updates_do_not_wait_for_account_state_locks() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         guardian
             .states
             .insert("account".into(), AccountQoSState::Healthy);
@@ -1014,6 +1310,7 @@ mod tests {
     #[test]
     fn probe_claim_uses_current_expired_jail_level_once() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         guardian.states.insert(
             "account".into(),
             AccountQoSState::Jailed {
@@ -1034,6 +1331,7 @@ mod tests {
     #[test]
     fn probe_claim_preserves_states_changed_after_candidate_scan() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let now = Instant::now();
         for current in [
             AccountQoSState::Healthy,
@@ -1068,6 +1366,7 @@ mod tests {
     #[test]
     fn probe_claim_does_not_recreate_a_removed_account() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         assert_eq!(guardian.try_mark_probing("removed"), None);
         assert!(!guardian.states.contains_key("removed"));
     }
@@ -1075,6 +1374,7 @@ mod tests {
     #[test]
     fn probe_claim_has_one_winner_across_concurrent_scans() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         guardian.states.insert(
             "account".into(),
             AccountQoSState::Jailed {
@@ -1133,6 +1433,7 @@ mod tests {
     fn probe_completion_preserves_manual_reset_and_release() {
         for reset in [QoSGuardian::reset_account, QoSGuardian::release_from_jail] {
             let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
             let claim = jail_for_probe(&guardian, 1);
             guardian
                 .penalty_memory
@@ -1150,6 +1451,7 @@ mod tests {
     #[test]
     fn probe_completion_does_not_recreate_a_removed_account() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let claim = jail_for_probe(&guardian, 1);
         guardian.states.remove("account");
 
@@ -1162,6 +1464,7 @@ mod tests {
     #[test]
     fn stale_probe_completion_preserves_a_new_claim_at_the_same_level() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let old_claim = jail_for_probe(&guardian, 1);
         guardian.reset_account("account");
         let new_claim = jail_for_probe(&guardian, 1);
@@ -1179,6 +1482,7 @@ mod tests {
     #[test]
     fn stale_probe_completion_preserves_a_later_jail_and_penalty() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let claim = jail_for_probe(&guardian, 0);
         let now = Instant::now();
         let current = AccountQoSState::Jailed {
@@ -1199,6 +1503,7 @@ mod tests {
     fn probe_completion_applies_only_once() {
         for passes in [true, false] {
             let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
             let claim = jail_for_probe(&guardian, 1);
             if passes {
                 assert!(guardian.mark_probe_passed("account", claim));
@@ -1251,6 +1556,7 @@ mod tests {
     #[test]
     fn test_pure_peer_baseline_filtering() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let acc_c = create_test_token("acc_c", "PRO");
@@ -1300,6 +1606,7 @@ mod tests {
     #[test]
     fn test_thinking_model_dynamic_compensation() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1332,6 +1639,7 @@ mod tests {
     #[test]
     fn test_global_outage_brake() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1350,6 +1658,7 @@ mod tests {
     #[test]
     fn test_hysteresis_deadband() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1370,6 +1679,7 @@ mod tests {
     #[test]
     fn test_sliding_window_strike_and_jail_handover() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1399,6 +1709,7 @@ mod tests {
     #[test]
     fn test_ladder_probing_escalation_and_probation() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1437,6 +1748,7 @@ mod tests {
     #[test]
     fn test_penalty_memory_retention() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1466,6 +1778,7 @@ mod tests {
     #[test]
     fn test_cold_start_uncached_tokens_bonus_and_isolation() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let all = vec![acc_a.clone(), acc_b.clone()];
@@ -1511,5 +1824,148 @@ mod tests {
         );
         assert_eq!(act2, QoSAction::TaggedSuspicious);
         assert!(guardian.is_suspicious("acc_a"));
+    }
+
+    #[test]
+    fn test_multiturn_thinking_model_prevents_false_strikes() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let acc_a = create_test_token("acc_a", "PRO");
+        let acc_b = create_test_token("acc_b", "PRO");
+        let all = vec![acc_a.clone(), acc_b.clone()];
+
+        // 注入同行基准 4.0s
+        guardian.push_sample("acc_b", 4000.0, false, false);
+
+        // Turn 1: 50K tokens
+        let _ = guardian.record_and_evaluate(
+            "acc_a",
+            Some("session_multi_turn"),
+            "PRO",
+            12000.0,
+            true,
+            Some(50_000),
+            &all,
+            |_| false,
+        );
+
+        // Turn 2: 51K tokens (热缓存增量仅 1K)，思考耗时 28s。
+        // 若 is_deep_thinking = true (思考模型)，基础阈值为 35.0s，因此 28s 不触发 Strike；
+        // 若错误判定为 false，20.15s 阈值将导致误判 Suspicious。
+        let act2 = guardian.record_and_evaluate(
+            "acc_a",
+            Some("session_multi_turn"),
+            "PRO",
+            28000.0,
+            true, // is_deep_thinking
+            Some(51_000),
+            &all,
+            |_| false,
+        );
+        assert_eq!(act2, QoSAction::None);
+        assert_eq!(guardian.get_state("acc_a"), AccountQoSState::Healthy);
+    }
+
+    #[test]
+    fn test_take_expired_jails_for_probing_does_not_deadlock() {
+        let guardian = Arc::new(QoSGuardian::new());
+        guardian.set_auto_jail_enabled(true);
+
+        // 设置到期账号 (50ms 前入狱，刑期 10ms)
+        let expired_at = Instant::now() - Duration::from_millis(50);
+        guardian.states.insert(
+            "acc_expired".to_string(),
+            AccountQoSState::Jailed {
+                level: 0,
+                jailed_at: expired_at,
+                current_wait: Duration::from_millis(10),
+            },
+        );
+
+        // 设置未到期账号 (刑期 1 小时)
+        guardian.states.insert(
+            "acc_waiting".to_string(),
+            AccountQoSState::Jailed {
+                level: 1,
+                jailed_at: Instant::now(),
+                current_wait: Duration::from_secs(3600),
+            },
+        );
+
+        // 设置普通健康账号
+        guardian
+            .states
+            .insert("acc_healthy".to_string(), AccountQoSState::Healthy);
+
+        // 在单独线程中运行，配合 5 秒超时保护检测死锁
+        let g = guardian.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let expired = g.take_expired_jails_for_probing(|id, _| Some(id.to_string()));
+            let _ = tx.send(expired);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("take_expired_jails_for_probing deadlocked or timed out!");
+
+        // 断言：仅已到期账号被取出
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "acc_expired");
+        assert_eq!(result[0].1.level, 0);
+
+        // 断言：到期账号状态已原子转换为 Probing
+        match guardian.get_state("acc_expired") {
+            AccountQoSState::Probing { level, .. } => assert_eq!(level, 0),
+            other => panic!("Expected Probing state, got {:?}", other),
+        }
+
+        // 断言：未到期账号依然保持 Jailed
+        match guardian.get_state("acc_waiting") {
+            AccountQoSState::Jailed { level, .. } => assert_eq!(level, 1),
+            other => panic!("Expected Jailed state, got {:?}", other),
+        }
+
+        // 断言：再次调用不会重复取出（已在 Probing 中）
+        let second_run = guardian.take_expired_jails_for_probing(|id, _| Some(id.to_string()));
+        assert!(second_run.is_empty());
+    }
+
+    #[test]
+    fn test_auto_jail_disabled_ignores_duration_and_jail() {
+        let guardian = QoSGuardian::new();
+        assert!(!guardian.is_auto_jail_enabled());
+
+        let acc_a = create_test_token("acc_a", "PRO");
+        let acc_b = create_test_token("acc_b", "PRO");
+        let all = vec![acc_a.clone(), acc_b.clone()];
+        guardian.push_sample("acc_b", 4000.0, false, false);
+
+        // 默认关闭状态：即使耗时高达 120s (120000ms)，直接忽略校验时长，不产生 Strike 判定
+        let act =
+            guardian
+                .record_and_evaluate("acc_a", None, "PRO", 120000.0, false, None, &all, |_| false);
+        assert_eq!(act, QoSAction::None);
+        assert_eq!(guardian.get_state("acc_a"), AccountQoSState::Healthy);
+        assert!(!guardian.is_suspicious("acc_a"));
+        assert!(!guardian.is_jailed_or_probing("acc_a"));
+        assert!(guardian.is_healthy("acc_a"));
+        assert_eq!(guardian.get_jailed_remaining_seconds("acc_a"), None);
+
+        // 动态开启开关：再次超标应该被标记为 Suspicious
+        guardian.set_auto_jail_enabled(true);
+        assert!(guardian.is_auto_jail_enabled());
+        let act_strike =
+            guardian
+                .record_and_evaluate("acc_a", None, "PRO", 30000.0, false, None, &all, |_| false);
+        assert_eq!(act_strike, QoSAction::TaggedSuspicious);
+        assert!(guardian.is_suspicious("acc_a"));
+
+        // 动态关闭开关：所有限制应立即解封，状态清空恢复为 Healthy
+        guardian.set_auto_jail_enabled(false);
+        assert!(!guardian.is_auto_jail_enabled());
+        assert_eq!(guardian.get_state("acc_a"), AccountQoSState::Healthy);
+        assert!(!guardian.is_suspicious("acc_a"));
+        assert!(guardian.is_healthy("acc_a"));
     }
 }

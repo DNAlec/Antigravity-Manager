@@ -854,6 +854,39 @@ mod tests {
         assert!(!updated.live_limited_models.contains_key("gemini-2.5-pro"));
         std::env::remove_var("ABV_DATA_DIR");
     }
+
+    #[test]
+    fn test_delete_account_cleans_orphan_file_when_not_in_index() {
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TestDataDir::new();
+        std::env::set_var("ABV_DATA_DIR", dir.path());
+
+        // 创建孤儿实体文件，但 accounts.json 索引中不包含它
+        let orphan_id = "orphan-ghost-acc-id";
+        let path_buf = dir.path().clone();
+        create_account_file(&path_buf, orphan_id, "orphan@example.com");
+
+        let index = AccountIndex::new();
+        save_account_index_in_dir(&path_buf, &index).unwrap();
+
+        let orphan_file = dir
+            .path()
+            .join("accounts")
+            .join(format!("{}.json", orphan_id));
+        assert!(orphan_file.exists());
+
+        // 执行 delete_account 即使不在索引中也成功清理物理文件
+        let res = delete_account(orphan_id);
+        assert!(res.is_ok());
+        assert!(!orphan_file.exists());
+
+        // 再次删除不存在的文件和索引返回 Err
+        assert!(delete_account("completely-non-existent").is_err());
+
+        std::env::remove_var("ABV_DATA_DIR");
+    }
 }
 
 /// Global account write lock to prevent corruption during concurrent operations
@@ -1670,6 +1703,55 @@ pub fn update_account_priority(account_id: &str, priority: u8) -> Result<(), Str
     save_account(&account)
 }
 
+/// Update account GCP Project ID.
+///
+/// When project_id is provided, sets is_gcp_tos to true so the gateway
+/// seamlessly routes requests to the enterprise/Vertex AI platform.
+pub fn update_account_project_id(
+    account_id: &str,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    let _account_write = lock_account_file_updates()?;
+    let mut account = load_account(account_id)?;
+    let cleaned_pid = project_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if cleaned_pid.is_some() {
+        account.token.is_gcp_tos = true;
+    }
+    account.token.project_id = cleaned_pid;
+    save_account(&account)
+}
+
+/// Automatically fetch and associate Project ID from upstream for a given account.
+pub async fn auto_fetch_account_project_id(account_id: &str) -> Result<String, String> {
+    let mut account = load_account(account_id)?;
+
+    // Ensure access token is valid before querying upstream
+    let token = crate::modules::oauth::ensure_fresh_token(&account.token, Some(&account.id))
+        .await
+        .map_err(|e| format!("Failed to refresh token: {}", e))?;
+
+    if token.access_token != account.token.access_token {
+        account.token = token.clone();
+        let _ = save_account(&account);
+    }
+
+    match crate::proxy::project_resolver::fetch_project_id_for_account(
+        &token.access_token,
+        Some(account_id),
+    )
+    .await
+    {
+        Ok(pid) => {
+            update_account_project_id(account_id, Some(pid.clone()))?;
+            Ok(pid)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// List all accounts
 pub fn list_accounts() -> Result<Vec<Account>, String> {
     crate::modules::logger::log_info("Listing accounts...");
@@ -1836,8 +1918,14 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
     // Remove from index
     let original_len = index.accounts.len();
     index.accounts.retain(|s| s.id != account_id);
+    let index_modified = index.accounts.len() != original_len;
 
-    if index.accounts.len() == original_len {
+    let accounts_dir = get_accounts_dir()?;
+    let account_path = accounts_dir.join(format!("{}.json", account_id));
+    let file_existed = account_path.exists();
+
+    // 既未在索引中匹配，磁盘上也不存在实体文件，才报错未找到
+    if !index_modified && !file_existed {
         return Err(format!("Account ID not found: {}", account_id));
     }
 
@@ -1846,13 +1934,13 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
         index.current_account_id = index.accounts.first().map(|s| s.id.clone());
     }
 
-    save_account_index(&index)?;
+    // [FIX #3806, #3808] 失败点前置：先写索引（若索引发生变更），成功后再删除物理文件
+    if index_modified {
+        save_account_index(&index)?;
+    }
 
-    // Delete account file
-    let accounts_dir = get_accounts_dir()?;
-    let account_path = accounts_dir.join(format!("{}.json", account_id));
-
-    if account_path.exists() {
+    // 无论索引中是否存在，均尝试删除物理凭据文件（兜底清理孤儿文件）；删除失败通过 ? 向上抛错
+    if file_existed {
         fs::remove_file(&account_path)
             .map_err(|e| format!("failed_to_delete_account_file: {}", e))?;
     }
@@ -2017,11 +2105,12 @@ pub async fn switch_account(
 }
 
 fn is_enterprise_client(client_key: Option<&str>) -> bool {
-    client_key
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(|key| key.eq_ignore_ascii_case("antigravity_enterprise"))
-        .unwrap_or(false)
+    crate::modules::oauth::is_gcp_enterprise_client(client_key)
+        || client_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| key.eq_ignore_ascii_case("antigravity_enterprise"))
+            .unwrap_or(false)
 }
 
 fn normalize_project_id(project_id: Option<&str>) -> Option<String> {
@@ -3232,6 +3321,17 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                     }
                 };
 
+                let is_gcp_tos = if crate::modules::oauth::is_gcp_enterprise_client(
+                    token_res
+                        .oauth_client_key
+                        .as_deref()
+                        .or(account.token.oauth_client_key.as_deref()),
+                ) {
+                    true
+                } else {
+                    account.token.is_gcp_tos
+                };
+
                 let new_token = TokenData::new(
                     token_res.access_token.clone(),
                     account.token.refresh_token.clone(),
@@ -3239,7 +3339,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                     account.token.email.clone(),
                     account.token.project_id.clone(), // Keep original project_id
                     None,                             // Add None as session_id
-                    account.token.is_gcp_tos,
+                    is_gcp_tos,
                     token_res.id_token.clone(),
                 )
                 .with_oauth_client_key(
@@ -3733,6 +3833,16 @@ pub async fn batch_import_accounts_logic(
                     )
                     .await;
 
+                    let is_gcp_tos = if crate::modules::oauth::is_gcp_enterprise_client(
+                        token_res.oauth_client_key.as_deref(),
+                    ) {
+                        true
+                    } else if let Ok(existing_acc) = load_account(&account_id) {
+                        existing_acc.token.is_gcp_tos
+                    } else {
+                        false
+                    };
+
                     // 5. 构造 TokenData 与 Account（若为既有账号，保留原有偏好与配额数据原地更新，杜绝重复凭据文件！）
                     let mut account = if let Ok(mut existing_acc) = load_account(&account_id) {
                         existing_acc.token = crate::models::TokenData::new(
@@ -3742,7 +3852,7 @@ pub async fn batch_import_accounts_logic(
                             Some(real_email.clone()),
                             project_id.or(existing_acc.token.project_id.clone()),
                             None,
-                            false,
+                            is_gcp_tos,
                             token_res.id_token,
                         )
                         .with_oauth_client_key(token_res.oauth_client_key);
@@ -3764,7 +3874,7 @@ pub async fn batch_import_accounts_logic(
                             Some(real_email.clone()),
                             project_id,
                             None,
-                            false,
+                            is_gcp_tos,
                             token_res.id_token,
                         )
                         .with_oauth_client_key(token_res.oauth_client_key);

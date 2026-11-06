@@ -151,7 +151,8 @@
             "stringValue": "\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE."
           }
         }
-      }
+      },
+      "thinkingLevel": 1
     },
     "gemini-2.5-flash": {
       "displayName": "Gemini 3.5 Flash Lite",
@@ -224,7 +225,7 @@
         "audio/flac": true,
         "application/x-python-code": true
       },
-      "thinkingLevel": 3,
+      "thinkingLevel": 1,
       "modelExperiments": {
         "experiments": {
           "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
@@ -816,7 +817,8 @@
             "boolValue": true
           }
         }
-      }
+      },
+      "thinkingLevel": 2
     },
     "gpt-oss-120b-medium": {
       "displayName": "GPT-OSS 120B (Medium)",
@@ -858,7 +860,10 @@
             "stringValue": "{\n    \"strategy\": \"CHECKPOINT_STRATEGY_SINGLE_PROMPT\",\n    \"max_token_limit\": \"128000\",\n    \"token_threshold\": \"50000\",\n    \"max_overhead_ratio\": \"0.15\",\n    \"moving_window_size\": \"1\",\n    \"enabled\": true,\n    \"max_output_tokens\": \"16384\",\n    \"checkpoint_model\": \"MODEL_PLACEHOLDER_M50\",\n    \"use_last_planner_model\": false,\n    \"is_sync\": false,\n    \"max_user_requests\": 10,\n    \"include_last_user_message\": false,\n    \"include_conversation_log\": true,\n    \"include_running_task_snapshots\": true,\n    \"include_subagent_snapshots\": true,\n    \"include_artifact_snapshots\": true,\n    \"retry_config\": {\n        \"max_retries\": 0,\n        \"initial_sleep_duration_ms\": 1000,\n        \"exponential_multiplier\": 2,\n        \"include_error_feedback\": false\n    },\n    \"session_summary_prompt_override\": \"\"\n}"
           }
         }
-      }
+      },
+      "thinkingLevel": 1,
+      "supportsThinking": true,
+      "minThinkingBudget": 128
     },
     "gemini-2.5-flash-lite": {
       "displayName": "Gemini 3.5 Flash Lite",
@@ -931,7 +936,7 @@
         "application/x-javascript": true,
         "video/jpeg2000": true
       },
-      "thinkingLevel": 3,
+      "thinkingLevel": 1,
       "modelExperiments": {
         "experiments": {
           "retry_model_capacity_exhausted": {
@@ -1196,7 +1201,8 @@
             "boolValue": true
           }
         }
-      }
+      },
+      "thinkingLevel": 3
     },
     "chat_20706": {
       "maxTokens": 16384,
@@ -1470,7 +1476,7 @@
         "text/html": true,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": true
       },
-      "thinkingLevel": 3,
+      "thinkingLevel": 1,
       "modelExperiments": {
         "experiments": {
           "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
@@ -1647,7 +1653,8 @@
             "stringValue": "- Keep your responses concise.\n- Provide a summary of your work when you end your turn. Ground your response in the work you did. Keep your tone professional and avoid overconfident language, bragging, or overclaiming success.\n- AVOID using superlatives such as \"perfectly\", \"flawlessly\", \"100% correct\", \"Summary of Accomplishments\" etc. to summarize your work for the user. Be humble.\n- AVOID over-the-top politeness or complimenting the user excessively.\n- Format your responses in github-style markdown."
           }
         }
-      }
+      },
+      "thinkingLevel": 3
     },
     "chat_23310": {
       "maxTokens": 32768,
@@ -1918,7 +1925,8 @@
             "stringValue": "{\n    \"enabled\": false,\n    \"disabledHeuristics\": [\"planning_mode\", \"bash_command_reminder\", \"running_tasks_reminder\"],\n    \"staticMessages\": [],\n    \"useAllowlist\": false,\n    \"enabledHeuristics\": []\n}"
           }
         }
-      }
+      },
+      "thinkingLevel": 3
     },
     "gemini-pro-agent": {
       "displayName": "Gemini 3.1 Pro (High)",
@@ -2432,6 +2440,19 @@
       },
       "vertexModelId": "claude-sonnet-5-5@default",
       "supportsAdaptiveThinking": true
+    },
+    "gemini-3.5-flash-lite": {
+      "displayName": "Gemini 3.5 Flash Lite",
+      "supportsImages": true,
+      "supportsThinking": true,
+      "thinkingLevel": 1,
+      "minThinkingBudget": 128,
+      "recommended": true,
+      "maxTokens": 1048576,
+      "maxOutputTokens": 65535,
+      "model": "MODEL_PLACEHOLDER_M198",
+      "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+      "modelProvider": "MODEL_PROVIDER_GOOGLE"
     }
   }
 }

@@ -7,6 +7,7 @@
   - **Minimalist & Contextual UI**: Prioritize user-friendly, non-intrusive interactions. Reuse existing design conventions (e.g., pill toggle buttons, badge switches, or contextual setting panels) placed strictly within their most relevant sections rather than scattering unrelated controls.
   - **Headless & CLI Parity**: Ensure GUI configurations maintain functional parity across headless servers, CLI environments, and cross-platform environments. Provide configuration file fields, environment variable overrides, or dedicated CLI flags/commands for essential settings.
   - **Cross-Platform Compatibility**: Evaluate every code addition and dependency change for seamless cross-platform support.
+  - **Config Surface Parity**: When changing hardcoded backend data such as timeouts, thinking budgets, or model mappings, judge whether the change should also surface as a frontend setting — adding or updating the corresponding item in model settings, timeout settings, agent one-click presets, the custom model mapping table, and downstream model visibility. Keep the same knob reachable for CLI and headless users via config field, environment variable, or CLI flag.
 - **Code Quality**: Prioritize root-cause, future-proof fixes rather than hardcoded logic, dead code, or speculative changes. Prioritize generalized solutions that cover entire classes of problems rather than one-off patches.
   - *Model Routing Example*: Prioritize wildcard patterns (e.g., `gemini-*-flash-*`) to anticipate future model releases rather than exact string matches.
   - *Prompt Sanitization Example*: For agent-client prompt sanitization, prioritize regex-based pattern matching over static keyword replacement, ensuring full coverage without stripping pipeline system prompts or user queries.
@@ -54,9 +55,10 @@
   - **Strictly Scoped Attribution (致谢范围约束)**: Gratitude, inline attribution, and co-authorship are strictly limited to:
     1. The current active developer/author;
     2. The contributor/author of the referenced PR;
-    3. User-defined co-creators (e.g., `Co-Authored-By: JeikCode <code@jeikcode.top>`).
+    3. User-defined co-creators.
     Never emit indiscriminate, unverified, or irrelevant thanks/attributions to arbitrary third parties.
 - **Contributor Respect & Attribution**:
+  - **Merge From the Original PR First**: Integrate a contributor's original remote PR properly *before* applying any local modifications, then comment on that PR with the acceptance/merge points and any extra changes — never pull it locally, process it privately, and close the remote PR on your own; keep contribution credit and contributor goodwill intact.
   - Preserve authorship by preferring the contributor's own PR for squash commits, or attaching explicit `Co-authored-by:` trailers on merge commits and proxy PRs.
   - Disclose costs before merging: highlight affected existing behaviors and unverified paths alongside improvements.
   - Own tooling and documentation gaps directly rather than attributing downstream frictions to contributors.

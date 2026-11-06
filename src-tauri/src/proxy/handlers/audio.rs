@@ -125,7 +125,20 @@ pub async fn handle_audio_transcription(
             Some(account_id.as_str()),
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("上游请求失败: {}", e)))?
+        .map_err(|e| {
+            // 终态（首字节 / 上传 / 全局预算 / 重放上限）由流水线统一分类并给出状态码；
+            // 内部标记必须剔除，不能泄漏到客户端报文。
+            let status = crate::proxy::pipeline::terminal::classify(&e)
+                .map(|terminal| terminal.disposition().status)
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            (
+                status,
+                format!(
+                    "上游请求失败: {}",
+                    crate::proxy::upstream::client::strip_internal_markers(&e)
+                ),
+            )
+        })?
         .response;
 
     if !response.status().is_success() {

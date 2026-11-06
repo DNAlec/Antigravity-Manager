@@ -355,12 +355,12 @@ mod tests {
     fn embedded_catalog_accepts_numeric_thinking_level() {
         let flash = OfficialModelCatalog::get("gemini-2.5-flash")
             .expect("gemini-2.5-flash must load; numeric thinkingLevel used to panic the catalog");
-        assert_eq!(flash.thinking_level.as_deref(), Some("3"));
+        assert_eq!(flash.thinking_level.as_deref(), Some("1"));
 
         let high = OfficialModelCatalog::get("gemini-3.8-flash-high")
             .expect("gemini-3.8-flash-high must load from the embedded catalog");
         assert_eq!(high.model, "MODEL_PLACEHOLDER_M318");
-        assert!(high.thinking_level.is_none());
+        assert_eq!(high.thinking_level.as_deref(), Some("3"));
     }
 
     #[test]
