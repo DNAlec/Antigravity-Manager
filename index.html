@@ -31,6 +31,27 @@
           document.documentElement.classList.remove('dark');
           document.documentElement.setAttribute('data-theme', 'light');
         }
+        // Restore UI zoom immediately during boot (keep in sync with src/utils/zoom.ts)
+        // The mini overlay is a fixed-size floating panel and keeps its native scale.
+        if (!isMini) {
+          const ZOOM_PRESETS = [85, 90, 100, 110, 120, 130, 140, 150];
+          const rawZoom = parseInt(localStorage.getItem('app-ui-zoom') || '', 10);
+          if (!isNaN(rawZoom)) {
+            let zoom = ZOOM_PRESETS[0];
+            for (let i = 1; i < ZOOM_PRESETS.length; i++) {
+              if (Math.abs(rawZoom - ZOOM_PRESETS[i]) < Math.abs(rawZoom - zoom)) {
+                zoom = ZOOM_PRESETS[i];
+              }
+            }
+            if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+              window.__TAURI_INTERNALS__.invoke('plugin:webview|set_webview_zoom', { value: zoom / 100 }).catch(function() {
+                document.documentElement.style.zoom = zoom + '%';
+              });
+            } else {
+              document.documentElement.style.zoom = zoom + '%';
+            }
+          }
+        }
       } catch (e) {
         console.error('Failed to apply theme during boot:', e);
       }

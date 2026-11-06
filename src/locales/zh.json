@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "思考档位：网关自适应（官方结构体驱动）",
+        "tag": "推荐",
+        "desc": "客户端直控模式与自定义 Token 档位已下线：具备 thinkingLevel 的模型由模型档位直接决定等级（low / medium / high），其余模型沿用官方 thinkingBudget 默认值。客户端传入的思考档位仅在无后缀（裸）模型上生效，用于选择具体档位模型。"
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}}，如果请求正常请忽略"
+    },
     "common": {
         "loading": "加载中...",
         "load_more": "加载更多",
@@ -152,6 +160,13 @@
         "btn_include_disabled": "包含禁用账号 ({{count}})",
         "btn_proxy_online": "反代账号 ({{count}})",
         "btn_all_available": "可用账号 ({{count}})",
+        "qos_auto_jail": "自动小黑屋",
+        "qos_auto_jail_badge_on": "开",
+        "qos_auto_jail_badge_off": "关",
+        "qos_auto_jail_on": "小黑屋: 开",
+        "qos_auto_jail_off": "小黑屋: 关",
+        "qos_auto_jail_enabled_tip": "当前：已开启自动限流进小黑屋。遇响应过长的限速账号将自动隔离并解绑会话（点击关闭）",
+        "qos_auto_jail_disabled_tip": "当前：已关闭自动小黑屋。直接忽略校验时长，不因首字延迟过长标记疑似限速或解绑会话（点击开启）",
         "btn_title_proxy_online": "当前：仅统计参与反代分发的在线账号配额",
         "btn_title_all_available": "当前：统计所有正常未停用的可用账号配额",
         "btn_title_only_available": "当前：仅看开启且正常的可用账号 (点击包含已禁用账号)",
@@ -395,6 +410,10 @@
             "proxy_enabled": "成功启用 {{count}} 个账号的反代功能",
             "proxy_disabled": "成功禁用 {{count}} 个账号的反代功能"
         },
+        "type": {
+            "personal": "个人账号 (Personal)",
+            "enterprise": "企业 / GCP (Vertex AI)"
+        },
         "add": {
             "title": "添加新账号",
             "tabs": {
@@ -403,6 +422,8 @@
                 "import": "从数据库导入"
             },
             "oauth": {
+                "enterprise_title": "Google Cloud / Vertex AI 企业授权",
+                "enterprise_desc": "使用官方企业 GCP 专属客户端授权，自动保留企业配额并关联 Vertex AI 项目",
                 "recommend": "推荐方式",
                 "desc": "将打开默认浏览器进行 Google 登录授权，自动获取并保存 Token。",
                 "btn_start": "开始 OAuth 授权",
@@ -412,6 +433,7 @@
                 "copied": "已复制",
                 "link_label": "授权链接",
                 "link_click_to_copy": "点击复制",
+                "remote_hint": "💡 Docker / 远程服务器提示：Google 授权完成后浏览器跳转到 localhost 显示拒绝连接属正常安全限制。请直接从浏览器地址栏复制完整 URL（包含 code）粘贴到下方提交即可。",
                 "manual_hint": "浏览器没有自动跳转？请在此处粘贴回调链接或 Authorization Code：",
                 "manual_placeholder": "粘贴回调链接或 Code...",
                 "error_no_flow": "请先点击“开始 OAuth 授权”",
@@ -483,7 +505,15 @@
             "batch_warmup_msg": "确定要为选中的 {{count}} 个账号立即触发预热吗？"
         },
         "switch_to_agy": "Switch to Antigravity CLI (agy)",
-        "switch_next_short": "切下个"
+        "switch_next_short": "切下个",
+        "project_id": "GCP Project ID",
+        "project_id_hint": "企业/GCP 账号关联的 Google Cloud 项目 ID。原生 Antigravity 在登录后会自动关联或使用缺省项目。",
+        "project_id_placeholder": "如: my-project-id",
+        "project_id_updated": "GCP Project ID 已更新",
+        "auto_fetch_project_id": "自动获取",
+        "fetching_project_id": "获取中...",
+        "auto_fetch_success": "成功自动获取 Project ID: {{projectId}}",
+        "auto_fetch_failed": "未能在上游找到关联的 Project ID"
     },
     "settings": {
         "save": "保存设置",
@@ -502,6 +532,10 @@
             "theme_light": "浅色",
             "theme_dark": "深色",
             "theme_system": "跟随系统",
+            "ui_zoom": "界面与字体缩放",
+            "ui_zoom_desc": "调整软件整体界面和字体大小，支持随时使用快捷键 Cmd/Ctrl + / - / 0 快速缩放",
+            "ui_zoom_default": "默认",
+            "ui_zoom_recommended": "推荐大屏",
             "auto_launch": "开机自动启动",
             "auto_launch_enabled": "启用",
             "auto_launch_disabled": "禁用",
@@ -520,7 +554,13 @@
             "lightweight_mode": "轻量模式 (释放内存)",
             "lightweight_mode_desc": "退出或最小化到托盘时销毁前端渲染进程，常驻内存可降至 ~35MB。重新打开主窗口时需要数毫秒重建。",
             "lightweight_mode_enabled": "已启用轻量模式",
-            "lightweight_mode_disabled": "已禁用轻量模式"
+            "lightweight_mode_disabled": "已禁用轻量模式",
+            "tray_click_action": "托盘左键单击操作",
+            "tray_click_action_desc": "选择单击系统托盘/菜单栏图标时的默认响应动作",
+            "tray_click_action_mini": "弹出 Mini 悬浮监控窗 (推荐)",
+            "tray_click_action_main": "直接打开主控制台界面",
+            "tray_click_action_mini_short": "Mini 悬浮窗",
+            "tray_click_action_main_short": "主控制台"
         },
         "account": {
             "title": "账号设置",
@@ -847,8 +887,13 @@
             "request": {
                 "user_agent": "User-Agent 覆盖",
                 "user_agent_tooltip": "自定义发送给上游 API 的 User-Agent 请求头。留空则使用默认值。",
-                "user_agent_hint": "当前默认值: antigravity/<version> <os>/<arch>",
-                "user_agent_placeholder": "输入自定义 User-Agent 字符串..."
+                "user_agent_hint": "当前默认值: antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)",
+                "user_agent_placeholder": "输入自定义 User-Agent 字符串...",
+                "user_agent_risk_title": "风险提示",
+                "user_agent_risk_desc": "自定义 User-Agent 可能会影响出站请求的协议兼容性。Google Cloud Code 上游对新一代旗舰模型（如 Gemini 4 Argon 等）实施了严格的客户端指纹门禁。若填入非 Hub 签名格式（如 antigravity/4.3.0 等旧 IDE 指纹）或版本过旧（低于官方最新基准 {{version}}），上游将直接返回 HTTP 404 (Requested entity was not found)，并可能导致网关账号池被临时保护性熔断挂起 15 分钟。若不了解上游指纹协议细节，请谨慎操作或保持默认。",
+                "user_agent_restored_success": "已成功恢复官方默认 Hub User-Agent",
+                "user_agent_sandbox_test_title": "User-Agent 与 Argon 门禁沙盒联调测试",
+                "user_agent_sandbox_test_desc": "可实时模拟不同 User-Agent 指纹并向网关发送 Argon 连通性测试请求，观察网关的定向检测与诊断输出。"
             },
             "port": "监听端口",
             "port_tooltip": "本地 API 代理监听的端口。需要先停止服务再修改，修改后需重启生效。",
@@ -997,6 +1042,16 @@
                 "max_wait_tooltip": "仅在“缓存优先”模式下生效：如果账号限流重置时间小于此值，则原地等待而非切换账号。",
                 "max_spillover_accounts": "分流并发账号上限",
                 "max_spillover_accounts_tooltip": "当启动多个子代理或高并发多会话时，最多允许同时调用的健康账号数量。设为 0 表示不限制（全池空闲账号皆可外溢加速）；设为正整数（如 2）则限制最多同时使用该数量的账号，超出时在已有账号间负载均衡，防止子代理占用过多额外账号。",
+                "affinity_scope": "粘性绑定维度",
+                "affinity_scope_tooltip": "会话级：按 Session ID 绑定账号（默认模式，自动归一化多Agent派生后缀）；凭据级：将来自同一 API Key 的请求强制锁定在同一账号（专治多Agent框架频繁生成随机UUID导致的缓存击穿）。",
+                "affinity_scopes": {
+                    "session": "会话级 (Session)",
+                    "api_key": "凭据级 (API-Key)"
+                },
+                "affinity_scopes_desc": {
+                    "session": "按 Session ID 绑定账号，自动归一化多智能体子任务前缀（如 :step:N）。",
+                    "api_key": "将来自同一 API Key 的所有请求锁定在同一个主账号，彻底杜绝 AutoGPT/Cindy 等多Agent框架打穿 Prompt Cache。"
+                },
                 "spillover_unlimited": "不限制 (全池可用)",
                 "spillover_count": "{{count}} 个账号",
                 "clear_bindings": "清除会话绑定",
@@ -1150,6 +1205,18 @@
                 "default_600_tag": "默认 600",
                 "max_memory_turns_desc": "控制单会话在内存 (RAM) 中常驻保留的历史思考块轮次。单轮思考块的预估内存消耗约为 1.5 KB ~ 2.5 KB（600 轮约占用 1.2 MB / 会话）。",
                 "turns_unit": "轮",
+                "signature_cache_title": "工具签名缓存（自动）",
+                "signature_cache_clear_btn": "清空签名缓存",
+                "signature_cache_desc": "按本机 CPU / 内存自动选择缓存档位；SQLite 仅做冷层，批量写入与压缩清理均在后台完成。",
+                "clear_signature_confirm": "确定清空工具签名缓存吗？不会影响请求日志与思考块。",
+                "clear_signature_success": "已清空签名缓存 ({{count}} 条 L1 记录)",
+                "clear_signature_error": "清空签名缓存失败: {{error}}",
+                "signature_cache_hit_rate": "命中率",
+                "signature_cache_thinking": "思考块",
+                "signature_cache_thinking_value": "{{turns}} 轮 / {{sessions}} 会话",
+                "signature_cache_dropped": "丢弃",
+                "signature_cache_pending": "待删除",
+                "signature_cache_machine": "本机 {{mb}} MB / {{cores}} 核。",
                 "window_guide_title": "滑动窗口淘汰机制与各并发规模选型建议",
                 "window_guide_desc": "超长会话超过此设定轮次时，采用先进先出（FIFO）滑动窗口自动淘汰最旧思考块。被淘汰轮次绝不降级为破坏缓存的占位符，而是由本地 SQLite 专属索引（primary_tool_id）在纳秒级精准穿透回捞，保证 Prompt Cache 100% 字节级严格对齐且绝不 OOM。",
                 "tooltip_32768": "32,768 Tokens：适合复杂编程与深度架构任务",
@@ -1198,20 +1265,20 @@
                 "guide_preset_cluster_desc": "推荐填写 <1>50 ~ 100 轮</1>。单机无压承载数万并发会话，WAL 高速索引并发无锁秒级响应。",
                 "gemini_soft_budget_note": "⚠️ 思考预算特性说明：Google Gemini 上游将 thinkingBudget 视为启发式偏好（Soft Target）。面对超长 Prompt、复杂代码推演或 Agent 任务时，上游推理引擎会自动深入展开思考链，可能突破所设数值；设置为 0 则彻底关闭思考。"
             },
-            "stream_timeout_settings": {
-                "title": "流式超时设置 (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "超时设置"
             },
             "thinking_settings": {
-                "title": "思考设置 (Thinking Settings)"
+                "title": "思考设置"
             },
             "prompt_multimodal": {
-                "title": "全局提示词与多模态设置 (Prompt & Multimodal)"
+                "title": "全局提示词与多模态设置"
             },
             "multimodal_settings": {
-                "title": "多模态交互设置 (Multimodal Settings)"
+                "title": "多模态交互设置"
             },
             "agent_settings": {
-                "title": "特定 Agent 配置 (Specific Agent Settings)"
+                "title": "特定 Agent 配置"
             },
             "hub": {
                 "title": "官方 Hub 客户端指纹",
@@ -1230,17 +1297,54 @@
         "stream_timeouts": {
             "banner_title": "三阶段流式梯度超时与保活机制",
             "banner_desc": "针对深度思考模型、超大上下文 Prefill、长历史压缩摘要及大文件代码写入场景，通过三阶段独立计时与全程底层心跳保活（: ping），彻底杜绝中间网关掐断、过渡断崖误杀与客户端重试死循环。",
-            "ttft_title": "首字响应宽限 (TTFT)",
+            "ttft_title": "首字响应宽限",
             "default_badge": "默认: 180s",
             "ttft_desc": "涵盖上游冷启动排队、超大提示词 Prefill 与长历史压缩摘要任务的最大容忍时间。期间每 3 秒下发心跳保活。",
             "transition_title": "状态切换宽限 (全新轮回)",
             "transition_desc": "思考完毕至首个正文或工具调用出字的过渡期。思考结束时自适应重置计时器，为大文件写入等装配留出充分时间。",
-            "sliding_title": "推流滑动超时 (Streaming)",
+            "sliding_title": "推流滑动超时",
             "default_badge_sliding": "默认: 120s",
             "sliding_desc": "持续吐字过程中相邻 Token 的最大允许静默间隔。若中途意外断流超过此时长，自动优雅截断收尾并保全已生成的代码。",
             "toast_reset": "已恢复超时配置默认值",
             "btn_reset": "恢复默认值",
             "btn_save": "保存超时设置"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "上传超时：自动根据带宽判定",
+            "min_speed_title": "上传带宽 (Mbps)",
+            "min_speed_desc": "VPN用户通常高下行、低上行、推荐填1-5Mbps。",
+            "extra_wait_title": "额外等待系数",
+            "extra_wait_desc": "该参数影响上传最大等待时间。",
+            "formula_title": "最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)",
+            "stall_title": "停滞超时 (秒)",
+            "stall_desc": "上传阶段单次持续无传输进展的判定超时；系统自动保底不低于连接超时，避免建连握手误判。",
+            "header_wait_title": "首响应头超时 (秒)",
+            "header_wait_desc": "0 = 使用内置值：首选端点 30 秒 / 备用端点 25 秒；填非 0 时只作为下限往上抬。",
+            "large_body_desc": "超过阈值的文件默认只发一次，避免反复重传占满上行。",
+            "large_body_threshold_title": "大文件阈值 (MB)",
+            "endpoint_attempts_title": "最多尝试次数",
+            "toast_reset": "已恢复超时默认值",
+            "btn_reset": "恢复默认值",
+            "btn_save": "保存超时设置"
+        },
+        "timeouts": {
+            "banner_title": "超时设置",
+            "banner_desc": "一次请求的完整超时链路：① 端点建立连接 → ② 上传请求体 → ③ 首字响应与连续输出。",
+            "section_connect": "① 端点建立连接 （自动故障切换端点）",
+            "connect_label": "连接超时 (秒)",
+            "connect_desc": "和端点的TCP连接建立超时时间，通常速度极快。",
+            "connect_restart": "改完需重启代理服务。",
+            "section_upload": "② 上传（发送请求体）",
+            "section_large_body": "大文件重试",
+            "section_header": "③ 首响应头（自动故障切换端点）",
+            "header_primary_title": "首选端点：",
+            "header_primary_items": "常规：TTFT　图片：TTFT+45　视频：TTFT+60　辅助：TTFT−30",
+            "header_fallback_title": "备选端点：",
+            "header_fallback_items": "同类增量减半（负增量不减半）",
+            "first_byte_effective": "当前生效（基准上限 {{cap}}s）：常规 {{text}}s　图片 {{image}}s　视频 {{video}}s　辅助 {{aux}}s",
+            "section_stream": "③ 首字与连续输出",
+            "stream_desc": "首响应头与首个输出 token 已合并为统一首字延迟：未收到 200 前可切换端点；收到 200 后只安全收尾，不再切换。",
+            "auto_summary": "例：最大等待时间= 47MB ÷ 2Mbps ×1.4 ≈ {{big}} 秒；"
         },
         "cloudflared": {
             "title": "公网访问 (Cloudflared)",
@@ -1431,6 +1535,10 @@
             "reset_mapping": "重置映射",
             "add_mapping": "添加映射 (Add Mapping)",
             "current_list": "当前映射列表 (Custom List)",
+            "expose_public": "公开",
+            "expose_hidden": "暗访",
+            "expose_public_tip": "对外公开（已列入 /v1/models 与选单，点击切换为暗访）",
+            "expose_hidden_tip": "暗路由（仅用于请求转发与自适应，不列入模型目录，点击切换为公开）",
             "no_custom_mapping": "暂无自定义精确映射",
             "gemini3_only_warning": "⚠️ 仅支持 Gemini 3 系列",
             "default_suffix": "（默认）",
@@ -1514,7 +1622,8 @@
             "sync_confirm_title": "同步确认",
             "sync_confirm_message": "即将为您同步 {{name}} 的配置。⚠️ 注意：此操作将覆盖您本地已有的配置文件（如登录状态、API Key 等）。确定要继续吗？",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "hermes_sync": {
@@ -1751,7 +1860,7 @@
             "out_tokens_title": "输出 Token",
             "ttft_prefix": "首字:",
             "total_duration_title": "总耗时",
-            "ttft_title": "首字延迟 (TTFT)"
+            "ttft_title": "首字延迟"
         },
         "details": {
             "title": "请求详情",
@@ -1775,10 +1884,47 @@
             "search_placeholder_with_shortcut": "搜索此报文... (Enter 下一个, Shift+Enter 上一个)",
             "case_sensitive": "区分大小写",
             "wrap_lines": "自动折行",
-            "no_wrap": "单行模式",
+            "no_wrap": "单行",
             "no_matches": "无匹配",
             "no_upstream_payload": "无中转报文 (直接转发或未记录)",
-            "headers": "请求与响应头 (Headers)"
+            "headers": "请求与响应头 (Headers)",
+            "layout_3col": "三栏对比",
+            "layout_3col_title": "三栏横向对比视图",
+            "layout_postman": "Postman 风格",
+            "layout_postman_title": "Postman 风格上下分屏视图",
+            "export_menu": "导出 / 复制",
+            "export_menu_title": "导出 HAR 格式、复制为 cURL 或诊断 JSON",
+            "copy_har": "复制 HAR 报文",
+            "download_har": "下载 .har 文件",
+            "copy_curl": "复制为 cURL 命令",
+            "copy_full_json": "复制全量诊断 JSON",
+            "copied_har": "已复制 HAR",
+            "exported_har": "已导出 .har",
+            "copied_curl": "已复制 cURL",
+            "copied_full_json": "已复制全量 JSON",
+            "collapse_metadata": "收起元数据",
+            "expand_metadata": "展开元数据",
+            "collapse_metadata_title": "折叠元数据以增大报文视野",
+            "expand_metadata_title": "展开元数据信息",
+            "wrap": "折行",
+            "wrap_on_title": "当前：自动折行 (点击切换为单行)",
+            "wrap_off_title": "当前：单行横向滚动 (点击切换为自动折行)",
+            "case_sensitive_on": "已开启区分大小写",
+            "case_sensitive_off": "点击开启区分大小写",
+            "clear_search": "清除搜索",
+            "no_match": "无匹配",
+            "prev_match": "上一处 (Shift+Enter)",
+            "next_match": "下一处 (Enter)",
+            "lines_count": "行",
+            "expand": "展开",
+            "collapse": "收起",
+            "req_headers": "请求头 (Headers)",
+            "upstream_headers": "转出请求头 (Headers)",
+            "resp_headers": "响应头 (Headers)",
+            "param_key": "参数名称 (Key)",
+            "param_value": "参数值 (Value)",
+            "header_key": "请求头 (Header)",
+            "header_value": "请求头值 (Value)"
         },
         "timing": {
             "title": "耗时分类诊断",
@@ -1808,7 +1954,12 @@
             "total": "总耗时",
             "copy_timing": "复制耗时分类",
             "copied_timing": "已复制耗时",
-            "legacy_hint": "历史记录未采集微观阶段耗时"
+            "legacy_hint": "历史记录未采集微观阶段耗时",
+            "collapse": "收起耗时诊断",
+            "expand": "展开耗时诊断",
+            "endpoint_label": "端点",
+            "status_label": "状态",
+            "network_timeout_or_error": "网络超时/异常"
         },
         "dialog": {
             "clear_title": "清除监控日志",
@@ -1849,6 +2000,7 @@
         "title": "安全访问控制",
         "desc": "当前运行在 Web 模式下，请输入管理密码或 API Key 以进入后台。",
         "placeholder": "请输入管理密码或 API Key",
+        "remember_me": "记住登录凭据",
         "btn_login": "验证并进入",
         "btn_verifying": "验证中...",
         "error_invalid_key": "密码或 API Key 错误，请重试",
@@ -1880,6 +2032,10 @@
         "by_account": "分账号统计",
         "by_model": "按模型",
         "by_account_view": "按账号",
+        "perspective_routed": "实际路由",
+        "perspective_requested": "请求模型",
+        "perspective_routed_tip": "按实际路由与转发生效的模型统计消耗",
+        "perspective_requested_tip": "按客户端发起请求时填写的原始模型统计",
         "model_details": "分模型详细统计",
         "account_details": "账号详细统计",
         "model": "模型",
@@ -2026,7 +2182,10 @@
         "cockpit_view_detail": "详情",
         "cockpit_tab_accounts": "账号",
         "cockpit_tab_models": "模型",
-        "cockpit_tab_users": "用户"
+        "cockpit_tab_users": "用户",
+        "avg_ttft": "首字延迟",
+        "ttft": "首字耗时",
+        "avg_ttft_tip": "平均首字响应耗时"
     },
     "errors": {
         "stream": {
@@ -2193,6 +2352,7 @@
     "apiKeyFun": {
         "title": "APIKEY.FUN 中转站",
         "eyebrow": "中转站",
+        "double11Badge": "双 11 特惠中",
         "description": "Antigravity Tools 官方合作中转站，为用户提供稳定、开放、高性价比的大模型 API 接入服务。支持 Claude、OpenAI、Gemini 等主流模型，适合在 Codex、Gemini CLI、Claude Code 及其他开发工具中统一配置使用。通过 Antigravity Tools 专属链接注册，可享受最高充值永久 95 折优惠。",
         "viewNow": "立即查看",
         "usage": {
@@ -2255,5 +2415,18 @@
         "confirm": "立即删除",
         "cancel": "暂不删除",
         "success": "已成功删除思考块缓存，将在后续对话中自动重建。"
+    },
+    "pedal": {
+        "notice_title": "发现即将重置的 {{model}} 周配额！",
+        "notice_desc": "以下账号的周配额在 24 小时内即将重置清零，可启动“蹬额度模式”全力消耗，避免额度作废：",
+        "mode_explanation": "启动后将优先调度并全力消耗以上账号，保留其他账号以保证会话连贯性与并发弹性。待额度全部用完 (0%) 或官方重置后，系统将自动恢复默认优先级。",
+        "suppress_button": "不再提示 {{model}} 模型",
+        "activate_button": "启动蹬额度模式",
+        "banner_running": "🚴 蹬额度模式运行中 ({{model}})",
+        "banner_priority_badge": "最高优先级调度",
+        "banner_suspended_count": "已挂起 {{count}} 个账号",
+        "banner_active_count": "{{count}} 个待消耗",
+        "banner_subtext": "正在全力优先消耗临期配额，其他正常账号正常待命作为会话连续性与并发弹性保底。当目标账号配额全部降至 0% 或到达重置时间后，系统将自动恢复默认调度。",
+        "exit_button": "手动退出并恢复"
     }
 }

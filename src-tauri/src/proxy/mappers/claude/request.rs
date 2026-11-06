@@ -475,24 +475,8 @@ pub fn transform_claude_request_in_timed(
     // This handles cases where context compression (kilo) incorrectly reorders blocks
     sort_thinking_blocks_first(&mut cleaned_req.messages);
 
-    // [FIX #1747] If thinking is auto-enabled by model default (e.g. Opus) but no
-    // ThinkingConfig was provided by the client, inject a default config with a budget
-    // to prevent 'thinking requires a budget' errors from upstream APIs.
-    if cleaned_req.thinking.is_none() && should_enable_thinking_by_default(&cleaned_req.model) {
-        let default_budget =
-            crate::proxy::model_specs::get_thinking_budget(&cleaned_req.model, token);
-        tracing::info!(
-            "[Thinking-Mode] Injecting default ThinkingConfig (budget={}) for model: {}",
-            default_budget,
-            cleaned_req.model
-        );
-        cleaned_req.thinking = Some(ThinkingConfig {
-            type_: "enabled".to_string(),
-            budget_tokens: Some(default_budget as u32),
-            effort: None,
-            display: None,
-        });
-    }
+    // [FIX #1747] 思考默认开启的模型不再由适配器伪造预算：
+    // `is_thinking_enabled` 会在下游触发流水线按官方模型结构体注入通道与预算。
 
     let claude_req = &cleaned_req; // 后续使用清理后的请求
 
@@ -568,29 +552,6 @@ pub fn transform_claude_request_in_timed(
     let allow_dummy_thought = false;
 
     // Check if thinking is enabled in the request
-    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
-        claude_req.thinking.as_ref().map(|t| t.type_.as_str()),
-        claude_req
-            .thinking
-            .as_ref()
-            .and_then(|t| t.budget_tokens.map(|b| b as u64)),
-        claude_req
-            .output_config
-            .as_ref()
-            .and_then(|c| c.effort.as_deref())
-            .or_else(|| {
-                claude_req
-                    .thinking
-                    .as_ref()
-                    .and_then(|t| t.effort.as_deref())
-            }),
-    );
-
-    let tb_config = crate::proxy::config::get_thinking_budget_config();
-    let is_client_control =
-        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
-
     let thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
     let force_server_thinking = crate::proxy::thinking_store::any_model_forces_server_thinking(&[
         claude_req.model.as_str(),
@@ -599,8 +560,7 @@ pub fn transform_claude_request_in_timed(
     let target_model_supports_thinking = model_supports_thinking(&mapped_model);
     let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(&mapped_model)
         || crate::proxy::model_specs::is_gemini_under_v3(&claude_req.model);
-    let mut is_thinking_enabled = !is_client_disabled
-        && !is_under_v3
+    let mut is_thinking_enabled = !is_under_v3
         && (target_model_supports_thinking
             || force_server_thinking
             || thinking_type == Some("enabled")
@@ -1653,7 +1613,7 @@ fn build_google_contents(
         mapped_model,
         should_finalize_thinking,
         Some(session_id),
-        false,
+        is_retry,
     );
     timing.think_fill_micros = think_start.elapsed().as_micros() as u64;
 
@@ -1816,10 +1776,11 @@ fn build_generation_config(
             }),
     );
 
-    let tb_config = crate::proxy::config::get_thinking_budget_config();
-    let is_client_control =
-        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
+    // 客户端 max_tokens → maxOutputTokens：必须在流水线之前写入。
+    // `configure_inbound_thinking` 是唯一写入方（官方硬顶 + budget 协商），适配器不再二次改写。
+    if let Some(max_tokens) = claude_req.max_tokens {
+        config["maxOutputTokens"] = json!(max_tokens as i64);
+    }
 
     let effort = claude_req
         .output_config
@@ -1833,16 +1794,7 @@ fn build_generation_config(
         .as_ref()
         .and_then(|t| t.budget_tokens.map(|b| b as u64));
 
-    if is_client_disabled {
-        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
-            mapped_model,
-            &mut config,
-            client_switch,
-            None,
-            None,
-            token,
-        );
-    } else if is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model) {
+    if is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model) {
         crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
             mapped_model,
             &mut config,
@@ -1863,53 +1815,8 @@ fn build_generation_config(
         config["topK"] = json!(top_k);
     }
 
-    // max_tokens 映射为 maxOutputTokens。客户端没传时留给流水线按官方模型结构体补齐。
-    let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
-
-    if let Some(thinking_config) = config.get("thinkingConfig") {
-        if let Some(budget) = thinking_config
-            .get("thinkingBudget")
-            .and_then(|t| t.as_u64())
-        {
-            let current = final_max_tokens.unwrap_or(0);
-            if current <= budget as i64 {
-                let overhead = if mapped_model.contains("-image") {
-                    2048
-                } else {
-                    8192
-                };
-                let boosted = (budget as i64 + overhead).min(65536);
-                final_max_tokens = Some(boosted);
-                tracing::info!(
-                    "[Generation-Config] Bumping maxOutputTokens to {} due to thinking budget of {}",
-                    boosted, budget
-                );
-            }
-        }
-    }
-
-    if let Some(val) = final_max_tokens {
-        // [FIX] Cap maxOutputTokens to safe upper limit (128000 for Claude 5.5, 65535 for Pro, 65536 for Flash, 64000 for Claude 4.6)
-        let mapped_lower = mapped_model.to_lowercase();
-        let safe_limit = if mapped_lower.contains("5-5") || mapped_lower.contains("5.5") {
-            128000
-        } else if mapped_lower.contains("claude") {
-            64000
-        } else if mapped_lower.contains("pro") {
-            65535
-        } else {
-            65536
-        };
-        if val > safe_limit {
-            tracing::warn!(
-                "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
-                val, safe_limit
-            );
-            config["maxOutputTokens"] = json!(safe_limit);
-        } else {
-            config["maxOutputTokens"] = json!(val);
-        }
-    }
+    // max_tokens 映射与「maxOutputTokens > thinkingBudget」不变量、官方硬顶
+    // 已由 `configure_inbound_thinking` 统一处理，适配器不再二次协商。
 
     config
 }
@@ -2773,80 +2680,6 @@ mod tests {
         assert_eq!(max_output, Some(65536));
     }
     #[test]
-    fn test_claude_flash_thinking_budget_capping() {
-        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Use full path or ensure import of ThinkingConfig
-        // transform_claude_request and models are needed.
-        // Assuming models are available via super imports, but let's be explicit if needed.
-
-        // Setup request with high budget
-        let req = ClaudeRequest {
-            model: "gemini-2.0-flash-thinking-exp".to_string(), // Contains "flash"
-            messages: vec![],
-            thinking: Some(ThinkingConfig {
-                type_: "enabled".to_string(),
-                budget_tokens: Some(32000),
-                effort: None,
-                display: None,
-            }),
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None, // Added missing field
-            stream: false,
-            system: None,
-            tools: None,
-            metadata: None,
-            output_config: None,
-            size: None,
-            quality: None,
-            tool_choice: None,
-        };
-
-        let result =
-            transform_claude_request_in(&req, "proj", false, None, "test_session", None).unwrap();
-        let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        assert_eq!(budget, 24576); // capped by model_specs.get_thinking_budget("gemini-2.0-flash-thinking-exp")
-
-        // Setup request for Pro thinking model (mock name for testing)
-        let req_pro = ClaudeRequest {
-            model: "gemini-2.0-pro-thinking-exp".to_string(), // Contains "thinking" but not "flash"
-            messages: vec![],
-            thinking: Some(ThinkingConfig {
-                type_: "enabled".to_string(),
-                budget_tokens: Some(32000),
-                effort: None,
-                display: None,
-            }),
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None, // Added missing field
-            stream: false,
-            system: None,
-            tools: None,
-            metadata: None,
-            output_config: None,
-            size: None,
-            quality: None,
-            tool_choice: None,
-        };
-
-        // Should cap
-        let result_pro =
-            transform_claude_request_in(&req_pro, "proj", false, None, "test_session", None)
-                .unwrap();
-        assert_eq!(
-            result_pro["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            49152
-        );
-    }
-
-    #[test]
     fn test_gemini_pro_thinking_support() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
@@ -2889,11 +2722,12 @@ mod tests {
             "thinkingConfig should be preserved for gemini-3-pro"
         );
 
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // In Auto mode, client's budget is ignored and bare gemini-3-pro defaults to 10001
-        assert_eq!(budget, 10001);
+        // 新规则：Pro 模型只下发 includeThoughts，不显式下发 thinkingBudget
+        assert_eq!(gen_config["thinkingConfig"]["includeThoughts"], true);
+        assert!(
+            gen_config["thinkingConfig"].get("thinkingBudget").is_none(),
+            "Pro 模型不再显式下发 thinkingBudget"
+        );
     }
 
     #[test]
@@ -3322,12 +3156,9 @@ mod tests {
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        assert_eq!(assistant_parts.len(), 2);
-        assert!(assistant_parts[0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Considering the question deeply..."));
-        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
+        // 新规则：无签名思考块出站前丢弃，仅保留正文
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
     }
 
     #[test]

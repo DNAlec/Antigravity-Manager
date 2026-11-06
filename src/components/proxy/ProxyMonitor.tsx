@@ -98,6 +98,27 @@ function extractTtft(log: ProxyRequestLog): number | undefined {
                         if (!isNaN(val) && val > 0) return val;
                     }
                 }
+                // 1.1 兜底：若 x-timing-ttft-ms 为 -1，则尝试从 x-timing-headers-ms 读取响应头到达耗时
+                for (const key of Object.keys(headers)) {
+                    const lower = key.toLowerCase();
+                    if (lower === 'x-timing-headers-ms') {
+                        const val = parseFloat(String(headers[key]));
+                        if (!isNaN(val) && val > 0) return val;
+                    }
+                }
+                // 1.2 兜底：从 x-timing-ttft-attempts 中读取生效端点的尝试耗时
+                const attemptsRaw = headers['x-timing-ttft-attempts'] || headers['X-Timing-Ttft-Attempts'];
+                if (attemptsRaw) {
+                    try {
+                        const arr = JSON.parse(atob(String(attemptsRaw)));
+                        if (Array.isArray(arr)) {
+                            const eff = arr.find((a: any) => a.is_effective);
+                            if (eff && typeof eff.duration_s === 'number' && eff.duration_s > 0) {
+                                return eff.duration_s * 1000;
+                            }
+                        }
+                    } catch {}
+                }
             }
         } catch {}
     }
@@ -110,6 +131,13 @@ function extractTtft(log: ProxyRequestLog): number | undefined {
                 const t = body._timing;
                 if (typeof t.ttft_ms === 'number' && t.ttft_ms > 0) return t.ttft_ms;
                 if (typeof t.ttft_s === 'number' && t.ttft_s > 0) return t.ttft_s * 1000;
+                // 兜底 attempts
+                if (Array.isArray(t.ttft_attempts)) {
+                    const eff = t.ttft_attempts.find((a: any) => a.is_effective);
+                    if (eff && typeof eff.duration_s === 'number' && eff.duration_s > 0) {
+                        return eff.duration_s * 1000;
+                    }
+                }
             }
         } catch {}
     }
@@ -429,9 +457,28 @@ const LogTable: React.FC<LogTableProps> = ({
                                  {/* 4. 服务账号 */}
                                  <td style={{ width: `${colWidths.account}px`, maxWidth: `${colWidths.account}px` }} className="py-2.5 px-3 align-middle overflow-hidden box-border">
                                      <div className="flex items-center gap-1.5 min-w-0 max-w-full">
-                                         <span className="text-gray-700 dark:text-gray-300 font-sans text-xs truncate" title={log.account_email || ''}>
-                                             {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
-                                         </span>
+                                         {(() => {
+                                             const account = log.account_email || '';
+                                             // 网关前置拦截哨兵：账号列直接亮出拒答原因（亮色/暗色都保持高对比度）
+                                             if (account === 'model not exist' || account === 'no quota accounts') {
+                                                 const isNotFound = account === 'model not exist';
+                                                 return (
+                                                     <span
+                                                         className={`inline-flex items-center font-sans font-semibold text-[11px] leading-none px-1.5 py-0.5 rounded whitespace-nowrap ${isNotFound
+                                                             ? 'text-rose-600 bg-rose-50 dark:text-rose-300 dark:bg-rose-500/15'
+                                                             : 'text-amber-600 bg-amber-50 dark:text-amber-300 dark:bg-amber-500/15'}`}
+                                                         title={account}
+                                                     >
+                                                         {account}
+                                                     </span>
+                                                 );
+                                             }
+                                             return (
+                                                 <span className="text-gray-700 dark:text-gray-300 font-sans text-xs truncate" title={account}>
+                                                     {account ? account.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                                                 </span>
+                                             );
+                                         })()}
                                          {log.account_email && accountQosByEmail.get(log.account_email.toLowerCase()) && (
                                              <QoSStatusBadge
                                                  status={accountQosByEmail.get(log.account_email.toLowerCase())}

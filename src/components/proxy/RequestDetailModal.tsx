@@ -99,13 +99,13 @@ export const parseTimingFromHeadersAndBody = (
                 if (typeof t.thinking_s === 'number') thinkingSec = t.thinking_s;
                 else if (typeof t.thinking_ms === 'number') thinkingSec = t.thinking_ms / 1000;
 
-                if (typeof t.ttft_s === 'number') ttftSec = t.ttft_s;
-                else if (typeof t.ttft_ms === 'number') ttftSec = t.ttft_ms / 1000;
+                if (typeof t.ttft_s === 'number' && t.ttft_s > 0) ttftSec = t.ttft_s;
+                else if (typeof t.ttft_ms === 'number' && t.ttft_ms > 0) ttftSec = t.ttft_ms / 1000;
 
-                if (typeof t.ttft_overhead_s === 'number') ttftOverheadSec = t.ttft_overhead_s;
-                else if (typeof t.ttft_overhead_ms === 'number') ttftOverheadSec = t.ttft_overhead_ms / 1000;
+                if (typeof t.ttft_overhead_s === 'number' && t.ttft_overhead_s > 0) ttftOverheadSec = t.ttft_overhead_s;
+                else if (typeof t.ttft_overhead_ms === 'number' && t.ttft_overhead_ms > 0) ttftOverheadSec = t.ttft_overhead_ms / 1000;
 
-                if (typeof t.ttft_total_wait_s === 'number') ttftTotalWaitSec = t.ttft_total_wait_s;
+                if (typeof t.ttft_total_wait_s === 'number' && t.ttft_total_wait_s > 0) ttftTotalWaitSec = t.ttft_total_wait_s;
 
                 if (Array.isArray(t.ttft_attempts)) {
                     ttftAttempts = t.ttft_attempts;
@@ -156,11 +156,15 @@ export const parseTimingFromHeadersAndBody = (
                 }
                 if (ttftSec === undefined) {
                     const ms = getVal('x-timing-ttft-ms');
-                    if (ms !== undefined) ttftSec = ms / 1000;
+                    if (ms !== undefined && ms > 0) ttftSec = ms / 1000;
+                }
+                if (ttftSec === undefined) {
+                    const ms = getVal('x-timing-headers-ms');
+                    if (ms !== undefined && ms > 0) ttftSec = ms / 1000;
                 }
                 if (ttftOverheadSec === undefined) {
                     const ms = getVal('x-timing-ttft-overhead-ms');
-                    if (ms !== undefined) ttftOverheadSec = ms / 1000;
+                    if (ms !== undefined && ms > 0) ttftOverheadSec = ms / 1000;
                 }
                 if (streamSec === undefined) {
                     const ms = getVal('x-timing-stream-ms');
@@ -183,8 +187,35 @@ export const parseTimingFromHeadersAndBody = (
                         }
                     } catch {}
                 }
+
+                // 兜底：若 ttftSec 依然未知，从生效端点 attempts 中读取真实端点耗时
+                if (ttftSec === undefined && ttftAttempts && ttftAttempts.length > 0) {
+                    const eff = ttftAttempts.find((a) => a.is_effective);
+                    if (eff && typeof eff.duration_s === 'number' && eff.duration_s > 0) {
+                        ttftSec = eff.duration_s;
+                    }
+                }
             }
         } catch {}
+    }
+
+    // 兜底：若 responseBody 中带有 ttftAttempts，也可用于兜底 ttftSec
+    if (ttftSec === undefined && ttftAttempts && ttftAttempts.length > 0) {
+        const eff = ttftAttempts.find((a) => a.is_effective);
+        if (eff && typeof eff.duration_s === 'number' && eff.duration_s > 0) {
+            ttftSec = eff.duration_s;
+        }
+    }
+
+    // 防御性过滤：绝不允许负数泄露到展示层
+    if (ttftSec !== undefined && ttftSec <= 0) {
+        ttftSec = undefined;
+    }
+    if (ttftOverheadSec !== undefined && ttftOverheadSec <= 0) {
+        ttftOverheadSec = undefined;
+    }
+    if (ttftTotalWaitSec !== undefined && ttftTotalWaitSec <= 0) {
+        ttftTotalWaitSec = undefined;
     }
 
     if (ttftTotalWaitSec === undefined && ttftSec !== undefined) {
@@ -426,7 +457,7 @@ export const TimingDiagnosticsCard: React.FC<TimingDiagnosticsCardProps> = ({ ti
                         type="button"
                         onClick={() => setIsExpanded((prev) => !prev)}
                         className="btn btn-ghost btn-xs p-1 h-6 min-h-0 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-500/15"
-                        title={isExpanded ? '收起耗时诊断' : '展开耗时诊断'}
+                        title={isExpanded ? t('monitor.timing.collapse', '收起耗时诊断') : t('monitor.timing.expand', '展开耗时诊断')}
                     >
                         <ChevronDown size={14} className={`transition-transform duration-200 ${isExpanded ? '' : '-rotate-90'}`} />
                     </button>
@@ -528,13 +559,13 @@ export const TimingDiagnosticsCard: React.FC<TimingDiagnosticsCardProps> = ({ ti
                                                             <span className="font-black">{formatSeconds(att.duration_s)}</span>
                                                         </div>
                                                         <div className="text-[10px] text-gray-500 dark:text-gray-400 truncate mt-0.5" title={att.endpoint_url}>
-                                                            端点: {att.endpoint_url}
+                                                            {t('monitor.timing.endpoint_label', '端点')}: {att.endpoint_url}
                                                         </div>
                                                         <div className="text-[10px] mt-1 text-gray-600 dark:text-gray-300 space-y-1">
                                                             <div>
-                                                                <span className="font-medium">状态: </span>
+                                                                <span className="font-medium">{t('monitor.timing.status_label', '状态')}: </span>
                                                                 <span className="font-bold">
-                                                                    {att.status ? `${att.status}` : '网络超时/异常'}
+                                                                    {att.status ? `${att.status}` : t('monitor.timing.network_timeout_or_error', '网络超时/异常')}
                                                                     {att.is_effective ? ' OK' : ''}
                                                                     {!att.is_effective && (
                                                                         <span className="font-normal opacity-85 ml-1">

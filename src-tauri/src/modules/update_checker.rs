@@ -74,6 +74,51 @@ impl Default for UpdateSettings {
     }
 }
 
+/// 更新设置的局部补丁：仅覆盖显式提供的字段，未提供的字段保留磁盘上的现有值。
+///
+/// 该结构同时服务于 Web (Axum) 与桌面 (Tauri) 两条链路：
+/// - Web 前端 `invoke('save_update_settings', { settings: { ... } })` 经 HTTP 原样透传；
+/// - 桌面端由 Tauri 按参数名 `settings` 自动解包。
+///
+/// 直接用完整结构体落盘会带来两个历史问题：前端硬编码的 `last_check_time: 0`
+/// 会清空最近检查时间并触发立即检查；部分调用点省略的 `update_channel` 会因
+/// `#[serde(default)]` 被静默重置为构建默认通道。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateSettingsPatch {
+    pub auto_check: Option<bool>,
+    pub last_check_time: Option<u64>,
+    pub check_interval_hours: Option<u64>,
+    pub update_channel: Option<UpdateChannel>,
+}
+
+impl UpdateSettingsPatch {
+    /// 补丁未携带任何字段时视为无效请求，避免静默返回成功。
+    pub fn is_empty(&self) -> bool {
+        self.auto_check.is_none()
+            && self.last_check_time.is_none()
+            && self.check_interval_hours.is_none()
+            && self.update_channel.is_none()
+    }
+}
+
+impl UpdateSettings {
+    /// 将补丁字段合并进当前设置，未提供的字段保持不变。
+    pub fn apply_patch(&mut self, patch: UpdateSettingsPatch) {
+        if let Some(auto_check) = patch.auto_check {
+            self.auto_check = auto_check;
+        }
+        if let Some(last_check_time) = patch.last_check_time {
+            self.last_check_time = last_check_time;
+        }
+        if let Some(check_interval_hours) = patch.check_interval_hours {
+            self.check_interval_hours = check_interval_hours;
+        }
+        if let Some(update_channel) = patch.update_channel {
+            self.update_channel = update_channel;
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -597,6 +642,24 @@ pub fn save_update_settings(settings: &UpdateSettings) -> Result<(), String> {
         .map_err(|e| format!("Failed to write settings file: {}", e))
 }
 
+/// 读取现有设置、应用补丁后落盘，返回合并后的完整设置。
+///
+/// 配置文件尚不存在时 `load_update_settings` 会返回按构建版本推导的默认值，
+/// 因此首次保存同样能产出完整、合法的配置。空补丁一律拒绝，避免两条传输链路
+/// （Web / Tauri）出现“字段名拼错但静默成功”的假象。
+pub fn patch_update_settings(patch: UpdateSettingsPatch) -> Result<UpdateSettings, String> {
+    if patch.is_empty() {
+        return Err(
+            "Empty update settings patch: expected at least one field to update".to_string(),
+        );
+    }
+
+    let mut settings = load_update_settings()?;
+    settings.apply_patch(patch);
+    save_update_settings(&settings)?;
+    Ok(settings)
+}
+
 /// Update last check time
 pub fn update_last_check_time() -> Result<(), String> {
     let mut settings = load_update_settings()?;
@@ -727,6 +790,48 @@ mod tests {
         assert!(compare_versions("4.8.1", "4.8.1-beta.2")); // 正式版 > 预发布版
         assert!(!compare_versions("4.8.1-beta.2", "4.8.1"));
         assert!(compare_versions("4.8.2-beta.1", "4.8.1"));
+    }
+
+    #[test]
+    fn test_apply_patch_preserves_unspecified_fields() {
+        let mut settings = UpdateSettings {
+            auto_check: true,
+            last_check_time: 1_700_000_000,
+            check_interval_hours: 6,
+            update_channel: UpdateChannel::Beta,
+        };
+
+        settings.apply_patch(UpdateSettingsPatch {
+            auto_check: Some(false),
+            ..Default::default()
+        });
+
+        assert!(!settings.auto_check);
+        assert_eq!(settings.last_check_time, 1_700_000_000);
+        assert_eq!(settings.check_interval_hours, 6);
+        assert_eq!(settings.update_channel, UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn test_update_settings_patch_only_contains_provided_fields() {
+        let patch: UpdateSettingsPatch = serde_json::from_value(serde_json::json!({
+            "update_channel": "beta"
+        }))
+        .expect("partial patch should deserialize");
+
+        assert!(!patch.is_empty());
+        assert_eq!(patch.auto_check, None);
+        assert_eq!(patch.last_check_time, None);
+        assert_eq!(patch.update_channel, Some(UpdateChannel::Beta));
+
+        let empty: UpdateSettingsPatch = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_patch_update_settings_rejects_empty_patch() {
+        // 空补丁在触达磁盘前即被拒绝，不依赖数据目录环境
+        assert!(patch_update_settings(UpdateSettingsPatch::default()).is_err());
     }
 
     #[test]

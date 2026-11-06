@@ -30,12 +30,19 @@ pub static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
 /// 获取当前 Thinking Budget 配置
+///
+/// [2026-10-29] 官方已把 Gemini 3.8/4 与 Claude 5.5 全量迁移到 `thinkingLevel`，
+/// 网关不再提供「客户端自适应（Client Direct Control）」模式，也不再用自造的档位预算表。
+/// 这里强制归一到 `Gateway`：旧配置文件里的 `client` 会在读取时被忽略，
+/// 保证四个协议适配层全部走「官方结构体为准」的统一通道。
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
-    GLOBAL_THINKING_BUDGET_CONFIG
+    let mut cfg = GLOBAL_THINKING_BUDGET_CONFIG
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|cfg| cfg.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cfg.control_source = ThinkingControlSource::Gateway;
+    cfg
 }
 
 /// 更新全局 Thinking Budget 配置
@@ -244,6 +251,96 @@ pub fn update_stream_timeout_config(config: StreamTimeoutConfig) {
             config.initial_ttft_secs,
             config.transition_secs,
             config.streaming_sliding_secs
+        );
+    }
+}
+
+// ============================================================================
+// 全局上游发送阶段分级超时配置存储 (Fixes #3763)
+// ============================================================================
+static GLOBAL_UPLOAD_TIMEOUT_CONFIG: OnceLock<RwLock<UploadTimeoutConfig>> = OnceLock::new();
+
+/// 获取当前上传阶段超时配置（支持环境变量覆盖，保证 Headless/CLI 一致性）
+pub fn get_upload_timeout_config() -> UploadTimeoutConfig {
+    let base = GLOBAL_UPLOAD_TIMEOUT_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|cfg| cfg.clone())
+        .unwrap_or_default();
+
+    // 允许通过环境变量覆盖，符合 AGENTS.md Headless & CLI Parity 纪律
+    let connect_secs = env_u64("ANTIGRAVITY_TIMEOUT_CONNECT_SECS", base.connect_secs);
+    let min_upload_mbps = std::env::var("ANTIGRAVITY_TIMEOUT_UPLOAD_MIN_MBPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(base.min_upload_mbps);
+    let extra_wait_ratio = std::env::var("ANTIGRAVITY_TIMEOUT_UPLOAD_EXTRA_WAIT_RATIO")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(base.extra_wait_ratio);
+    let stall_secs = env_u64("ANTIGRAVITY_TIMEOUT_UPLOAD_STALL_SECS", base.stall_secs);
+    let header_wait_secs = env_u64(
+        "ANTIGRAVITY_TIMEOUT_HEADER_WAIT_SECS",
+        base.header_wait_secs,
+    );
+    let large_body_threshold_mb = env_u64(
+        "ANTIGRAVITY_TIMEOUT_LARGE_BODY_MB",
+        base.large_body_threshold_mb,
+    );
+    let large_body_endpoint_attempts = env_u64(
+        "ANTIGRAVITY_TIMEOUT_LARGE_BODY_ENDPOINT_ATTEMPTS",
+        base.large_body_endpoint_attempts as u64,
+    ) as usize;
+
+    UploadTimeoutConfig {
+        connect_secs,
+        min_upload_mbps,
+        extra_wait_ratio,
+        stall_secs,
+        header_wait_secs,
+        large_body_threshold_mb,
+        large_body_endpoint_attempts,
+    }
+    .normalized()
+}
+
+fn env_u64(key: &str, fallback: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(fallback)
+}
+
+/// 更新全局上传阶段超时配置
+pub fn update_upload_timeout_config(config: UploadTimeoutConfig) {
+    let config = config.normalized();
+    if let Some(lock) = GLOBAL_UPLOAD_TIMEOUT_CONFIG.get() {
+        if let Ok(mut cfg) = lock.write() {
+            if *cfg != config {
+                *cfg = config.clone();
+                tracing::info!(
+                    "[Upstream-Timeouts] Global config updated: connect={}s, min_mbps={:.2}, extra_ratio={:.2}, stall={}s, header_wait={}s, large_body={}MB/{}",
+                    config.connect_secs,
+                    config.min_upload_mbps,
+                    config.extra_wait_ratio,
+                    config.stall_secs,
+                    config.header_wait_secs,
+                    config.large_body_threshold_mb,
+                    config.large_body_endpoint_attempts
+                );
+            }
+        }
+    } else {
+        let _ = GLOBAL_UPLOAD_TIMEOUT_CONFIG.set(RwLock::new(config.clone()));
+        tracing::info!(
+            "[Upstream-Timeouts] Global config initialized: connect={}s, min_mbps={:.2}, extra_ratio={:.2}, stall={}s, header_wait={}s, large_body={}MB/{}",
+            config.connect_secs,
+            config.min_upload_mbps,
+            config.extra_wait_ratio,
+            config.stall_secs,
+            config.header_wait_secs,
+            config.large_body_threshold_mb,
+            config.large_body_endpoint_attempts
         );
     }
 }
@@ -534,13 +631,17 @@ impl Default for ThinkingBudgetMode {
 }
 
 /// Thinking Budget 配置
+///
+/// 官方模型目录已收录的模型完全由官方 `thinkingBudget` / `thinkingLevel` 驱动；
+/// 这里的数值仅作为「官方目录未收录的实验模型」的兜底，且必须 `mode = Custom`。
+/// 设置界面已不再暴露这些字段，保留仅为兼容旧配置与 headless 用户。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingBudgetConfig {
     /// 控制权大选择：网关控制 vs 客户端控制
     #[serde(default = "default_control_source")]
     pub control_source: ThinkingControlSource,
 
-    // --- Gemini Flash 系列配置 ---
+    // --- Gemini Flash 系列配置（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub flash_mode: ThinkingBudgetMode,
     #[serde(default = "default_flash_low")]
@@ -575,7 +676,7 @@ pub struct ThinkingBudgetConfig {
     #[serde(default = "default_claude_high")]
     pub claude_high: i32, // 默认 16000
 
-    // --- 历史向后兼容字段 ---
+    // --- 历史向后兼容字段（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub mode: ThinkingBudgetMode,
     #[serde(default = "default_thinking_budget_custom_value")]
@@ -705,15 +806,15 @@ fn default_sliding_strategy() -> String {
 /// 多模态交互与保鲜滑窗配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultimodalConfig {
-    /// 是否启用多模态历史保鲜滑动窗口 (默认关闭，贯彻保真透传)
-    #[serde(default)]
+    /// 是否启用多模态历史保鲜滑动窗口 (默认开启，自动防范长上下文堆积多图导致请求体膨胀及 504)
+    #[serde(default = "default_enable_sliding_window")]
     pub enable_sliding_window: bool,
 
     /// 保鲜策略模式: "count" (按图片张数) 或 "memory" (按累积内存大小)
     #[serde(default = "default_sliding_strategy")]
     pub strategy: String,
 
-    /// 滑动窗口保鲜最大图片张数（默认 10，填 0 为不限张数）
+    /// 滑动窗口保鲜最大图片张数（默认 5，填 0 为不限张数）
     #[serde(default = "default_max_fresh_images")]
     pub max_fresh_images: usize,
 
@@ -726,8 +827,12 @@ pub struct MultimodalConfig {
     pub max_total_image_mb: usize,
 }
 
+fn default_enable_sliding_window() -> bool {
+    true
+}
+
 fn default_max_fresh_images() -> usize {
-    10
+    5
 }
 
 fn default_max_total_image_mb() -> usize {
@@ -737,12 +842,119 @@ fn default_max_total_image_mb() -> usize {
 impl Default for MultimodalConfig {
     fn default() -> Self {
         Self {
-            enable_sliding_window: false,
+            enable_sliding_window: default_enable_sliding_window(),
             strategy: default_sliding_strategy(),
             max_fresh_images: default_max_fresh_images(),
             strip_remote_urls: false,
             max_total_image_mb: default_max_total_image_mb(),
         }
+    }
+}
+
+/// 上游超时配置（连接期 / 上传阶段 / 首响应头 / 大文件重试）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UploadTimeoutConfig {
+    /// 连接期看门狗（每个端点独立建连时限，秒，默认 10s）；超时即切换下一端点。
+    /// 该值在 HTTP 客户端构建时生效，修改后需重启代理服务
+    #[serde(default = "default_connect_secs")]
+    pub connect_secs: u64,
+
+    /// 上传带宽（Mbps，默认 2.0，推荐 1-5 Mbps）
+    #[serde(default = "default_min_upload_mbps")]
+    pub min_upload_mbps: f64,
+
+    /// 额外等待系数（默认 0.4；最大等待时间 = 大小 ÷ 带宽 × (1 + 系数)）
+    #[serde(default = "default_extra_wait_ratio")]
+    pub extra_wait_ratio: f64,
+
+    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断；若最大等待时间更短则取较短者
+    #[serde(default = "default_upload_stall_secs")]
+    pub stall_secs: u64,
+
+    /// 已废弃：仅为配置 round-trip 保留，不再参与首字预算。
+    ///
+    /// 「首响应头」与「首字」已合并为统一首字延迟（TTFB≡TTFT），唯一来源是
+    /// [`StreamTimeoutConfig::initial_ttft_secs`] + 按 token 规模的自适应下限；
+    /// 媒体增量：常规 +0 / 图片 +45 / 视频 +60 / 辅助 −30，备用端点增量减半。
+    /// 新配置请只使用 `initial_ttft_secs`。
+    #[serde(default = "default_header_wait_secs")]
+    pub header_wait_secs: u64,
+
+    /// 大文件判定阈值（MB，默认 8MB）
+    #[serde(default = "default_large_body_threshold_mb")]
+    pub large_body_threshold_mb: u64,
+
+    /// 大文件最多尝试次数（默认 1；默认只发一次，避免反复重传占满上行）
+    #[serde(default = "default_large_body_endpoint_attempts")]
+    pub large_body_endpoint_attempts: usize,
+}
+
+fn default_connect_secs() -> u64 {
+    10
+}
+
+fn default_min_upload_mbps() -> f64 {
+    0.8
+}
+
+fn default_extra_wait_ratio() -> f64 {
+    0.4
+}
+
+fn default_upload_stall_secs() -> u64 {
+    45
+}
+
+fn default_header_wait_secs() -> u64 {
+    0
+}
+
+fn default_large_body_threshold_mb() -> u64 {
+    8
+}
+
+fn default_large_body_endpoint_attempts() -> usize {
+    1
+}
+
+impl Default for UploadTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: default_connect_secs(),
+            min_upload_mbps: default_min_upload_mbps(),
+            extra_wait_ratio: default_extra_wait_ratio(),
+            stall_secs: default_upload_stall_secs(),
+            header_wait_secs: default_header_wait_secs(),
+            large_body_threshold_mb: default_large_body_threshold_mb(),
+            large_body_endpoint_attempts: default_large_body_endpoint_attempts(),
+        }
+    }
+}
+
+impl UploadTimeoutConfig {
+    /// 归一化非法配置，避免 0 值或倒挂阈值导致发送阶段瞬间自断
+    pub fn normalized(mut self) -> Self {
+        self.connect_secs = self.connect_secs.clamp(3, 120);
+        self.min_upload_mbps = if self.min_upload_mbps.is_finite() {
+            self.min_upload_mbps.clamp(0.1, 1000.0)
+        } else {
+            default_min_upload_mbps()
+        };
+        self.extra_wait_ratio = if self.extra_wait_ratio.is_finite() {
+            self.extra_wait_ratio.clamp(0.0, 10.0)
+        } else {
+            default_extra_wait_ratio()
+        };
+        self.stall_secs = self.stall_secs.clamp(5, 600);
+        self.header_wait_secs = self.header_wait_secs.min(600);
+        self.large_body_threshold_mb = self.large_body_threshold_mb.max(1);
+        self.large_body_endpoint_attempts = self.large_body_endpoint_attempts.max(1);
+        self
+    }
+
+    /// 大体积请求阈值（字节）
+    pub fn large_body_threshold_bytes(&self) -> usize {
+        (self.large_body_threshold_mb as usize).saturating_mul(1024 * 1024)
     }
 }
 
@@ -903,8 +1115,17 @@ pub struct ProxyConfig {
     pub auto_start: bool,
 
     /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
-    #[serde(default)]
+    #[serde(default = "default_custom_mapping")]
     pub custom_mapping: std::collections::HashMap<String, String>,
+
+    /// 自定义模型对外暴露状态 (key: 原始模型名, value: 是否对外暴露)
+    /// 默认精确条目对外暴露 (true)，内置兼容暗路由规则不暴露 (false)
+    #[serde(default = "default_custom_mapping_expose")]
+    pub custom_mapping_expose: std::collections::HashMap<String, bool>,
+
+    /// 内置映射版本号，用于无感迁移与防复活保障
+    #[serde(default = "default_builtin_mapping_version")]
+    pub builtin_mapping_version: u32,
 
     /// API 请求超时时间(秒)
     #[serde(default = "default_request_timeout")]
@@ -1006,6 +1227,16 @@ pub struct ProxyConfig {
     /// 流式梯度超时配置 (首字响应、状态切换、推流滑动)
     #[serde(default)]
     pub stream_timeouts: StreamTimeoutConfig,
+
+    /// 上游发送阶段分级超时配置 (连接 → 上传 → 等待响应头)
+    #[serde(default)]
+    pub upload_timeouts: UploadTimeoutConfig,
+
+    /// 遇到限流账号自动进小黑屋 (QoS 降速熔断守卫)
+    /// - false: 默认关闭。直接忽略校验时长，不标记疑似限速，不进小黑屋，不解绑会话。
+    /// - true: 开启。当账号 TTFT 显著异常时标记疑似限速，累计超标关入小黑屋并解绑会话。
+    #[serde(default)]
+    pub qos_auto_jail: bool,
 }
 
 /// Request log retention policy.
@@ -1111,8 +1342,30 @@ pub struct UpstreamProxyConfig {
     pub url: String,
 }
 
+pub fn default_builtin_mapping_version() -> u32 {
+    1
+}
+
 pub fn default_custom_mapping() -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::new()
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), "auto:claude-opus".to_string());
+    m.insert(
+        "claude-opus-4-7*".to_string(),
+        "auto:claude-opus-4-7".to_string(),
+    );
+    m.insert(
+        "claude-haiku-*".to_string(),
+        "auto:gemini-flash-low".to_string(),
+    );
+    m
+}
+
+pub fn default_custom_mapping_expose() -> std::collections::HashMap<String, bool> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), false);
+    m.insert("claude-opus-4-7*".to_string(), false);
+    m.insert("claude-haiku-*".to_string(), false);
+    m
 }
 
 impl Default for ProxyConfig {
@@ -1126,6 +1379,8 @@ impl Default for ProxyConfig {
             admin_password: None,
             auto_start: false,
             custom_mapping: default_custom_mapping(),
+            custom_mapping_expose: default_custom_mapping_expose(),
+            builtin_mapping_version: default_builtin_mapping_version(),
             request_timeout: default_request_timeout(),
             enable_logging: true,       // 默认开启，支持 token 统计功能
             capture_health_logs: false, // 默认关闭，过滤 GET 探活与第三方网关探测请求且不入库
@@ -1148,8 +1403,10 @@ impl Default for ProxyConfig {
             proxy_pool: ProxyPoolConfig::default(),
             multimodal: MultimodalConfig::default(),
             stream_timeouts: StreamTimeoutConfig::default(),
+            upload_timeouts: UploadTimeoutConfig::default(),
             image_thinking_mode: None,
             image_scheduler: ImageSchedulerConfig::default(),
+            qos_auto_jail: false,
         }
     }
 }

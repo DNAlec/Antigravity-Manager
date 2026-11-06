@@ -513,7 +513,7 @@ fn record_user_token_usage(
         let _ = crate::modules::user_token_db::record_token_usage_and_ip(
             &identity.token_id,
             log.client_ip.as_deref().unwrap_or("127.0.0.1"),
-            log.model.as_deref().unwrap_or("unknown"),
+            log.effective_model(),
             log.input_tokens.unwrap_or(0) as i32,
             log.output_tokens.unwrap_or(0) as i32,
             log.status as u16,
@@ -863,8 +863,23 @@ fn consolidate_non_streaming_response(
         let hdr_key = format!("x-timing-{}", key);
         if let Some(val) = headers_map.get(&hdr_key).and_then(|v| v.as_str()) {
             if let Ok(n) = val.parse::<f64>() {
+                if key == "ttft_ms" && n <= 0.0 {
+                    continue;
+                }
                 let out_key = key.replace("_ms", "_s");
                 timing_obj.insert(out_key, serde_json::json!(n / 1000.0));
+            }
+        }
+    }
+    if !timing_obj.contains_key("ttft_s") {
+        if let Some(hms) = headers_map
+            .get("x-timing-headers-ms")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(n) = hms.parse::<f64>() {
+                if n > 0.0 {
+                    timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                }
             }
         }
     }
@@ -872,7 +887,7 @@ fn consolidate_non_streaming_response(
         timing_obj.get("ttft_s").and_then(|v| v.as_f64()),
         timing_obj.get("ttft_overhead_s").and_then(|v| v.as_f64()),
     ) {
-        if overhead > 0.0 {
+        if ttft > 0.0 && overhead > 0.0 {
             timing_obj.insert(
                 "ttft_total_wait_s".to_string(),
                 serde_json::json!(ttft + overhead),
@@ -1201,19 +1216,28 @@ pub async fn monitor_middleware(
     };
 
     if content_type.contains("text/event-stream") {
+        let stream_ttft_capture = response
+            .extensions()
+            .get::<crate::proxy::pipeline::timing::StreamTtftCapture>()
+            .cloned();
         let (parts, body) = response.into_parts();
         let mut stream = body.into_data_stream();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let start_instant = start;
-        let attempts_for_stream = upstream_attempts.clone();
+        let mut attempts_for_stream = upstream_attempts.clone();
 
         tokio::spawn(async move {
             let stream_start = std::time::Instant::now();
             let mut all_stream_data = Vec::new();
             let mut last_few_bytes = Vec::new();
+            let mut first_chunk_elapsed_ms: Option<f64> = None;
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
+                    if first_chunk_elapsed_ms.is_none() && !chunk.is_empty() {
+                        first_chunk_elapsed_ms =
+                            Some(start_instant.elapsed().as_secs_f64() * 1000.0);
+                    }
                     all_stream_data.extend_from_slice(&chunk);
 
                     if chunk.len() > 8192 {
@@ -1245,6 +1269,75 @@ pub async fn monitor_middleware(
                 .and_then(|h| serde_json::from_str(h).ok())
                 .unwrap_or_default();
 
+            // 解析真实纯净 TTFT (消除发头时 -1 哨兵值造成的负时间 Bug)
+            let mut final_ttft_ms: Option<f64> = None;
+            // 1. 优先使用生效端点探针捕获到的真实首包耗时
+            if let Some(cap) = stream_ttft_capture.as_ref().and_then(|c| c.get()) {
+                if cap > 0.0 {
+                    final_ttft_ms = Some(cap);
+                }
+            }
+            // 2. 其次使用 monitor 自身观测到的首个非空数据块耗时
+            if final_ttft_ms.is_none() {
+                if let Some(ms) = first_chunk_elapsed_ms {
+                    if ms > 0.0 {
+                        final_ttft_ms = Some(ms);
+                    }
+                }
+            }
+            // 3. 再次使用 headers_map 中有效的正数 TTFT
+            if final_ttft_ms.is_none() {
+                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = ttft.parse::<f64>() {
+                        if n > 0.0 {
+                            final_ttft_ms = Some(n);
+                        }
+                    }
+                }
+            }
+            // 4. 再次兜底使用响应头到达耗时 (x-timing-headers-ms)
+            if final_ttft_ms.is_none() {
+                if let Some(hms) = headers_map
+                    .get("x-timing-headers-ms")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(n) = hms.parse::<f64>() {
+                        if n > 0.0 {
+                            final_ttft_ms = Some(n);
+                        }
+                    }
+                }
+            }
+            // 5. 再次兜底使用生效端点尝试的 duration_s
+            if final_ttft_ms.is_none() {
+                if let Some(attempts) = &attempts_for_stream {
+                    if let Some(eff) = attempts.iter().find(|a| a.is_effective) {
+                        if eff.duration_s > 0.0 {
+                            final_ttft_ms = Some(eff.duration_s * 1000.0);
+                        }
+                    }
+                }
+            }
+
+            // 回填真实 TTFT 到响应头，彻底消除 -1.000
+            if let Some(ttft_ms) = final_ttft_ms {
+                headers_map.insert(
+                    "x-timing-ttft-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", ttft_ms)),
+                );
+                if let Some(ref mut attempts) = attempts_for_stream {
+                    if let Some(eff) = attempts.iter_mut().find(|a| a.is_effective) {
+                        eff.duration_s = ttft_ms / 1000.0;
+                    }
+                }
+            } else if headers_map
+                .get("x-timing-ttft-ms")
+                .and_then(|v| v.as_str())
+                .map_or(false, |s| s.starts_with('-'))
+            {
+                headers_map.remove("x-timing-ttft-ms");
+            }
+
             headers_map.insert(
                 "x-timing-stream-ms".to_string(),
                 serde_json::json!(format!("{:.3}", stream_ms)),
@@ -1274,12 +1367,6 @@ pub async fn monitor_middleware(
                     }
 
                     if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                        if let Some(mv) = json.get("modelVersion").and_then(|v| v.as_str()) {
-                            if !mv.trim().is_empty() {
-                                log.upstream_model = Some(mv.to_string());
-                            }
-                        }
-
                         // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
                         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                             for choice in choices {
@@ -1638,10 +1725,17 @@ pub async fn monitor_middleware(
                     }
                 }
                 let mut ttft_val = 0.0;
-                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
+                if let Some(ttft_ms) = final_ttft_ms {
+                    ttft_val = ttft_ms / 1000.0;
+                    timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                } else if let Some(ttft) =
+                    headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str())
+                {
                     if let Ok(n) = ttft.parse::<f64>() {
-                        ttft_val = n / 1000.0;
-                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                        if n > 0.0 {
+                            ttft_val = n / 1000.0;
+                            timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                        }
                     }
                 }
                 if let Some(oh) = headers_map
@@ -1689,14 +1783,6 @@ pub async fn monitor_middleware(
                             {
                                 let json_str = line.trim_start_matches("data: ").trim();
                                 if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                    if let Some(mv) =
-                                        json.get("modelVersion").and_then(|v| v.as_str())
-                                    {
-                                        if !mv.trim().is_empty() {
-                                            log.upstream_model = Some(mv.to_string());
-                                        }
-                                    }
-
                                     if let Some(usage) = json
                                         .get("usage")
                                         .or(json.get("usageMetadata"))
@@ -1870,6 +1956,10 @@ pub async fn monitor_middleware(
             "x-timing-total-ms".to_string(),
             serde_json::json!(format!("{:.3}", total_ms)),
         );
+        headers_map.insert(
+            "x-timing-ttft-ms".to_string(),
+            serde_json::json!(format!("{:.3}", total_ms)),
+        );
         log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
         let (parts, body) = response.into_parts();
@@ -1877,16 +1967,6 @@ pub async fn monitor_middleware(
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        if let Some(mv) = json
-                            .get("modelVersion")
-                            .or_else(|| json.get("response").and_then(|r| r.get("modelVersion")))
-                            .and_then(|v| v.as_str())
-                        {
-                            if !mv.trim().is_empty() {
-                                log.upstream_model = Some(mv.to_string());
-                            }
-                        }
-
                         // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
                         if let Some(usage) = json
                             .get("usage")

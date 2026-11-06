@@ -8,6 +8,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { request as invoke } from '../../utils/request';
 import { isTauri } from '../../utils/env';
 import { copyToClipboard } from '../../utils/clipboard';
+import * as accountService from '../../services/accountService';
 
 interface AddAccountDialogProps {
     onAdd: (email: string, refreshToken: string) => Promise<void>;
@@ -21,6 +22,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const fetchAccounts = useAccountStore(state => state.fetchAccounts);
     const [isOpen, setIsOpen] = useState(false);
     const [activeTab, setActiveTab] = useState<'oauth' | 'token' | 'import'>(isTauri() ? 'oauth' : 'token');
+    const [accountType, setAccountType] = useState<'personal' | 'enterprise'>('personal');
     const [refreshToken, setRefreshToken] = useState('');
     const [oauthUrl, setOauthUrl] = useState('');
     const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
@@ -119,17 +121,17 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     useEffect(() => {
         if (!isOpen) return;
         if (activeTab !== 'oauth') return;
-        if (oauthUrl) return;
 
-        invoke<any>('prepare_oauth_url')
-            .then((res) => {
-                const url = typeof res === 'string' ? res : res?.url;
+        const clientKey = accountType === 'enterprise' ? 'antigravity_gcp' : 'antigravity_enterprise';
+
+        accountService.prepareOAuthUrl(clientKey)
+            .then((url) => {
                 if (url && url.length > 0) setOauthUrl(url);
             })
             .catch((e) => {
                 console.error('Failed to prepare OAuth URL:', e);
             });
-    }, [isOpen, activeTab, oauthUrl]);
+    }, [isOpen, activeTab, accountType]);
 
     // If user navigates away from OAuth tab, cancel prepared flow to release the port.
     useEffect(() => {
@@ -279,15 +281,18 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             setStatus('loading');
             setMessage(t('accounts.add.oauth.btn_start') + '...');
 
-            // 1. 获取 URL (指向 /auth/callback)
-            const res = await invoke<any>('prepare_oauth_url');
-            const url = typeof res === 'string' ? res : res.url;
+            const clientKey = accountType === 'enterprise' ? 'antigravity_gcp' : 'antigravity_enterprise';
 
+            // 1. 获取 URL (复用已有 URL，避免重复触发 prepare_oauth_url 导致后端 Flow 状态被覆盖重置)
+            let url = oauthUrl;
             if (!url) {
-                throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
-            }
+                url = await accountService.prepareOAuthUrl(clientKey);
 
-            setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
+                if (!url) {
+                    throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
+                }
+                setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
+            }
 
             // 2. 打开新标签页 (响应用户反馈：Web 端直接使用新标签体验更好)
             const popup = window.open(url, '_blank');
@@ -347,9 +352,10 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             handleOAuthWeb();
             return;
         }
+        const clientKey = accountType === 'enterprise' ? 'antigravity_gcp' : 'antigravity_enterprise';
         // Default flow: opens the default browser and completes automatically.
         // (If user opened the URL manually, completion is also triggered by oauth-callback-received.)
-        handleAction(t('accounts.add.tabs.oauth'), startOAuthLogin, { clearOauthUrl: false });
+        handleAction(t('accounts.add.tabs.oauth'), () => startOAuthLogin(clientKey), { clearOauthUrl: false });
     };
 
     const handleCompleteOAuth = () => {
@@ -374,23 +380,34 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         setMessage(t('accounts.add.oauth.manual_submitting', '認可コードを送信中...'));
 
         try {
-            await invoke('submit_oauth_code', { code: manualCode.trim(), state: null });
+            // 从预生成的 oauthUrl 中提取 state 参数作为兜底 CSRF 校验，防止用户只回填 bare code 时丢失 state 导致状态未比对
+            let fallbackState: string | null = null;
+            if (oauthUrl) {
+                try {
+                    const parsedUrl = new URL(oauthUrl);
+                    fallbackState = parsedUrl.searchParams.get('state');
+                } catch {
+                    // ignore URL parse failure
+                }
+            }
 
-            // 提交成功反馈
+            await invoke('submit_oauth_code', { code: manualCode.trim(), state: fallbackState });
+
+            // 兑换并保存成功后，先刷新账号列表，再提示成功并关闭弹窗
+            await fetchAccounts();
+
             setStatus('success');
-            setMessage(t('accounts.add.oauth.manual_submitted', '認可コードを送信しました。バックエンドで処理中です...'));
-
+            setMessage(t('accounts.add.oauth_success') || t('common.success'));
             setManualCode('');
 
-            // 对齐 Web 模式下的刷新逻辑
-            if (!isTauri()) {
-                setTimeout(async () => {
-                    await fetchAccounts();
-                    setIsOpen(false);
-                    resetState();
-                }, 2000);
-            }
+            setTimeout(() => {
+                setIsOpen(false);
+                resetState();
+            }, 1500);
         } catch (error) {
+            console.error('Manual OAuth Code submission error:', error);
+            // 提交失败后清空失效的 URL 缓存，方便用户点击重试时重新生成全新的可用授权 URL
+            setOauthUrl('');
             let errStr = String(error);
             if (errStr.includes("No active OAuth flow")) {
                 setMessage(t('accounts.add.oauth.error_no_flow'));
@@ -521,6 +538,36 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                             </button>
                         </div>
 
+                        {/* 账号类型选择：个人账号 vs 企业 / Google Cloud (Vertex AI) 账号 */}
+                        <div className="flex p-1 bg-gray-100 dark:bg-base-200 rounded-xl mb-4">
+                            <button
+                                type="button"
+                                className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-medium transition-all duration-200 ${accountType === 'personal'
+                                    ? 'bg-white dark:bg-base-100 shadow-sm text-blue-600 dark:text-blue-400'
+                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                                    }`}
+                                onClick={() => {
+                                    setAccountType('personal');
+                                    setOauthUrl('');
+                                }}
+                            >
+                                {t('accounts.type.personal', '个人账号 (Personal)')}
+                            </button>
+                            <button
+                                type="button"
+                                className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-medium transition-all duration-200 ${accountType === 'enterprise'
+                                    ? 'bg-white dark:bg-base-100 shadow-sm text-blue-600 dark:text-blue-400'
+                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                                    }`}
+                                onClick={() => {
+                                    setAccountType('enterprise');
+                                    setOauthUrl('');
+                                }}
+                            >
+                                {t('accounts.type.enterprise', '企业 / GCP (Vertex AI)')}
+                            </button>
+                        </div>
+
                         {/* 添加 Web 模式提示 */}
                         {!isTauri() && (
                             <div className="alert alert-info mb-4 text-xs py-2 flex items-center gap-2 bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 border-blue-100 dark:border-blue-800">
@@ -541,9 +588,15 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                                             <Globe className="w-10 h-10 text-blue-500" />
                                         </div>
                                         <div className="space-y-1">
-                                            <h4 className="font-medium text-gray-900 dark:text-gray-100">{t('accounts.add.oauth.recommend')}</h4>
+                                            <h4 className="font-medium text-gray-900 dark:text-gray-100">
+                                                {accountType === 'enterprise'
+                                                    ? t('accounts.add.oauth.enterprise_title', 'Google Cloud / Vertex AI 企业授权')
+                                                    : t('accounts.add.oauth.recommend')}
+                                            </h4>
                                             <p className="text-sm text-gray-500 dark:text-gray-400 max-w-xs mx-auto">
-                                                {t('accounts.add.oauth.desc')}
+                                                {accountType === 'enterprise'
+                                                    ? t('accounts.add.oauth.enterprise_desc', '使用官方企业 GCP 专属客户端授权，自动保留企业配额并关联 Vertex AI 项目')
+                                                    : t('accounts.add.oauth.desc')}
                                             </p>
                                         </div>
                                     </div>
@@ -580,20 +633,27 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                                                     </span>
                                                 </button>
 
-                                                <button
-                                                    type="button"
-                                                    className="w-full px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-xl border border-gray-200 dark:border-base-300 hover:bg-gray-50 dark:hover:bg-base-200 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
-                                                    onClick={handleCompleteOAuth}
-                                                    disabled={status === 'loading' || status === 'success'}
-                                                >
-                                                    <CheckCircle2 className="w-4 h-4" />
-                                                    {t('accounts.add.oauth.btn_finish')}
-                                                </button>
+                                                {isTauri() && (
+                                                    <button
+                                                        type="button"
+                                                        className="w-full px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-xl border border-gray-200 dark:border-base-300 hover:bg-gray-50 dark:hover:bg-base-200 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
+                                                        onClick={handleCompleteOAuth}
+                                                        disabled={status === 'loading' || status === 'success'}
+                                                    >
+                                                        <CheckCircle2 className="w-4 h-4" />
+                                                        {t('accounts.add.oauth.btn_finish')}
+                                                    </button>
+                                                )}
                                             </div>
                                         )}
 
                                         {/* Manual Code Entry - Always enabled to rescue stuck flows */}
                                         <div className="pt-4 mt-2 border-t border-gray-100 dark:border-base-200">
+                                            {!isTauri() && (
+                                                <div className="mb-2.5 p-2.5 bg-blue-50/60 dark:bg-blue-950/20 border border-blue-100 dark:border-blue-900/30 rounded-xl text-[11px] text-blue-700 dark:text-blue-300 leading-relaxed text-left">
+                                                    {t('accounts.add.oauth.remote_hint')}
+                                                </div>
+                                            )}
                                             <div className="text-[11px] font-medium text-gray-400 dark:text-gray-500 mb-2 uppercase tracking-wider">
                                                 {t('accounts.add.oauth.manual_hint')}
                                             </div>

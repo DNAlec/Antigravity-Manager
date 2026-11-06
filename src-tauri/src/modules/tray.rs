@@ -81,6 +81,25 @@ pub fn ensure_mini_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow
     Ok(window)
 }
 
+/// 隐藏/收起 Mini 悬浮视窗并清理激活状态，在 macOS 下按需恢复主窗口 ActivationPolicy
+pub fn hide_mini_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("mini") {
+        let _ = window.hide();
+    }
+    set_mini_view_active(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(main) = app.get_webview_window("main") {
+            let is_open =
+                main.is_visible().unwrap_or(false) || main.is_minimized().unwrap_or(false);
+            if is_open {
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            }
+        }
+    }
+}
+
 /// 处理系统托盘点击事件：实现跨平台现代 Popover（类似腾讯 Lemon / Raycast）
 /// 默认失焦自动收起（除非用户点击图钉进行固定）
 pub fn handle_tray_click(app: &tauri::AppHandle, rect: Option<tauri::Rect>) {
@@ -90,10 +109,7 @@ pub fn handle_tray_click(app: &tauri::AppHandle, rect: Option<tauri::Rect>) {
     }
 
     if is_mini_view_active() {
-        if let Some(window) = app.get_webview_window("mini") {
-            let _ = window.hide();
-        }
-        set_mini_view_active(false);
+        hide_mini_window(app);
         return;
     }
 
@@ -187,15 +203,14 @@ pub fn handle_tray_click(app: &tauri::AppHandle, rect: Option<tauri::Rect>) {
         win_y as i32,
     )));
 
+    // macOS 专属策略：唤起 Mini 视窗时，始终切换为 Accessory 附属模式。
+    // 关键点：当主控制台处于 Regular 模式（在后台、另一个桌面 Space、或已最小化到 Dock）时，
+    // 若在 Regular 模式下直接调用 window.set_focus()，AppKit 的 activateIgnoringOtherApps:YES
+    // 会将整个应用程序激活并将其所有可见窗口（包括主控制台）强制提至前台或触发跨 Space 跳转。
+    // 切至 Accessory 模式后，系统仅将 Mini 独立呈现置顶，绝不干扰或强拉后台的主控制台。
     #[cfg(target_os = "macos")]
     {
-        let main_visible = app
-            .get_webview_window("main")
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !main_visible {
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        }
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
 
     let _ = window.show();
@@ -387,7 +402,18 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     button == MouseButton::Left && button_state == MouseButtonState::Up;
 
                 if should_handle {
-                    handle_tray_click(tray.app_handle(), Some(rect));
+                    let app = tray.app_handle();
+                    let click_action = crate::modules::load_app_config()
+                        .map(|c| c.tray_click_action)
+                        .unwrap_or_else(|_| "mini".to_string());
+
+                    if click_action == "main" {
+                        hide_mini_window(app);
+                        let _ = crate::modules::lightweight::exit_lightweight_mode(app);
+                        let _ = app.emit("tray://show-window", ());
+                    } else {
+                        handle_tray_click(app, Some(rect));
+                    }
                 }
             }
             _ => {}
@@ -423,6 +449,9 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     });
                 }
                 "quit" => {
+                    #[cfg(target_os = "linux")]
+                    crate::linux_display_guard::mark_user_initiated_exit();
+
                     let app_handle = app.clone();
                     tauri::async_runtime::spawn(async move {
                         tracing::info!("[Tray] 退出网关触发，开始全面清理服务与端口...");
@@ -471,6 +500,8 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
                         // 4. 给予底层套接字彻底注销的微小缓冲，然后干净退出进程
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        // `process::exit` 会绕过 Tauri 事件循环，签名缓存必须在退出前主动 flush。
+                        crate::proxy::signature_cache::flush_on_exit();
                         std::process::exit(0);
                     });
                 }
@@ -547,6 +578,11 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 /// Helper function to update tray menu
 pub fn update_tray_menus(app: &tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    if crate::linux_display_guard::is_display_disconnected() {
+        return;
+    }
+
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         // Read config to get language
@@ -649,103 +685,131 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
             menu_lines.push(texts.unknown_quota.clone());
         };
 
-        // Always update tray tooltip and macOS title (regardless of menu rebuild status)
-        if let Some(tray) = app_clone.tray_by_id("main") {
-            let _ = tray.set_tooltip(Some(tooltip_text));
-            #[cfg(target_os = "macos")]
-            let _ = tray.set_title(macos_title);
-        }
+        // [Fix #3757] 统一将所有 GTK/AppKit 系统托盘和菜单项创建调度到操作系统原生主线程执行
+        // 彻底杜绝在 Linux Tokio 工作线程上跨线程直接调用 GTK 导致并发死锁或断言崩溃 _exit(1)
+        let app_handle_for_main = app_clone.clone();
+        let _ = app_clone.run_on_main_thread(move || {
+            #[cfg(target_os = "linux")]
+            if crate::linux_display_guard::is_display_disconnected() {
+                return;
+            }
 
-        // Rebuild menu items (dynamic quotas + shortcuts)
-        let info_user = MenuItem::with_id(&app_clone, "info_user", &user_text, false, None::<&str>);
+            // Always update tray tooltip and macOS title (regardless of menu rebuild status)
+            if let Some(tray) = app_handle_for_main.tray_by_id("main") {
+                let _ = tray.set_tooltip(Some(tooltip_text));
+                #[cfg(target_os = "macos")]
+                let _ = tray.set_title(macos_title);
+            }
 
-        let mut quota_items = Vec::new();
-        for (i, line) in menu_lines.iter().enumerate() {
-            let item = MenuItem::with_id(
-                &app_clone,
-                format!("info_quota_{}", i),
-                line,
+            // Rebuild menu items (dynamic quotas + shortcuts) safely on the UI main thread
+            let info_user = MenuItem::with_id(
+                &app_handle_for_main,
+                "info_user",
+                &user_text,
                 false,
                 None::<&str>,
             );
-            if let Ok(item) = item {
-                quota_items.push(item);
-            }
-        }
 
-        let switch_next = MenuItem::with_id(
-            &app_clone,
-            "switch_next",
-            &texts.switch_next,
-            true,
-            None::<&str>,
-        );
-        let refresh_curr = MenuItem::with_id(
-            &app_clone,
-            "refresh_curr",
-            &texts.refresh_current,
-            true,
-            None::<&str>,
-        );
-
-        let show_i = MenuItem::with_id(&app_clone, "show", &texts.show_window, true, None::<&str>);
-        let mini_i = MenuItem::with_id(
-            &app_clone,
-            "mini_view",
-            &texts.mini_view,
-            true,
-            None::<&str>,
-        );
-        let lightweight_i = CheckMenuItem::with_id(
-            &app_clone,
-            "toggle_lightweight",
-            &texts.lightweight_mode,
-            true,
-            config.lightweight_mode,
-            None::<&str>,
-        );
-        let quit_i = MenuItem::with_id(&app_clone, "quit", &texts.quit, true, None::<&str>);
-
-        if let (Ok(i_u), Ok(s_n), Ok(r_c), Ok(s), Ok(m), Ok(l), Ok(q)) = (
-            info_user,
-            switch_next,
-            refresh_curr,
-            show_i,
-            mini_i,
-            lightweight_i,
-            quit_i,
-        ) {
-            let sep1 = PredefinedMenuItem::separator(&app_clone).ok();
-            let sep2 = PredefinedMenuItem::separator(&app_clone).ok();
-            let sep3 = PredefinedMenuItem::separator(&app_clone).ok();
-
-            let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&i_u];
-            for item in &quota_items {
-                items.push(item);
-            }
-
-            if let Some(ref s1) = sep1 {
-                items.push(s1);
-            }
-            items.push(&s_n);
-            items.push(&r_c);
-            if let Some(ref s2) = sep2 {
-                items.push(s2);
-            }
-            items.push(&s);
-            items.push(&m);
-            items.push(&l);
-            if let Some(ref s3) = sep3 {
-                items.push(s3);
-            }
-            items.push(&q);
-
-            if let Ok(menu) = Menu::with_items(&app_clone, &items) {
-                if let Some(tray) = app_clone.tray_by_id("main") {
-                    #[cfg(not(target_os = "macos"))]
-                    let _ = tray.set_menu(Some(menu));
+            let mut quota_items = Vec::new();
+            for (i, line) in menu_lines.iter().enumerate() {
+                let item = MenuItem::with_id(
+                    &app_handle_for_main,
+                    format!("info_quota_{}", i),
+                    line,
+                    false,
+                    None::<&str>,
+                );
+                if let Ok(item) = item {
+                    quota_items.push(item);
                 }
             }
-        }
+
+            let switch_next = MenuItem::with_id(
+                &app_handle_for_main,
+                "switch_next",
+                &texts.switch_next,
+                true,
+                None::<&str>,
+            );
+            let refresh_curr = MenuItem::with_id(
+                &app_handle_for_main,
+                "refresh_curr",
+                &texts.refresh_current,
+                true,
+                None::<&str>,
+            );
+
+            let show_i = MenuItem::with_id(
+                &app_handle_for_main,
+                "show",
+                &texts.show_window,
+                true,
+                None::<&str>,
+            );
+            let mini_i = MenuItem::with_id(
+                &app_handle_for_main,
+                "mini_view",
+                &texts.mini_view,
+                true,
+                None::<&str>,
+            );
+            let lightweight_i = CheckMenuItem::with_id(
+                &app_handle_for_main,
+                "toggle_lightweight",
+                &texts.lightweight_mode,
+                true,
+                config.lightweight_mode,
+                None::<&str>,
+            );
+            let quit_i = MenuItem::with_id(
+                &app_handle_for_main,
+                "quit",
+                &texts.quit,
+                true,
+                None::<&str>,
+            );
+
+            if let (Ok(i_u), Ok(s_n), Ok(r_c), Ok(s), Ok(m), Ok(l), Ok(q)) = (
+                info_user,
+                switch_next,
+                refresh_curr,
+                show_i,
+                mini_i,
+                lightweight_i,
+                quit_i,
+            ) {
+                let sep1 = PredefinedMenuItem::separator(&app_handle_for_main).ok();
+                let sep2 = PredefinedMenuItem::separator(&app_handle_for_main).ok();
+                let sep3 = PredefinedMenuItem::separator(&app_handle_for_main).ok();
+
+                let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&i_u];
+                for item in &quota_items {
+                    items.push(item);
+                }
+
+                if let Some(ref s1) = sep1 {
+                    items.push(s1);
+                }
+                items.push(&s_n);
+                items.push(&r_c);
+                if let Some(ref s2) = sep2 {
+                    items.push(s2);
+                }
+                items.push(&s);
+                items.push(&m);
+                items.push(&l);
+                if let Some(ref s3) = sep3 {
+                    items.push(s3);
+                }
+                items.push(&q);
+
+                if let Ok(menu) = Menu::with_items(&app_handle_for_main, &items) {
+                    if let Some(tray) = app_handle_for_main.tray_by_id("main") {
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = tray.set_menu(Some(menu));
+                    }
+                }
+            }
+        });
     });
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect, startTransition } from 'react';
-import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check } from 'lucide-react';
+import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useConfigStore } from '../stores/useConfigStore';
@@ -22,6 +22,7 @@ import { emit } from '@tauri-apps/api/event';
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 import { motion } from 'framer-motion';
+import { ZOOM_LEVELS, getStoredZoom, applyZoom } from '../utils/zoom';
 
 function normalizeDataDirDisplay(path: string): string {
     const trimmed = path.trim();
@@ -45,12 +46,12 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('5.0.0');
+    const [appVersion, setAppVersion] = useState<string>('5.0.3');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
         auto_refresh: false,
-        refresh_interval: 15,
+        refresh_interval: 10,
         auto_sync: false,
         sync_interval: 5,
         auto_switch_classic_depleted: false,
@@ -102,8 +103,8 @@ function Settings() {
             use_http2: true
         },
         circuit_breaker: {
-            enabled: false,
-            backoff_steps: [30, 60, 120, 300, 600]
+            enabled: true,
+            backoff_steps: [60, 300, 1800, 7200]
         },
         hidden_menu_items: [],  // 菜单显示设置：默认不隐藏任何菜单项
 
@@ -138,6 +139,22 @@ function Settings() {
     const [isBrewConfirmOpen, setIsBrewConfirmOpen] = useState(false);
     const [isBrewSuccessOpen, setIsBrewSuccessOpen] = useState(false);
     const [isUpdateConfirmOpen, setIsUpdateConfirmOpen] = useState(false);
+
+    // UI Zoom state
+    const [uiZoom, setUiZoom] = useState<number>(() => getStoredZoom());
+
+    useEffect(() => {
+        const handleZoomChange = (e: Event) => {
+            const customEvent = e as CustomEvent<number>;
+            if (customEvent.detail) {
+                setUiZoom(customEvent.detail);
+            }
+        };
+        window.addEventListener('app-ui-zoom-change', handleZoomChange);
+        return () => {
+            window.removeEventListener('app-ui-zoom-change', handleZoomChange);
+        };
+    }, []);
 
     // Official Hub fingerprint state
     const [hubFingerprint, setHubFingerprint] = useState<HubFingerprint | null>(null);
@@ -653,6 +670,35 @@ function Settings() {
                                 </select>
                             </div>
 
+                            {/* 界面与字体缩放 */}
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content">
+                                        {t('settings.general.ui_zoom', '界面与字体缩放')}
+                                    </label>
+                                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                                        Cmd / Ctrl + / - / 0
+                                    </span>
+                                </div>
+                                <select
+                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
+                                    value={uiZoom}
+                                    onChange={(e) => {
+                                        // applyZoom dispatches 'app-ui-zoom-change', which syncs uiZoom
+                                        applyZoom(Number(e.target.value));
+                                    }}
+                                >
+                                    {ZOOM_LEVELS.map((level) => (
+                                        <option key={level} value={level}>
+                                            {level}%{level === 100 ? ` (${t('settings.general.ui_zoom_default', '默认')})` : ''}{level === 120 ? ` (${t('settings.general.ui_zoom_recommended', '推荐大屏')})` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                    {t('settings.general.ui_zoom_desc', '调整软件整体界面和字体大小，支持随时使用快捷键 Cmd/Ctrl + / - / 0 快速缩放')}
+                                </p>
+                            </div>
+
                             {/* 开机自动启动 */}
                             <div>
                                 <div className="flex justify-between items-center mb-2">
@@ -733,7 +779,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: enabled,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -764,7 +809,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: formData.auto_check_update ?? true,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -798,6 +842,46 @@ function Settings() {
                                         />
                                         <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
                                     </label>
+                                </div>
+                            )}
+
+                            {/* 托盘左键单击操作 */}
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div className="pr-4">
+                                        <div className="font-medium text-gray-900 dark:text-base-content">
+                                            {t('settings.general.tray_click_action')}
+                                        </div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                            {t('settings.general.tray_click_action_desc')}
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center bg-gray-200/80 dark:bg-base-300 p-1 rounded-lg shrink-0">
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'mini' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                (formData.tray_click_action || 'mini') === 'mini'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_mini_short', 'Mini 悬浮窗')}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'main' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                formData.tray_click_action === 'main'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_main_short', '主控制台')}
+                                        </button>
+                                    </div>
                                 </div>
                             )}
 
@@ -1651,6 +1735,47 @@ function Settings() {
                                     </div>
                                 )}
                             </div>
+
+                            {/* 遇到限流账号自动进小黑屋 (QoS 降速熔断) 开关 */}
+                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-amber-200 transition-all duration-300 shadow-sm relative overflow-hidden">
+                                <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/5 -mr-12 -mt-12 rounded-full blur-2xl group-hover:bg-amber-500/10 transition-colors"></div>
+                                <div className="flex items-center justify-between relative z-10">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-900/20 flex items-center justify-center text-amber-500 group-hover:bg-amber-500 group-hover:text-white transition-all duration-300 shadow-sm">
+                                            <ShieldAlert size={18} />
+                                        </div>
+                                        <div>
+                                            <div className="font-bold text-gray-900 dark:text-gray-100 text-sm">
+                                                {t('dashboard.qos_auto_jail', '自动小黑屋')} (QoS)
+                                            </div>
+                                            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 leading-tight max-w-[340px]">
+                                                {t('dashboard.qos_auto_jail_enabled_tip', '开启后遇响应过长的限速账号将自动隔离并解绑会话；关闭时直接忽略校验时长。')}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer scale-90">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.proxy?.qos_auto_jail ?? false}
+                                            onChange={(e) => {
+                                                const nextVal = e.target.checked;
+                                                const updated = {
+                                                    ...formData,
+                                                    proxy: {
+                                                        ...formData.proxy,
+                                                        qos_auto_jail: nextVal,
+                                                    },
+                                                };
+                                                setFormData(updated);
+                                                saveConfig({ ...updated, auto_refresh: true })
+                                                    .catch(err => console.error('Save failed:', err));
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500 shadow-inner"></div>
+                                    </label>
+                                </div>
+                            </div>
                         </div>
                     )}
 
@@ -1776,9 +1901,6 @@ function Settings() {
                                                     try {
                                                         await invoke('save_update_settings', {
                                                             settings: {
-                                                                auto_check: formData.auto_check_update ?? true,
-                                                                last_check_time: 0,
-                                                                check_interval_hours: formData.update_check_interval ?? 24,
                                                                 update_channel: 'stable',
                                                             }
                                                         });
@@ -1803,9 +1925,6 @@ function Settings() {
                                                     try {
                                                         await invoke('save_update_settings', {
                                                             settings: {
-                                                                auto_check: formData.auto_check_update ?? true,
-                                                                last_check_time: 0,
-                                                                check_interval_hours: formData.update_check_interval ?? 24,
                                                                 update_channel: 'beta',
                                                             }
                                                         });

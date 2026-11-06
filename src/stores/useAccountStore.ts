@@ -22,7 +22,7 @@ interface AccountState {
     reorderAccounts: (accountIds: string[]) => Promise<void>;
 
     // 新增 actions
-    startOAuthLogin: () => Promise<void>;
+    startOAuthLogin: (oauthClientKey?: string) => Promise<void>;
     completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
@@ -35,6 +35,8 @@ interface AccountState {
     warmUpAccount: (accountId: string) => Promise<string>;
     updateAccountLabel: (accountId: string, label: string) => Promise<void>;
     updateAccountPriority: (accountId: string, priority: number) => Promise<void>;
+    updateAccountProjectId: (accountId: string, projectId: string) => Promise<void>;
+    autoFetchAccountProjectId: (accountId: string) => Promise<string>;
 }
 
 const ACCOUNTS_CACHE_KEY = 'antigravity_accounts_cache';
@@ -250,10 +252,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    startOAuthLogin: async () => {
+    startOAuthLogin: async (oauthClientKey?: string) => {
         set({ loading: true, error: null });
         try {
-            await accountService.startOAuthLogin();
+            await accountService.startOAuthLogin(oauthClientKey);
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -395,6 +397,37 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             accounts: state.accounts.map(account => account.id === accountId ? { ...account, priority } : account),
             currentAccount: state.currentAccount?.id === accountId ? { ...state.currentAccount, priority } : state.currentAccount,
         }));
+    },
+
+    updateAccountProjectId: async (accountId, projectId) => {
+        await accountService.updateAccountProjectId(accountId, projectId);
+        set(state => ({
+            accounts: state.accounts.map(account =>
+                account.id === accountId
+                    ? { ...account, token: { ...account.token, project_id: projectId.trim() || undefined } }
+                    : account
+            ),
+            currentAccount:
+                state.currentAccount?.id === accountId
+                    ? { ...state.currentAccount, token: { ...state.currentAccount.token, project_id: projectId.trim() || undefined } }
+                    : state.currentAccount,
+        }));
+    },
+
+    autoFetchAccountProjectId: async (accountId) => {
+        const projectId = await accountService.autoFetchAccountProjectId(accountId);
+        set(state => ({
+            accounts: state.accounts.map(account =>
+                account.id === accountId
+                    ? { ...account, token: { ...account.token, project_id: projectId.trim() || undefined } }
+                    : account
+            ),
+            currentAccount:
+                state.currentAccount?.id === accountId
+                    ? { ...state.currentAccount, token: { ...state.currentAccount.token, project_id: projectId.trim() || undefined } }
+                    : state.currentAccount,
+        }));
+        return projectId;
     },
 
     updateAccountLabel: async (accountId: string, label: string) => {

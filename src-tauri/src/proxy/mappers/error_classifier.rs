@@ -156,7 +156,7 @@ pub fn format_stream_error<E: std::fmt::Display>(error: &E) -> String {
 /// SSE/JSON 原文预览，截断并脱敏后写入诊断。
 pub fn preview_payload(raw: &str) -> String {
     let truncated = crate::proxy::mappers::common_utils::safe_truncate_str(raw.trim(), 160);
-    sanitize_raw(&truncated)
+    sanitize_raw(truncated)
 }
 
 fn sanitize_raw(raw: &str) -> String {

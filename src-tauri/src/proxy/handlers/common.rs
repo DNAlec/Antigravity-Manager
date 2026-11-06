@@ -6,158 +6,40 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use tokio::time::{sleep, Duration};
-use tracing::{debug, info};
 
-// ===== 统一重试与退避策略 =====
+// ===== 重试 / 退避 / 轮换策略已下沉到 Pipeline（协议无关）=====
+//
+// 这里仅保留兼容导出，避免四个适配器与既有测试一次性大改；
+// 新代码请直接用 `crate::proxy::pipeline::rotation::*`。
+pub use crate::proxy::pipeline::rotation::{
+    apply_retry_strategy, calculate_max_retry_attempts, clamp_retry_after_for_claude,
+    determine_retry_strategy, determine_retry_strategy_adaptive,
+    determine_retry_strategy_with_grace, extract_retry_after_seconds, is_model_not_found_error,
+    next_rotation_attempt, should_rotate_account, RequestRetryState, RetryStrategy,
+};
 
-/// 重试策略枚举
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetryStrategy {
-    /// 不重试，直接返回错误
-    NoRetry,
-    /// 固定延迟
-    FixedDelay(Duration),
-    /// 线性退避：base_ms * (attempt + 1)
-    LinearBackoff { base_ms: u64 },
-    /// 指数退避：base_ms * 2^attempt，上限 max_ms
-    ExponentialBackoff { base_ms: u64, max_ms: u64 },
-    /// [NEW] 原地重试 (Grace Retry)：在当前账号上小窗口等待后直接重试，不计入常规切换
-    GraceRetry(Duration),
-}
+/// 请求内「结构化失败状态」聚合器已下沉到 `pipeline::terminal`（协议无关）。
+///
+/// 这里仅保留兼容导出，避免四个适配器与既有测试一次性大改；
+/// 新代码请直接用 `crate::proxy::pipeline::terminal::FailureStatusTracker`。
+pub use crate::proxy::pipeline::terminal::FailureStatusTracker;
 
-#[derive(Debug, Default)]
-pub struct RequestRetryState {
-    grace_retried_accounts: HashSet<String>,
-}
+/// 全局请求预算已下沉到 Pipeline（`proxy::pipeline::budget`），四大协议适配器统一生效。
+///
+/// 这里仅保留兼容导出，避免既有引用点一次性大改；新代码请直接用
+/// `crate::proxy::pipeline::budget::gateway_request_budget_secs()`。
+pub use crate::proxy::pipeline::budget::{
+    gateway_request_budget_secs,
+    DEFAULT_GATEWAY_REQUEST_BUDGET_SECS as MAX_GATEWAY_REQUEST_BUDGET_SECS,
+};
 
-impl RequestRetryState {
-    pub fn determine_strategy(
-        &mut self,
-        account_id: &str,
-        status_code: u16,
-        error_text: &str,
-        retry_after: Option<&str>,
-        retried_without_thinking: bool,
-    ) -> RetryStrategy {
-        self.determine_strategy_with_grace(
-            account_id,
-            status_code,
-            error_text,
-            retry_after,
-            retried_without_thinking,
-            true,
-        )
-    }
-
-    pub fn determine_strategy_with_grace(
-        &mut self,
-        account_id: &str,
-        status_code: u16,
-        error_text: &str,
-        retry_after: Option<&str>,
-        retried_without_thinking: bool,
-        allow_grace: bool,
-    ) -> RetryStrategy {
-        self.determine_strategy_adaptive(
-            account_id,
-            status_code,
-            error_text,
-            retry_after,
-            retried_without_thinking,
-            0,
-            if allow_grace { 1 } else { 2 },
-        )
-    }
-
-    /// [NEW] 自适应感知多账号池轮次与配额重置间隙的重试裁决器
-    pub fn determine_strategy_adaptive(
-        &mut self,
-        account_id: &str,
-        status_code: u16,
-        error_text: &str,
-        retry_after: Option<&str>,
-        retried_without_thinking: bool,
-        attempt: usize,
-        pool_size: usize,
-    ) -> RetryStrategy {
-        let allow_grace_retry = !self.grace_retried_accounts.contains(account_id);
-        let strategy = determine_retry_strategy_adaptive(
-            status_code,
-            error_text,
-            retry_after,
-            retried_without_thinking,
-            allow_grace_retry,
-            attempt,
-            pool_size,
-        );
-        if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-            self.grace_retried_accounts.insert(account_id.to_string());
-        }
-        strategy
-    }
-}
-
-pub fn next_rotation_attempt(
-    used_attempts: &mut usize,
-    max_attempts: usize,
-    retry_same_account: bool,
-) -> Option<usize> {
-    crate::proxy::upstream::request_policy::request_policy().next_rotation_attempt(
-        used_attempts,
-        max_attempts,
-        retry_same_account,
-    )
-}
-
-#[derive(Debug, Default)]
-pub struct FailureStatusTracker {
-    saw_failure: bool,
-    last_non_rate_limit: Option<StatusCode>,
-}
-
-impl FailureStatusTracker {
-    pub fn record(&mut self, status: StatusCode) {
-        self.saw_failure = true;
-        if status != StatusCode::TOO_MANY_REQUESTS {
-            self.last_non_rate_limit = Some(status);
-        }
-    }
-
-    pub fn final_status(&self) -> StatusCode {
-        self.last_non_rate_limit.unwrap_or_else(|| {
-            if self.saw_failure {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::BAD_GATEWAY
-            }
-        })
-    }
-}
-
-/// 自适应计算最大重试次数
-/// - 单账号 (pool_size <= 1): 允许初次请求 + 2次基于 quotaResetDelay 的退避重试 (共 3 次)，绝不 50ms 刷死
-/// - 多账号 (pool_size > 1): 保证整池账号至少能完整轮换 2 轮 (Round 1 闪电快切 + Round 2 退避小等重试)
-///   最小 4 次，上限 12 次 (既能把 2~6 个账号试满 2 轮，又防止超长等待导致客户端超时)
-pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
-    let normal_limit = if pool_size <= 1 {
-        3
-    } else {
-        (pool_size * 2).clamp(4, 12)
-    };
-    crate::proxy::upstream::request_policy::request_policy().account_attempt_limit(normal_limit)
-}
-
-/// 单次客户端请求在网关内部允许消耗的最大全局时间预算（秒，默认 240s）
-/// Claude Code 客户端原生设置了 300 秒（5分钟）的首包超时看门狗 (firstWindowMs = 300_000)。
-/// 网关内部在尝试跨账号轮换时，总耗时必须严格控制在 240 秒以内，确保在看门狗触发前向客户端返回
-/// 结构化规范化错误（504 Gateway Timeout 或 429/503），避免客户端弹出未响应警告框。
-pub const MAX_GATEWAY_REQUEST_BUDGET_SECS: u64 = 240;
+// ===== QoS / 错误解析已下沉到 Pipeline（协议无关）=====
+pub use crate::proxy::pipeline::errors::{is_transient_token_error, parse_raw_upstream_error};
+pub use crate::proxy::pipeline::qos::report_qos_ttft;
 
 /// [Issue #3634, #3693] 统一自适应计算流预读（Peek）阶段的超时时间。
 /// - Compaction 摘要请求：大 Prompt 处理，默认 180s；
-/// - 图像生成请求：图像生成耗时较长，默认 60s；
+/// - 图像生成请求：图像生成耗时较长（特别是 4K 高分辨率渲染），默认 90s；
 /// - 思考/深度推理模型请求：思考阶段 TTFT 较长，底线 60s（大上下文 90s/120s）；
 /// - 正常会话请求：根据估算 Token 数量动态自适应，避免大上下文 Prompt 预热（TTFT）超过 30s 被过早误杀导致全池轮换雪崩；
 ///   * > 100k tokens: 120s
@@ -178,302 +60,13 @@ pub fn calculate_adaptive_peek_timeout_full(
     is_thinking: bool,
     estimated_tokens: Option<u32>,
 ) -> u64 {
-    if is_compaction {
-        180
-    } else if is_image_gen {
-        60
-    } else if is_thinking {
-        // [Issue #3693] 深度思考模型预热耗时长，设置 60s 宽限底线，防止过早误杀
-        match estimated_tokens {
-            Some(tokens) if tokens >= 100_000 => 120,
-            Some(tokens) if tokens >= 50_000 => 90,
-            _ => 60,
-        }
-    } else {
-        match estimated_tokens {
-            Some(tokens) if tokens >= 100_000 => 120,
-            Some(tokens) if tokens >= 50_000 => 90,
-            Some(tokens) if tokens >= 20_000 => 60,
-            _ => 30,
-        }
-    }
-}
-
-/// 根据错误状态码和错误信息确定重试策略
-pub fn determine_retry_strategy(
-    status_code: u16,
-    error_text: &str,
-    retried_without_thinking: bool,
-) -> RetryStrategy {
-    determine_retry_strategy_with_grace(status_code, error_text, retried_without_thinking, true)
-}
-
-pub fn determine_retry_strategy_with_grace(
-    status_code: u16,
-    error_text: &str,
-    retried_without_thinking: bool,
-    allow_grace: bool,
-) -> RetryStrategy {
-    determine_retry_strategy_adaptive(
-        status_code,
-        error_text,
-        None,
-        retried_without_thinking,
-        allow_grace,
-        0,
-        if allow_grace { 1 } else { 2 },
+    // 分档表已收敛到 `pipeline::stream_peek`（与 upstream::client 的 TTFT 预算同源）
+    crate::proxy::pipeline::stream_peek::peek_budget_secs(
+        is_compaction,
+        is_image_gen,
+        is_thinking,
+        estimated_tokens,
     )
-}
-
-/// [NEW] 自适应多账号池与单账号退避裁决核心逻辑
-pub fn determine_retry_strategy_adaptive(
-    status_code: u16,
-    error_text: &str,
-    retry_after: Option<&str>,
-    retried_without_thinking: bool,
-    allow_grace_retry: bool,
-    attempt: usize,
-    pool_size: usize,
-) -> RetryStrategy {
-    // [DEFENSE] 若错误已明确为模型不存在，绝对禁止无效轮换或退避重试！
-    if is_model_not_found_error(status_code, error_text) {
-        return RetryStrategy::NoRetry;
-    }
-
-    let lower = error_text.to_lowercase();
-    match status_code {
-        // 400 错误：
-        // 1. 若为 Sandbox 地域限制 (User location is not supported)，允许在多账号/端点间快速重试逃逸至可用节点 (Prod)
-        400 if lower.contains("user location is not supported") && attempt < pool_size => {
-            tracing::warn!(
-                "[Retry] 400 User location is not supported on attempt {}/{}; fast rotating to fallback endpoint/account",
-                attempt + 1,
-                pool_size
-            );
-            RetryStrategy::FixedDelay(Duration::from_millis(50))
-        }
-
-        // 2. 仅在特定 Thinking 签名失败时重试一次
-        400 if !retried_without_thinking
-            && (lower.contains("invalid thought signature")
-                || lower.contains("invalid `signature`")
-                || lower.contains("invalid signature")
-                || lower.contains("thought_signature")
-                || lower.contains("thoughtsignature")
-                || lower.contains("thinking.signature")
-                || lower.contains("thinking.thinking")
-                || lower.contains("corrupted thought signature")) =>
-        {
-            RetryStrategy::FixedDelay(Duration::from_millis(200))
-        }
-
-        // 429 限流错误
-        429 => {
-            // 1. 优先尝试解析结构化或自然语言的重试延迟 (quotaResetDelay / Retry-After)
-            let parsed_delay = crate::proxy::upstream::retry::parse_retry_delay_with_source(
-                error_text,
-                retry_after,
-            );
-
-            // 2. 单账号模式 (pool_size <= 1)：无法切号，若未曾 GraceRetry 则等待，否则降级为固定退避或放弃
-            // 【核心防线】单账号判定必须严格位于任何快切或硬配额判定之前，严禁 50ms 闪电空转刷死
-            if pool_size <= 1 {
-                if let Some(delay) = parsed_delay {
-                    let actual_ms = delay.actual_wait_ms();
-                    if actual_ms <= 30_000 && allow_grace_retry {
-                        tracing::info!(
-                            "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
-                            actual_ms
-                        );
-                        return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
-                    } else {
-                        return RetryStrategy::FixedDelay(Duration::from_millis(
-                            actual_ms.min(30_000),
-                        ));
-                    }
-                } else if allow_grace_retry {
-                    // 没有给出明确延迟时的保底退避 (单账号等待 3s~10s，杜绝 50ms 闪电耗尽重试)
-                    let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
-                    tracing::info!(
-                        "[Retry] Single account 429 without explicit delay: backing off {}ms",
-                        backoff_ms
-                    );
-                    return RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms));
-                } else {
-                    let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
-                    return RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms));
-                }
-            }
-
-            // 3. 多账号模式 (pool_size > 1)：
-            // 账号级硬配额枯竭检测：仅当没有提供重试延迟且包含确定性枯竭关键字时判定
-            // 包含明确的账号额度/周期枯竭字样（如 exceeded your current quota / insufficient_quota / weekly quota / credits 等）
-            // 注意：Google 标准通用 429 的 "resource has been exhausted (e.g. check quota)" 属于无明确延迟的通用流控/TPM拒绝，
-            // 严禁归入硬配额，否则将导致全池快速轮换遍历并引发全池 30 秒级联锁定 (#3506)。
-            // 但若明确包含 multi-day/跨小时超长重置延迟 (如 quotaResetDelay: 68h / retryDelay > 30min)，则明确属于周期硬配额耗尽。
-            let is_long_delay = parsed_delay
-                .as_ref()
-                .map(|d| d.actual_wait_ms() > 1800_000)
-                .unwrap_or(false);
-            let is_hard_quota_exhausted = (parsed_delay.is_none() || is_long_delay)
-                && (lower.contains("exceeded your current quota")
-                    || lower.contains("insufficient_quota")
-                    || lower.contains("credits")
-                    || lower.contains("zero_quota")
-                    || lower.contains("weekly quota")
-                    || lower.contains("daily quota")
-                    || lower.contains("per day")
-                    || lower.contains("individual quota")
-                    || lower.contains("quotaresetdelay")
-                    || (lower.contains("quota_exhausted")
-                        && (!lower.contains("resource has been exhausted")
-                            || lower.contains("quotaresetdelay"))));
-
-            // 多账号环境下，账号级硬配额枯竭立即切换下一个账号（50ms 闪电切号，避免 CPU 空转并快速恢复响应）
-            if is_hard_quota_exhausted {
-                tracing::info!(
-                    "[Retry] Account hard quota exhausted detected on attempt {}/{}; fast rotating to next account in pool (50ms)",
-                    attempt + 1,
-                    pool_size
-                );
-                return RetryStrategy::FixedDelay(Duration::from_millis(50));
-            }
-
-            // 请求级 429 防早退与极速失败保护 (无明确重置时间且非账号硬配额耗尽)：
-            // 在多账号池中，第一轮 (attempt < pool_size) 允许全池每一个可用健康账号均获得 1 次 150ms 执行机会，
-            // 并支持第二轮 (pool_size <= attempt < pool_size * 2) 线性退避 (1.5s~3.5s) 恢复重试，
-            // 解决大 Prompt 突发并发导致瞬态 429 时全池健康账号被 150ms 闪电过早误杀退出（Fixes #3506）。
-            // 仅当第二轮全池遍历耗尽（attempt >= pool_size * 2）仍 429 时，立即快速失败退出 (NoRetry)。
-            let is_request_level_429 = parsed_delay.is_none() && !is_hard_quota_exhausted;
-            let request_level_429_max_attempts = (pool_size * 2).max(2);
-            if is_request_level_429 && attempt >= request_level_429_max_attempts {
-                tracing::warn!(
-                    "[Retry] Request-level 429 persisted across 2 rounds ({} attempts); aborting to prevent excessive client stalls.",
-                    attempt
-                );
-                return RetryStrategy::NoRetry;
-            }
-
-            // [FIX #3329, #3409] 关键防线：微间隙优先原地 GraceRetry (Micro-gap Grace Retry First)
-            // 若上游返回了明确且极短的重置延迟 (<= 2500ms，例如 Google 图像生成典型的 1.17s quotaResetDelay)
-            // 且该账号本轮尚未执行过 GraceRetry：
-            // 绝不能在第 1 轮就无脑 50ms 闪电切号！
-            // 因为 50ms 闪电切号会在 300ms 内把全池所有账号全部轮询打一遍，并将它们全部作为 RateLimitExceeded 封锁进入 RateLimitTracker，
-            // 导致所有账号在第 2 轮全部处于限流冷却中并抛出 503 "All accounts limited"（生图成功率骤降至 13% 的根因）。
-            // 优先在当前账号原地等待 actual_ms (如 1.37s) 并在上游配额刚恢复的瞬间重试，即可原地满血复活，完全避免全池被连坐封死！
-            if let Some(delay) = parsed_delay {
-                let actual_ms = delay.actual_wait_ms();
-                if actual_ms <= 2500 && allow_grace_retry {
-                    tracing::info!(
-                        "[Retry] Multi-account 429 micro-gap ({}ms <= 2500ms): applying GraceRetry on current account instead of fast-rotating to protect pool",
-                        actual_ms
-                    );
-                    return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
-                }
-            }
-
-            let is_first_round = attempt < pool_size;
-            if is_first_round {
-                // Round 1 (第一轮)：全池匀速轮换 (150ms)，留出微冷却时间，毫秒级逃逸至其他健康账号
-                tracing::info!(
-                    "[Retry] Multi-account Round 1 (attempt {}/{}): rotating to next account in pool (150ms)",
-                    attempt + 1, pool_size
-                );
-                return RetryStrategy::FixedDelay(Duration::from_millis(150));
-            }
-
-            // Round 2 (第二轮)：全池在第一轮已全部遭遇 429，进入智能退避与小间隙等待阶段
-            if let Some(delay) = parsed_delay {
-                let actual_ms = delay.actual_wait_ms();
-                // 遇到小间隙 (<= 5s) 时，在当前账号原地小等并重试
-                if actual_ms <= 5000 && allow_grace_retry {
-                    tracing::info!(
-                        "[Retry] Multi-account Round 2 (attempt {}): small reset gap ({}ms <= 5s), applying GraceRetry",
-                        attempt + 1, actual_ms
-                    );
-                    return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
-                }
-
-                // 延迟较大 (> 5s，如 10s 以上) 且可用账号数 > 2：优先继续闪电轮换寻找其他可能到期的账号
-                if pool_size > 2 && attempt + 1 < pool_size * 2 {
-                    tracing::info!(
-                        "[Retry] Multi-account Round 2 (attempt {}): delay is {}ms (> 5s) with pool_size > 2, fast rotating",
-                        attempt + 1, actual_ms
-                    );
-                    return RetryStrategy::FixedDelay(Duration::from_millis(50));
-                }
-
-                // 其余情况 (例如仅 2 账号或第二轮后半段)：等待该延迟 (上限 12s，防止客户端超时)
-                let capped_ms = actual_ms.min(12_000);
-                tracing::info!(
-                    "[Retry] Multi-account Round 2: waiting capped delay {}ms before retry",
-                    capped_ms
-                );
-                return RetryStrategy::FixedDelay(Duration::from_millis(capped_ms));
-            }
-
-            // 第二轮未解析出具体 delay：线性温和退避 1.5s~3.5s，让瞬时并发与 TPM 高峰平息冷却
-            let step = (attempt.saturating_sub(pool_size)) as u64;
-            let backoff_ms = (1500 + step * 1000).min(3500);
-            RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
-        }
-
-        // 503 服务不可用 / 529 服务器过载
-        503 | 529 => {
-            if pool_size > 1 && attempt < pool_size {
-                // 多账号第一轮遭遇 503/529: 快速切向其他健康账号 (50ms)
-                tracing::info!(
-                    "[Retry] 503/529 detected in multi-account pool (attempt {}/{}): fast escaping to other accounts",
-                    attempt + 1, pool_size
-                );
-                RetryStrategy::FixedDelay(Duration::from_millis(50))
-            } else {
-                // 单账号或已遍历全池: 适度温和退避 (起始 1s，上限 4s，杜绝单次重试死等 30s 阻塞网关)
-                RetryStrategy::ExponentialBackoff {
-                    base_ms: 1000,
-                    max_ms: 4000,
-                }
-            }
-        }
-
-        // 500 服务器内部错误
-        500 => {
-            // 线性退避：起始 1s，上限 3s
-            RetryStrategy::LinearBackoff { base_ms: 1000 }
-        }
-
-        // 401/403 认证/权限错误：切换账号前给予极短缓冲
-        401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(200)),
-
-        // 404 资源未找到：Google Cloud Code API 的 404 通常是账号级别的间歇性问题
-        // (灰度发布、账号权限不同步等)，轮换账号往往能解决
-        404 => RetryStrategy::FixedDelay(Duration::from_millis(300)),
-
-        // 其他错误：不重试
-        _ => RetryStrategy::NoRetry,
-    }
-}
-
-/// 上报并评估首包 TTFT 耗时到 QoS 守卫
-pub fn report_qos_ttft(
-    token_manager: &crate::proxy::token_manager::TokenManager,
-    account_id: &str,
-    session_id: Option<&str>,
-    ttft_ms: f64,
-    is_deep_thinking: bool,
-    input_tokens: Option<u32>,
-) {
-    let tier = token_manager
-        .get_account_tier(account_id)
-        .unwrap_or_else(|| "PRO".to_string());
-    token_manager.record_qos_ttft(
-        account_id,
-        session_id,
-        &tier,
-        ttft_ms,
-        is_deep_thinking,
-        input_tokens,
-    );
 }
 
 #[cfg(test)]
@@ -528,97 +121,154 @@ mod tests {
     }
 }
 
-/// 执行退避策略并返回是否应该继续重试
-pub async fn apply_retry_strategy(
-    strategy: RetryStrategy,
-    attempt: usize,
-    max_attempts: usize,
-    status_code: u16,
-    trace_id: &str,
-) -> bool {
-    if crate::proxy::upstream::request_policy::request_policy().single_attempt {
-        return false;
+/// 入站模型闸门（协议无关）。
+///
+/// - 缺失 / 不存在的 model-id → 404 `model not exist`
+/// - 整池无配额 → 502 `no quota accounts`
+///
+/// 拒绝时：响应头带上 `X-Account-Email` 哨兵文案（日志账号列直接展示），
+/// 并把英文排障说明写入 `upstream_recorder`，使「转出报文」面板可展开查看。
+pub async fn enforce_model_gate(
+    state: &AppState,
+    requested_model: Option<&str>,
+    protocol: &str,
+    upstream_recorder: Option<&crate::proxy::monitor::UpstreamRequestBodyHolder>,
+) -> Result<String, Response> {
+    let decision = crate::proxy::common::model_gate::gate_inbound_model(
+        requested_model,
+        &state.custom_mapping,
+        &state.token_manager,
+    )
+    .await;
+
+    let Some((status, reason)) = decision.rejection() else {
+        return Ok(decision.allowed_model().unwrap_or_default().to_string());
+    };
+
+    let requested = requested_model.unwrap_or("").trim().to_string();
+    tracing::warn!(
+        "[ModelGate] Blocked inbound model '{}' ({}): HTTP {} - {}",
+        requested,
+        protocol,
+        status.as_u16(),
+        reason
+    );
+
+    // 把英文详细原因写入「转出报文」面板（原本这里会是空的“无中转报文”）
+    if let Some(holder) = upstream_recorder {
+        let explanation =
+            crate::proxy::common::model_gate::blocked_explanation(reason, &requested, protocol);
+        holder
+            .set(serde_json::to_string_pretty(&explanation).unwrap_or_else(|_| reason.to_string()));
     }
-    match strategy {
-        RetryStrategy::NoRetry => {
-            debug!(
-                "[{}] Non-retryable error {}, stopping",
-                trace_id, status_code
-            );
-            false
-        }
 
-        RetryStrategy::FixedDelay(duration) => {
-            let base_ms = duration.as_millis() as u64;
-            info!(
-                "[{}] ⏱️ Retry with fixed delay: status={}, attempt={}/{}, delay={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                max_attempts,
-                base_ms
-            );
-            sleep(duration).await;
-            true
-        }
-
-        RetryStrategy::LinearBackoff { base_ms } => {
-            let calculated_ms = base_ms * (attempt as u64 + 1);
-            info!(
-                "[{}] ⏱️ Retry with linear backoff: status={}, attempt={}/{}, delay={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                max_attempts,
-                calculated_ms
-            );
-            sleep(Duration::from_millis(calculated_ms)).await;
-            true
-        }
-
-        RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
-            let calculated_ms = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
-            info!(
-                "[{}] ⏱️ Retry with exponential backoff: status={}, attempt={}/{}, delay={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                max_attempts,
-                calculated_ms
-            );
-            sleep(Duration::from_millis(calculated_ms)).await;
-            true
-        }
-
-        RetryStrategy::GraceRetry(duration) => {
-            info!(
-                "[{}] ⚡ Grace Retry: Performing micro-wait ({}ms) on current account...",
-                trace_id,
-                duration.as_millis()
-            );
-            sleep(duration).await;
-            true // 原地重试在 handlers 层面通过 should_rotate_account 判断是否切换
-        }
-    }
+    let body = build_dual_track_error(protocol, status.as_u16(), &requested, reason);
+    Err((
+        status,
+        [
+            ("X-Account-Email", reason),
+            ("X-Mapped-Model", requested.as_str()),
+            ("X-Gateway-Error", reason),
+        ],
+        Json(body),
+    )
+        .into_response())
 }
 
-/// 判断是否应该轮换账号
-pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>) -> bool {
-    // [NEW] 如果识别为 Grace Retry，则显式要求不轮换账号
-    if let Some(RetryStrategy::GraceRetry(_)) = strategy {
-        return false;
-    }
+/// 模型列表投影的公共输入（协议无关）
+#[derive(Debug, Clone)]
+pub struct ModelListEntry {
+    pub id: String,
+    pub context_limit: i64,
+    pub output_limit: i64,
+    pub display_name: Option<String>,
+    pub metadata: Option<crate::models::quota::ModelListingMeta>,
+}
 
-    match status_code {
-        // 这些错误是账号级别或特定节点配额的，需要轮换
-        // [FIX #3485] 503/529 边缘节点熔断或特定账号负载过高，多账号时支持轮换逃逸，杜绝死锁死等
-        429 | 401 | 403 | 404 | 500 | 503 | 529 => true,
-        // 若为 400 且返回了 50ms 快速退避策略（例如 user location is not supported），需要轮换账号/节点
-        400 if matches!(strategy, Some(RetryStrategy::FixedDelay(d)) if *d == Duration::from_millis(50)) => {
-            true
-        }
-        _ => false,
-    }
+/// 统一收集 `/v1/models`、`/v1/models/claude`、`/v1beta/models` 的共同数据
+///
+/// 三个协议过去各自重复“取动态模型 + 取元数据 + 回退 token 上限”三遍；
+/// 这里只保留一份数据投影，协议层只负责最终 JSON 形状。
+pub async fn collect_model_list_entries(
+    state: &crate::proxy::server::AppState,
+) -> Vec<ModelListEntry> {
+    use crate::proxy::common::model_mapping::{
+        get_all_dynamic_models, get_all_dynamic_models_metadata,
+    };
+
+    let only_raw = *state.only_raw_quota_models.read().await;
+    let model_ids =
+        get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
+    let metadata_map = get_all_dynamic_models_metadata(
+        &state.custom_mapping,
+        Some(&state.token_manager),
+        only_raw,
+    )
+    .await;
+
+    model_ids
+        .into_iter()
+        .map(|id| {
+            let (fallback_ctx, fallback_out) =
+                crate::proxy::handlers::openai::resolve_model_token_limits(&id);
+            let meta = metadata_map
+                .get(&id)
+                .or_else(|| metadata_map.get(&id.to_lowercase()))
+                .cloned();
+            let context_limit = meta
+                .as_ref()
+                .and_then(|m| m.max_tokens)
+                .map(|v| v as i64)
+                .unwrap_or(fallback_ctx);
+            let output_limit = meta
+                .as_ref()
+                .and_then(|m| m.max_output_tokens)
+                .map(|v| v as i64)
+                .unwrap_or(fallback_out);
+            let display_name = meta.as_ref().and_then(|m| m.display_name.clone());
+            ModelListEntry {
+                id,
+                context_limit,
+                output_limit,
+                display_name,
+                metadata: meta,
+            }
+        })
+        .collect()
+}
+
+/// OpenAI / Anthropic 兼容的模型对象投影
+pub fn openai_style_model_objects(entries: Vec<ModelListEntry>) -> Vec<serde_json::Value> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut obj = serde_json::json!({
+                "id": entry.id,
+                "object": "model",
+                "created": 1706745600,
+                "owned_by": "antigravity",
+                "context_length": entry.context_limit,
+                "max_context_length": entry.context_limit,
+                "max_input_tokens": entry.context_limit,
+                "max_model_len": entry.context_limit,
+                "max_tokens": entry.context_limit,
+                "input_token_limit": entry.context_limit,
+                "max_completion_tokens": entry.output_limit,
+                "max_output_tokens": entry.output_limit,
+                "output_token_limit": entry.output_limit,
+            });
+            if let Some(meta) = entry.metadata {
+                if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(meta) {
+                    if let Some(target) = obj.as_object_mut() {
+                        for (k, v) in map {
+                            target.insert(k, v);
+                        }
+                    }
+                }
+            }
+            obj
+        })
+        .collect()
 }
 
 /// Detects model capabilities and configuration
@@ -670,36 +320,6 @@ pub async fn handle_detect_model(
     Json(response).into_response()
 }
 
-/// [Issue #3414] 从形如 "All accounts limited. Wait 29s." 或其他明确冷却提示中解析等待秒数
-pub fn extract_retry_after_seconds(error_text: &str) -> Option<u64> {
-    // 查找 "Wait " (大写) 或 "wait " (小写)
-    let pos = error_text
-        .find("Wait ")
-        .or_else(|| error_text.find("wait "))?;
-    let rest = &error_text[pos + 5..];
-    if let Some(s_pos) = rest.find('s') {
-        if let Ok(sec) = rest[..s_pos].trim().parse::<u64>() {
-            if sec > 0 {
-                return Some(sec);
-            }
-        }
-    }
-    None
-}
-
-/// [Issue #3634] 为 Claude 协议收敛 Retry-After 秒数。
-/// Claude Code 客户端对 Retry-After 设置了严格的 20,000ms (20s) 门禁：
-/// 1. 若 Retry-After >= 20s 或缺失 (null)，立即触发 10~30 分钟 (1,800,000ms) 的过载/限流冷冻与 fastMode 熔断；
-/// 2. 若 Retry-After < 20s (且非 null)，客户端执行快速原位重试循环 (Math.min(U$(...), 20000))。
-///
-/// 因此网关为 Claude 协议返回的 Retry-After 必须稳定收敛至 safe 范围 (默认 12s，兜底 8s)。
-pub fn clamp_retry_after_for_claude(sec: Option<u64>) -> u64 {
-    match sec {
-        Some(s) if s > 0 => s.clamp(1, 12),
-        _ => 8,
-    }
-}
-
 /// [Issue #3414 / #3634] 统一构造带有 X-Mapped-Model、可选 X-Account-Email 以及针对协议感知的 Retry-After HeaderMap
 pub fn build_token_error_headers_for_protocol<'a>(
     protocol: &str,
@@ -745,105 +365,6 @@ pub fn build_token_error_headers<'a>(
     build_token_error_headers_for_protocol("common", mapped_model, account_email, error_text)
 }
 
-/// 判定是否属于偶发性/瞬态 Token 获取错误（例如超时、锁争抢、系统繁忙）
-pub fn is_transient_token_error(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("timeout") || lower.contains("too busy") || lower.contains("deadlock")
-}
-
-/// 判断是否为模型不存在/不支持的错误
-pub fn is_model_not_found_error(_status: u16, body: &str) -> bool {
-    let lower = body.to_lowercase();
-    lower.contains("model not found")
-        || lower.contains("unknown model")
-        || lower.contains("does not exist")
-        || lower.contains("is not found")
-        || lower.contains("unsupported model")
-        || lower.contains("not found for api version")
-        || lower.contains("publisher model")
-        || lower.contains("model_not_found")
-        || lower.contains("no such model")
-        || lower.contains("invalid model")
-        || lower.contains("model is not available")
-}
-
-/// 深度解析、剥离前缀与反转义上游错误，返回 (上游原始纯文本消息, 结构化解析对象)
-pub fn parse_raw_upstream_error(error_text: &str) -> (String, serde_json::Value) {
-    let trimmed = error_text.trim();
-    // 1. 剥离可能附带的外层 HTTP 前缀，如 "HTTP 400: "、"HTTP 500: "、"All accounts exhausted. Last error: "
-    let clean_str = if let Some(pos) = trimmed.find("HTTP ") {
-        if let Some(colon_pos) = trimmed[pos..].find(": ") {
-            trimmed[pos + colon_pos + 2..].trim()
-        } else {
-            trimmed
-        }
-    } else if let Some(stripped) = trimmed.strip_prefix("All accounts exhausted. Last error: ") {
-        stripped.trim()
-    } else {
-        trimmed
-    };
-
-    // 2. 深度递归反转义解析 JSON
-    let mut current_val: Option<serde_json::Value> = serde_json::from_str(clean_str).ok();
-    // 如果解析出来的还是 string 且看起来像 JSON，尝试二次/三次解析（处理被双重转义的情况）
-    for _ in 0..3 {
-        if let Some(serde_json::Value::String(ref s)) = current_val {
-            let s_trim = s.trim();
-            if (s_trim.starts_with('{') && s_trim.ends_with('}'))
-                || (s_trim.starts_with('[') && s_trim.ends_with(']'))
-            {
-                if let Ok(nested) = serde_json::from_str(s_trim) {
-                    current_val = Some(nested);
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-
-    // 3. 如果当前值是个 Object，且它某个字段（例如 "response" 或 "raw"）又是嵌套 JSON 字符串，递归解析内部
-    if let Some(mut parsed) = current_val {
-        if let Some(obj) = parsed.as_object_mut() {
-            for key in ["response", "raw", "error", "details", "message"] {
-                if let Some(serde_json::Value::String(s)) = obj.get(key) {
-                    let s_trim = s.trim();
-                    if (s_trim.starts_with('{') && s_trim.ends_with('}'))
-                        || (s_trim.starts_with('[') && s_trim.ends_with(']'))
-                    {
-                        if let Ok(nested) = serde_json::from_str::<serde_json::Value>(s_trim) {
-                            obj.insert(key.to_string(), nested);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 从结构化对象中提取原生的 message
-        let raw_msg = if let Some(err_obj) = parsed.get("error") {
-            if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
-                msg.to_string()
-            } else if let Some(msg) = err_obj.as_str() {
-                msg.to_string()
-            } else {
-                clean_str.to_string()
-            }
-        } else if let Some(msg) = parsed.get("message").and_then(|m| m.as_str()) {
-            msg.to_string()
-        } else if let Some(msg) = parsed.get("detail").and_then(|m| m.as_str()) {
-            msg.to_string()
-        } else {
-            clean_str.to_string()
-        };
-
-        (raw_msg, parsed)
-    } else {
-        (
-            clean_str.to_string(),
-            serde_json::json!({ "raw": clean_str }),
-        )
-    }
-}
-
 fn map_status_code_to_gemini_status(status_code: u16) -> &'static str {
     match status_code {
         400 => "INVALID_ARGUMENT",
@@ -860,6 +381,129 @@ fn map_status_code_to_gemini_status(status_code: u16) -> &'static str {
     }
 }
 
+/// 检测是否存在因自定义 User-Agent 过时或未采用官方 Hub 格式导致上游拒绝访问的特征
+pub fn check_outdated_user_agent_issue(
+    model: &str,
+    status_code: u16,
+    error_text: &str,
+    custom_ua: Option<&str>,
+) -> Option<(String, String, String, &'static str, &'static str)> {
+    let lang = crate::modules::config::load_app_config()
+        .ok()
+        .map(|c| c.language)
+        .unwrap_or_else(|| "zh".to_string());
+    check_outdated_user_agent_issue_with_lang(
+        model,
+        status_code,
+        error_text,
+        custom_ua,
+        Some(&lang),
+    )
+}
+
+/// 支持指定语言环境的 User-Agent 门禁与熔断特征检测
+pub fn check_outdated_user_agent_issue_with_lang(
+    model: &str,
+    status_code: u16,
+    error_text: &str,
+    custom_ua: Option<&str>,
+    lang: Option<&str>,
+) -> Option<(String, String, String, &'static str, &'static str)> {
+    let lower_err = error_text.to_lowercase();
+    let is_suspended_pool = lower_err.contains("temporarily suspended for model");
+    let is_not_found = is_model_not_found_error(status_code, error_text) || is_suspended_pool;
+    let is_forbidden = status_code == 403
+        || lower_err.contains("permission_denied")
+        || lower_err.contains("forbidden");
+
+    if !(is_not_found || is_forbidden) {
+        return None;
+    }
+
+    let i18n_err = crate::modules::i18n::get_gateway_error_strings(lang.unwrap_or("zh"));
+
+    if let Some(ua) = custom_ua {
+        let trimmed_ua = ua.trim();
+        if !trimmed_ua.is_empty() {
+            // 获取当前动态解析的官方 Hub 客户端指纹基线（来自官方远程 releases 探测或稳态基准）
+            let active_fp = crate::modules::hub_version::get_current_hub_fingerprint();
+            let active_baseline_ver = active_fp.version.as_str();
+
+            // 判定是否缺少官方 Hub 签名，或 Hub 版本低于当前官方最新基准
+            let is_hub = trimmed_ua.starts_with("antigravity/hub/");
+            let (is_risk, reason) = if is_hub {
+                if let Some(caps) = crate::constants::parse_antigravity_version(trimmed_ua) {
+                    if crate::constants::compare_semver(&caps, active_baseline_ver)
+                        == std::cmp::Ordering::Less
+                    {
+                        (true, "outdated_version")
+                    } else {
+                        (false, "ok")
+                    }
+                } else {
+                    (false, "ok")
+                }
+            } else {
+                (true, "missing_hub_signature") // 纯 IDE 格式 (如 antigravity/4.3.0) 缺少 Hub 签名
+            };
+
+            if is_risk {
+                let current_upstream_ua = crate::modules::hub_version::get_current_hub_user_agent();
+                let (title, diagnosis, suggestion) = if reason == "missing_hub_signature" {
+                    (
+                        format!("{} [{}]", i18n_err.outdated_ua_missing_sig_title, model),
+                        i18n_err
+                            .outdated_ua_missing_sig_diag
+                            .replace("{model}", model)
+                            .replace("{status}", &status_code.to_string())
+                            .replace("{ua}", trimmed_ua),
+                        i18n_err
+                            .outdated_ua_missing_sig_sug
+                            .replace("{recommended_ua}", &current_upstream_ua),
+                    )
+                } else {
+                    let user_ver = crate::constants::parse_antigravity_version(trimmed_ua)
+                        .unwrap_or_else(|| "未知".to_string());
+                    (
+                        format!("{} [{}]", i18n_err.outdated_ua_low_ver_title, model),
+                        i18n_err
+                            .outdated_ua_low_ver_diag
+                            .replace("{model}", model)
+                            .replace("{status}", &status_code.to_string())
+                            .replace("{ua}", trimmed_ua)
+                            .replace("{user_version}", &user_ver)
+                            .replace("{baseline_version}", active_baseline_ver),
+                        i18n_err
+                            .outdated_ua_low_ver_sug
+                            .replace("{recommended_ua}", &current_upstream_ua)
+                            .replace("{baseline_version}", active_baseline_ver),
+                    )
+                };
+
+                return Some((
+                    title,
+                    diagnosis,
+                    suggestion,
+                    "invalid_request_error",
+                    "outdated_user_agent",
+                ));
+            }
+        }
+    }
+
+    if is_suspended_pool {
+        return Some((
+            format!("{} [{}]", i18n_err.model_pool_suspended_title, model),
+            i18n_err.model_pool_suspended_diag.replace("{model}", model),
+            i18n_err.model_pool_suspended_sug.to_string(),
+            "rate_limit_error",
+            "model_pool_suspended",
+        ));
+    }
+
+    None
+}
+
 /// 格式化双轨制错误报文（四大标准协议原始字段散开 + 顶层/UI层不阉割双轨诊断）
 pub fn build_dual_track_error(
     protocol: &str, // "claude", "openai", "responses", or "gemini"
@@ -867,13 +511,67 @@ pub fn build_dual_track_error(
     model: &str,
     error_text: &str,
 ) -> serde_json::Value {
+    // 动态提取当前生效的自定义 User-Agent 覆盖与语言环境
+    let cfg = crate::modules::config::load_app_config().ok();
+    let active_ua_override = cfg
+        .as_ref()
+        .and_then(|c| c.proxy.user_agent_override.clone());
+    let lang = cfg
+        .as_ref()
+        .map(|c| c.language.clone())
+        .unwrap_or_else(|| "zh".to_string());
+    build_dual_track_error_with_ua_and_lang(
+        protocol,
+        status_code,
+        model,
+        error_text,
+        active_ua_override.as_deref(),
+        Some(&lang),
+    )
+}
+
+/// 格式化双轨制错误报文（可显式注入 custom_ua 用于单元测试或环境注入）
+pub fn build_dual_track_error_with_ua(
+    protocol: &str,
+    status_code: u16,
+    model: &str,
+    error_text: &str,
+    custom_ua: Option<&str>,
+) -> serde_json::Value {
+    let lang = crate::modules::config::load_app_config()
+        .ok()
+        .map(|c| c.language)
+        .unwrap_or_else(|| "zh".to_string());
+    build_dual_track_error_with_ua_and_lang(
+        protocol,
+        status_code,
+        model,
+        error_text,
+        custom_ua,
+        Some(&lang),
+    )
+}
+
+/// 格式化双轨制错误报文（支持显式注入自定义 UA 及当前会话语言环境）
+pub fn build_dual_track_error_with_ua_and_lang(
+    protocol: &str,
+    status_code: u16,
+    model: &str,
+    error_text: &str,
+    custom_ua: Option<&str>,
+    lang: Option<&str>,
+) -> serde_json::Value {
+    let effective_lang = lang.unwrap_or("zh");
+    let i18n_err = crate::modules::i18n::get_gateway_error_strings(effective_lang);
+
+    // [Fixes #3763] 剔除内部链路控制标记，避免大体积上传终态标记泄漏到客户端报文
+    let sanitized_error_text = crate::proxy::upstream::client::strip_internal_markers(error_text);
+    let error_text = sanitized_error_text.as_str();
     let lower = error_text.to_lowercase();
-    let is_internal_limited = lower.contains("all accounts limited")
-        || lower.contains("no accounts available")
-        || lower.contains("all accounts failed")
-        || lower.contains("token pool is empty")
-        || lower.contains("all accounts exhausted")
-        || lower.contains("all accounts unhealthy");
+    let is_internal_limited =
+        crate::proxy::pipeline::policy::UpstreamClassification::is_internal_gateway_exhaustion(
+            &lower,
+        );
 
     let is_network_error = lower.contains("http request failed")
         || lower.contains("failed to connect")
@@ -883,64 +581,101 @@ pub fn build_dual_track_error(
         || lower.contains("timeout")
         || lower.contains("error trying to connect")
         || lower.contains("dns error")
-        || lower.contains("all endpoints failed");
+        || lower.contains("all endpoints failed")
+        // [Fixes #3763] 分阶段上传诊断归入网络类故障，保留真实阶段语义
+        || lower.contains("upload stalled")
+        || lower.contains("upload budget exhausted")
+        || lower.contains("upstream send failed")
+        || lower.contains("no response")
+        || lower.contains("未收到请求回报");
 
     let is_not_found = is_model_not_found_error(status_code, error_text);
+
+    // 账号被上游封禁 / 权限拒绝：与「容量耗尽」「模型不存在」严格区分，
+    // 避免 403 被 Claude 协议映射为 503 后与真实容量问题混淆。
+    let is_account_forbidden = lower.contains("tos_violation")
+        || lower.contains("violation of terms of service")
+        || lower.contains("disabled in this account")
+        || (status_code == 403 && lower.contains("permission_denied"));
 
     // 1. 深度解析并反转义上游错误
     let (raw_upstream_msg, parsed_upstream) = parse_raw_upstream_error(error_text);
 
-    let (readable_prefix, diagnosis, suggestion, err_type, err_code) = if is_internal_limited {
+    let (readable_prefix, diagnosis, suggestion, err_type, err_code) = if let Some(ua_diag) =
+        check_outdated_user_agent_issue_with_lang(
+            model,
+            status_code,
+            error_text,
+            custom_ua,
+            Some(effective_lang),
+        ) {
+        ua_diag
+    } else if is_account_forbidden {
         (
-            "【网关调度受限】".to_string(),
-            format!(
-                "网关本地账号池当前暂无可用账号或全部可用账号处于限流冷却中。调度详情: {}",
-                error_text
-            ),
-            "请等待冷却结束（参考等待秒数），或在网关中添加更多正常账号。".to_string(),
+            i18n_err.account_forbidden_title.replace("{model}", model),
+            i18n_err
+                .account_forbidden_diag
+                .replace("{error}", &error_text.chars().take(400).collect::<String>()),
+            i18n_err.account_forbidden_sug.to_string(),
+            "permission_error",
+            "account_forbidden",
+        )
+    } else if is_internal_limited {
+        (
+            i18n_err.all_accounts_limited_title.to_string(),
+            i18n_err
+                .all_accounts_limited_diag
+                .replace("{error}", error_text),
+            i18n_err.all_accounts_limited_sug.to_string(),
             "rate_limit_error",
             "all_accounts_limited",
         )
     } else if is_network_error {
         (
-            "【网络请求异常（非服务端故障）】".to_string(),
-            format!(
-                "请求上游接口时网络连接失败（非网关服务端故障，请排查网络或代理）：{}",
-                error_text
-            ),
-            "请检查系统代理、上游节点连通性或本地网络设置，确保能正常连接上游服务。".to_string(),
+            i18n_err.upstream_network_error_title.to_string(),
+            i18n_err
+                .upstream_network_error_diag
+                .replace("{error}", error_text),
+            i18n_err.upstream_network_error_sug.to_string(),
             "network_error",
             "upstream_network_error",
         )
     } else if is_not_found {
         (
-            format!("【模型不存在】[{}]", model),
-            format!("模型 [{}] 在上游端点不存在，或当前绑定的账号暂未开通该模型的访问权限。", model),
-            "请核对模型名称，或在网关配置中的「自定义模型映射」将其重定向至可用模型（如 gemini-2.5-flash）。".to_string(),
+            i18n_err.model_not_found_title.replace("{model}", model),
+            i18n_err.model_not_found_diag.replace("{model}", model),
+            i18n_err.model_not_found_sug.to_string(),
             "invalid_request_error",
             "model_not_found",
         )
     } else if status_code == 429 || status_code == 529 {
         (
-            format!("【上游限流 HTTP {}】", status_code),
-            format!("模型 [{}] 触发上游配额耗尽或频率限制。", model),
-            "请稍候自动恢复，或添加更多账号以分散并发请求。".to_string(),
+            i18n_err
+                .rate_limit_title
+                .replace("{status}", &status_code.to_string()),
+            i18n_err.rate_limit_diag.replace("{model}", model),
+            i18n_err.rate_limit_sug.to_string(),
             "rate_limit_error",
             "rate_limit_exceeded",
         )
     } else {
         (
-            format!("【上游错误 HTTP {}】", status_code),
-            format!("调用上游模型 [{}] 发生错误 (HTTP {})。", model, status_code),
-            "请参考 upstream_error 中的详细字段排查原因。".to_string(),
+            i18n_err
+                .upstream_error_title
+                .replace("{status}", &status_code.to_string()),
+            i18n_err
+                .upstream_error_diag
+                .replace("{model}", model)
+                .replace("{status}", &status_code.to_string()),
+            i18n_err.upstream_error_sug.to_string(),
             "api_error",
             "upstream_error",
         )
     };
 
     let readable_message = format!(
-        "{} 网关诊断: {} 建议: {}",
-        readable_prefix, diagnosis, suggestion
+        "{} {} {} {} {}",
+        readable_prefix, i18n_err.label_diagnosis, diagnosis, i18n_err.label_suggestion, suggestion
     );
 
     // 2. 确定散开到各自协议标准 message 字段的内容：
@@ -1048,6 +783,7 @@ pub fn encode_attempts_header(
 #[cfg(test)]
 mod retry_after_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_extract_retry_after_seconds() {
@@ -1089,8 +825,8 @@ mod retry_after_tests {
             180
         );
 
-        // 2. 图像生成请求给予 60s
-        assert_eq!(calculate_adaptive_peek_timeout(false, true, None), 60);
+        // 2. 图像生成请求给予 90s
+        assert_eq!(calculate_adaptive_peek_timeout(false, true, None), 90);
 
         // 3. 正常会话根据 token 规模自适应阶梯分配
         assert_eq!(
@@ -1431,5 +1167,121 @@ mod retry_after_tests {
             }
             other => panic!("Expected FixedDelay(50ms), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_check_outdated_user_agent_issue_detects_legacy_ide_ua() {
+        let legacy_ua = "antigravity/4.3.0 darwin/arm64";
+        let raw_404 = r#"HTTP 404: {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#;
+
+        // 场景 1: 上游直接 404 (中文测试)
+        let res_zh = build_dual_track_error_with_ua_and_lang(
+            "openai",
+            404,
+            "gemini-4-argon-low",
+            raw_404,
+            Some(legacy_ua),
+            Some("zh"),
+        );
+        assert_eq!(res_zh["error"]["code"], "outdated_user_agent");
+        let diag_zh = res_zh["error"]["gateway_error"]["diagnosis"]
+            .as_str()
+            .unwrap();
+        assert!(diag_zh.contains("缺少官方 Hub 签名"));
+        assert!(diag_zh.contains("antigravity/4.3.0 darwin/arm64"));
+        assert_eq!(
+            res_zh["error"]["gateway_error"]["error_code"],
+            "outdated_user_agent"
+        );
+
+        // 场景 1b: 英文测试
+        let res_en = build_dual_track_error_with_ua_and_lang(
+            "openai",
+            404,
+            "gemini-4-argon-low",
+            raw_404,
+            Some(legacy_ua),
+            Some("en"),
+        );
+        assert_eq!(res_en["error"]["code"], "outdated_user_agent");
+        let diag_en = res_en["error"]["gateway_error"]["diagnosis"]
+            .as_str()
+            .unwrap();
+        assert!(diag_en.contains("lacks the official Hub signature"));
+
+        // 场景 2: 因所有账号 404 导致全池挂起熔断 (HTTP 503)
+        let suspended_err =
+            "All candidate accounts temporarily suspended for model: gemini-4-argon-low";
+        let res_503 = build_dual_track_error_with_ua_and_lang(
+            "openai",
+            503,
+            "gemini-4-argon-low",
+            suspended_err,
+            Some(legacy_ua),
+            Some("zh"),
+        );
+        assert_eq!(res_503["error"]["code"], "outdated_user_agent");
+        assert!(res_503["error"]["gateway_error"]["readable_summary"]
+            .as_str()
+            .unwrap()
+            .contains("【上游指纹门禁异常】"));
+    }
+
+    #[test]
+    fn test_check_outdated_user_agent_issue_detects_low_version_hub_ua() {
+        // 具有官方 Hub 签名，但版本号 (2.11.0) 低于当前推荐默认基准 (OFFICIAL_HUB_VERSION 2.28.0)
+        let low_hub_ua =
+            "antigravity/hub/2.11.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)";
+        let raw_404 = r#"HTTP 404: {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#;
+
+        let res = build_dual_track_error_with_ua_and_lang(
+            "claude",
+            404,
+            "gemini-4-argon",
+            raw_404,
+            Some(low_hub_ua),
+            Some("zh"),
+        );
+        assert_eq!(res["error"]["code"], "outdated_user_agent");
+        let diag = res["error"]["gateway_error"]["diagnosis"].as_str().unwrap();
+        assert!(diag.contains("2.11.0"));
+        assert!(diag.contains("低于当前官方推荐默认基准"));
+    }
+
+    #[test]
+    fn test_check_outdated_user_agent_issue_passes_modern_hub_ua() {
+        let modern_ua =
+            "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)";
+        let raw_404 = r#"HTTP 404: {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#;
+
+        let res = build_dual_track_error_with_ua(
+            "claude",
+            404,
+            "gemini-non-existent",
+            raw_404,
+            Some(modern_ua),
+        );
+        // 现代 Hub UA 不应误判为 outdated_user_agent，正常走 model_not_found
+        assert_eq!(res["error"]["code"], "model_not_found");
+    }
+
+    #[test]
+    fn test_check_outdated_user_agent_issue_detects_suspended_pool_without_custom_ua() {
+        let suspended_err =
+            "All candidate accounts temporarily suspended for model: gemini-4-argon-low";
+        let res = build_dual_track_error_with_ua_and_lang(
+            "openai",
+            503,
+            "gemini-4-argon-low",
+            suspended_err,
+            None,
+            Some("zh"),
+        );
+        // 无自定义 UA 时，全池临时熔断给出清晰的 model_pool_suspended 诊断
+        assert_eq!(res["error"]["code"], "model_pool_suspended");
+        assert!(res["error"]["gateway_error"]["readable_summary"]
+            .as_str()
+            .unwrap()
+            .contains("【模型全池临时熔断】"));
     }
 }

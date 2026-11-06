@@ -223,6 +223,7 @@ pub enum CliApp {
     OpenCode,
     JeikCode,
     GrokBuild,
+    DeepSeekHarness,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -240,6 +241,7 @@ impl CliApp {
             CliApp::OpenCode => "opencode",
             CliApp::JeikCode => "jeikcode",
             CliApp::GrokBuild => "grok",
+            CliApp::DeepSeekHarness => "dsh",
         }
     }
 
@@ -347,6 +349,29 @@ impl CliApp {
                     path: grok_dir.join("config.toml"),
                 }]
             }
+            CliApp::DeepSeekHarness => {
+                let dsh_dir = home.join(".dsh");
+                vec![
+                    CliConfigFile {
+                        name: "profiles/desktop/cordis.patch.yml".to_string(),
+                        path: dsh_dir
+                            .join("profiles")
+                            .join("desktop")
+                            .join("cordis.patch.yml"),
+                    },
+                    CliConfigFile {
+                        name: "profiles/web/cordis.patch.yml".to_string(),
+                        path: dsh_dir
+                            .join("profiles")
+                            .join("web")
+                            .join("cordis.patch.yml"),
+                    },
+                    CliConfigFile {
+                        name: ".credentials.yaml".to_string(),
+                        path: dsh_dir.join(".credentials.yaml"),
+                    },
+                ]
+            }
         }
     }
 
@@ -358,6 +383,7 @@ impl CliApp {
             CliApp::OpenCode => "https://api.openai.com/v1",
             CliApp::JeikCode => "http://127.0.0.1:8046/v1",
             CliApp::GrokBuild => "https://api.x.ai/v1",
+            CliApp::DeepSeekHarness => "https://api.deepseek.com/v1",
         }
     }
 }
@@ -379,6 +405,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         CliApp::Gemini => vec!["agy_cli", "agy", "gemini"],
         CliApp::JeikCode => vec!["jeikcode", "atomcode"],
         CliApp::GrokBuild => vec!["grok", "grokbuild"],
+        CliApp::DeepSeekHarness => vec!["dsh", "deepseek-harness", "deepseek"],
         _ => vec![app.as_str()],
     };
 
@@ -507,6 +534,44 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
                 || grokbuild_dir.exists()
             {
                 installed = true;
+            }
+        }
+    }
+
+    // 如果是 DeepSeek Harness 且常规检测未命中，尝试检测应用目录或 ~/.dsh 目录
+    if !installed && app == &CliApp::DeepSeekHarness {
+        #[cfg(target_os = "macos")]
+        {
+            let mac_dsh = PathBuf::from(
+                "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+            );
+            if mac_dsh.exists() {
+                executable_path = mac_dsh;
+                installed = true;
+            } else if PathBuf::from("/Applications/DeepSeek Harness.app").exists() {
+                installed = true;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(home) = dirs::home_dir() {
+            let win_paths = vec![
+                home.join(".dsh").join("bin").join("dsh.cmd"),
+                home.join(".dsh").join("bin").join("dsh.exe"),
+            ];
+            for p in win_paths {
+                if is_safe_path(&p) {
+                    executable_path = p;
+                    installed = true;
+                    break;
+                }
+            }
+        }
+        if !installed {
+            if let Some(home) = dirs::home_dir() {
+                let dsh_dir = home.join(".dsh");
+                if dsh_dir.exists() {
+                    installed = true;
+                }
             }
         }
     }
@@ -789,6 +854,57 @@ pub fn get_sync_status(
                             all_synced = false;
                         }
                     } else {
+                        all_synced = false;
+                    }
+                }
+            }
+            CliApp::DeepSeekHarness => {
+                if file.name.ends_with("cordis.patch.yml") {
+                    let normalized_proxy = proxy_url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/');
+
+                    let has_ag_provider = content.contains("provider: antigravity")
+                        || content.contains("antigravity:");
+
+                    let mut matched = false;
+                    let re_url =
+                        regex::Regex::new(r#"(?m)^\s*baseURL:\s*['"]?([^'"\s#]+)['"]?"#).ok();
+                    if let Some(re) = re_url {
+                        for cap in re.captures_iter(&content) {
+                            if let Some(m) = cap.get(1) {
+                                let found_url = m.as_str();
+                                let norm_found = found_url
+                                    .trim_end_matches('/')
+                                    .trim_end_matches("/v1")
+                                    .trim_end_matches('/');
+                                if norm_found == normalized_proxy {
+                                    current_base_url = Some(found_url.to_string());
+                                    matched = true;
+                                    break;
+                                } else if current_base_url.is_none() {
+                                    current_base_url = Some(found_url.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if current_model.is_none() {
+                        let re_model = regex::Regex::new(
+                            r#"(?s)id:\s*agent-default-model[\s\S]*?config:[\s\S]*?model:\s*['"]?([a-zA-Z0-9_.-]+)['"]?"#,
+                        )
+                        .ok();
+                        if let Some(re) = re_model {
+                            if let Some(cap) = re.captures(&content) {
+                                if let Some(m) = cap.get(1) {
+                                    current_model = Some(m.as_str().to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if !matched || !has_ag_provider {
                         all_synced = false;
                     }
                 }
@@ -1399,6 +1515,29 @@ pub fn sync_config(
                     content = doc.to_string();
                 }
             }
+            CliApp::DeepSeekHarness => {
+                if file.name.ends_with("cordis.patch.yml") {
+                    let target_model = match model {
+                        Some(m) if !m.is_empty() => m,
+                        _ => "gemini-3.8-flash-high",
+                    };
+                    let normalized_proxy_url = {
+                        let trimmed = proxy_url.trim().trim_end_matches('/');
+                        if trimmed.ends_with("/v1") {
+                            trimmed.to_string()
+                        } else {
+                            format!("{}/v1", trimmed)
+                        }
+                    };
+                    content = sync_dsh_cordis_patch_content(
+                        &content,
+                        &normalized_proxy_url,
+                        target_model,
+                    );
+                } else if file.name == ".credentials.yaml" {
+                    content = sync_dsh_credentials_content(&content, api_key);
+                }
+            }
         }
 
         // 使用临时文件原子写入
@@ -1573,128 +1712,167 @@ pub struct CoreModel {
     pub context_window: i64,
 }
 
-/// 导出网关全量核心模型（仅保留官方最新支持的旗舰模型及后缀派生裸模型）
-pub fn get_core_gateway_models() -> &'static [CoreModel] {
-    &[
-        // Claude 5.5 系列 (1M 上下文)
-        CoreModel {
-            id: "claude-opus-5-5",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-low",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-low",
-            context_window: 1_000_000,
-        },
-        // Claude 4.6 系列 (256k 上下文)
-        CoreModel {
-            id: "claude-opus-4-6",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-opus-4-6-thinking",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-4-6",
-            context_window: 256_000,
-        },
-        // Gemini 4 Argon 系列 (Google 旗舰推理模型，1M 上下文)
-        CoreModel {
-            id: "gemini-4-argon",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-medium",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-low",
-            context_window: 1_048_576,
-        },
-        // Gemini 3.8 Flash 系列 (1M 上下文)
-        CoreModel {
-            id: "gemini-3.8-flash",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-tiered",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-medium",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-low",
-            context_window: 1_048_576,
-        },
-        // Gemini 3.1 Pro & 专用模型
-        CoreModel {
-            id: "gemini-3.1-pro",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-pro-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-pro-low",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-flash-image",
-            context_window: 65_536,
-        },
-        // GPT-OSS 官方支持系列
-        CoreModel {
-            id: "gpt-oss-120b",
-            context_window: 131_072,
-        },
-        CoreModel {
-            id: "gpt-oss-120b-medium",
-            context_window: 131_072,
-        },
-    ]
+static CORE_GATEWAY_MODELS: &[CoreModel] = &[
+    // Claude 5.5 系列 (1M 上下文)
+    CoreModel {
+        id: "claude-opus-5-5",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-high",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-medium",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-low",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-high",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-medium",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-low",
+        context_window: 1_000_000,
+    },
+    // Claude 4.6 系列 (256k 上下文)
+    CoreModel {
+        id: "claude-opus-4-6",
+        context_window: 256_000,
+    },
+    CoreModel {
+        id: "claude-opus-4-6-thinking",
+        context_window: 256_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-4-6",
+        context_window: 256_000,
+    },
+    // Gemini 4 Argon 系列 (Google 旗舰推理模型，1M 上下文)
+    CoreModel {
+        id: "gemini-4-argon",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-medium",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-low",
+        context_window: 1_048_576,
+    },
+    // Gemini 3.8 Flash 系列 (1M 上下文)
+    CoreModel {
+        id: "gemini-3.8-flash",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-tiered",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-medium",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-low",
+        context_window: 1_048_576,
+    },
+    // Gemini 3.1 Pro & 专用模型
+    CoreModel {
+        id: "gemini-3.1-pro",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-pro-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-pro-low",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.5-flash-lite",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-flash-image",
+        context_window: 65_536,
+    },
+    // GPT-OSS 官方支持系列
+    CoreModel {
+        id: "gpt-oss-120b",
+        context_window: 131_072,
+    },
+    CoreModel {
+        id: "gpt-oss-120b-medium",
+        context_window: 131_072,
+    },
+];
+
+/// 当前账号池官方可用模型并集（由 TokenManager 在模型加载/刷新后写入）。
+/// 空集合 = 首启尚未拉到 quota → 回退静态全量，不阻塞一键配置。
+static AVAILABLE_MODEL_IDS: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// 由 TokenManager 调用：刷新“官方可用模型”全局快照（不含内部保护桶名）
+pub fn update_available_model_ids<I: IntoIterator<Item = String>>(ids: I) {
+    if let Ok(mut guard) = AVAILABLE_MODEL_IDS.write() {
+        *guard = ids.into_iter().collect();
+    }
+}
+
+/// 模型是否真实可用：精确命中，或其带后缀的具体档位存在（如 claude-opus-5-5 → claude-opus-5-5-high）
+fn model_matches_available(id: &str, set: &std::collections::HashSet<String>) -> bool {
+    set.contains(id)
+        || set
+            .iter()
+            .any(|a| a.starts_with(id) && a.as_bytes().get(id.len()) == Some(&b'-'))
+}
+
+/// 模型当前是否真实可用（全局快照；快照为空 = 尚未加载 → 放行）
+pub fn is_model_available_now(id: &str) -> bool {
+    match AVAILABLE_MODEL_IDS.read() {
+        Ok(guard) if !guard.is_empty() => model_matches_available(id, &guard),
+        _ => true,
+    }
+}
+
+/// 导出网关核心模型（仅保留当前账号池官方真实可用的模型；冷启动时回退全量）
+pub fn get_core_gateway_models() -> Vec<CoreModel> {
+    let snapshot = AVAILABLE_MODEL_IDS
+        .read()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if snapshot.is_empty() {
+        return CORE_GATEWAY_MODELS.to_vec();
+    }
+    CORE_GATEWAY_MODELS
+        .iter()
+        .filter(|m| model_matches_available(m.id, &snapshot))
+        .copied()
+        .collect()
 }
 
 /// 核心逻辑：为 JeikCode 生成/更新 config.toml 内容
@@ -1807,24 +1985,30 @@ pub fn sync_jeikcode_toml_content(
 
     let models_entry = doc.entry("models").or_insert(Item::Table(Table::new()));
     if let Some(m_table) = models_entry.as_table_mut() {
-        for m in core_models {
+        for m in &core_models {
             let mut model_table = Table::new();
             model_table.insert("account", value(target_provider_id));
             model_table.insert("model", value(m.id));
             model_table.insert("context_window", value(m.context_window));
             model_table.insert("image_input", value(true));
-            model_table.insert("reasoning_model", value(true));
+            // [2026-10-29] 思考强度由官方模型目录提供，不再硬编码 low/medium/high 三档，
+            // 也不向没有档位的模型（如 gpt-oss）强行声明 reasoning_model。
+            let efforts = crate::proxy::model_specs::available_efforts_for(m.id);
+            model_table.insert("reasoning_model", value(!efforts.is_empty()));
             model_table.insert("reasoning_history", value("exclude"));
-            model_table.insert("reasoning_effort", value("high"));
-
-            let mut levels = Array::new();
-            levels.push("low");
-            levels.push("medium");
-            levels.push("high");
-            model_table.insert(
-                "reasoning_levels",
-                Item::Value(toml_edit::Value::Array(levels)),
-            );
+            if let Some(default_effort) = efforts.last() {
+                model_table.insert("reasoning_effort", value(default_effort.as_str()));
+            }
+            if !efforts.is_empty() {
+                let mut levels = Array::new();
+                for effort in &efforts {
+                    levels.push(effort.as_str());
+                }
+                model_table.insert(
+                    "reasoning_levels",
+                    Item::Value(toml_edit::Value::Array(levels)),
+                );
+            }
 
             m_table.insert(m.id, Item::Table(model_table));
         }
@@ -1854,6 +2038,303 @@ pub fn sync_jeikcode_toml_content(
     doc.insert("default_provider", value(&chosen_model));
 
     Ok(doc.to_string())
+}
+
+/// 同步 DeepSeek Harness 的 .credentials.yaml 密钥文件
+fn sync_dsh_credentials_content(content: &str, api_key: &str) -> String {
+    if content.trim().is_empty() {
+        return format!("version: 1\nrefs:\n  ANTIGRAVITY_API_KEY: {}\n", api_key);
+    }
+
+    let re_key = regex::Regex::new(r#"(?m)^(\s*ANTIGRAVITY_API_KEY:\s*).*$"#).unwrap();
+    if re_key.is_match(content) {
+        return re_key
+            .replace(content, regex::NoExpand(&format!("${{1}}{}", api_key)))
+            .to_string();
+    }
+
+    let re_inline_refs = regex::Regex::new(r#"(?s)(refs:\s*\{[\s\S]*?)(\})"#).unwrap();
+    if let Some(caps) = re_inline_refs.captures(content) {
+        let p1 = caps.get(1).unwrap().as_str().trim_end();
+        let needs_comma = !p1.ends_with('{') && !p1.ends_with(',');
+        let comma = if needs_comma { "," } else { "" };
+        let replacement = format!(
+            "{}{}\n    ANTIGRAVITY_API_KEY: {}\n  }}",
+            p1, comma, api_key
+        );
+        return re_inline_refs
+            .replace(content, regex::NoExpand(&replacement))
+            .to_string();
+    }
+
+    let re_block_refs = regex::Regex::new(r#"(?m)^(refs:\s*)$"#).unwrap();
+    if re_block_refs.is_match(content) {
+        return re_block_refs
+            .replace(
+                content,
+                regex::NoExpand(&format!("refs:\n  ANTIGRAVITY_API_KEY: {}", api_key)),
+            )
+            .to_string();
+    }
+
+    format!(
+        "{}\nrefs:\n  ANTIGRAVITY_API_KEY: {}\n",
+        content.trim_end(),
+        api_key
+    )
+}
+
+fn build_dsh_models_yaml(selected_model: &str) -> String {
+    let core_models = get_core_gateway_models();
+    let mut out = String::new();
+
+    if !core_models.iter().any(|m| m.id == selected_model) {
+        out.push_str(&format!(
+            "          - id: {}\n            name: {}\n            contextWindow: 1048576\n            input:\n              - text\n              - image\n            maxTokens: 128000\n",
+            selected_model, selected_model
+        ));
+    }
+
+    for m in core_models {
+        out.push_str(&format!(
+            "          - id: {}\n            name: {}\n            contextWindow: {}\n            input:\n              - text\n              - image\n            maxTokens: 128000\n",
+            m.id, m.id, m.context_window
+        ));
+        // [2026-10-29] 思考强度完全由官方模型目录提供：只写真实存在的档位后缀，
+        // 并提供 default（不指定 effort，由网关默认路由决定档位）。
+        let efforts = crate::proxy::model_specs::available_efforts_for(m.id);
+        if !efforts.is_empty() {
+            out.push_str("            reasoningEfforts:\n              off: null\n");
+            for effort in &efforts {
+                out.push_str(&format!("              {}: {}\n", effort, effort));
+            }
+            out.push_str("              default: null\n");
+        }
+    }
+    out
+}
+
+fn build_dsh_provider_block(proxy_url: &str, selected_model: &str) -> String {
+    let models_yaml = build_dsh_models_yaml(selected_model);
+    format!(
+        "      antigravity:\n        displayName: antigravity\n        apiKeyEnv: ANTIGRAVITY_API_KEY\n        api: openai-completions\n        baseURL: {}\n        models:\n{}",
+        proxy_url, models_yaml
+    )
+}
+
+struct DshPatchEntry {
+    id: String,
+    lines: Vec<String>,
+}
+
+fn parse_dsh_patch_entries(content: &str) -> (Vec<String>, Vec<DshPatchEntry>) {
+    let mut header = Vec::new();
+    let mut entries = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut in_header = true;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- id:") {
+            in_header = false;
+            if let Some(id) = current_id.take() {
+                entries.push(DshPatchEntry {
+                    id,
+                    lines: current_lines.clone(),
+                });
+                current_lines.clear();
+            }
+            let id_val = trimmed["- id:".len()..]
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            current_id = Some(id_val.to_string());
+        }
+
+        if in_header {
+            header.push(line.to_string());
+        } else {
+            current_lines.push(line.to_string());
+        }
+    }
+
+    if let Some(id) = current_id {
+        entries.push(DshPatchEntry {
+            id,
+            lines: current_lines,
+        });
+    }
+
+    (header, entries)
+}
+
+/// 同步 DeepSeek Harness 的 cordis.patch.yml 配置（同时适用于 Desktop/CLI 与 Web GUI Profile）
+fn sync_dsh_cordis_patch_content(content: &str, proxy_url: &str, selected_model: &str) -> String {
+    let default_model_block = format!(
+        "- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: antigravity\n    model: {}\n",
+        selected_model
+    );
+    let provider_block = build_dsh_provider_block(proxy_url, selected_model);
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed == "[]" || !trimmed.contains("- id:") {
+        let comment = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
+        return format!(
+            "{}{}- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n{}\n",
+            comment, default_model_block, provider_block
+        );
+    }
+
+    let (header, mut entries) = parse_dsh_patch_entries(content);
+
+    // 1. 更新或插入 agent-default-model
+    if let Some(entry) = entries.iter_mut().find(|e| e.id == "agent-default-model") {
+        let mut new_lines = Vec::new();
+        let mut has_config = false;
+        let mut has_provider = false;
+        let mut has_model = false;
+
+        for line in &entry.lines {
+            let t = line.trim();
+            if t.starts_with("config:") {
+                has_config = true;
+                new_lines.push(line.clone());
+            } else if t.starts_with("provider:") {
+                has_provider = true;
+                let indent = line.len() - line.trim_start().len();
+                new_lines.push(format!(
+                    "{:indent$}provider: antigravity",
+                    "",
+                    indent = indent
+                ));
+            } else if t.starts_with("model:") {
+                has_model = true;
+                let indent = line.len() - line.trim_start().len();
+                new_lines.push(format!(
+                    "{:indent$}model: {}",
+                    "",
+                    selected_model,
+                    indent = indent
+                ));
+            } else {
+                new_lines.push(line.clone());
+            }
+        }
+
+        if !has_config {
+            new_lines.push("  config:".to_string());
+        }
+        if !has_provider {
+            new_lines.push("    provider: antigravity".to_string());
+        }
+        if !has_model {
+            new_lines.push(format!("    model: {}", selected_model));
+        }
+
+        entry.lines = new_lines;
+    } else {
+        entries.insert(
+            0,
+            DshPatchEntry {
+                id: "agent-default-model".to_string(),
+                lines: default_model_block.lines().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
+    // 2. 更新或插入 llm-pi-ai
+    if let Some(entry) = entries.iter_mut().find(|e| e.id == "llm-pi-ai") {
+        let mut new_lines = Vec::new();
+        let mut in_providers = false;
+        let mut in_antigravity = false;
+        let mut provider_replaced = false;
+        let mut has_providers_header = false;
+
+        let provider_block_lines: Vec<String> =
+            provider_block.lines().map(|s| s.to_string()).collect();
+
+        for line in &entry.lines {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+
+            if trimmed.starts_with("providers:") {
+                in_providers = true;
+                has_providers_header = true;
+                new_lines.push(line.clone());
+                continue;
+            }
+
+            if in_providers {
+                if indent == 6 && trimmed.ends_with(':') {
+                    if trimmed.starts_with("antigravity:") {
+                        in_antigravity = true;
+                        if !provider_replaced {
+                            new_lines.extend(provider_block_lines.clone());
+                            provider_replaced = true;
+                        }
+                        continue;
+                    } else {
+                        in_antigravity = false;
+                    }
+                } else if indent < 6 && !trimmed.is_empty() {
+                    in_providers = false;
+                    in_antigravity = false;
+                }
+
+                if in_antigravity {
+                    continue;
+                }
+            }
+
+            new_lines.push(line.clone());
+        }
+
+        if !has_providers_header {
+            if !new_lines.iter().any(|l| l.trim().starts_with("config:")) {
+                new_lines.push("  config:".to_string());
+            }
+            new_lines.push("    providers:".to_string());
+            new_lines.extend(provider_block_lines);
+        } else if !provider_replaced {
+            let mut final_lines = Vec::new();
+            for l in new_lines {
+                let is_prov = l.trim().starts_with("providers:");
+                final_lines.push(l);
+                if is_prov {
+                    final_lines.extend(provider_block_lines.clone());
+                }
+            }
+            new_lines = final_lines;
+        }
+
+        entry.lines = new_lines;
+    } else {
+        let new_llm_block = format!(
+            "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n{}\n",
+            provider_block
+        );
+        entries.push(DshPatchEntry {
+            id: "llm-pi-ai".to_string(),
+            lines: new_llm_block.lines().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    // 3. 组装输出
+    let mut out = String::new();
+    if !header.is_empty() {
+        for l in header {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+    for e in entries {
+        for l in e.lines {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1981,5 +2462,73 @@ model = "deepseek-chat"
             doc.get("default_model").unwrap().as_str().unwrap(),
             "gemini-3.8-flash-high"
         );
+    }
+
+    #[test]
+    fn test_sync_dsh_credentials_content() {
+        let empty = "";
+        let res1 = sync_dsh_credentials_content(empty, "sk-test1");
+        assert!(res1.contains("ANTIGRAVITY_API_KEY: sk-test1"));
+
+        let existing = r#"version: 1
+records:
+  browser-session:
+    kind: grant
+refs:
+  {
+    KIMI_KEY: sk-kimi,
+    ANTIGRAVITY_API_KEY: sk-old
+  }
+"#;
+        let res2 = sync_dsh_credentials_content(existing, "sk-new");
+        assert!(res2.contains("sk-new"), "新 key 必须写入: {res2}");
+        assert!(res2.contains("sk-kimi"), "其他 key 必须保留: {res2}");
+    }
+
+    #[test]
+    fn test_sync_dsh_cordis_patch_content() {
+        let empty = "[]";
+        let res1 = sync_dsh_cordis_patch_content(
+            empty,
+            "http://127.0.0.1:8045/v1",
+            "gemini-3.8-flash-high",
+        );
+        assert!(res1.contains("provider: antigravity"));
+        assert!(res1.contains("model: gemini-3.8-flash-high"));
+        assert!(res1.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res1.contains("apiKeyEnv: ANTIGRAVITY_API_KEY"));
+
+        let existing = r#"- id: ui-settings
+  config:
+    enabled: true
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-chat
+- id: llm-pi-ai
+  config:
+    providers:
+      kimi-k3:
+        displayName: kimi-k3
+        baseURL: https://hubway.cc
+"#;
+        let res2 = sync_dsh_cordis_patch_content(
+            existing,
+            "http://127.0.0.1:8045/v1",
+            "claude-sonnet-4-6",
+        );
+        assert!(res2.contains("provider: antigravity"));
+        assert!(res2.contains("model: claude-sonnet-4-6"));
+        assert!(res2.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res2.contains("kimi-k3:"));
+        assert!(res2.contains("ui-settings"));
+
+        // 二次同步覆盖（更新模型与代理端口）
+        let res3 =
+            sync_dsh_cordis_patch_content(&res2, "http://127.0.0.1:9000/v1", "gpt-oss-120b-medium");
+        assert!(res3.contains("model: gpt-oss-120b-medium"));
+        assert!(res3.contains("baseURL: http://127.0.0.1:9000/v1"));
+        assert!(!res3.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res3.contains("kimi-k3:"));
     }
 }

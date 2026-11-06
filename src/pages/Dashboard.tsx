@@ -7,6 +7,7 @@ import {
     Calendar,
     Clock,
     RefreshCw,
+    ShieldAlert,
     Sparkles,
     Zap,
 } from 'lucide-react';
@@ -19,6 +20,7 @@ import BestAccounts from '../components/dashboard/BestAccounts';
 import { findImageQuotaModel, findQuotaModel } from '../config/modelConfig';
 import CurrentAccount from '../components/dashboard/CurrentAccount';
 import { useAccountStore } from '../stores/useAccountStore';
+import { useConfigStore } from '../stores/useConfigStore';
 import { Account } from '../types/account';
 import { DashboardQuotaView } from '../utils/quotaDisplay';
 
@@ -37,6 +39,30 @@ function Dashboard() {
         refreshQuota,
         loading
     } = useAccountStore();
+    const { config, saveConfig } = useConfigStore();
+    const qosAutoJail = !!config?.proxy?.qos_auto_jail;
+
+    const handleToggleQoSAutoJail = async () => {
+        if (!config) return;
+        const nextVal = !qosAutoJail;
+        try {
+            await saveConfig({
+                ...config,
+                proxy: {
+                    ...config.proxy,
+                    qos_auto_jail: nextVal,
+                },
+            });
+            showToast(
+                nextVal
+                    ? t('dashboard.qos_auto_jail_on', '小黑屋: 开')
+                    : t('dashboard.qos_auto_jail_off', '小黑屋: 关'),
+                'info'
+            );
+        } catch (err) {
+            console.error('Failed to update QoS auto jail setting:', err);
+        }
+    };
 
     useEffect(() => {
         fetchAccounts();
@@ -114,6 +140,13 @@ function Dashboard() {
         // 2. 单账号配额提取辅助函数
         const get5hQuota = (a: Account, modelKey: 'gemini-pro' | 'gemini-image' | 'claude'): number | null => {
             const isClaude = modelKey === 'claude';
+            if (isClaude) {
+                const hasClaude = a.quota?.models?.some(m => {
+                    const n = m.name.toLowerCase();
+                    return !n.includes('-disabled') && !n.endsWith('_disabled') && !(m as any).disabled && (n.startsWith('claude') || n.startsWith('gpt'));
+                });
+                if (!hasClaude) return null;
+            }
             // 优先从 quota_groups 提取原生 5H 滚动配额桶
             if (a.quota?.quota_groups) {
                 for (const group of a.quota.quota_groups) {
@@ -143,6 +176,13 @@ function Dashboard() {
 
         const getWeeklyQuota = (a: Account, modelKey: 'gemini-pro' | 'gemini-image' | 'claude'): number | null => {
             const isClaude = modelKey === 'claude';
+            if (isClaude) {
+                const hasClaude = a.quota?.models?.some(m => {
+                    const n = m.name.toLowerCase();
+                    return !n.includes('-disabled') && !n.endsWith('_disabled') && !(m as any).disabled && (n.startsWith('claude') || n.startsWith('gpt'));
+                });
+                if (!hasClaude) return null;
+            }
             if (a.quota?.quota_groups) {
                 for (const group of a.quota.quota_groups) {
                     const gname = group.display_name.toLowerCase();
@@ -191,6 +231,10 @@ function Dashboard() {
             for (const a of pool) {
                 const q5h = get5hQuota(a, modelKey);
                 const qWeekly = getWeeklyQuota(a, modelKey);
+
+                if (q5h === null && qWeekly === null) {
+                    continue;
+                }
 
                 if (q5h !== null && q5h >= 0) {
                     sum5h += q5h;
@@ -243,6 +287,7 @@ function Dashboard() {
                 constrainedAvg5h: countConstrained5h > 0 ? Math.round(sumConstrained5h / countConstrained5h) : 0,
                 avgWeekly: countWeekly > 0 ? Math.round(sumWeekly / countWeekly) : 0,
                 weightedEffective: totalWeight > 0 ? Math.round(sumWeighted / totalWeight) : 0,
+                hasActivePool: count5h > 0 || countWeekly > 0,
                 zeroWeeklyCount,
                 coolingCount,
                 cappedCount,
@@ -280,11 +325,14 @@ function Dashboard() {
             ? t('dashboard.view_mode_weekly', '7天周配额均值')
             : t('dashboard.view_mode_weighted', '综合加权可用');
 
-    const claudeQuotaValue = quotaView === '5h'
-        ? stats.claude.avg5h
-        : quotaView === 'weekly'
-            ? stats.claude.avgWeekly
-            : stats.claude.weightedEffective;
+    const hasClaudePool = stats.claude.hasActivePool;
+    const claudeQuotaValue = !hasClaudePool
+        ? null
+        : quotaView === '5h'
+            ? stats.claude.avg5h
+            : quotaView === 'weekly'
+                ? stats.claude.avgWeekly
+                : stats.claude.weightedEffective;
     const claudeQuotaLabel = quotaView === '5h'
         ? t('dashboard.view_mode_5h', '5小时滚动可用')
         : quotaView === 'weekly'
@@ -442,6 +490,34 @@ function Dashboard() {
                                 title={t('dashboard.btn_title_all_available', '当前：统计所有正常未停用的可用账号配额')}
                             >
                                 {t('dashboard.btn_all_available', { count: stats.available, defaultValue: `可用账号 (${stats.available})` })}
+                            </button>
+                        </div>
+
+                        {/* 4. 自动限流进小黑屋 (QoS 降速熔断) 开关 */}
+                        <div className="flex items-center bg-gray-100 dark:bg-white/[0.04] p-1 rounded-xl text-xs dark:border dark:border-white/[0.08]">
+                            <button
+                                type="button"
+                                onClick={handleToggleQoSAutoJail}
+                                className={`px-2.5 py-1 rounded-lg font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                                    qosAutoJail
+                                        ? 'bg-white dark:bg-zinc-800 text-amber-600 dark:text-amber-300 shadow-sm font-bold dark:border dark:border-white/[0.12]'
+                                        : 'text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200'
+                                }`}
+                                title={
+                                    qosAutoJail
+                                        ? t('dashboard.qos_auto_jail_enabled_tip', '当前：已开启自动限流进小黑屋。遇响应过长的限速账号将自动隔离并解绑会话（点击关闭）')
+                                        : t('dashboard.qos_auto_jail_disabled_tip', '当前：已关闭自动小黑屋。直接忽略校验时长，不因首字延迟过长标记疑似限速或解绑会话（点击开启）')
+                                }
+                            >
+                                <ShieldAlert className={`w-3.5 h-3.5 ${qosAutoJail ? 'text-amber-500 dark:text-amber-400' : 'text-gray-400 dark:text-zinc-500'}`} />
+                                <span>{t('dashboard.qos_auto_jail', '自动小黑屋')}</span>
+                                <span className={`text-[10px] px-1 py-0.5 rounded font-mono ${
+                                    qosAutoJail
+                                        ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300 font-bold'
+                                        : 'bg-gray-200 dark:bg-white/[0.08] text-gray-400 dark:text-zinc-500'
+                                }`}>
+                                    {qosAutoJail ? t('dashboard.qos_auto_jail_badge_on', '开') : t('dashboard.qos_auto_jail_badge_off', '关')}
+                                </span>
                             </button>
                         </div>
                     </div>
@@ -665,11 +741,13 @@ function Dashboard() {
                                             </span>
                                         </div>
                                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                            claudeQuotaValue >= 50
-                                                ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border dark:border-emerald-500/30'
-                                                : 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300 dark:border dark:border-amber-500/30'
+                                            claudeQuotaValue === null
+                                                ? 'bg-gray-100 text-gray-500 dark:bg-white/10 dark:text-zinc-400'
+                                                : claudeQuotaValue >= 50
+                                                    ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border dark:border-emerald-500/30'
+                                                    : 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300 dark:border dark:border-amber-500/30'
                                         }`}>
-                                            {claudeQuotaValue >= 50 ? t('dashboard.quota_sufficient_short', '充足') : t('dashboard.quota_tight_short', '偏紧')}
+                                            {claudeQuotaValue === null ? '-' : (claudeQuotaValue >= 50 ? t('dashboard.quota_sufficient_short', '充足') : t('dashboard.quota_tight_short', '偏紧'))}
                                         </span>
                                     </div>
 
@@ -677,7 +755,7 @@ function Dashboard() {
                                     <div className="flex items-baseline justify-between">
                                         <div>
                                             <span className="text-3xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
-                                                {claudeQuotaValue}%
+                                                {claudeQuotaValue !== null ? `${claudeQuotaValue}%` : '-'}
                                             </span>
                                             <span className="text-[11px] text-gray-400 dark:text-zinc-400 block mt-0.5">
                                                 {claudeQuotaLabel}
@@ -703,13 +781,13 @@ function Dashboard() {
                                                         {t('dashboard.view_mode_5h', '5H 滚动')}
                                                     </span>
                                                     <span className={`font-mono text-xs font-bold ${quotaView === '5h' ? 'text-cyan-700 dark:text-cyan-300' : 'text-gray-700 dark:text-zinc-200'}`}>
-                                                        {stats.claude.avg5h}%
+                                                        {hasClaudePool ? `${stats.claude.avg5h}%` : '-'}
                                                     </span>
                                                 </div>
                                                 <div className="h-1.5 w-full bg-gray-200/80 dark:bg-white/10 rounded-full overflow-hidden">
                                                     <div
                                                         className="h-full bg-gradient-to-r from-cyan-500 to-sky-400 rounded-full transition-all duration-300 shadow-[0_0_6px_rgba(6,182,212,0.5)]"
-                                                        style={{ width: `${Math.min(stats.claude.avg5h, 100)}%` }}
+                                                        style={{ width: `${hasClaudePool ? Math.min(stats.claude.avg5h, 100) : 0}%` }}
                                                     />
                                                 </div>
                                             </button>
@@ -729,13 +807,13 @@ function Dashboard() {
                                                         {t('dashboard.view_mode_weekly', '7天周配额')}
                                                     </span>
                                                     <span className={`font-mono text-xs font-bold ${quotaView === 'weekly' ? 'text-indigo-700 dark:text-indigo-300' : 'text-gray-700 dark:text-zinc-200'}`}>
-                                                        {stats.claude.avgWeekly}%
+                                                        {hasClaudePool ? `${stats.claude.avgWeekly}%` : '-'}
                                                     </span>
                                                 </div>
                                                 <div className="h-1.5 w-full bg-gray-200/80 dark:bg-white/10 rounded-full overflow-hidden">
                                                     <div
                                                         className="h-full bg-gradient-to-r from-indigo-500 to-purple-400 rounded-full transition-all duration-300 shadow-[0_0_6px_rgba(99,102,241,0.5)]"
-                                                        style={{ width: `${Math.min(stats.claude.avgWeekly, 100)}%` }}
+                                                        style={{ width: `${hasClaudePool ? Math.min(stats.claude.avgWeekly, 100) : 0}%` }}
                                                     />
                                                 </div>
                                             </button>

@@ -556,6 +556,7 @@ pub async fn save_config(
     crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
     crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
+    crate::proxy::update_upload_timeout_config(config.proxy.upload_timeouts.clone());
     crate::proxy::config::update_global_audit_config(
         config.proxy.experimental.payload_storage_mode.clone(),
         config.proxy.experimental.log_retention_days,
@@ -612,6 +613,7 @@ pub async fn save_config(
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
         crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
         crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
+        crate::proxy::update_upload_timeout_config(config.proxy.upload_timeouts.clone());
         crate::proxy::config::update_global_audit_config(
             config.proxy.experimental.payload_storage_mode.clone(),
             config.proxy.experimental.log_retention_days,
@@ -625,6 +627,10 @@ pub async fn save_config(
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        instance
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
         // 更新熔断配置
         instance
             .token_manager
@@ -658,6 +664,10 @@ pub async fn save_config(
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        admin
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
         admin
             .axum_server
             .token_manager
@@ -737,9 +747,16 @@ pub async fn cancel_oauth_login() -> Result<(), String> {
 
 /// 手动提交 OAuth Code (用于 Docker/远程环境无法自动回调时)
 #[tauri::command]
-pub async fn submit_oauth_code(code: String, state: Option<String>) -> Result<(), String> {
+pub async fn submit_oauth_code(
+    app_handle: tauri::AppHandle,
+    code: String,
+    state: Option<String>,
+) -> Result<crate::models::Account, String> {
     modules::logger::log_info("收到手动提交 OAuth Code 请求");
-    modules::oauth_server::submit_oauth_code(code, state).await
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle),
+    );
+    service.submit_oauth_code(code, state).await
 }
 
 #[tauri::command]
@@ -1194,19 +1211,15 @@ pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
 /// 从迷你悬浮窗或其他入口原子化安全切换回主控制台窗口
 #[tauri::command]
 pub async fn switch_to_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    // 1. 若迷你窗未钉在桌面，则呼出主控制台时先在后端安全收起，避免前端 await 挂起与失焦事件竞态
-    if !crate::modules::tray::is_mini_view_pinned() {
-        if let Some(mini) = app.get_webview_window("mini") {
-            let _ = mini.hide();
-        }
-        crate::modules::tray::set_mini_view_active(false);
-    }
-
-    // 2. 调度到主线程执行 exit_lightweight_mode，彻底消除跨线程窗口操作与消息泵死锁
+    // 统一调度到操作系统主线程执行窗口唤起与收起，消除跨线程 AppKit/Win32 冲突与 0-可见窗口悬空死锁 (Fixes #3744)
     let app_handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let _ = crate::modules::lightweight::exit_lightweight_mode(&app_handle);
         let _ = app_handle.emit("tray://show-window", ());
+
+        if !crate::modules::tray::is_mini_view_pinned() {
+            crate::modules::tray::hide_mini_window(&app_handle);
+        }
     });
     Ok(())
 }
@@ -1436,12 +1449,12 @@ pub async fn get_update_settings() -> Result<crate::modules::update_checker::Upd
     crate::modules::update_checker::load_update_settings()
 }
 
-/// 保存更新设置
+/// 保存更新设置（局部更新：仅覆盖传入字段）
 #[tauri::command]
 pub async fn save_update_settings(
-    settings: crate::modules::update_checker::UpdateSettings,
+    settings: crate::modules::update_checker::UpdateSettingsPatch,
 ) -> Result<(), String> {
-    crate::modules::update_checker::save_update_settings(&settings)
+    crate::modules::update_checker::patch_update_settings(settings).map(|_| ())
 }
 
 /// 切换账号的反代禁用状态
@@ -1527,6 +1540,35 @@ pub async fn update_account_priority(
             .update_account_priority(&account_id, priority);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn update_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    modules::account::update_account_project_id(&account_id, project_id.clone())?;
+    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
+        instance
+            .token_manager
+            .update_account_project_id(&account_id, project_id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auto_fetch_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<String, String> {
+    let pid = modules::account::auto_fetch_account_project_id(&account_id).await?;
+    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
+        instance
+            .token_manager
+            .update_account_project_id(&account_id, Some(pid.clone()));
+    }
+    Ok(pid)
 }
 
 /// 更新账号自定义标签
@@ -1644,30 +1686,34 @@ pub async fn get_token_stats_summary(hours: i64) -> Result<TokenStatsSummary, St
 #[tauri::command]
 pub async fn get_token_stats_by_model(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTokenStats>, String> {
-    crate::modules::token_stats::get_model_stats(hours)
+    crate::modules::token_stats::get_model_stats(hours, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_minute(
     minutes: i64,
     step_minutes: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_minute(minutes, step_minutes)
+    crate::modules::token_stats::get_model_trend_minute(minutes, step_minutes, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_hourly(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_hourly(hours)
+    crate::modules::token_stats::get_model_trend_hourly(hours, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_daily(
     days: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_daily(days)
+    crate::modules::token_stats::get_model_trend_daily(days, view_mode.as_deref())
 }
 
 #[tauri::command]
@@ -1720,6 +1766,9 @@ pub async fn query_transit_info(url: String, key: String) -> Result<String, Stri
 /// 优雅关闭网关服务并退出应用
 #[tauri::command]
 pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    crate::linux_display_guard::mark_user_initiated_exit();
+
     use tauri::Manager;
     tauri::async_runtime::spawn(async move {
         tracing::info!("[Command] 退出应用触发，开始全面清理服务与端口...");
@@ -1763,6 +1812,8 @@ pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
 
         // 4. 给予底层套接字彻底注销的微小缓冲，然后干净退出进程
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // `process::exit` 会绕过 Tauri 事件循环，签名缓存必须在退出前主动 flush。
+        crate::proxy::signature_cache::flush_on_exit();
         std::process::exit(0);
     });
     Ok(())
@@ -1786,10 +1837,7 @@ pub fn set_mini_view_active(active: bool) {
 /// 安全收起/关闭迷你悬浮窗
 #[tauri::command]
 pub fn hide_mini_view(app: tauri::AppHandle) {
-    if let Some(mini) = app.get_webview_window("mini") {
-        let _ = mini.hide();
-    }
-    crate::modules::tray::set_mini_view_active(false);
+    crate::modules::tray::hide_mini_window(&app);
 }
 
 #[tauri::command]

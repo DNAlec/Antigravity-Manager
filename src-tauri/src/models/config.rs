@@ -48,6 +48,12 @@ pub struct AppConfig {
     pub auto_switch_classic_depleted: bool, // [NEW] 兼容旧版开关
     #[serde(default)]
     pub classic_auto_switch: ClassicAutoSwitchConfig, // [NEW] 经典款配额自动热切换配置
+    #[serde(default = "default_tray_click_action")]
+    pub tray_click_action: String, // [NEW] 托盘左键点击行为: "mini" | "main"
+}
+
+fn default_tray_click_action() -> String {
+    "mini".to_string()
 }
 
 fn default_quiet_autostart() -> bool {
@@ -242,7 +248,7 @@ impl AppConfig {
             language: crate::modules::i18n::default_language(),
             theme: "system".to_string(),
             auto_refresh: true,
-            refresh_interval: 15,
+            refresh_interval: 10,
             auto_sync: false,
             sync_interval: 5,
             default_export_path: None,
@@ -265,6 +271,7 @@ impl AppConfig {
             dismissed_thinking_cleanup_version: None,
             auto_switch_classic_depleted: false,
             classic_auto_switch: ClassicAutoSwitchConfig::default(),
+            tray_click_action: default_tray_click_action(),
         }
     }
 }
@@ -302,5 +309,19 @@ mod tests {
         let saved = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&saved).unwrap();
         assert!(!restored.quiet_autostart);
+    }
+
+    #[test]
+    fn tray_click_action_defaults_to_mini_when_missing() {
+        let mut config = AppConfig::new();
+        config.tray_click_action = "main".to_string();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("tray_click_action");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.tray_click_action, "mini");
+
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.tray_click_action, "main");
     }
 }

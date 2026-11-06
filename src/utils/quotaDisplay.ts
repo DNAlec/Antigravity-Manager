@@ -1,4 +1,4 @@
-import type { ModelQuota, QuotaGroup } from '../types/account';
+import { checkArgonEligibility, type ModelQuota, type QuotaGroup } from '../types/account';
 
 export type DashboardQuotaView = 'weighted' | '5h' | 'weekly';
 
@@ -41,11 +41,28 @@ export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefi
             || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
         return thirdParty ? isThirdParty : name.startsWith('gemini') && !isThirdParty;
     }).flatMap(group => group?.buckets || []);
+    const hasGroups = (groups || []).length > 0;
+    if (isArgon && hasGroups && buckets.length === 0) {
+        if (model && model.percentage > 0) {
+            return {
+                percentage: model.percentage,
+                resetTime: model.reset_time,
+                isWeeklyConstrained: false,
+                weeklyResetTime: undefined,
+            };
+        }
+        return {
+            percentage: 0,
+            resetTime: undefined,
+            isWeeklyConstrained: false,
+            weeklyResetTime: undefined,
+        };
+    }
     const fiveHour = buckets.filter(bucket => /5h|hour/i.test(`${bucket.window} ${bucket.bucket_id}`))
         .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
             !chosen || bucket.remaining_fraction < chosen.remaining_fraction ? bucket : chosen, undefined);
     const weekly = buckets.filter(bucket => /week|7d/i.test(`${bucket.window} ${bucket.bucket_id}`)
-        && bucket.remaining_fraction <= 0.001 && Date.parse(bucket.reset_time) > Date.now())
+        && bucket.remaining_fraction <= 0.015 && Date.parse(bucket.reset_time) > Date.now())
         .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
             !chosen || Date.parse(bucket.reset_time) > Date.parse(chosen.reset_time) ? bucket : chosen, undefined);
     return {
@@ -81,6 +98,36 @@ export function getModelConstrainedQuota(
         return thirdParty ? isThirdParty : name.startsWith('gemini') && !isThirdParty;
     }).flatMap(group => group?.buckets || []);
 
+    const hasGroups = (groups || []).length > 0;
+    if (isArgon && hasGroups && buckets.length === 0) {
+        if (model && model.percentage > 0) {
+            return {
+                effectivePercentage: model.percentage,
+                raw5h: null,
+                rawWeekly: model.percentage,
+                weighted: model.percentage,
+                resetTime: model.reset_time,
+                isWeeklyConstrained: false,
+                isWeeklyExhausted: false,
+                is5hCooling: false,
+                fiveHourResetTime: undefined,
+                weeklyResetTime: model.reset_time,
+            };
+        }
+        return {
+            effectivePercentage: 0,
+            raw5h: null,
+            rawWeekly: null,
+            weighted: 0,
+            resetTime: undefined,
+            isWeeklyConstrained: false,
+            isWeeklyExhausted: false,
+            is5hCooling: false,
+            fiveHourResetTime: undefined,
+            weeklyResetTime: undefined,
+        };
+    }
+
     const fiveHourBucket = buckets.filter(bucket => /5h|hour/i.test(`${bucket?.window || ''} ${bucket?.bucket_id || ''}`))
         .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
             !chosen || bucket.remaining_fraction < chosen.remaining_fraction ? bucket : chosen, undefined);
@@ -101,8 +148,8 @@ export function getModelConstrainedQuota(
     const fiveHourResetTime = fiveHourBucket?.reset_time || model?.reset_time;
     const weeklyResetTime = weeklyBucket?.reset_time;
 
-    // 2. 状态判定
-    const isWeeklyExhausted = rawWeekly !== null && rawWeekly <= 0;
+    // 2. 状态判定 (周配额低于 1.5% 即实际见底，木桶短板生效)
+    const isWeeklyExhausted = rawWeekly !== null && rawWeekly <= 1;
     const isWeeklyConstrained = isWeeklyExhausted || (rawWeekly !== null && raw5h !== null && rawWeekly < raw5h);
     const is5hCooling = raw5h !== null && raw5h <= 0 && (rawWeekly === null || rawWeekly > 0);
 
@@ -202,6 +249,12 @@ function summarizeSupportedModels(models: ModelQuota[], key: 'gemini' | 'claude'
         .filter(isSupportedDisplayModel);
 
     if (active.length === 0) {
+        if (key === 'argon') {
+            return {
+                dynamicLabel: 'Gemini 4 Argon',
+                supportedModels: ['gemini-4-argon', 'gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low'],
+            };
+        }
         return { supportedModels: [] };
     }
 
@@ -261,17 +314,19 @@ function summarizeSupportedModels(models: ModelQuota[], key: 'gemini' | 'claude'
  * 提取 Gemini Models、Claude & GPT models 以及 Gemini 4 Argon 的聚合配额
  * @param groups 配额组数据 (quota_groups)
  * @param fallbackModels 兜底模型列表 (models)
- * @param tier 账号订阅类型 ('ultra' | 'pro' | 'free')
+ * @param tier 账号订阅类型 ('ultra' | 'pro' | 'enterprise' | 'free')
  */
 export function getGroupQuotaSummaries(
     groups: QuotaGroup[] = [],
     fallbackModels: ModelQuota[] = [],
-    tier?: 'ultra' | 'pro' | 'free'
+    tier?: 'ultra' | 'pro' | 'enterprise' | 'free'
 ): GroupQuotaSummary[] {
     const isFreeTier = tier === 'free';
+    const isUltraTier = tier === 'ultra';
+    const isEnterpriseTier = tier === 'enterprise';
 
     const findGroupBuckets = (target: 'gemini' | 'claude' | 'argon') => {
-        return (groups || []).filter(group => {
+        const directBuckets = (groups || []).filter(group => {
             const groupName = (group?.display_name || '').toLowerCase();
             const hasArgonBucket = (group?.buckets || []).some(b => /argon/i.test(`${b?.bucket_id || ''} ${b?.display_name || ''}`));
             const isArgon = /argon/i.test(groupName) || hasArgonBucket;
@@ -282,6 +337,18 @@ export function getGroupQuotaSummaries(
                 || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
             return target === 'claude' ? isThirdParty : !isThirdParty;
         }).flatMap(group => group?.buckets || []);
+
+        // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
+        if (target === 'argon' && directBuckets.length === 0 && isUltraTier) {
+            return (groups || []).filter(group => {
+                const groupName = (group?.display_name || '').toLowerCase();
+                const isThirdParty = /claude|gpt|3p/.test(groupName)
+                    || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
+                return !isThirdParty;
+            }).flatMap(group => group?.buckets || []);
+        }
+
+        return directBuckets;
     };
 
     const buildGroup = (key: 'gemini' | 'claude' | 'argon'): GroupQuotaSummary => {
@@ -355,22 +422,26 @@ export function getGroupQuotaSummaries(
             }
         }
 
+        // 若服务端返回了真实的 quota_groups，绝不能被 fallbackModels 跨组污染（特别是 Argon 仅有官方周配额，无 5H 配额）
+        const useFallback = (!groups || groups.length === 0) && key !== 'argon';
+
         // Free 账号在官方架构下只有周额度，没有 5H 额度
         const raw5h = (!isFreeTier && fiveHourBucket)
             ? Math.round(fiveHourBucket.remaining_fraction * 100)
-            : (!isFreeTier && fallback5h ? fallback5h.percentage : undefined);
+            : (!isFreeTier && useFallback && fallback5h ? fallback5h.percentage : undefined);
 
         const rawWeekly = weeklyBucket
             ? Math.round(weeklyBucket.remaining_fraction * 100)
-            : (fallbackWeekly ? fallbackWeekly.percentage : (isFreeTier && fallback5h ? fallback5h.percentage : undefined));
+            : (useFallback && fallbackWeekly ? fallbackWeekly.percentage : (isFreeTier && useFallback && fallback5h ? fallback5h.percentage : undefined));
 
-        const weeklyResetTime = weeklyBucket?.reset_time || fallbackWeekly?.resetTime || (isFreeTier ? fallback5h?.resetTime : undefined);
-        const fiveHourResetTime = isFreeTier ? undefined : (fiveHourBucket?.reset_time || fallback5h?.resetTime);
+        const weeklyResetTime = weeklyBucket?.reset_time || (useFallback ? fallbackWeekly?.resetTime : undefined) || (isFreeTier && useFallback ? fallback5h?.resetTime : undefined);
+        const fiveHourResetTime = isFreeTier ? undefined : (fiveHourBucket?.reset_time || (useFallback ? fallback5h?.resetTime : undefined));
 
         const effectiveWeekly = rawWeekly;
         const effectiveWeeklyResetTime = weeklyResetTime;
 
-        const isWeeklyExhausted = effectiveWeekly !== undefined && effectiveWeekly <= 0;
+        // 周配额低于 1.5% (取整 <= 1%) 时实际已无法支撑请求，木桶短板生效触发周熔断
+        const isWeeklyExhausted = effectiveWeekly !== undefined && effectiveWeekly <= 1;
         const isWeeklyConstrained = isWeeklyExhausted || (effectiveWeekly !== undefined && raw5h !== undefined && effectiveWeekly < raw5h);
 
         const labelKey = key === 'argon'
@@ -389,6 +460,37 @@ export function getGroupQuotaSummaries(
             return key === 'claude' ? (n.startsWith('claude') || n.startsWith('gpt')) : n.startsWith('gemini');
         });
         const { dynamicLabel, supportedModels } = summarizeSupportedModels(matchedForSummary, key);
+
+        // [3P MODEL ZERO DEFENSE] 若账号在该模型组下无任何实际未禁用的支持模型（如不支持 Opus 5.5 且 4.6/GPT 不存在），
+        // 严格留空 (fiveHour: undefined, weekly: undefined)，杜绝因上游返回通用 3P 桶而展示虚假满额
+        if (key === 'claude' && matchedForSummary.length === 0) {
+            return {
+                key,
+                labelKey,
+                defaultLabel,
+                dynamicLabel,
+                supportedModels,
+                fiveHour: undefined,
+                weekly: undefined,
+                isWeeklyConstrained: false,
+                isWeeklyExhausted: false,
+            };
+        }
+
+        // 企业账号走 Vertex AI 组织资源池，没有个人 5H/Weekly 滑动窗口约束，统一展示为 100% 满额可用
+        if (isEnterpriseTier && matchedForSummary.length > 0) {
+            return {
+                key,
+                labelKey,
+                defaultLabel,
+                dynamicLabel,
+                supportedModels,
+                fiveHour: { percentage: 100, resetTime: undefined },
+                weekly: { percentage: 100, resetTime: undefined },
+                isWeeklyConstrained: false,
+                isWeeklyExhausted: false,
+            };
+        }
 
         return {
             key,
@@ -410,14 +512,8 @@ export function getGroupQuotaSummaries(
         };
     };
 
-    const hasArgon = (groups || []).some(group => {
-        const groupName = (group?.display_name || '').toLowerCase();
-        return /argon/i.test(groupName)
-            || (group?.buckets || []).some(b => /argon/i.test(`${b?.bucket_id || ''} ${b?.display_name || ''}`));
-    }) || fallbackModels.some(m => {
-        const n = (m?.name || '').toLowerCase();
-        return /argon/i.test(n) && !n.includes('-disabled') && !n.endsWith('_disabled') && !(m as any)?.disabled;
-    });
+    // 使用统一收敛判据：综合校验 Ultra 旗舰套餐、Pro 独立分组套餐与 Free 隔离防呆
+    const hasArgon = checkArgonEligibility(groups, fallbackModels, tier);
 
     const summaries: GroupQuotaSummary[] = [
         buildGroup('gemini'),

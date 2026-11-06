@@ -1,5 +1,5 @@
 //! 测试 determine_retry_strategy 和 should_rotate_account 的所有分支，
-//! 重点覆盖 404 重试与账号轮换逻辑。
+//! 重点覆盖 404 终态与账号轮换逻辑。
 
 use crate::proxy::handlers::common::{
     determine_retry_strategy, should_rotate_account, RetryStrategy,
@@ -10,10 +10,15 @@ use std::time::Duration;
 
 #[test]
 fn test_retry_strategy_404() {
-    let strategy = determine_retry_strategy(404, "", false);
-    match strategy {
-        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(300)),
-        other => panic!("Expected FixedDelay(300ms), got {:?}", other),
+    // 404 统一归类为 ModelNotFound → NoRetry；账号级灰度 / 权限不同步
+    // 由 policy::apply_model_not_found 熔断单模型并换号承担。
+    for body in ["", "model not found", "account permission not synced"] {
+        let strategy = determine_retry_strategy(404, body, false);
+        assert!(
+            matches!(strategy, RetryStrategy::NoRetry),
+            "Expected NoRetry for 404 ({body:?}), got {:?}",
+            strategy
+        );
     }
 }
 
@@ -131,7 +136,7 @@ fn test_retry_strategy_400_no_signature() {
 
 #[test]
 fn test_rotate_account_true_cases() {
-    for status in [429, 401, 403, 404, 500, 503, 529] {
+    for status in [429, 401, 403, 500, 503, 529] {
         assert!(
             should_rotate_account(status, None),
             "Expected should_rotate_account({}) == true",
@@ -142,7 +147,8 @@ fn test_rotate_account_true_cases() {
 
 #[test]
 fn test_rotate_account_false_cases() {
-    for status in [400, 200, 502] {
+    // 404 已是终态：不再归入“需要换号”，避免与 policy 熔断形成半套行为
+    for status in [400, 404, 200, 502] {
         assert!(
             !should_rotate_account(status, None),
             "Expected should_rotate_account({}) == false",
@@ -289,7 +295,7 @@ fn test_adaptive_retry_explicit_hard_quota_rotates_full_pool_and_backs_off() {
     let hard_quota_429 = r#"{"error":{"code":429,"message":"You have exceeded your current quota. Please check your plan and billing details."}}"#;
 
     let pool_size = 3;
-    // Round 1 (attempt 0, 1, 2): 账号级额度枯竭，全池快切寻找有额度账号
+    // Round 1 (attempt 0, 1, 2): 账号级额度枯竭，全池快切寻找有额度账号 (50ms)
     for attempt in 0..pool_size {
         let s = determine_retry_strategy_adaptive(
             429,
@@ -302,7 +308,7 @@ fn test_adaptive_retry_explicit_hard_quota_rotates_full_pool_and_backs_off() {
         );
         assert_eq!(
             s,
-            RetryStrategy::FixedDelay(Duration::from_millis(150)),
+            RetryStrategy::FixedDelay(Duration::from_millis(50)),
             "Attempt {} should fast rotate in round 1",
             attempt
         );

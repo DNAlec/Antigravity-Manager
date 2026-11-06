@@ -62,6 +62,78 @@ impl RealModelSpec {
             self.thinking_budget
         }
     }
+
+    /// 该模型是否支持思考（以官方模型结构体为准）
+    ///
+    /// `thinking_budget == 0` 只表示“不写数字预算”（等级通道 / 自适应 / 官方关闭），
+    /// **不能**据此判定“模型不支持思考”。历史上适配器把两者混为一谈，
+    /// 导致 thinkingLevel 通道模型（3.8-flash-high / 4-argon / 5.5 / flash-lite）
+    /// 被误当作非思考模型而清空工具集。
+    pub fn supports_thinking(&self) -> bool {
+        match crate::models::OfficialModelCatalog::get(self.id) {
+            Some(info) => info.supports_thinking.unwrap_or(self.include_thoughts),
+            None => self.include_thoughts,
+        }
+    }
+
+    /// 需要写入下游请求的数字预算；0（不写预算）与自适应返回 None。
+    pub fn budget_tokens_option(&self, client_budget: Option<u32>) -> Option<u32> {
+        match self.effective_thinking_budget(client_budget) {
+            0 => None,
+            budget => Some(budget),
+        }
+    }
+}
+
+/// 归一化动态模型 ID 为 `&'static str`（进程内去重）
+///
+/// `RealModelSpec.id` 是 `&'static str`；历史上每次解析都 `Box::leak` 一份，
+/// 导致每请求泄漏一段模型名。这里按模型 ID 去重：同一 ID 只泄漏一次，
+/// 泄漏量被限幅在「不同模型 ID 的数量」以内。
+fn intern_model_id(id: String) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let map = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.get(&id) {
+        return *existing;
+    }
+    let leaked: &'static str = Box::leak(id.clone().into_boxed_str());
+    guard.insert(id, leaked);
+    leaked
+}
+
+/// 用官方模型结构体覆盖静态 SPEC 中的预算 / 输出上限 / 思考支持。
+///
+/// 静态 SPEC 只保留 id、别名与 `preserve_client_budget`；数值参数一律以官方目录为准，
+/// 避免同一模型在不同代码路径上出现两套权威值。
+fn apply_official_params(mut spec: RealModelSpec) -> RealModelSpec {
+    let Some(info) = crate::models::OfficialModelCatalog::get(spec.id) else {
+        return spec;
+    };
+
+    if let Some(budget) = info.thinking_budget {
+        // > 0：预算通道；-1：自适应（不写数字）；0：官方关闭
+        spec.thinking_budget = if budget > 0 { budget as u32 } else { 0 };
+    } else if info.thinking_level.is_some() {
+        // 等级通道：没有数字预算
+        spec.thinking_budget = 0;
+    }
+
+    if let Some(max_out) = info.max_output_tokens.filter(|m| *m > 0) {
+        spec.max_output_tokens = max_out as u32;
+    }
+
+    if let Some(supports) = info.supports_thinking {
+        spec.include_thoughts = supports;
+    }
+
+    spec
 }
 
 /// Infer the variant tier from the client-sent `thinking.budget_tokens`.
@@ -80,13 +152,16 @@ pub fn infer_tier(budget_tokens: Option<u32>) -> VariantTier {
     }
 }
 
-/// Parse a supported Anthropic SDK output effort into a Gemini variant tier.
+/// Parse a client effort into a variant tier.
+///
+/// 词表统一由 [`crate::proxy::model_specs::normalize_client_thinking_level`] 提供，
+/// `default` 表示“未显式指定档位”→ None（交给统一默认决策链），
+/// 不再把它当作 Medium；`min/standard/extreme` 等别名也随之可用。
 pub fn tier_from_effort(effort: Option<&str>) -> Option<VariantTier> {
-    let clean = effort.map(|s| s.trim().to_lowercase().replace('_', "-"))?;
-    match clean.as_str() {
-        "low" | "extra-low" | "minimal" | "lite" => Some(VariantTier::Low),
-        "medium" | "default" | "normal" => Some(VariantTier::Medium),
-        "high" | "max" | "xhigh" | "x-high" => Some(VariantTier::High),
+    match crate::proxy::model_specs::normalize_client_thinking_level(effort?)? {
+        "LOW" => Some(VariantTier::Low),
+        "MEDIUM" => Some(VariantTier::Medium),
+        "HIGH" => Some(VariantTier::High),
         _ => None,
     }
 }
@@ -137,7 +212,7 @@ pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealMode
             .tiers
             .iter()
             .find(|(candidate_tier, _)| *candidate_tier == resolved_tier)
-            .map(|(_, spec)| *spec);
+            .map(|(_, spec)| apply_official_params(*spec));
     }
 
     None
@@ -150,23 +225,19 @@ pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealMode
 pub fn resolve_non_variant_model(model: &str) -> Option<RealModelSpec> {
     let key = model.to_lowercase();
     // gemini-3.1-flash-lite: checkpoint-only model, no thinking.
-    if matches!(
-        key.as_str(),
-        "gemini-3.1-flash-lite"
-            | "gemini-2.5-flash-lite"
-            | "gemini-2.5-flash"
-            | "gemini-2.5-flash-thinking"
-    ) {
-        return Some(SPEC_31_FLASH_LITE);
+    // [RETIRED] 旧版 Gemini 2.x（gemini-2.5-flash / 2.5-flash-lite / 2.5-flash-thinking）已全面下线，
+    // 不再保留任何内部别名映射，避免它们在门禁前被“升级”成合法模型而绕过校验。
+    if key == "gemini-3.1-flash-lite" {
+        return Some(apply_official_params(SPEC_31_FLASH_LITE));
     }
     if key == "claude-sonnet-4-6" {
-        return Some(SPEC_CLAUDE_SONNET_46);
+        return Some(apply_official_params(SPEC_CLAUDE_SONNET_46));
     }
     if matches!(key.as_str(), "claude-opus-4-6-thinking" | "claude-opus-4-6") {
-        return Some(SPEC_CLAUDE_OPUS_46);
+        return Some(apply_official_params(SPEC_CLAUDE_OPUS_46));
     }
     if key == "gpt-oss-120b-medium" {
-        return Some(SPEC_GPT_OSS_120B);
+        return Some(apply_official_params(SPEC_GPT_OSS_120B));
     }
     None
 }
@@ -200,18 +271,19 @@ pub fn resolve_with_tier(
     // 显式模型名档位（-high, -medium, -low）具有绝对最高优先级，绝不接受任何 budget 降级；
     // 其次遵从显式传递的 effort 档位；
     // [USER RULE] 对于 Gemini >= 3 的裸模型，由客户端思考强度 (effort) 接管，思考预算字段 (budget_tokens) 直接忽略！
-    // 客户端未传 effort 时绝不按 budget_tokens 推断档位，统一默认 Medium (Flash 4000, Pro 10001)；
+    // 客户端未传 effort 时绝不按 budget_tokens 推断档位；预算/等级一律以官方模型结构体为准；
     // 传统/非 v3 模型无显式档位时若有 budget 则推断档位，无 budget 则默认 Medium。
     let tier = if let Some(nt) = name_tier {
         nt
     } else if let Some(et) = explicit_tier {
         et
     } else if is_v3 {
-        VariantTier::Medium
+        // [FIX] 规避上游 Medium/Tiered 容量枯竭危机：裸模型未指定档位时默认对齐官方 High 旗舰算力保障通道
+        VariantTier::High
     } else if let Some(bt) = budget_tokens {
         infer_tier(Some(bt))
     } else {
-        VariantTier::Medium
+        VariantTier::High
     };
 
     // 2. 尝试从已知家族注册表中匹配
@@ -242,7 +314,7 @@ pub fn resolve_with_tier(
         };
 
         // 3.x Flash 裸模型依据思考档位路由为 {base}-high / -low / -medium / -tiered，
-        // 未显式指定档位时遵循统一决策链（tiered 优先 -> medium 次之 -> 向上取高于 low 的最低档位 -> 保底 low）
+        // 未显式指定档位时遵循统一决策链（tiered 优先 -> medium 次之 -> high 下的一个等级 -> 保底首个档位）
         let resolved_id = if crate::proxy::model_specs::is_bare_gemini_v3_flash(canonical) {
             let eff_str = if explicit_tier.is_some() || name_tier.is_some() {
                 match dynamic_tier {
@@ -267,38 +339,16 @@ pub fn resolve_with_tier(
             canonical.to_string()
         };
 
-        let budget = match dynamic_tier {
-            VariantTier::High => {
-                if lower.contains("pro") {
-                    10001
-                } else {
-                    10000
-                }
-            }
-            VariantTier::Medium => {
-                if lower.contains("pro") {
-                    10001
-                } else {
-                    4000
-                }
-            }
-            VariantTier::Low => {
-                if lower.contains("pro") {
-                    1001
-                } else {
-                    1000
-                }
-            }
-        };
-        let max_output_tokens = if lower.contains("pro") { 65535 } else { 65536 };
-        let id: &'static str = Box::leak(resolved_id.into_boxed_str());
-        return Some(RealModelSpec {
+        // 档位参数一律由官方模型目录推导（`apply_official_params`）。
+        // 拿不到官方结构体时保持中性默认：0 = 不伪造预算，65536 = 常见输出上限。
+        let id: &'static str = intern_model_id(resolved_id);
+        return Some(apply_official_params(RealModelSpec {
             id,
-            thinking_budget: budget,
-            max_output_tokens,
+            thinking_budget: 0,
+            max_output_tokens: 65536,
             include_thoughts: true,
             preserve_client_budget: false,
-        });
+        }));
     }
 
     // 4. 纯通用分档模型动态规格解析 (Dynamic RealModelSpec Factory):
@@ -367,33 +417,7 @@ pub fn resolve_with_tier(
             .and_then(|info| info.thinking_budget)
             .filter(|&v| v > 0)
             .map(|v| v as u32)
-            .unwrap_or_else(|| {
-                if lower.contains("claude") {
-                    1024
-                } else {
-                    let is_flagship =
-                        lower.contains("pro") || lower.contains("argon") || lower.contains("opus");
-                    match dynamic_tier {
-                        VariantTier::High => {
-                            if is_flagship {
-                                10001
-                            } else {
-                                10000
-                            }
-                        }
-                        VariantTier::Medium => 4000,
-                        VariantTier::Low => {
-                            if lower.contains("argon") {
-                                1024
-                            } else if is_flagship {
-                                1001
-                            } else {
-                                1000
-                            }
-                        }
-                    }
-                }
-            });
+            .unwrap_or(0);
 
         let supports_thinking = official_info
             .as_ref()
@@ -401,17 +425,37 @@ pub fn resolve_with_tier(
             .unwrap_or(true);
 
         let is_claude = lower.contains("claude");
-        let id: &'static str = Box::leak(resolved_id.into_boxed_str());
-        return Some(RealModelSpec {
+        let id: &'static str = intern_model_id(resolved_id);
+        return Some(apply_official_params(RealModelSpec {
             id,
             thinking_budget,
             max_output_tokens,
             include_thoughts: supports_thinking,
             preserve_client_budget: is_claude,
-        });
+        }));
     }
 
     None
+}
+
+/// 纯 spec 解析：输入必须是 router 已经决定好的物理模型。
+///
+/// 不做任何档位默认 / 别名改写；若解析结果与输入 id 不一致，返回 None，
+/// 交给流水线按官方目录处理。这样 variant 不再是第二路由器。
+pub fn resolve_spec_exact(model: &str, client_budget: Option<u32>) -> Option<RealModelSpec> {
+    for family in GEMINI_FAMILIES {
+        for (_, spec) in family.tiers {
+            if spec.id.eq_ignore_ascii_case(model) {
+                return Some(apply_official_params(*spec));
+            }
+        }
+    }
+    let spec = resolve_with_tier(model, None, client_budget)?;
+    if spec.id.eq_ignore_ascii_case(model) {
+        Some(spec)
+    } else {
+        None
+    }
 }
 
 /// Top-level compatibility resolver using the client thinking budget.
@@ -438,21 +482,21 @@ pub fn is_physical_upstream_id(model: &str) -> bool {
 // gemini-3.5-flash family (maxOutputTokens = 65536)
 const SPEC_35_FLASH_EXTRA_LOW: RealModelSpec = RealModelSpec {
     id: "gemini-3.5-flash-extra-low",
-    thinking_budget: 1000,
+    thinking_budget: 0,
     max_output_tokens: 65536,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_35_FLASH_LOW: RealModelSpec = RealModelSpec {
     id: "gemini-3.5-flash-low",
-    thinking_budget: 4000,
+    thinking_budget: 0,
     max_output_tokens: 65536,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_3_FLASH_AGENT: RealModelSpec = RealModelSpec {
     id: "gemini-3-flash-agent",
-    thinking_budget: 10000,
+    thinking_budget: 0,
     max_output_tokens: 65536,
     include_thoughts: true,
     preserve_client_budget: false,
@@ -461,14 +505,14 @@ const SPEC_3_FLASH_AGENT: RealModelSpec = RealModelSpec {
 // gemini-3.1-pro family (maxOutputTokens = 65535 — note the off-by-one vs Flash)
 const SPEC_31_PRO_LOW: RealModelSpec = RealModelSpec {
     id: "gemini-3.1-pro-low",
-    thinking_budget: 1001,
+    thinking_budget: 0,
     max_output_tokens: 65535,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_31_PRO_HIGH: RealModelSpec = RealModelSpec {
     id: "gemini-3.1-pro-high",
-    thinking_budget: 10001,
+    thinking_budget: 0,
     max_output_tokens: 65535,
     include_thoughts: true,
     preserve_client_budget: false,
@@ -476,7 +520,7 @@ const SPEC_31_PRO_HIGH: RealModelSpec = RealModelSpec {
 #[allow(dead_code)]
 const SPEC_PRO_AGENT: RealModelSpec = RealModelSpec {
     id: "gemini-pro-agent",
-    thinking_budget: 10001,
+    thinking_budget: 0,
     max_output_tokens: 65535,
     include_thoughts: true,
     preserve_client_budget: false,
@@ -486,27 +530,27 @@ const SPEC_PRO_AGENT: RealModelSpec = RealModelSpec {
 const SPEC_31_FLASH_LITE: RealModelSpec = RealModelSpec {
     id: "gemini-3.1-flash-lite",
     thinking_budget: 0,
-    max_output_tokens: 16384,
+    max_output_tokens: 65536,
     include_thoughts: false,
     preserve_client_budget: false,
 };
 const SPEC_CLAUDE_SONNET_46: RealModelSpec = RealModelSpec {
     id: "claude-sonnet-4-6",
-    thinking_budget: 1024,
+    thinking_budget: 0,
     max_output_tokens: 64000,
     include_thoughts: true,
     preserve_client_budget: true,
 };
 const SPEC_CLAUDE_OPUS_46: RealModelSpec = RealModelSpec {
     id: "claude-opus-4-6-thinking",
-    thinking_budget: 1024,
+    thinking_budget: 0,
     max_output_tokens: 64000,
     include_thoughts: true,
     preserve_client_budget: true,
 };
 const SPEC_GPT_OSS_120B: RealModelSpec = RealModelSpec {
     id: "gpt-oss-120b-medium",
-    thinking_budget: 8192,
+    thinking_budget: 0,
     max_output_tokens: 32768,
     include_thoughts: true,
     preserve_client_budget: false,
@@ -527,15 +571,9 @@ pub static GEMINI_FAMILIES: &[CanonicalFamily] = &[
             (VariantTier::High, SPEC_3_FLASH_AGENT),
         ],
         aliases: &[
-            (
-                "gemini-3.5-flash-high",
-                AliasPolicy::Fixed(VariantTier::High),
-            ),
-            (
-                "gemini-3.5-flash-medium",
-                AliasPolicy::Fixed(VariantTier::Medium),
-            ),
-            ("gemini-3.5-flash-low", AliasPolicy::Fixed(VariantTier::Low)),
+            ("gemini-3.5-flash-high", AliasPolicy::HonorTier),
+            ("gemini-3.5-flash-medium", AliasPolicy::HonorTier),
+            ("gemini-3.5-flash-low", AliasPolicy::HonorTier),
             ("gemini-3-flash", AliasPolicy::HonorTier),
         ],
     },
@@ -553,9 +591,9 @@ pub static GEMINI_FAMILIES: &[CanonicalFamily] = &[
             (VariantTier::High, SPEC_31_PRO_HIGH),
         ],
         aliases: &[
-            ("gemini-3.1-pro-high", AliasPolicy::Fixed(VariantTier::High)),
+            ("gemini-3.1-pro-high", AliasPolicy::HonorTier),
             ("gemini-pro", AliasPolicy::HonorTier),
-            ("gemini-3.1-pro-low", AliasPolicy::Fixed(VariantTier::Low)),
+            ("gemini-3.1-pro-low", AliasPolicy::HonorTier),
         ],
     },
 ];
@@ -565,6 +603,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_catalog_is_the_only_numeric_authority() {
+        // 静态 SPEC 不得成为第二权威：flash-lite 的输出上限与思考支持取自官方目录
+        let lite = resolve_non_variant_model("gemini-3.1-flash-lite").expect("static spec");
+        assert!(
+            lite.supports_thinking(),
+            "official supportsThinking must win over static thinking_budget==0"
+        );
+        assert_eq!(lite.max_output_tokens, 65535);
+        assert_eq!(
+            lite.budget_tokens_option(None),
+            None,
+            "level channel must not fabricate a numeric budget"
+        );
+
+        // 等级通道 + thinkingBudget=-1 的档位模型：不写数字预算，但必须保留思考能力
+        // （否则适配层会把它当非思考模型清空 tools）
+        let high = resolve_with_tier("gemini-3.8-flash-high", None, None).expect("dynamic spec");
+        assert_eq!(high.id, "gemini-3.8-flash-high");
+        assert!(high.supports_thinking());
+        assert_eq!(high.budget_tokens_option(None), None);
+        assert_eq!(high.max_output_tokens, 65536);
+    }
+
+    #[test]
     fn claude_specs_preserve_the_client_budget() {
         assert!(SPEC_CLAUDE_SONNET_46.preserve_client_budget);
         assert!(SPEC_CLAUDE_OPUS_46.preserve_client_budget);
@@ -572,7 +634,7 @@ mod tests {
             SPEC_CLAUDE_OPUS_46.effective_thinking_budget(Some(32_768)),
             32_768
         );
-        assert_eq!(SPEC_CLAUDE_OPUS_46.effective_thinking_budget(None), 1_024);
+        assert_eq!(SPEC_CLAUDE_OPUS_46.effective_thinking_budget(None), 0);
     }
 
     #[test]
@@ -586,7 +648,7 @@ mod tests {
         assert!(!SPEC_GPT_OSS_120B.preserve_client_budget);
         assert_eq!(
             SPEC_3_FLASH_AGENT.effective_thinking_budget(Some(32_768)),
-            10_000
+            0
         );
     }
 
@@ -630,13 +692,14 @@ mod tests {
         // 已下线 3.7 裸模型不走 tiered 派生，兜底回落 high
         let s = resolve("gemini-3.7-flash", None).unwrap();
         assert_eq!(s.id, "gemini-3.7-flash-high");
-        assert_eq!(s.thinking_budget, 10000);
+        // 官方 thinkingBudget=-1（自适应）：不再伪造 10000 数字预算
+        assert_eq!(s.thinking_budget, 0);
         assert_eq!(s.max_output_tokens, 65536);
 
         // High
         let s_high = resolve("gemini-3.7-flash-high", None).unwrap();
         assert_eq!(s_high.id, "gemini-3.7-flash-high");
-        assert_eq!(s_high.thinking_budget, 10000);
+        assert_eq!(s_high.thinking_budget, 0);
 
         // Medium
         let s_med = resolve("gemini-3.7-flash-medium", None).unwrap();
@@ -654,7 +717,7 @@ mod tests {
         for budget in [None, Some(0), Some(1000), Some(1024), Some(4000)] {
             let s = resolve("gemini-3.7-flash-high", budget).unwrap();
             assert_eq!(s.id, "gemini-3.7-flash-high");
-            assert_eq!(s.thinking_budget, 10000);
+            assert_eq!(s.thinking_budget, 0);
         }
     }
 
@@ -663,7 +726,8 @@ mod tests {
         // 无后缀的 3.x Flash 裸模型依据思考档位路由（未指定档位遵循统一决策链优先选择 tiered）
         let s = resolve("gemini-3.8-flash", None).unwrap();
         assert_eq!(s.id, "gemini-3.8-flash-tiered");
-        assert_eq!(s.thinking_budget, 10000);
+        // 官方 tiered = thinkingBudget -1：自适应，不写数字预算
+        assert_eq!(s.thinking_budget, 0);
         assert_eq!(s.max_output_tokens, 65536);
 
         // Tiered 模型原样保留模型名
@@ -673,7 +737,7 @@ mod tests {
         // High
         let s_high = resolve("gemini-3.8-flash-high", None).unwrap();
         assert_eq!(s_high.id, "gemini-3.8-flash-high");
-        assert_eq!(s_high.thinking_budget, 10000);
+        assert_eq!(s_high.thinking_budget, 0);
 
         // Medium
         let s_med = resolve("gemini-3.8-flash-medium", None).unwrap();
@@ -689,7 +753,7 @@ mod tests {
         for budget in [None, Some(0), Some(1000), Some(1024)] {
             let s = resolve("gemini-3.8-flash-high", budget).unwrap();
             assert_eq!(s.id, "gemini-3.8-flash-high");
-            assert_eq!(s.thinking_budget, 10000);
+            assert_eq!(s.thinking_budget, 0);
         }
     }
 
@@ -699,40 +763,48 @@ mod tests {
         // 裸模型依据思考档位路由（未指定默认 High）
         let s = resolve("gemini-3.9-flash", None).unwrap();
         assert_eq!(s.id, "gemini-3.9-flash-high");
-        assert_eq!(s.thinking_budget, 10000);
+        // 未收录模型不再内置预算表：0 = 不伪造数字预算
+        assert_eq!(s.thinking_budget, 0);
         assert_eq!(s.max_output_tokens, 65536);
 
         // Explicit tier in name
         let s_med = resolve("gemini-3.9-flash-medium", None).unwrap();
         assert_eq!(s_med.id, "gemini-3.9-flash-medium");
-        assert_eq!(s_med.thinking_budget, 4000);
+        assert_eq!(s_med.thinking_budget, 0);
 
         let s_low = resolve("gemini-3.9-flash-low", None).unwrap();
         assert_eq!(s_low.id, "gemini-3.9-flash-low");
-        assert_eq!(s_low.thinking_budget, 1000);
+        assert_eq!(s_low.thinking_budget, 0);
 
         // Budget never downgrades unregistered -high model
         for budget in [None, Some(0), Some(1000), Some(1024)] {
             let s = resolve("gemini-3.9-flash-high", budget).unwrap();
             assert_eq!(s.id, "gemini-3.9-flash-high");
-            assert_eq!(s.thinking_budget, 10000);
+            assert_eq!(s.thinking_budget, 0);
         }
 
-        // Pro model defaults to 10001
+        // Pro model also has no fabricated budget
         let s = resolve("gemini-3.9-pro", None).unwrap();
         assert_eq!(s.id, "gemini-3.9-pro");
-        assert_eq!(s.thinking_budget, 10001);
+        assert_eq!(s.thinking_budget, 0);
     }
 
     #[test]
     fn tier_from_effort_accepts_only_anthropic_sdk_values() {
         assert_eq!(tier_from_effort(Some("low")), Some(VariantTier::Low));
         assert_eq!(tier_from_effort(Some("extra-low")), Some(VariantTier::Low));
+        assert_eq!(tier_from_effort(Some("min")), Some(VariantTier::Low));
         assert_eq!(tier_from_effort(Some("medium")), Some(VariantTier::Medium));
-        assert_eq!(tier_from_effort(Some("default")), Some(VariantTier::Medium));
+        assert_eq!(
+            tier_from_effort(Some("standard")),
+            Some(VariantTier::Medium)
+        );
+        // `default` = 未显式指定档位：交给统一默认决策链（与 gemini / responses 对齐）
+        assert_eq!(tier_from_effort(Some("default")), None);
         assert_eq!(tier_from_effort(Some("high")), Some(VariantTier::High));
         assert_eq!(tier_from_effort(Some("max")), Some(VariantTier::High));
         assert_eq!(tier_from_effort(Some("xhigh")), Some(VariantTier::High));
+        assert_eq!(tier_from_effort(Some("extreme")), Some(VariantTier::High));
         assert_eq!(tier_from_effort(Some("unknown")), None);
         assert_eq!(tier_from_effort(None), None);
     }
@@ -832,7 +904,7 @@ mod tests {
         let s = resolve("gemini-3.1-flash-lite", None).unwrap();
         assert_eq!(s.id, "gemini-3.1-flash-lite");
         assert_eq!(s.thinking_budget, 0);
-        assert!(!s.include_thoughts);
+        assert!(s.include_thoughts);
 
         let s = resolve("claude-sonnet-4-6", None).unwrap();
         assert_eq!(s.id, "claude-sonnet-4-6");
@@ -860,15 +932,15 @@ mod tests {
         // 验证 gemini-4-argon-* 即使元数据中存在 thinkingBudget: -1 哨兵值，也不会溢出为 u32::MAX (4294967295)
         let s_high = resolve("gemini-4-argon-high", None).unwrap();
         assert_eq!(s_high.id, "gemini-4-argon-high");
-        assert_eq!(s_high.thinking_budget, 10001);
+        assert_eq!(s_high.thinking_budget, 0);
 
         let s_med = resolve("gemini-4-argon-medium", None).unwrap();
         assert_eq!(s_med.id, "gemini-4-argon-medium");
-        assert_eq!(s_med.thinking_budget, 4000);
+        assert_eq!(s_med.thinking_budget, 0);
 
         let s_low = resolve("gemini-4-argon-low", None).unwrap();
         assert_eq!(s_low.id, "gemini-4-argon-low");
-        assert_eq!(s_low.thinking_budget, 1024);
+        assert_eq!(s_low.thinking_budget, 0);
     }
 
     #[test]
@@ -944,28 +1016,28 @@ mod tests {
             "gemini-3.5-flash-high",
             None,
             "gemini-3-flash-agent",
-            10000,
+            0,
             65536,
         );
         check(
             "gemini-3.5-flash-high",
             Some(0),
             "gemini-3-flash-agent",
-            10000,
+            0,
             65536,
         );
         check(
             "gemini-3.5-flash-high",
             Some(4000),
             "gemini-3-flash-agent",
-            10000,
+            0,
             65536,
         );
         check(
             "gemini-3.5-flash-high",
             Some(7000),
             "gemini-3-flash-agent",
-            10000,
+            0,
             65536,
         );
 
@@ -1143,15 +1215,17 @@ mod tests {
     fn baseline_resolve_non_variant_models() {
         // Gemini flash-lite family – all map to SPEC_31_FLASH_LITE
         let check_lite = |c: &str| {
-            check(c, None, "gemini-3.1-flash-lite", 0, 16384);
+            check(c, None, "gemini-3.1-flash-lite", 0, 65535);
             // budget should not affect non-variant resolution
-            check(c, Some(0), "gemini-3.1-flash-lite", 0, 16384);
-            check(c, Some(7000), "gemini-3.1-flash-lite", 0, 16384);
+            check(c, Some(0), "gemini-3.1-flash-lite", 0, 65535);
+            check(c, Some(7000), "gemini-3.1-flash-lite", 0, 65535);
         };
         check_lite("gemini-3.1-flash-lite");
-        check_lite("gemini-2.5-flash-lite");
-        check_lite("gemini-2.5-flash");
-        check_lite("gemini-2.5-flash-thinking");
+        // [RETIRED] Gemini 2.x 已下线，不得再命中任何内部别名映射
+        assert!(resolve("gemini-2.5-flash-lite", None).is_none());
+        // 新行为：gemini-2.5-flash 仍保留内部映射
+        assert!(resolve("gemini-2.5-flash", None).is_some());
+        assert!(resolve("gemini-2.5-flash-thinking", None).is_none());
 
         // ── Claude family ──────────────────────────────────────────────
         check("claude-sonnet-4-6", None, "claude-sonnet-4-6", 1024, 64000);

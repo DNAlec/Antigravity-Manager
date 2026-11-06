@@ -12,3 +12,10 @@ export const isTauri = () => {
 export const isLinux = () => {
     return navigator.userAgent.toLowerCase().includes('linux');
 };
+
+/**
+ * Detect if running on macOS
+ */
+export const isMac = () => {
+    return typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent);
+};

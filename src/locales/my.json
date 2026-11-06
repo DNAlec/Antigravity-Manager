@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "တွေးခေါ်မှုအဆင့်- gateway ကိုယ်တိုင်လိုက်လျောညီထွေ (တရားဝင် catalog အခြေခံ)",
+        "tag": "အကြံပြု",
+        "desc": "Client ကိုယ်တိုင်ထိန်းချုပ်မုဒ်နှင့် စိတ်ကြိုက် Token အဆင့်များ ပိတ်သိမ်းပြီးဖြစ်သည်- thinkingLevel ပါသော မော်ဒယ်များသည် မော်ဒယ်အဆင့် (low / medium / high) မှ အဆင့်ကို ယူမည်ဖြစ်ပြီး ကျန်မော်ဒယ်များသည် တရားဝင် thinkingBudget မူလတန်ဖိုးကို လိုက်နာမည်။ Client မှ ပေးပို့သော တွေးခေါ်မှုအားသည် suffix မပါသော မော်ဒယ်များတွင်သာ သီးခြားအဆင့်မော်ဒယ် ရွေးချယ်ရန် အသုံးပြုမည်။"
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — တောင်းဆိုမှုများ ပုံမှန်အတိုင်း အလုပ်လုပ်နေပါက လျစ်လျူရှုပါ"
+    },
     "common": {
         "loading": "Memuatkan...",
         "load_more": "Muat Lagi",
@@ -195,6 +203,13 @@
         "proxy_online_unit": "ပရောက်စီ အွန်လိုင်း",
         "btn_proxy_online": "ပရောက်စီ အွန်လိုင်း ({{count}})",
         "btn_all_available": "အသုံးပြုနိုင်သည် ({{count}})",
+        "qos_auto_jail": "အလိုအလျောက် သီးသန့်ထားခြင်း",
+        "qos_auto_jail_badge_on": "ဖွင့်",
+        "qos_auto_jail_badge_off": "ပိတ်",
+        "qos_auto_jail_on": "သီးသန့်: ဖွင့်",
+        "qos_auto_jail_off": "သီးသန့်: ပိတ်",
+        "qos_auto_jail_enabled_tip": "လက်ရှိ: ကန့်သတ်ခံထားရသော အကောင့်များကို အလိုအလျောက် သီးသန့်ထားခြင်းကို ဖွင့်ထားသည် (ပိတ်ရန် နှိပ်ပါ)",
+        "qos_auto_jail_disabled_tip": "လက်ရှိ: အလိုအလျောက် သီးသန့်ထားခြင်းကို ပိတ်ထားသည်။ စစ်ဆေးချိန်ကို လျစ်လျူရှုမည် (ဖွင့်ရန် နှိပ်ပါ)",
         "btn_title_proxy_online": "လတ်တလောတွင် ပရောက်စီပါဝင်သော အကောင့်များကိုသာ ရေတွက်နေသည်",
         "btn_title_all_available": "လတ်တလောတွင် အသုံးပြုနိုင်သော အကောင့်အားလုံးကို ရေတွက်နေသည်",
         "proxy_joined_pool": "✓ ပရောက်စီအုပ်စုတွင် အကောင့် {{count}} ခု ပါဝင်သည်",
@@ -357,6 +372,7 @@
                 "copied": "Disalin",
                 "link_label": "URL Kebenaran",
                 "link_click_to_copy": "Klik untuk salin",
+                "remote_hint": "💡 Petua Docker / Pelayan Jauh: adalah normal untuk pelayar memaparkan sambungan ditolak apabila mengubah hala ke localhost selepas kebenaran Google. Cuma salin URL penuh (mengandungi kod) dari bar alamat pelayar anda dan tampal di bawah.",
                 "manual_hint": "Pelayar tidak dialihkan? Tampal URL panggil balik penuh atau Kod mentah di sini:",
                 "manual_placeholder": "Tampal URL panggil balik atau kod...",
                 "error_no_flow": "Sila klik 'Mula OAuth' dahulu",
@@ -364,7 +380,9 @@
                 "error_no_url": "Gagal mendapatkan URL OAuth",
                 "popup_blocked": "Pop timbul disekat",
                 "manual_submitting": "Menghantar kod pengesahan...",
-                "manual_submitted": "Kod pengesahan dihantar, sedang diproses di latar belakang..."
+                "manual_submitted": "Kod pengesahan dihantar, sedang diproses di latar belakang...",
+                "enterprise_title": "Google Cloud / Vertex AI လုပ်ငန်းသုံး ခွင့်ပြုချက်",
+                "enterprise_desc": "လုပ်ငန်းသုံး ခွဲတမ်းကို ထိန်းသိမ်းပြီး Vertex AI ပရောဂျက်နှင့် ချိတ်ဆက်ရန် တရားဝင် GCP လုပ်ငန်းသုံး client ဖြင့် ခွင့်ပြုပါ"
             },
             "token": {
                 "label": "Token Muat Semula",
@@ -467,7 +485,19 @@
         "client_cli": "CLI",
         "client_cli_tooltip": "Akaun log masuk Antigravity CLI (agy) semasa",
         "switch_next_short": "Seterusnya",
-        "weekly_exhausted_tooltip": "Kuota mingguan habis, perlindungan automatik diaktifkan"
+        "weekly_exhausted_tooltip": "Kuota mingguan habis, perlindungan automatik diaktifkan",
+        "type": {
+            "personal": "ကိုယ်ပိုင်အကောင့် (Personal)",
+            "enterprise": "လုပ်ငန်းသုံး / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "လုပ်ငန်း/GCP အကောင့်နှင့် ဆက်စပ်နေသော Google Cloud Project ID။ Antigravity မူရင်းအက်ပ်သည် အကောင့်ဝင်ချိန်တွင် အလိုအလျောက်ချိတ်ဆက်ပါသည် သို့မဟုတ် မူရင်းကိုသုံးပါသည်။",
+        "project_id_placeholder": "ဥပမာ: my-project-id",
+        "project_id_updated": "GCP Project ID ကို အောင်မြင်စွာ ပြင်ဆင်ပြီးပါပြီ",
+        "auto_fetch_project_id": "အလိုအလျောက် ရယူရန်",
+        "fetching_project_id": "ရယူနေသည်...",
+        "auto_fetch_success": "Project ID ကို အောင်မြင်စွာ ရယူနိုင်ခဲ့ပါသည်: {{projectId}}",
+        "auto_fetch_failed": "ဆက်စပ်နေသော Project ID ကို မတွေ့ရှိပါ"
     },
     "settings": {
         "save": "Simpan Tetapan",
@@ -486,6 +516,10 @@
             "theme_light": "Cerah",
             "theme_dark": "Gelap",
             "theme_system": "Sistem",
+            "ui_zoom": "Skala Antara Muka & Fon",
+            "ui_zoom_desc": "Laraskan saiz keseluruhan antara muka dan fon. Gunakan pintasan Cmd/Ctrl + / - / 0 pada bila-bila masa untuk mengezum",
+            "ui_zoom_default": "Lalai",
+            "ui_zoom_recommended": "Disyorkan untuk skrin besar",
             "auto_launch": "Lancar pada Permulaan",
             "auto_launch_enabled": "Diaktifkan",
             "auto_launch_disabled": "Dinyahaktifkan",
@@ -504,7 +538,13 @@
             "lightweight_mode": "Mod Ringan (Lepaskan Memori)",
             "lightweight_mode_desc": "Tamatkan proses paparan WebView apabila diminimumkan ke dulang sistem untuk mengurangkan memori ke ~35MB. Membuka semula tetingkap memerlukan beberapa milisaat.",
             "lightweight_mode_enabled": "Mod ringan didayakan",
-            "lightweight_mode_disabled": "Mod ringan dilumpuhkan"
+            "lightweight_mode_disabled": "Mod ringan dilumpuhkan",
+            "tray_click_action": "Tindakan Klik Kiri Dulang",
+            "tray_click_action_desc": "Pilih tindakan lalai apabila mengklik ikon dulang sistem",
+            "tray_click_action_mini": "Buka Tetingkap Mini Pemantauan (Disyorkan)",
+            "tray_click_action_main": "Buka Konsol Utama Secara Langsung",
+            "tray_click_action_mini_short": "Tetingkap Mini",
+            "tray_click_action_main_short": "Konsol Utama"
         },
         "account": {
             "title": "Tetapan Akaun",
@@ -960,6 +1000,20 @@
                 },
                 "max_wait": "Tunggu Maks (saat)",
                 "max_wait_tooltip": "Hanya digunakan dalam mod 'Cache First': tunggu bukannya menukar jika masa reset had kadar adalah di bawah nilai ini.",
+                "max_spillover_accounts": "Had Akaun Limpahan",
+                "max_spillover_accounts_tooltip": "Bilangan maksimum akaun yang dibenarkan untuk limpahan trafik serentak. Tetapkan ke 0 untuk tanpa had; tetapkan integer positif (cth. 2) untuk mengehadkan akaun aktif.",
+                "spillover_unlimited": "Tanpa Had (Semua tersedia)",
+                "spillover_count": "{{count}} akaun",
+                "affinity_scope": "Skop Afiniti",
+                "affinity_scope_tooltip": "Sesi: Ikat mengikut ID sesi (lalai, normalisasi subtugasan automatik); Kunci API: Kunci semua permintaan dari kunci API yang sama ke akaun tunggal.",
+                "affinity_scopes": {
+                    "session": "ID Sesi",
+                    "api_key": "Kunci API"
+                },
+                "affinity_scopes_desc": {
+                    "session": "Mengikat akaun mengikut ID sesi dengan normalisasi automatik awalan subtugasan (:step:N).",
+                    "api_key": "Mengunci semua permintaan daripada kunci API yang sama kepada satu akaun untuk memaksimumkan hit Prompt Cache."
+                },
                 "clear_bindings": "Kosongkan Pengikatan Sesi",
                 "clear_bindings_tooltip": "Reset keras semua pengikatan sesi-akaun, memaksa akaun ditugaskan semula pada permintaan seterusnya.",
                 "clear_rate_limits": "Kosongkan Rekod Had Kadar",
@@ -1055,6 +1109,18 @@
                 "default_600_tag": "မူရင်း: 600",
                 "max_memory_turns_desc": "Controls the maximum number of historical thinking turns kept in RAM per session. Estimated RAM usage per turn is ~1.5 KB - 2.5 KB (~1.2 MB / session for 600 turns).",
                 "turns_unit": "turns",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "FIFO Sliding Window Eviction & Concurrency Sizing Guide",
                 "window_guide_desc": "When session length exceeds this limit, FIFO sliding window automatically evicts oldest thinking blocks from memory. Evicted blocks are rehydrated in nanoseconds via indexed SQLite (primary_tool_id), maintaining strict byte-level Prompt Cache alignment without OOM.",
                 "tooltip_32768": "32,768 Tokens: Ideal for complex coding and deep architecture design",
@@ -1103,11 +1169,11 @@
                 "clear_error": "Gagal memadam blok pemikiran: {{error}}",
                 "gemini_soft_budget_note": "⚠️ စဉ်းစားတွေးခေါ်မှု ဘတ်ဂျက် သဘောသဘာဝ- Google Gemini သည် thinkingBudget ကို အကြံပြုချက် (Soft Target) အဖြစ်သာ မှတ်ယူသည်။ ရှည်လျားသော Prompt သို့မဟုတ် ရှုပ်ထွေးသော ကုဒ်သုံးသပ်မှုများတွင် စဉ်းစားမှု သတ်မှတ်ချက်ကို ကျော်လွန်နိုင်ပါသည်။ စဉ်းစားမှုကို အပြီးပိတ်ရန် 0 သတ်မှတ်ပါ။"
             },
-            "stream_timeout_settings": {
-                "title": "Stream အချိန်ကုန်ဆုံးမှု ဆက်တင်များ (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "အချိန်ကန့်သတ် ဆက်တင်များ"
             },
             "thinking_settings": {
-                "title": "စဉ်းစားတွေးခေါ်မှု ဆက်တင်များ (Thinking Settings)"
+                "title": "စဉ်းစားတွေးခေါ်မှု ဆက်တင်များ"
             },
             "prompt_multimodal": {
                 "title": "အလုံးစုံ Prompt နှင့် ဘက်စုံသုံး ဆက်တင်များ"
@@ -1177,7 +1243,7 @@
                 }
             },
             "agent_settings": {
-                "title": "Konfigurasi Agent Khusus (Specific Agent Settings)"
+                "title": "Konfigurasi Agent Khusus"
             },
             "hub": {
                 "title": "တရားဝင် Hub Client Fingerprint",
@@ -1196,17 +1262,54 @@
         "stream_timeouts": {
             "banner_title": "အဆင့် ၃ ဆင့်ပါ စမ်းချောင်းပုံစံ အချိန်ကုန်ဆုံးမှုနှင့် အဆက်အသွယ် ထိန်းသိမ်းခြင်း စနစ်",
             "banner_desc": "နက်နဲစွာ စဉ်းစားတွေးခေါ်သော မော်ဒယ်များ၊ ကြီးမားသော စကားစပ် Prefill များနှင့် ဖိုင်ကြီးများ ရေးသားခြင်းအတွက် သီးသန့် ပြုလုပ်ထားသည်။ တသမတ်တည်း နောက်ခံ ping (: ping) ဖြင့် ချိတ်ဆက်မှု ပြတ်တောက်ခြင်းနှင့် ထပ်တလဲလဲ ကြိုးစားမှု ပြဿနာများကို ဖြေရှင်းပေးသည်။",
-            "ttft_title": "ပထမဆုံး စာလုံး တုံ့ပြန်မှု စောင့်ဆိုင်းချိန် (TTFT)",
+            "ttft_title": "ပထမဆုံး စာလုံး တုံ့ပြန်မှု စောင့်ဆိုင်းချိန်",
             "default_badge": "မူလ: 180s",
             "ttft_desc": "စတင်ချိန် တန်းစီစောင့်ဆိုင်းခြင်း၊ တိုကင် ၁၀၀k ကျော် Prefill ပြုလုပ်ခြင်းနှင့် အကျဉ်းချုပ် လုပ်ငန်းစဉ်များအတွက် အမြင့်ဆုံး ခွင့်ပြုချိန်။ ၃ စက္ကန့်လျှင် တစ်ကြိမ် ping ပေးပို့သည်။",
             "transition_title": "အသွင်ကူးပြောင်းမှု ခွင့်ပြုချိန် (ပြန်လည်စတင်ခြင်း)",
             "transition_desc": "စဉ်းစားတွေးခေါ်မှု ပြီးဆုံးချိန်မှ ပထမဆုံး စာသား သို့မဟုတ် tool ခေါ်ယူမှု မထွက်မချင်း ကြားကာလ။ စဉ်းစားမှု ပြီးဆုံးပါက အချိန်တိုင်းကိရိယာကို အလိုအလျောက် ပြန်စတင်သည်။",
-            "sliding_title": "ဆက်တိုက် ထုတ်လွှင့်မှု အချိန်ကုန်ဆုံးချိန် (Streaming)",
+            "sliding_title": "ဆက်တိုက် ထုတ်လွှင့်မှု အချိန်ကုန်ဆုံးချိန်",
             "default_badge_sliding": "မူလ: 120s",
             "sliding_desc": "ဆက်တိုက် ထုတ်လွှင့်နေစဉ် တိုကင်များကြား အမြင့်ဆုံး ခွင့်ပြုသော တိတ်ဆိတ်မှု ကြာချိန်။ ရုတ်တရက် ပြတ်တောက်ပါက ထွက်ရှိပြီးသား အချက်အလက်များကို ထိန်းသိမ်းရန် လုံခြုံစွာ ပိတ်သိမ်းသည်။",
             "toast_reset": "အချိန်ကုန်ဆုံးမှု ဆက်တင်များကို မူလအတိုင်း ပြန်လည်သတ်မှတ်ပြီးပါပြီ",
             "btn_reset": "မူလအတိုင်း ပြန်သတ်မှတ်ရန်",
             "btn_save": "အချိန်ကုန်ဆုံးမှု ဆက်တင်များ သိမ်းဆည်းရန်"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "တင်ပို့ချိန်- bandwidth အလိုက် အလိုအလျောက် သတ်မှတ်",
+            "min_speed_title": "အပ်လုဒ် bandwidth (Mbps)",
+            "min_speed_desc": "VPN အသုံးပြုသူများသည် ဒေါင်းလုဒ်မြင့်ပြီး အပ်လုဒ်နိမ့်တတ်သည်။ 1–5 Mbps အကြံပြုသည်။",
+            "extra_wait_title": "ထပ်ဆောင်း စောင့်ဆိုင်းမှု အချိုး",
+            "extra_wait_desc": "ဤတန်ဖိုးသည် အများဆုံး တင်ပို့စောင့်ချိန်ကို သက်ရောက်သည်။",
+            "formula_title": "အများဆုံး စောင့်ချိန် = ကိုယ်ထည်အရွယ်အစား ÷ အပ်လုဒ် bandwidth × (1 + ထပ်ဆောင်းအချိုး)",
+            "stall_title": "ရပ်တန့်ချိန် ကန့်သတ် (စက္ကန့်)",
+            "stall_desc": "တင်ပို့နေစဉ် ဒေတာစီးဆင်းမှု လုံးဝရပ်တန့်နေပါက စောင့်ဆိုင်းချိန်။ ချိတ်ဆက်မှု စောင့်ဆိုင်းချိန်ထက် မနည်းစေရန် အလိုအလျောက် အာမခံထားသည်။",
+            "header_wait_title": "ပထမ ခေါင်းစီး စောင့်ချိန် (စက္ကန့်)",
+            "header_wait_desc": "0 = ပါဝင်တန်ဖိုးများ သုံးသည်- အဓိက endpoint 30 စက္ကန့် / အရန် 25 စက္ကန့်။ 0 မဟုတ်ပါက အနိမ့်ဆုံးကိုသာ မြှင့်သည်။",
+            "large_body_desc": "သတ်မှတ်ပမာဏထက် ကျော်သောဖိုင်များကို မူလအားဖြင့် တစ်ကြိမ်သာ ပို့ပြီး ထပ်ခါတလဲလဲ ပို့ခြင်းကို ရှောင်သည်။",
+            "large_body_threshold_title": "ဖိုင်ကြီး သတ်မှတ်ချက် (MB)",
+            "endpoint_attempts_title": "အများဆုံး ကြိုးစားမှု",
+            "toast_reset": "အချိန်ကန့်သတ် မူလတန်ဖိုးများ ပြန်ဖြစ်ပါပြီ",
+            "btn_reset": "မူလအတိုင်း ပြန်သတ်မှတ်",
+            "btn_save": "အချိန်ကန့်သတ် သိမ်းဆည်း"
+        },
+        "timeouts": {
+            "banner_title": "အချိန်ကန့်သတ် ဆက်တင်များ",
+            "banner_desc": "တောင်းဆိုမှုတစ်ခု၏ အချိန်ကန့်သတ် ကွင်းဆက်အပြည့်အစုံ- ① အဆုံးမှတ် ချိတ်ဆက်မှု ထူထောင်ခြင်း → ② တောင်းဆိုချက် အချက်အလက် တင်ပို့ခြင်း → ③ ပထမဆုံး token တုံ့ပြန်မှုနှင့် ဆက်တိုက်ထုတ်လွှတ်မှု။",
+            "section_connect": "① endpoint ချိတ်ဆက်မှု (အလိုအလျောက် ပြောင်းလဲ)",
+            "connect_label": "ချိတ်ဆက်မှု အချိန်ကန့်သတ် (စက္ကန့်)",
+            "connect_desc": "endpoint သို့ TCP ချိတ်ဆက်မှု တည်ဆောက်ချိန်။ များသောအားဖြင့် အလွန်မြန်သည်။",
+            "connect_restart": "proxy ဝန်ဆောင်မှု ပြန်စရန် လိုအပ်သည်။",
+            "section_upload": "② တင်ပို့မှု (ကိုယ်ထည် ပို့ခြင်း)",
+            "section_large_body": "ဖိုင်ကြီး ပြန်ကြိုးစားမှု",
+            "section_header": "③ ပထမ တုံ့ပြန်မှု ခေါင်းစီး (အလိုအလျောက် ပြောင်းလဲ)",
+            "header_primary_title": "အဓိက endpoint:",
+            "header_primary_items": "Text/code: TTFT　Image: TTFT+45　Video: TTFT+60　Auxiliary: TTFT−30",
+            "header_fallback_title": "အရန် endpoint:",
+            "header_fallback_items": "same offsets, halved (negative offsets unchanged)",
+            "first_byte_effective": "Effective now: text/code {{text}}s　image {{image}}s　video {{video}}s　auxiliary {{aux}}s",
+            "section_stream": "③ ပထမ token နှင့် ဆက်တိုက် ထုတ်လွှတ်မှု",
+            "stream_desc": "Header wait and first token are merged into one first-byte delay: endpoint failover is allowed before HTTP 200, and only a safe finalize after it.",
+            "auto_summary": "ဥပမာ- အများဆုံး စောင့်ချိန် = 47MB ÷ 2Mbps × 1.4 ≈ {{big}} စက္ကန့်;"
         },
         "cloudflared": {
             "title": "Akses Awam (Cloudflared)",
@@ -1461,7 +1564,8 @@
             "sync_confirm_message": "Bersedia untuk menyegerakkan konfigurasi {{name}}. ⚠️ Amaran: Ini akan menimpa fail konfigurasi tempatan sedia ada anda (cth. token log masuk, Kunci API). Adakah anda pasti mahu meneruskan?",
             "model_select": "Select Model",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "models": {
@@ -1631,7 +1735,7 @@
             "out_tokens_title": "အထွက် တိုကင်များ",
             "ttft_prefix": "ပထမစာလုံး:",
             "total_duration_title": "စုစုပေါင်း ကြာချိန်",
-            "ttft_title": "ပထမဆုံး တိုကင် ကြာချိန် (TTFT)"
+            "ttft_title": "ပထမဆုံး တိုကင် ကြာချိန်"
         },
         "details": {
             "title": "Butiran Permintaan",
@@ -1654,10 +1758,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "Tiada Balut",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3 Lajur",
+            "layout_3col_title": "Paparan perbandingan mendatar 3 lajur",
+            "layout_postman": "Gaya Postman",
+            "layout_postman_title": "Paparan pecahan gaya Postman",
+            "export_menu": "Eksport / Salin",
+            "export_menu_title": "Eksport format HAR, salin sebagai cURL atau JSON diagnostik",
+            "copy_har": "Salin Muatan HAR",
+            "download_har": "Muat turun Fail .har",
+            "copy_curl": "Salin sebagai Perintah cURL",
+            "copy_full_json": "Salin Penuh Diagnostik JSON",
+            "copied_har": "HAR Disalin",
+            "exported_har": ".har Dieksport",
+            "copied_curl": "cURL Disalin",
+            "copied_full_json": "JSON Penuh Disalin",
+            "collapse_metadata": "Runtuhkan Metadata",
+            "expand_metadata": "Kembangkan Metadata",
+            "collapse_metadata_title": "Runtuhkan metadata untuk meluaskan pandangan",
+            "expand_metadata_title": "Kembangkan maklumat metadata",
+            "wrap": "Balut",
+            "wrap_on_title": "Semasa: Balut automatik (klik untuk satu baris)",
+            "wrap_off_title": "Semasa: Satu baris (klik untuk balut automatik)",
+            "case_sensitive_on": "Peka huruf besar/kecil diaktifkan",
+            "case_sensitive_off": "Klik untuk aktifkan peka huruf besar/kecil",
+            "clear_search": "Kosongkan carian",
+            "no_match": "Tiada padanan",
+            "prev_match": "Sebelumnya (Shift+Enter)",
+            "next_match": "Seterusnya (Enter)",
+            "lines_count": "baris",
+            "expand": "Kembangkan",
+            "collapse": "Runtuhkan",
+            "req_headers": "Pengepala Permintaan",
+            "upstream_headers": "Pengepala Diteruskan",
+            "resp_headers": "Pengepala Respons",
+            "param_key": "Kunci Parameter (Key)",
+            "param_value": "Nilai Parameter (Value)",
+            "header_key": "Pengepala (Header)",
+            "header_value": "Nilai Pengepala (Value)"
         },
         "dialog": {
             "clear_title": "Kosongkan Log Proksi",
@@ -1686,14 +1827,19 @@
             "norm_desc": "Model routing / account scheduling / Gemini format conversion",
             "thinking": "Thinking & Signature Fill",
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
-            "ttft": "Time To First Token (TTFT)",
+            "ttft": "Time To First Token",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
             "stream": "Stream Transfer Duration",
             "stream_desc": "First chunk arrival to stream completion",
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "Runtuhkan Diagnostik Masa",
+            "expand": "Kembangkan Diagnostik Masa",
+            "endpoint_label": "Titik Akhir",
+            "status_label": "Status",
+            "network_timeout_or_error": "Masa Tamat Rangkaian / Ralat"
         }
     },
     "update_notification": {
@@ -1715,6 +1861,7 @@
         "title": "Kawalan Akses Selamat",
         "desc": "Berjalan dalam mod Web. Sila masukkan kata laluan pengurusan atau Kunci API untuk mengakses.",
         "placeholder": "Masukkan kata laluan pengurusan atau Kunci API",
+        "remember_me": "Ingat kelayakan log masuk",
         "btn_login": "Sahkan dan Masuk",
         "note": "Nota: Jika kata laluan pengurusan berasingan ditetapkan, sila masukkan; jika tidak, masukkan API_KEY.",
         "lookup_hint": "Jika terlupa, jalankan docker logs antigravity-manager untuk mencari Current API Key atau Web UI Password",
@@ -1739,6 +1886,10 @@
         "by_account": "Mengikut Akaun",
         "by_model": "Mengikut Model",
         "by_account_view": "Mengikut Akaun",
+        "perspective_routed": "Model Dihalakan",
+        "perspective_requested": "Model Diminta",
+        "perspective_routed_tip": "Kumpulkan statistik mengikut model yang sebenarnya dilaksanakan/dihalakan",
+        "perspective_requested_tip": "Kumpulkan statistik mengikut model asal yang diminta oleh pelanggan",
         "model_details": "Pecahan Model",
         "account_details": "Pecahan Akaun",
         "model": "Model",
@@ -1883,7 +2034,10 @@
         "cockpit_view_detail": "အသေးစိတ်",
         "cockpit_tab_accounts": "အကောင့်များ",
         "cockpit_tab_models": "မော်ဒယ်များ",
-        "cockpit_tab_users": "အသုံးပြုသူများ"
+        "cockpit_tab_users": "အသုံးပြုသူများ",
+        "avg_ttft": "Kependaman TTFT",
+        "ttft": "Masa TTFT",
+        "avg_ttft_tip": "Purata masa untuk token pertama (TTFT)"
     },
     "errors": {
         "stream": {

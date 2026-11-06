@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "Nível de pensamento: adaptativo do gateway (catálogo oficial)",
+        "tag": "Recomendado",
+        "desc": "O controle direto do cliente e os níveis de tokens personalizados foram descontinuados: modelos com thinkingLevel usam o nível do próprio escalão (low / medium / high) e os demais seguem o thinkingBudget oficial padrão. O esforço enviado pelo cliente só se aplica a modelos sem sufixo para escolher o modelo de escalão concreto."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — ignore se as solicitações estiverem funcionando normalmente"
+    },
     "common": {
         "loading": "Carregando...",
         "empty": "Vazio",
@@ -197,6 +205,13 @@
         "proxy_online_unit": "Proxy online",
         "btn_proxy_online": "Proxy Online ({{count}})",
         "btn_all_available": "Disponíveis ({{count}})",
+        "qos_auto_jail": "Quarentena auto",
+        "qos_auto_jail_badge_on": "ON",
+        "qos_auto_jail_badge_off": "OFF",
+        "qos_auto_jail_on": "Quarentena: LIG",
+        "qos_auto_jail_off": "Quarentena: DESL",
+        "qos_auto_jail_enabled_tip": "Atual: Quarentena automática ativada. Isola contas com TTFT excessivo e desvincula sessões (Clique para desativar)",
+        "qos_auto_jail_disabled_tip": "Atual: Quarentena automática desativada. Ignora a duração do TTFT sem isolar ou desvincular sessões (Clique para ativar)",
         "btn_title_proxy_online": "Atualmente contando apenas contas no proxy",
         "btn_title_all_available": "Atualmente contando todas as contas ativas",
         "proxy_joined_pool": "✓ {{count}} conta(s) no pool de proxy",
@@ -384,6 +399,7 @@
                 "copied": "Copiado",
                 "link_label": "URL de Autorização",
                 "link_click_to_copy": "Clique para copiar",
+                "remote_hint": "💡 Dica para Docker / Servidor Remoto: é normal que o navegador mostre conexão recusada ao redirecionar para localhost após a autorização do Google. Basta copiar a URL completa (contendo o código) da barra de endereços do seu navegador e colá-la abaixo.",
                 "manual_hint": "O navegador não redirecionou automaticamente? Cole o link de retorno ou o Código de Autorização aqui:",
                 "manual_placeholder": "Cole o link ou o código aqui...",
                 "error_no_flow": "Nenhum fluxo de autenticação ativo encontrado. Por favor, reinicie o OAuth.",
@@ -391,7 +407,9 @@
                 "error_no_url": "Não foi possível obter a URL OAuth",
                 "popup_blocked": "Popup bloqueado",
                 "manual_submitting": "Enviando código de autorização...",
-                "manual_submitted": "Código de autorização enviado, processando em segundo plano..."
+                "manual_submitted": "Código de autorização enviado, processando em segundo plano...",
+                "enterprise_title": "Autorização corporativa Google Cloud / Vertex AI",
+                "enterprise_desc": "Autorize com o cliente corporativo oficial do GCP para manter a cota corporativa e vincular o projeto Vertex AI"
             },
             "token": {
                 "label": "Refresh Token",
@@ -473,7 +491,19 @@
         "client_cli": "CLI",
         "client_cli_tooltip": "Conta conectada no Antigravity CLI (agy)",
         "switch_next_short": "Próximo",
-        "weekly_exhausted_tooltip": "Cota semanal esgotada, proteção ativada"
+        "weekly_exhausted_tooltip": "Cota semanal esgotada, proteção ativada",
+        "type": {
+            "personal": "Conta pessoal",
+            "enterprise": "Corporativo / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "ID do projeto do Google Cloud associado à conta corporativa/GCP. O Antigravity nativo o associa ou utiliza o padrão ao fazer login.",
+        "project_id_placeholder": "ex: my-project-id",
+        "project_id_updated": "GCP Project ID atualizado com sucesso",
+        "auto_fetch_project_id": "Obter automaticamente",
+        "fetching_project_id": "Obtendo...",
+        "auto_fetch_success": "Project ID obtido com sucesso: {{projectId}}",
+        "auto_fetch_failed": "Nenhum Project ID associado encontrado no upstream"
     },
     "settings": {
         "save": "Salvar Configurações",
@@ -492,6 +522,10 @@
             "theme_light": "Claro",
             "theme_dark": "Escuro",
             "theme_system": "Sistema",
+            "ui_zoom": "Escala de interface e fonte",
+            "ui_zoom_desc": "Ajuste o tamanho geral da interface e fontes. Use Cmd/Ctrl + / - / 0 a qualquer momento para redimensionar",
+            "ui_zoom_default": "Padrão",
+            "ui_zoom_recommended": "Recomendado para telas grandes",
             "auto_launch": "Iniciar na Inicialização",
             "auto_launch_enabled": "Habilitado",
             "auto_launch_disabled": "Desabilitado",
@@ -510,7 +544,13 @@
             "lightweight_mode": "Modo Leve (Liberar Memória)",
             "lightweight_mode_desc": "Destrói o processo de renderização WebView ao fechar ou minimizar para a bandeja, reduzindo a memória para ~35MB. Leva alguns milissegundos para reconstruir a janela ao reabrir.",
             "lightweight_mode_enabled": "Modo leve habilitado",
-            "lightweight_mode_disabled": "Modo leve desabilitado"
+            "lightweight_mode_disabled": "Modo leve desabilitado",
+            "tray_click_action": "Ação ao clicar na bandeja",
+            "tray_click_action_desc": "Escolha a ação padrão ao clicar no ícone da bandeja do sistema",
+            "tray_click_action_mini": "Abrir janela flutuante Mini (Recomendado)",
+            "tray_click_action_main": "Abrir console principal diretamente",
+            "tray_click_action_mini_short": "Janela Mini",
+            "tray_click_action_main_short": "Console"
         },
         "account": {
             "title": "Configurações de Conta",
@@ -988,6 +1028,20 @@
                 },
                 "max_wait": "Tempo Máximo de Espera (seg)",
                 "max_wait_tooltip": "Usado apenas no modo 'Cache Primeiro': aguardar em vez de alternar se o tempo de reset do limite de taxa estiver abaixo deste valor.",
+                "max_spillover_accounts": "Limite de Contas de Transbordamento",
+                "max_spillover_accounts_tooltip": "Número máximo de contas permitidas para transbordamento de tráfego simultâneo. 0 para ilimitado (todas disponíveis); um inteiro positivo (ex: 2) para limitar contas ativas.",
+                "spillover_unlimited": "Ilimitado (Todas disponíveis)",
+                "spillover_count": "{{count}} contas",
+                "affinity_scope": "Escopo de Afinidade",
+                "affinity_scope_tooltip": "Sessão: vincula por ID de sessão (padrão, normalização de subtarefas); Chave API: bloqueia requisições da mesma chave na mesma conta (evita perdas de cache em multiagentes).",
+                "affinity_scopes": {
+                    "session": "ID da Sessão",
+                    "api_key": "Chave API"
+                },
+                "affinity_scopes_desc": {
+                    "session": "Vincula contas por ID de sessão com normalização automática de subtarefas (:step:N).",
+                    "api_key": "Fixa todas as requisições da mesma chave API em uma única conta, maximizando hits de cache para frotas multiagentes."
+                },
                 "clear_bindings": "Limpar Vinculações de Sessão",
                 "clear_bindings_tooltip": "Redefinir todas as vinculações sessão-conta, forçando contas a serem reatribuídas na próxima solicitação.",
                 "clear_rate_limits": "Limpar Bloqueios de Taxa (429)",
@@ -1135,6 +1189,18 @@
                 "default_600_tag": "Padrão: 600",
                 "max_memory_turns_desc": "Controls the maximum number of historical thinking turns kept in RAM per session. Estimated RAM usage per turn is ~1.5 KB - 2.5 KB (~1.2 MB / session for 600 turns).",
                 "turns_unit": "turns",
+                "signature_cache_title": "Tool Signature Cache (Auto)",
+                "signature_cache_clear_btn": "Clear Signature Cache",
+                "signature_cache_desc": "Automatically selects a cache tier based on CPU / memory; SQLite is the cold layer, with batched writes and compaction running in the background.",
+                "clear_signature_confirm": "Clear the tool signature cache? Request logs and thinking blocks will not be affected.",
+                "clear_signature_success": "Signature cache cleared ({{count}} L1 entries)",
+                "clear_signature_error": "Failed to clear signature cache: {{error}}",
+                "signature_cache_hit_rate": "Hit Rate",
+                "signature_cache_thinking": "Thinking",
+                "signature_cache_thinking_value": "{{turns}} turns / {{sessions}} sessions",
+                "signature_cache_dropped": "Dropped",
+                "signature_cache_pending": "Pending Deletes",
+                "signature_cache_machine": "{{mb}} MB RAM / {{cores}} cores.",
                 "window_guide_title": "FIFO Sliding Window Eviction & Concurrency Sizing Guide",
                 "window_guide_desc": "When session length exceeds this limit, FIFO sliding window automatically evicts oldest thinking blocks from memory. Evicted blocks are rehydrated in nanoseconds via indexed SQLite (primary_tool_id), maintaining strict byte-level Prompt Cache alignment without OOM.",
                 "tooltip_32768": "32,768 Tokens: Ideal for complex coding and deep architecture design",
@@ -1183,11 +1249,11 @@
                 "clear_error": "Falha ao limpar blocos de pensamento: {{error}}",
                 "gemini_soft_budget_note": "⚠️ Comportamento do orçamento de pensamento: O Google Gemini trata o thinkingBudget como uma meta flexível (soft target). Em prompts longos ou raciocínios complexos de código, o modelo pode expandir sua cadeia de pensamento e superar o valor configurado; defina 0 para desativar completamente."
             },
-            "stream_timeout_settings": {
-                "title": "Configurações de tempo limite de streaming (Stream Timeout Settings)"
+            "timeout_settings": {
+                "title": "Configurações de tempo limite"
             },
             "thinking_settings": {
-                "title": "Configurações de Raciocínio (Thinking Settings)"
+                "title": "Configurações de Raciocínio"
             },
             "prompt_multimodal": {
                 "title": "Prompt Global e Configurações Multimodais"
@@ -1199,7 +1265,7 @@
             "log_retention_current_usage": "Current database disk usage",
             "log_retention_rows": "Maximum log rows",
             "agent_settings": {
-                "title": "Configurações específicas de Agent (Specific Agent Settings)"
+                "title": "Configurações específicas de Agent"
             },
             "hub": {
                 "title": "Impressão Digital do Hub Oficial",
@@ -1218,17 +1284,54 @@
         "stream_timeouts": {
             "banner_title": "Mecanismo de tempo limite em 3 etapas e keepalive contínuo",
             "banner_desc": "Projetado para modelos de raciocínio profundo, prefills de contexto massivos, compactação de histórico e escrita de arquivos extensos. Três etapas independentes com keepalive contínuo (: ping) para evitar quedas de gateway e loops de repetição.",
-            "ttft_title": "Tolerância para primeiro token (TTFT)",
+            "ttft_title": "Tolerância para primeiro token",
             "default_badge": "Padrão: 180s",
             "ttft_desc": "Cobre filas de inicialização, prefill de 100k+ tokens e tarefas de compactação. Envia pings a cada 3s para manter a conexão ativa.",
             "transition_title": "Tolerância de transição (Reinício de época)",
             "transition_desc": "Período de tolerância entre o término do raciocínio e o primeiro token de conteúdo ou chamada de ferramenta. Reinicia o cronômetro automaticamente ao concluir o raciocínio.",
-            "sliding_title": "Tempo limite deslizante (Streaming)",
+            "sliding_title": "Tempo limite deslizante",
             "default_badge_sliding": "Padrão: 120s",
             "sliding_desc": "Intervalo máximo de silêncio permitido entre tokens consecutivos. Em caso de interrupção, finaliza de forma suave para proteger o código gerado.",
             "toast_reset": "Configurações de tempo limite restauradas para o padrão",
             "btn_reset": "Restaurar padrões",
             "btn_save": "Salvar configurações de tempo limite"
+        },
+        "upload_timeouts": {
+            "adaptive_title": "Tempo de upload: determinado automaticamente pela banda",
+            "min_speed_title": "Banda de upload (Mbps)",
+            "min_speed_desc": "Usuários de VPN costumam ter download alto e upload baixo; recomenda-se 1–5 Mbps.",
+            "extra_wait_title": "Fator de espera extra",
+            "extra_wait_desc": "Este parâmetro afeta o tempo máximo de espera do upload.",
+            "formula_title": "Espera máxima = tamanho do corpo ÷ banda de upload × (1 + fator de espera)",
+            "stall_title": "Tempo de travamento (segundos)",
+            "stall_desc": "Tempo limite para estagnação contínua durante o upload; garantido para não ser menor que o tempo de conexão, evitando cancelamentos prematuros no handshake.",
+            "header_wait_title": "Tempo do primeiro cabeçalho (segundos)",
+            "header_wait_desc": "0 = usar valores internos: 30 s no endpoint principal / 25 s no alternativo; um valor diferente de 0 apenas eleva o mínimo.",
+            "large_body_desc": "Arquivos acima do limite são enviados apenas uma vez por padrão, evitando repetições que saturem o upload.",
+            "large_body_threshold_title": "Limite de arquivo grande (MB)",
+            "endpoint_attempts_title": "Tentativas máximas",
+            "toast_reset": "Tempos de espera restaurados",
+            "btn_reset": "Restaurar padrões",
+            "btn_save": "Salvar tempos"
+        },
+        "timeouts": {
+            "banner_title": "Configurações de tempo limite",
+            "banner_desc": "Cadeia completa de tempo limite para uma solicitação: ① Conexão do endpoint → ② Upload do corpo → ③ Resposta do primeiro token e fluxo contínuo.",
+            "section_connect": "① Conexão ao endpoint (failover automático)",
+            "connect_label": "Tempo de conexão (segundos)",
+            "connect_desc": "Tempo de estabelecimento TCP com o endpoint; normalmente muito rápido.",
+            "connect_restart": "Requer reiniciar o serviço de proxy.",
+            "section_upload": "② Upload (enviar o corpo)",
+            "section_large_body": "Repetição de arquivos grandes",
+            "section_header": "③ Primeiro cabeçalho (failover automático)",
+            "header_primary_title": "Endpoint principal:",
+            "header_primary_items": "Texto/código: TTFT　Imagem: TTFT+45　Vídeo: TTFT+60　Auxiliar: TTFT−30",
+            "header_fallback_title": "Endpoint alternativo:",
+            "header_fallback_items": "os mesmos incrementos, pela metade (negativos inalterados)",
+            "first_byte_effective": "Em vigor agora: texto/código {{text}}s　imagem {{image}}s　vídeo {{video}}s　auxiliar {{aux}}s",
+            "section_stream": "③ Primeiro token e saída contínua",
+            "stream_desc": "A espera de cabeçalhos e o primeiro token foram unificados em uma única latência do primeiro byte: a troca de endpoint é permitida antes de HTTP 200 e, depois disso, apenas finalização segura.",
+            "auto_summary": "Ex.: espera máxima = 47MB ÷ 2Mbps × 1.4 ≈ {{big}} s;"
         },
         "cloudflared": {
             "title": "Túnel Cloudflare (Cloudflared)",
@@ -1493,7 +1596,8 @@
             "sync_confirm_title": "Confirmação de Sincronização",
             "sync_confirm_message": "Pronto para sincronizar a configuração do {{name}}. ⚠️ Aviso: Isso substituirá seus arquivos de configuração local existentes (como tokens de login, chaves de API). Tem certeza de que deseja continuar?",
             "apps": {
-                "gemini": "Antigravity CLI (agy)"
+                "gemini": "Antigravity CLI (agy)",
+                "deepseek_harness": "DeepSeek Harness"
             }
         },
         "opencode_sync": {
@@ -1673,7 +1777,7 @@
             "out_tokens_title": "Tokens de saída",
             "ttft_prefix": "TTFT:",
             "total_duration_title": "Latência total",
-            "ttft_title": "Latência do primeiro token (TTFT)"
+            "ttft_title": "Latência do primeiro token"
         },
         "details": {
             "title": "Detalhes da Solicitação",
@@ -1696,10 +1800,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "Sem quebra",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3 Colunas",
+            "layout_3col_title": "Visualização horizontal em 3 colunas",
+            "layout_postman": "Estilo Postman",
+            "layout_postman_title": "Visualização dividida estilo Postman",
+            "export_menu": "Exportar / Copiar",
+            "export_menu_title": "Exportar HAR, copiar como cURL ou JSON de diagnóstico",
+            "copy_har": "Copiar carga HAR",
+            "download_har": "Baixar arquivo .har",
+            "copy_curl": "Copiar como comando cURL",
+            "copy_full_json": "Copiar JSON de diagnóstico completo",
+            "copied_har": "HAR copiado",
+            "exported_har": ".har exportado",
+            "copied_curl": "cURL copiado",
+            "copied_full_json": "JSON completo copiado",
+            "collapse_metadata": "Recolher metadados",
+            "expand_metadata": "Expandir metadados",
+            "collapse_metadata_title": "Recolher metadados para ampliar a visualização",
+            "expand_metadata_title": "Expandir informações de metadados",
+            "wrap": "Quebra",
+            "wrap_on_title": "Atual: Quebra automática (clique para linha única)",
+            "wrap_off_title": "Atual: Linha única (clique para quebra automática)",
+            "case_sensitive_on": "Diferenciação de maiúsculas ativada",
+            "case_sensitive_off": "Clique para ativar diferenciação de maiúsculas",
+            "clear_search": "Limpar pesquisa",
+            "no_match": "Sem correspondências",
+            "prev_match": "Anterior (Shift+Enter)",
+            "next_match": "Próximo (Enter)",
+            "lines_count": "linhas",
+            "expand": "Expandir",
+            "collapse": "Recolher",
+            "req_headers": "Cabeçalhos da requisição",
+            "upstream_headers": "Cabeçalhos encaminhados",
+            "resp_headers": "Cabeçalhos da resposta",
+            "param_key": "Chave de parâmetro (Key)",
+            "param_value": "Valor de parâmetro (Value)",
+            "header_key": "Cabeçalho (Header)",
+            "header_value": "Valor do cabeçalho (Value)"
         },
         "dialog": {
             "clear_title": "Limpar Logs do Proxy",
@@ -1756,14 +1897,19 @@
             "norm_desc": "Model routing / account scheduling / Gemini format conversion",
             "thinking": "Thinking & Signature Fill",
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
-            "ttft": "Time To First Token (TTFT)",
+            "ttft": "Time To First Token",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
             "stream": "Stream Transfer Duration",
             "stream_desc": "First chunk arrival to stream completion",
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "Recolher diagnóstico de tempo",
+            "expand": "Expandir diagnóstico de tempo",
+            "endpoint_label": "Ponto de extremidade",
+            "status_label": "Status",
+            "network_timeout_or_error": "Tempo limite de rede / Erro"
         }
     },
     "update_notification": {
@@ -1785,6 +1931,7 @@
         "title": "Controle de Acesso Seguro",
         "desc": "Executando no modo Web. Por favor, insira a senha de administrador ou a Chave de API para acessar.",
         "placeholder": "Insira a senha de administrador ou a Chave de API",
+        "remember_me": "Lembrar credenciais de login",
         "btn_login": "Verificar e Entrar",
         "btn_verifying": "Verificando Autenticação...",
         "error_invalid_key": "Chave de acesso inválida ou expirada",
@@ -1809,6 +1956,10 @@
         "by_account": "Por Conta",
         "by_model": "Por Modelo",
         "by_account_view": "Por Conta",
+        "perspective_routed": "Modelo Roteado",
+        "perspective_requested": "Modelo Solicitado",
+        "perspective_routed_tip": "Agregar estatísticas pelo modelo realmente executado/roteado",
+        "perspective_requested_tip": "Agregar estatísticas pelo modelo original solicitado pelo cliente",
         "model_details": "Detalhes por Modelo",
         "account_details": "Detalhes por Conta",
         "model": "Modelo",
@@ -1953,7 +2104,10 @@
         "cockpit_view_detail": "Detalhes",
         "cockpit_tab_accounts": "Contas",
         "cockpit_tab_models": "Modelos",
-        "cockpit_tab_users": "Usuários"
+        "cockpit_tab_users": "Usuários",
+        "avg_ttft": "Latência TTFT",
+        "ttft": "Tempo TTFT",
+        "avg_ttft_tip": "Tempo médio até o primeiro token (TTFT)"
     },
     "errors": {
         "stream": {

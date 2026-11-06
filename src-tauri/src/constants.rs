@@ -17,9 +17,10 @@ pub const KNOWN_STABLE_CHROME: &str = "132.0.6834.160";
 static VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").expect("Invalid version regex"));
 
-/// Pre-compiled regex specifically matching version following antigravity (e.g. `antigravity/1.5`, `Antigravity/1.5.0`, `antigravity/4.3.0`)
+/// Pre-compiled regex specifically matching version following antigravity or antigravity/hub (e.g. `antigravity/1.5`, `Antigravity/1.5.0`, `antigravity/4.3.0`, `antigravity/hub/2.28.0`)
 static ANTIGRAVITY_VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)antigravity[/v\s]+(\d+(?:\.\d+)+)").expect("Invalid antigravity version regex")
+    Regex::new(r"(?i)antigravity(?:/hub)?[/v\s]+(\d+(?:\.\d+)+)")
+        .expect("Invalid antigravity version regex")
 });
 
 /// Parse version from response text using pre-compiled regex
@@ -216,21 +217,33 @@ pub static SESSION_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().
 
 /// Antigravity 官方语言服务枢纽 (Antigravity Hub) 版本号
 /// 对应官方出站 User-Agent: antigravity/hub/{OFFICIAL_HUB_VERSION}
-pub const OFFICIAL_HUB_VERSION: &str = "2.23.1";
+/// 2026-10-29 官方实抓版本与 CL（实抓自 Windows 客户端，出站平台段与之一致）
+pub const OFFICIAL_HUB_VERSION: &str = "2.28.0";
 
 /// Antigravity 官方内部代码仓库 (Google Piper Monorepo) 变更集编号 (Changelist Number / CL)
 /// 官方每一个正式版本发布均对应确定的构建提交点，全球正版客户端保持统一，切勿随机变动
-pub const OFFICIAL_HUB_CL: &str = "998881661";
+pub const OFFICIAL_HUB_CL: &str = "1008300195";
 
 /// Returns the official Antigravity Hub User-Agent matching the upstream egress signature:
 /// format: "antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type={os}; arch={arch}; cl={OFFICIAL_HUB_CL})"
-/// e.g.: "antigravity/hub/2.23.1 (aidev_client; os_type=darwin; arch=arm64; cl=998881661)"
+/// e.g.: "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)"
 pub fn build_official_upstream_user_agent() -> String {
     crate::modules::hub_version::get_current_hub_user_agent()
 }
 
 /// Official Antigravity upstream User-Agent
+///
+/// ⚠️ 这是**冷启动快照**：`LazyLock` 首次访问后即固定。
+/// 出站请求请统一使用 [`current_egress_user_agent()`]，以便启动时的远程 Hub 指纹探测能即时生效。
 pub static USER_AGENT: LazyLock<String> = LazyLock::new(build_official_upstream_user_agent);
+
+/// 当前生效的出站 User-Agent（动态读取已解析的 Hub 指纹）
+///
+/// 启动阶段**不做**远程版本跟随（版本与 CL 必须成对人工校准）；
+/// `/releases` 探测只驱动前端启动提示，出站指纹仍以下方的稳态基线为准。
+pub fn current_egress_user_agent() -> String {
+    crate::modules::hub_version::get_current_hub_user_agent()
+}
 
 /// Sanitizes a custom User-Agent string for upstream egress requests.
 ///
@@ -359,6 +372,15 @@ mod tests {
             "KNOWN_STABLE_VERSION ({}) must be > 4.1.22; please sync with Cargo.toml",
             KNOWN_STABLE_VERSION
         );
+    }
+
+    #[test]
+    fn test_official_hub_version_baseline() {
+        assert!(
+            compare_semver(OFFICIAL_HUB_VERSION, "2.27.0") > std::cmp::Ordering::Equal,
+            "OFFICIAL_HUB_VERSION must be >= 2.28.0 to satisfy upstream Google Argon gate"
+        );
+        assert_eq!(OFFICIAL_HUB_CL, "1008300195");
     }
 
     #[test]

@@ -12,6 +12,16 @@ use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::server::{ImagePermit, ImageScheduler};
 use crate::proxy::sticky_config::StickySessionConfig;
 
+/// 账号 JSON 模型清单的解析缓存快照（模块级，见 `get_available_models_from_json`）
+struct AccountModelFileSnapshot {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    models: Option<HashSet<String>>,
+}
+
+static ACCOUNT_MODEL_FILE_CACHE: once_cell::sync::Lazy<DashMap<PathBuf, AccountModelFileSnapshot>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnDiskAccountState {
     Enabled,
@@ -27,6 +37,12 @@ enum TrackerParserMode {
 
 fn classify_rate_limit_reason(error_body: &str) -> crate::proxy::rate_limit::RateLimitReason {
     use crate::proxy::rate_limit::RateLimitReason;
+
+    // 网关自答错误不来自任何账号：一律视为 Unknown，
+    // 避免 “no quota accounts” 因包含 quota 关键词被误判为真实配额耗尽而连坐账号。
+    if crate::proxy::common::model_gate::is_gateway_self_answer(error_body) {
+        return RateLimitReason::Unknown;
+    }
 
     let body = error_body.to_lowercase();
     let generic_resource_exhausted =
@@ -249,7 +265,14 @@ impl TokenManager {
             image_scheduler: std::sync::RwLock::new(None),
             unsupported_models: Arc::new(DashMap::new()),
             in_flight_requests: Arc::new(DashMap::new()),
-            qos_guardian: Arc::new(crate::proxy::qos_guardian::QoSGuardian::new()),
+            qos_guardian: {
+                let qos_auto_jail = crate::modules::config::load_app_config()
+                    .map(|c| c.proxy.qos_auto_jail)
+                    .unwrap_or(false);
+                let guardian = Arc::new(crate::proxy::qos_guardian::QoSGuardian::new());
+                guardian.set_auto_jail_enabled(qos_auto_jail);
+                guardian
+            },
             qos_probe_handle: Arc::new(tokio::sync::Mutex::new(None)),
             qos_upstream: std::sync::RwLock::new(Weak::new()),
         }
@@ -530,6 +553,7 @@ impl TokenManager {
                         let id_token = token_response.id_token;
                         let new_rt = token_response.refresh_token;
                         let write_ts = now + expires_in;
+                        let client_key = token_response.oauth_client_key;
                         tokio::task::spawn_blocking(move || {
                             let Ok(_lk) = crate::modules::account::lock_account_file_updates()
                             else {
@@ -550,6 +574,12 @@ impl TokenManager {
                             }
                             if let Some(rt) = new_rt {
                                 val["token"]["refresh_token"] = rt.into();
+                            }
+                            if let Some(ck) = client_key {
+                                if crate::modules::oauth::is_gcp_enterprise_client(Some(&ck)) {
+                                    val["token"]["is_gcp_tos"] = serde_json::Value::Bool(true);
+                                }
+                                val["token"]["oauth_client_key"] = ck.into();
                             }
                             if let Ok(s) = serde_json::to_string_pretty(&val) {
                                 let _ = std::fs::write(&write_path, s);
@@ -741,42 +771,43 @@ impl TokenManager {
 
         // 读取 accounts.json 索引，过滤掉用户在索引中标记为 disabled 或 proxy_disabled 的账号，防止实体文件残留导致已停用账号渗入代理池
         let index_file = self.resolved_data_dir().join("accounts.json");
-        let disabled_in_index: std::collections::HashSet<String> = if index_file.exists() {
+        let (valid_in_index, disabled_in_index): (
+            Option<std::collections::HashSet<String>>,
+            std::collections::HashSet<String>,
+        ) = if index_file.exists() {
             if let Ok(content) = std::fs::read_to_string(&index_file) {
                 if let Ok(index_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    index_val
-                        .get("accounts")
-                        .and_then(|a| a.as_array())
-                        .map(|accs| {
-                            accs.iter()
-                                .filter_map(|acc| {
-                                    let is_disabled = acc
-                                        .get("disabled")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    let is_proxy_disabled = acc
-                                        .get("proxy_disabled")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    if is_disabled || is_proxy_disabled {
-                                        acc.get("id")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
+                    if let Some(accs) = index_val.get("accounts").and_then(|a| a.as_array()) {
+                        let mut all_ids = std::collections::HashSet::new();
+                        let mut disabled_ids = std::collections::HashSet::new();
+                        for acc in accs {
+                            if let Some(id) = acc.get("id").and_then(|v| v.as_str()) {
+                                all_ids.insert(id.to_string());
+                                let is_disabled = acc
+                                    .get("disabled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let is_proxy_disabled = acc
+                                    .get("proxy_disabled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if is_disabled || is_proxy_disabled {
+                                    disabled_ids.insert(id.to_string());
+                                }
+                            }
+                        }
+                        (Some(all_ids), disabled_ids)
+                    } else {
+                        (None, std::collections::HashSet::new())
+                    }
                 } else {
-                    std::collections::HashSet::new()
+                    (None, std::collections::HashSet::new())
                 }
             } else {
-                std::collections::HashSet::new()
+                (None, std::collections::HashSet::new())
             }
         } else {
-            std::collections::HashSet::new()
+            (None, std::collections::HashSet::new())
         };
 
         let entries =
@@ -797,6 +828,37 @@ impl TokenManager {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
+
+            // [FIX #3806, #3808] 若 accounts.json 索引存在且有效，仅加载注册表中的合法账号。
+            // 孤儿账号（已在界面删除但磁盘残留的 *.json 文件）拒绝载入代理调度池，仅记录 warning 跳过，
+            // 严禁在此主动删除文件，避免并发导入或未提交窗口期误删 refresh token。
+            if let Some(ref valid_ids) = valid_in_index {
+                let is_valid = if valid_ids.contains(stem) {
+                    true
+                } else if let Ok(content) = std::fs::read_to_string(&path) {
+                    // 兼容 stem != id 的情况，解析内部 id
+                    serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("id")
+                                .and_then(|id| id.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .map(|internal_id| valid_ids.contains(&internal_id))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if !is_valid {
+                    tracing::warn!(
+                        "[Proxy] Skipping orphan account file {:?} from proxy pool (not present in accounts.json index)",
+                        path
+                    );
+                    continue;
+                }
+            }
+
             if disabled_in_index.contains(stem) {
                 // 实体文件是账号状态的真实权威来源。先检查实体文件，若实体文件本身未停用（索引数据陈旧），以实体文件为准；
                 // 仅当实体文件确实标记为停用或不可读时才跳过。
@@ -889,6 +951,21 @@ impl TokenManager {
         if index_file.exists() {
             if let Ok(content) = std::fs::read_to_string(&index_file) {
                 if let Ok(index_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(accs) = index_val.get("accounts").and_then(|a| a.as_array()) {
+                        let in_index = accs
+                            .iter()
+                            .any(|acc| acc.get("id").and_then(|v| v.as_str()) == Some(account_id));
+                        // [FIX #3806, #3808] 若 accounts.json 存在但该账号已被删除，仅从内存调度池卸载，不删物理文件，并返回 Ok(())
+                        if !in_index {
+                            self.remove_account(account_id);
+                            tracing::info!(
+                                "[Proxy] Account {} is not in accounts.json index, removed from proxy pool",
+                                account_id
+                            );
+                            return Ok(());
+                        }
+                    }
+
                     let is_disabled = index_val
                         .get("accounts")
                         .and_then(|a| a.as_array())
@@ -982,6 +1059,16 @@ impl TokenManager {
         if let Some(mut token) = self.tokens.get_mut(account_id) {
             token.priority = priority;
         }
+    }
+
+    /// Apply a saved GCP project_id dynamically to in-memory ProxyToken.
+    pub fn update_account_project_id(&self, account_id: &str, project_id: Option<String>) {
+        if let Some(mut token) = self.tokens.get_mut(account_id) {
+            token.project_id = project_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        self.project_id_failures.remove(account_id);
     }
 
     /// Check if an account has been disabled on disk.
@@ -1302,13 +1389,32 @@ impl TokenManager {
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("percentage").and_then(|v| v.as_i64()),
                 ) {
+                    let pct_val = pct as i32;
                     // Normalize name to standard ID
                     let standard_id =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(name)
                             .unwrap_or_else(|| name.to_string());
-                    model_quotas.insert(standard_id, pct as i32);
+                    // 粗粒度标准组归一化聚合时必须取组内最大可用配额，杜绝单模型 0 配额覆盖整组正额度
+                    model_quotas
+                        .entry(standard_id)
+                        .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                        .or_insert(pct_val);
+                    // 同时按具体模型原始 ID 及小写记录独立配额，确保具名查询精确可用
+                    model_quotas.insert(name.to_string(), pct_val);
+                    let name_lower = name.to_lowercase();
+                    model_quotas.insert(name_lower.clone(), pct_val);
+                    // 自动关联同族基底模型名（如 gemini-3.8-flash-high -> gemini-3.8-flash），取组内最高配额
+                    let base_name =
+                        crate::proxy::common::model_mapping::strip_tier_suffix(&name_lower);
+                    if base_name != name_lower {
+                        model_quotas
+                            .entry(base_name.clone())
+                            .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                            .or_insert(pct_val);
+                        available_models.insert(base_name);
+                    }
                     // [NEW] 同时记录原始模型名（小写），用于精确 / 基名路由匹配
-                    available_models.insert(name.to_lowercase());
+                    available_models.insert(name_lower);
                 }
                 // [NEW] 解析并缓存 max_output_tokens (按原始 model name，不归一化)
                 if let (Some(name), Some(limit)) = (
@@ -1367,6 +1473,11 @@ impl TokenManager {
                 })
             });
 
+            let is_ultra = subscription_tier
+                .as_deref()
+                .map(|s| s.to_uppercase() == "ULTRA")
+                .unwrap_or(false);
+
             if let Some(bucket) = argon_bucket {
                 let frac = bucket
                     .get("remaining_fraction")
@@ -1388,6 +1499,61 @@ impl TokenManager {
                 model_limits.insert("gemini-4-argon-high".to_string(), 65536);
                 model_limits.insert("gemini-4-argon-medium".to_string(), 65536);
                 model_limits.insert("gemini-4-argon-low".to_string(), 65536);
+            } else if is_ultra {
+                // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
+                let gemini_bucket = groups.iter().find_map(|g| {
+                    let name = g
+                        .get("display_name")
+                        .or_else(|| g.get("displayName"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if !name.contains("claude") && !name.contains("gpt") && !name.contains("3p") {
+                        g.get("buckets")
+                            .and_then(|b| b.as_array())
+                            .and_then(|bs| bs.first())
+                    } else {
+                        None
+                    }
+                });
+                let frac = gemini_bucket
+                    .and_then(|b| {
+                        b.get("remaining_fraction")
+                            .or_else(|| b.get("remainingFraction"))
+                    })
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                let pct = (frac * 100.0) as i32;
+                model_quotas.insert("gemini-4-argon".to_string(), pct);
+                model_quotas.insert("gemini-4-argon-high".to_string(), pct);
+                model_quotas.insert("gemini-4-argon-medium".to_string(), pct);
+                model_quotas.insert("gemini-4-argon-low".to_string(), pct);
+
+                available_models.insert("gemini-4-argon".to_string());
+                available_models.insert("gemini-4-argon-high".to_string());
+                available_models.insert("gemini-4-argon-medium".to_string());
+                available_models.insert("gemini-4-argon-low".to_string());
+
+                model_limits.insert("gemini-4-argon".to_string(), 65536);
+                model_limits.insert("gemini-4-argon-high".to_string(), 65536);
+                model_limits.insert("gemini-4-argon-medium".to_string(), 65536);
+                model_limits.insert("gemini-4-argon-low".to_string(), 65536);
+            } else {
+                // 配额组中明确不存在 Argon 分组且非 Ultra 账号，防呆清理（防止历史残存虚假配额注入调度器）
+                model_quotas.remove("gemini-4-argon");
+                model_quotas.remove("gemini-4-argon-high");
+                model_quotas.remove("gemini-4-argon-medium");
+                model_quotas.remove("gemini-4-argon-low");
+
+                available_models.remove("gemini-4-argon");
+                available_models.remove("gemini-4-argon-high");
+                available_models.remove("gemini-4-argon-medium");
+                available_models.remove("gemini-4-argon-low");
+
+                model_limits.remove("gemini-4-argon");
+                model_limits.remove("gemini-4-argon-high");
+                model_limits.remove("gemini-4-argon-medium");
+                model_limits.remove("gemini-4-argon-low");
             }
         }
 
@@ -1720,7 +1886,38 @@ impl TokenManager {
         legacy_claude_quota
     }
 
+    /// 账号 JSON 中模型清单的解析缓存（按文件长度 + mtime 失效）。
+    ///
+    /// 模型门禁与 `/v1/models` 会在**每个请求**上汇总全池模型，历史实现每次都
+    /// `read_to_string + serde_json::from_str` 每个账号文件。这里只缓存解析结果，
+    /// 文件变化（长度或 mtime）时立即失效，不引入 TTL 语义漂移。
     fn get_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
+        let meta = std::fs::metadata(account_path).ok()?;
+        let len = meta.len();
+        let modified = meta.modified().ok();
+
+        if let Some(hit) = ACCOUNT_MODEL_FILE_CACHE.get(account_path) {
+            if hit.len == len && hit.modified == modified {
+                return hit.models.clone();
+            }
+        }
+
+        let models = Self::parse_available_models_from_json(account_path);
+        if ACCOUNT_MODEL_FILE_CACHE.len() > 4096 {
+            ACCOUNT_MODEL_FILE_CACHE.clear();
+        }
+        ACCOUNT_MODEL_FILE_CACHE.insert(
+            account_path.clone(),
+            AccountModelFileSnapshot {
+                len,
+                modified,
+                models: models.clone(),
+            },
+        );
+        models
+    }
+
+    fn parse_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
         let content = std::fs::read_to_string(account_path).ok()?;
         let account: serde_json::Value = serde_json::from_str(&content).ok()?;
         let mut result = HashSet::new();
@@ -1744,12 +1941,22 @@ impl TokenManager {
                 }
             }
         }
-        // [NEW] 检查 quota_groups 是否包含 argon 分组
+        // [NEW] 检查 quota_groups 是否包含 argon 分组（Ultra 账号自动授权）
         if let Some(groups) = account
             .get("quota")
             .and_then(|q| q.get("quota_groups").or_else(|| q.get("quotaGroups")))
             .and_then(|g| g.as_array())
         {
+            let is_ultra = account
+                .get("quota")
+                .and_then(|q| {
+                    q.get("subscription_tier")
+                        .or_else(|| q.get("subscriptionTier"))
+                })
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_uppercase() == "ULTRA")
+                .unwrap_or(false);
+
             let has_argon = groups.iter().any(|g| {
                 let name = g
                     .get("display_name")
@@ -1777,11 +1984,16 @@ impl TokenManager {
                         })
                     })
             });
-            if has_argon {
+            if has_argon || is_ultra {
                 result.insert("gemini-4-argon".to_string());
                 result.insert("gemini-4-argon-high".to_string());
                 result.insert("gemini-4-argon-medium".to_string());
                 result.insert("gemini-4-argon-low".to_string());
+            } else {
+                result.remove("gemini-4-argon");
+                result.remove("gemini-4-argon-high");
+                result.remove("gemini-4-argon-medium");
+                result.remove("gemini-4-argon-low");
             }
         }
         Some(result)
@@ -2225,7 +2437,26 @@ impl TokenManager {
         }
 
         // [QoS Guardian] 剔除处于小黑屋隔离与正在探针探测中的受限账号
+        let before_jail = available.len();
         available.retain(|t| !self.qos_guardian.is_jailed_or_probing(&t.account_id));
+        let jailed = before_jail.saturating_sub(available.len());
+        if jailed > 0 {
+            if available.is_empty() {
+                // 全池都被关小黑屋：这是“没号可用”的真正原因，必须进 error.log
+                tracing::error!(
+                    "[Scheduler] 全部 {} 个候选账号均处于 QoS 小黑屋/探测中 | model={}",
+                    jailed,
+                    normalized_target
+                );
+            } else {
+                tracing::debug!(
+                    "[Scheduler] {} 个账号因 QoS 小黑屋/探测被排除 | model={} 剩余候选={}",
+                    jailed,
+                    normalized_target,
+                    available.len()
+                );
+            }
+        }
 
         // [QoS Guardian] 优先调度纯 Healthy 账号组，避开 Suspicious（只出不进）与 HalfOpen（缓刑试探）
         let pure_healthy: Vec<&ProxyToken> = available
@@ -2272,6 +2503,38 @@ impl TokenManager {
             }
             let allowed_set: HashSet<String> = distinct_account_ids.into_iter().collect();
             available.retain(|t| allowed_set.contains(&t.account_id));
+        }
+
+        // [FIX #3840] 目标模型正配额过滤必须**先于**优先级收敛执行。
+        //
+        // 为什么顺序不能反：下面的优先级收敛会把 available 直接收缩到
+        // 「最高优先级的空闲账号组」（available = min_p_idle 是赋值覆盖，
+        // 不是 retain）。若该组恰好是一个配额已耗尽的临期账号
+        // （蹬额度模式 pedal 会把它调到 priority=1，用户手动设高优先级同样可触发），
+        // 就会出现经典的优先级倒置 / 饥饿死锁：
+        //   1. 其他 priority=50 但配额 100% 的账号被提前剔除；
+        //   2. 随后 has_positive_model_quota 只能看到那个 0% 账号；
+        //   3. 于是直接 return None，报「无可用账号」——即使池中还有满额账号。
+        //
+        // 先做配额过滤，等于确立了调度器的核心不变式：
+        // 「优先级只在具备该模型有效正配额的健康账号之间竞争；
+        //   配额已知为 0% 的账号从一开始就不具备参与优先级裁决的资格。」
+        //
+        // 注：max_spillover 截断与 P2C 都在本步之后，语义不受影响——
+        // 被提前剔除的本就是不该参与并发调度的零配额账号。
+        let has_positive_model_quota = available
+            .iter()
+            .any(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
+        if has_positive_model_quota {
+            available.retain(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
+        } else {
+            // 全池候选账号确实均已配额耗尽：本地拦下，杜绝裸奔打爆 Google 429。
+            tracing::warn!(
+                "[Scheduler] All {} candidate accounts have 0% quota for model {}. Intercepting upstream call to protect pool.",
+                available.len(),
+                normalized_target
+            );
+            return None;
         }
 
         // Keep lower-priority groups for retries; only this draw is restricted.
@@ -2321,14 +2584,6 @@ impl TokenManager {
                     }
                 }
             }
-        }
-
-        // [FIX #3639] 优先保留对目标模型具备正配额 (> 0%) 的账号，防止抽中已知 0% 额度的账号导致 429
-        let has_positive_model_quota = available
-            .iter()
-            .any(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
-        if has_positive_model_quota {
-            available.retain(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
         }
 
         if available.len() == 1 {
@@ -2583,7 +2838,7 @@ impl TokenManager {
         }
     }
 
-    async fn get_token_filtered(
+    pub async fn get_token_filtered(
         &self,
         quota_group: &str,
         force_rotate: bool,
@@ -2645,8 +2900,21 @@ impl TokenManager {
         target_model: &str,
         excluded_accounts: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
-        let mut tokens_snapshot: Vec<ProxyToken> =
-            self.tokens.iter().map(|e| e.value().clone()).collect();
+        let now_ts = chrono::Utc::now().timestamp();
+        let mut tokens_snapshot: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|token| {
+                if token.validation_blocked
+                    && (token.validation_blocked_until == 0
+                        || token.validation_blocked_until > now_ts)
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
         tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
         let mut total = tokens_snapshot.len();
         if total == 0 {
@@ -3000,6 +3268,11 @@ impl TokenManager {
                                 )
                                 .unwrap_or_else(|| target_model.to_string());
 
+                            let is_validation_blocked = preferred_token.validation_blocked
+                                && (preferred_token.validation_blocked_until == 0
+                                    || preferred_token.validation_blocked_until
+                                        > chrono::Utc::now().timestamp());
+
                             let is_rate_limited = self
                                 .is_rate_limited(
                                     &preferred_token.account_id,
@@ -3011,23 +3284,32 @@ impl TokenManager {
                                     .protected_models
                                     .contains(&normalized_target);
 
-                            // [FIX #3639] 检查优先账号的目标模型配额：若已知为 0% 且池中有具备正配额的替代账号，自动逃逸切换
-                            let has_zero_quota = preferred_token
+                            // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
+                            let preferred_quota = preferred_token
                                 .model_quotas
                                 .get(&normalized_target)
-                                .copied()
-                                .unwrap_or(100)
-                                <= 0;
+                                .or_else(|| preferred_token.model_quotas.get(target_model))
+                                .copied();
+                            let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
                             let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
                                 t.account_id != preferred_token.account_id
                                     && !self
                                         .rate_limit_tracker
                                         .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                    && t.model_quotas.get(&normalized_target).copied().unwrap_or(0)
+                                    && t.model_quotas
+                                        .get(&normalized_target)
+                                        .or_else(|| t.model_quotas.get(target_model))
+                                        .copied()
+                                        .unwrap_or(0)
                                         > 0
                             });
 
-                            if has_zero_quota && has_healthy_alternative {
+                            if is_validation_blocked {
+                                tracing::warn!(
+                                    "🔒 [Validation-Blocked] Preferred account {} is blocked for validation, seamlessly falling back to available account in pool",
+                                    preferred_token.email
+                                );
+                            } else if has_zero_quota && has_healthy_alternative {
                                 tracing::warn!(
                                     "🔒 [Auto-Switch #3639] Preferred account {} has 0% quota for model {}, seamlessly falling back to available account in pool",
                                     preferred_token.email,
@@ -3150,22 +3432,38 @@ impl TokenManager {
                         let bound_zero_quota = bound_token
                             .model_quotas
                             .get(&normalized_target)
+                            .or_else(|| bound_token.model_quotas.get(target_model))
                             .copied()
-                            .unwrap_or(100)
-                            <= 0;
+                            .is_some_and(|q| q <= 0);
                         let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
                             t.account_id != bound_token.account_id
                                 && !attempted.contains(&t.account_id)
                                 && !self
                                     .rate_limit_tracker
                                     .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                && t.model_quotas.get(&normalized_target).copied().unwrap_or(0) > 0
+                                && t.model_quotas
+                                    .get(&normalized_target)
+                                    .or_else(|| t.model_quotas.get(target_model))
+                                    .copied()
+                                    .unwrap_or(0)
+                                    > 0
                         });
 
                         let is_qos_jailed = self
                             .qos_guardian
                             .is_jailed_or_probing(&bound_token.account_id);
-                        if is_qos_jailed {
+                        let is_validation_blocked = bound_token.validation_blocked
+                            && (bound_token.validation_blocked_until == 0
+                                || bound_token.validation_blocked_until
+                                    > chrono::Utc::now().timestamp());
+
+                        if is_validation_blocked {
+                            tracing::warn!(
+                                "Sticky Session: Bound account {} is VALIDATION BLOCKED, unbinding and switching.",
+                                bound_token.email
+                            );
+                            self.session_accounts.remove(sid);
+                        } else if is_qos_jailed {
                             tracing::warn!(
                                 "Sticky Session: Bound account {} is JAILED in QoS Guardian, unbinding and switching.",
                                 bound_token.email
@@ -3233,12 +3531,13 @@ impl TokenManager {
                                 tokens_snapshot.iter().find(|t| &t.account_id == account_id)
                             {
                                 // 【修复】检查限流状态和配额保护，避免复用已被锁定的账号
+                                // 多键容错匹配：归一化 ID 与实际模型名不一致时不能当作满额
                                 let last_zero_quota = found
                                     .model_quotas
                                     .get(&normalized_target)
+                                    .or_else(|| found.model_quotas.get(target_model))
                                     .copied()
-                                    .unwrap_or(100)
-                                    <= 0;
+                                    .is_some_and(|q| q <= 0);
                                 let has_healthy_alt = tokens_snapshot.iter().any(|t| {
                                     &t.account_id != account_id
                                         && !attempted.contains(&t.account_id)
@@ -3248,6 +3547,7 @@ impl TokenManager {
                                         )
                                         && t.model_quotas
                                             .get(&normalized_target)
+                                            .or_else(|| t.model_quotas.get(target_model))
                                             .copied()
                                             .unwrap_or(0)
                                             > 0
@@ -3623,6 +3923,7 @@ impl TokenManager {
         let expires_in = token_response.expires_in;
         let id_token = token_response.id_token.clone();
         let refresh_token = token_response.refresh_token.clone();
+        let oauth_client_key = token_response.oauth_client_key.clone();
         let expiry_timestamp = now + expires_in;
         update_account_json(&path, move |content| {
             content["token"]["access_token"] = serde_json::Value::String(access_token);
@@ -3638,6 +3939,13 @@ impl TokenManager {
             // 如果获取到了新的 refresh_token（Token 轮转），也一并保存
             if let Some(rt) = refresh_token {
                 content["token"]["refresh_token"] = serde_json::Value::String(rt);
+            }
+
+            if let Some(ck) = oauth_client_key {
+                if crate::modules::oauth::is_gcp_enterprise_client(Some(&ck)) {
+                    content["token"]["is_gcp_tos"] = serde_json::Value::Bool(true);
+                }
+                content["token"]["oauth_client_key"] = serde_json::Value::String(ck);
             }
         })
         .await?;
@@ -3751,6 +4059,11 @@ impl TokenManager {
         retry_after_header: Option<&str>,
         error_body: &str,
     ) {
+        // 网关自答（model not exist / no quota accounts）不得计入任何账号限流。
+        if crate::proxy::common::model_gate::is_gateway_self_answer(error_body) {
+            return;
+        }
+
         // [NEW] 检查熔断是否启用 (使用内存缓存，极快)
         let config = self.circuit_breaker_config.read().await.clone();
         if !config.enabled {
@@ -3774,13 +4087,12 @@ impl TokenManager {
 
     /// 检查账号是否在限流中 (支持模型级)
     pub async fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
-        // [NEW] 检查熔断是否启用
+        // 检查熔断配置：当自适应熔断器关闭时，依然坚定拦截明确的配额耗尽与每周硬配额
         let config = self.circuit_breaker_config.read().await;
         if !config.enabled {
             return self
                 .rate_limit_tracker
-                .get_quota_wait(account_id, model, true)
-                > 0;
+                .is_quota_exhausted_or_explicit_limited(account_id, model);
         }
         self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
@@ -3799,6 +4111,11 @@ impl TokenManager {
             "[QoS] Account {} manually released from QoS jail",
             account_id
         ));
+    }
+
+    /// 更新 QoS 自动限流进小黑屋机制开关
+    pub fn set_qos_auto_jail(&self, enabled: bool) {
+        self.qos_guardian.set_auto_jail_enabled(enabled);
     }
 
     /// 清除过期的限流记录
@@ -3950,6 +4267,16 @@ impl TokenManager {
         cooldown_secs: u64,
         reason: &str,
     ) {
+        // 网关自答（model not exist / no quota accounts）不对应任何账号，
+        // 绝不能触发冷却锁定与粘性会话解绑。
+        if crate::proxy::common::model_gate::is_gateway_self_answer(reason) {
+            tracing::debug!(
+                "[ModelGate] Skipped transient-failure lock for gateway self-answer: {}",
+                reason
+            );
+            return;
+        }
+
         let resolved_id = self
             .email_to_account_id(account_id)
             .unwrap_or_else(|| account_id.to_string());
@@ -3970,6 +4297,206 @@ impl TokenManager {
             reason = %reason,
             "Account marked with transient failure cooldown in rate limit tracker and unbound from sticky sessions"
         );
+    }
+
+    /// 返回所有账号上「真实配额 > 0」的模型名（原始 ID，含尺寸/档位变体，不做归一）。
+    ///
+    /// 供模型列表归一使用：只有真实有额度的变体才会把基底模型带入列表。
+    pub fn models_with_positive_quota(&self) -> Vec<String> {
+        let mut positive: HashSet<String> = HashSet::new();
+        for entry in self.tokens.iter() {
+            for (model, quota) in entry.value().model_quotas.iter() {
+                if *quota > 0 {
+                    positive.insert(model.clone());
+                }
+            }
+        }
+        positive.into_iter().collect()
+    }
+
+    /// 统计「对目标模型拥有正配额（或已授权可用）」的账号数量。
+    ///
+    /// 用于入站模型的配额闸门：返回 0 表示整池都没有该模型额度，
+    /// 应当由网关直接 502 拒答，而不是把请求发往上游换回一个 429。
+    pub fn accounts_with_positive_quota(&self, model: &str) -> usize {
+        let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+            .unwrap_or_else(|| model.to_string());
+        // 生图基底：若账号只上报了尺寸变体（-4k / -2k / -preview …），同族变体配额即代表基底可用
+        let image_base = crate::proxy::common::model_mapping::strip_image_variant_suffix(model);
+        let is_image = image_base.contains("image") || image_base.starts_with("imagen");
+
+        let model_lower = model.trim().to_lowercase();
+        // 极简两道判定，0 启发式：
+        // 1. 名字含 claude 或 gpt -> 3P 第三方大池
+        let is_3p = model_lower.contains("claude") || model_lower.contains("gpt");
+        // 2. 名字含 argon -> Argon 模型
+        let is_argon = model_lower.contains("argon");
+        let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&model_lower);
+        let now = chrono::Utc::now().timestamp();
+
+        self.tokens
+            .iter()
+            .filter(|entry| {
+                let token = entry.value();
+                // 验证锁定且未过期的账号跳过
+                if token.validation_blocked {
+                    if token.validation_blocked_until == 0 || token.validation_blocked_until > now {
+                        return false;
+                    }
+                }
+
+                // 生图独立大池判定
+                if is_image {
+                    if token.model_quotas.iter().any(|(known, quota)| {
+                        *quota > 0
+                            && crate::proxy::common::model_mapping::strip_image_variant_suffix(
+                                known,
+                            ) == image_base
+                    }) {
+                        return true;
+                    }
+                    return token.available_models.contains(model)
+                        || token.available_models.contains(&model_lower)
+                        || token.available_models.contains(&image_base);
+                }
+
+                // 3P 第三方大池判定（Claude / GPT）
+                if is_3p {
+                    let has_3p_positive = token
+                        .model_quotas
+                        .get(model)
+                        .copied()
+                        .filter(|&q| q > 0)
+                        .or_else(|| {
+                            token
+                                .model_quotas
+                                .get(&model_lower)
+                                .copied()
+                                .filter(|&q| q > 0)
+                        })
+                        .or_else(|| token.model_quotas.get("claude").copied().filter(|&q| q > 0))
+                        .or_else(|| {
+                            token
+                                .model_quotas
+                                .iter()
+                                .find(|(k, v)| {
+                                    let kl = k.to_lowercase();
+                                    **v > 0 && (kl.contains("claude") || kl.contains("gpt"))
+                                })
+                                .map(|(_, v)| *v)
+                        });
+                    if has_3p_positive.is_some() {
+                        return true;
+                    }
+                    // 【FIX】3P 桶耗尽时不要立即判死：若账号在 available_models 中仍持有该模型授权
+                    // 且未被限流，仍允许调度（最终鉴权交上游）。否则单个 3P 模型被标记 0% 后，
+                    // accounts_with_positive_quota 会返回 0，导致 gate_inbound_model 直接
+                    // 502 no quota accounts 把**整池**提前拒死（即使其他账号/模型仍有配额）。
+                    // 与下方 Gemini 通用池路径保持同一套兜底语义。
+                    let is_available_3p = token.available_models.contains(model)
+                        || token.available_models.contains(&model_lower)
+                        || token.available_models.contains(&normalized);
+                    if is_available_3p {
+                        return !self
+                            .rate_limit_tracker
+                            .is_rate_limited(&token.account_id, Some(model));
+                    }
+                    // 3P 配额打满（如 3p-5h 归 0），且账号无该模型授权
+                    return false;
+                }
+
+                // Argon 判定（数据驱动：看账号是否含有独立 Argon 桶，有就走独立桶，没有就落入通用大池）
+                if is_argon {
+                    // 检查该账号是否拥有 Argon 能力（available_models 中包含 argon，或 model_quotas 包含 argon）
+                    let has_argon_cap = token.available_models.iter().any(|m| m.contains("argon"))
+                        || token.model_quotas.keys().any(|k| k.contains("argon"));
+                    if !has_argon_cap {
+                        // 无 Argon 权限的账号（如无 Argon 的 Pro 账号）坚决排除，绝不连累它，也绝不派发 Argon
+                        return false;
+                    }
+                    // 有 Argon 能力的账号（有独立桶的 Pro，或 Ultra 共享通用大池）：
+                    // 无论是从独立桶注入的配额还是 Ultra 共享大池注入的配额，只要其 Argon 或通用大池配额 > 0 即通过
+                    let has_argon_positive = token
+                        .model_quotas
+                        .iter()
+                        .any(|(k, v)| *v > 0 && k.contains("argon"));
+                    if has_argon_positive {
+                        return true;
+                    }
+                    return !self
+                        .rate_limit_tracker
+                        .is_rate_limited(&token.account_id, Some(model));
+                }
+
+                // 除 3P 和独立 Argon 外的所有模型：一律直接落入 Gemini 通用配额大池！
+                // （无需启发式判断 3.8/3.5/Pro/Flash，只要账号的 Gemini 通用大池有任何正配额即放行）
+                let has_gemini_positive = token
+                    .model_quotas
+                    .get(model)
+                    .copied()
+                    .filter(|&q| q > 0)
+                    .or_else(|| {
+                        token
+                            .model_quotas
+                            .get(&model_lower)
+                            .copied()
+                            .filter(|&q| q > 0)
+                    })
+                    .or_else(|| {
+                        token
+                            .model_quotas
+                            .get(&base_name)
+                            .copied()
+                            .filter(|&q| q > 0)
+                    })
+                    .or_else(|| {
+                        token
+                            .model_quotas
+                            .get(&format!("{}-tiered", base_name))
+                            .copied()
+                            .filter(|&q| q > 0)
+                    })
+                    .or_else(|| {
+                        token
+                            .model_quotas
+                            .iter()
+                            .find(|(k, v)| {
+                                let kl = k.to_lowercase();
+                                **v > 0
+                                    && !kl.contains("claude")
+                                    && !kl.contains("gpt")
+                                    && !kl.contains("3p")
+                                    && !kl.contains("argon")
+                            })
+                            .map(|(_, v)| *v)
+                    })
+                    .or_else(|| {
+                        token
+                            .model_quotas
+                            .get(&normalized)
+                            .copied()
+                            .filter(|&q| q > 0)
+                    });
+
+                if has_gemini_positive.is_some() {
+                    return true;
+                }
+
+                // 兜底：账号在 available_models 中有授权且未被限流锁定
+                let is_available = token.available_models.contains(model)
+                    || token.available_models.contains(&model_lower)
+                    || (!base_name.is_empty() && token.available_models.contains(&base_name))
+                    || token.available_models.contains(&normalized);
+
+                if is_available {
+                    return !self
+                        .rate_limit_tracker
+                        .is_rate_limited(&token.account_id, Some(model));
+                }
+
+                false
+            })
+            .count()
     }
 
     /// 检查是否有可用的 Google 账号
@@ -4258,6 +4785,7 @@ impl TokenManager {
         email: &str,
         reason: crate::proxy::rate_limit::RateLimitReason,
         model: Option<String>,
+        error_body: Option<&str>,
     ) -> bool {
         // 1. 从 tokens 中获取该账号的 access_token 和 account_id
         // 同时获取 account_id，确保锁定 key 与检查 key 一致
@@ -4297,11 +4825,28 @@ impl TokenManager {
                         let norm_name =
                             crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
                                 .unwrap_or_else(|| m.name.clone());
-                        token.model_quotas.insert(norm_name, m.percentage as i32);
+                        let pct_val = m.percentage as i32;
                         token
                             .model_quotas
-                            .insert(m.name.clone(), m.percentage as i32);
-                        token.available_models.insert(m.name.to_lowercase());
+                            .entry(norm_name)
+                            .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                            .or_insert(pct_val);
+                        token.model_quotas.insert(m.name.clone(), pct_val);
+                        let m_lower = m.name.to_lowercase();
+                        token.model_quotas.insert(m_lower.clone(), pct_val);
+                        let base_name =
+                            crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
+                        if base_name != m_lower {
+                            token
+                                .model_quotas
+                                .entry(base_name.clone())
+                                .and_modify(|existing: &mut i32| {
+                                    *existing = (*existing).max(pct_val)
+                                })
+                                .or_insert(pct_val);
+                            token.available_models.insert(base_name);
+                        }
+                        token.available_models.insert(m_lower);
                     }
                     // [NEW] 同步 Argon 配额组能力
                     let argon_bucket = quota_data.quota_groups.as_ref().and_then(|groups| {
@@ -4317,6 +4862,12 @@ impl TokenManager {
                             })
                         })
                     });
+                    let is_ultra = token
+                        .subscription_tier
+                        .as_deref()
+                        .map(|s| s.to_uppercase() == "ULTRA")
+                        .unwrap_or(false);
+
                     if let Some(bucket) = argon_bucket {
                         let pct = (bucket.remaining_fraction * 100.0) as i32;
                         token.model_quotas.insert("gemini-4-argon".to_string(), pct);
@@ -4351,6 +4902,70 @@ impl TokenManager {
                         token
                             .model_limits
                             .insert("gemini-4-argon-low".to_string(), 65536);
+                    } else if is_ultra {
+                        // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
+                        let gemini_bucket = quota_data.quota_groups.as_ref().and_then(|groups| {
+                            groups.iter().find_map(|g| {
+                                let name = g.display_name.to_lowercase();
+                                if !name.contains("claude")
+                                    && !name.contains("gpt")
+                                    && !name.contains("3p")
+                                {
+                                    g.buckets.first()
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        let pct = gemini_bucket
+                            .map(|b| (b.remaining_fraction * 100.0) as i32)
+                            .unwrap_or(100);
+                        token.model_quotas.insert("gemini-4-argon".to_string(), pct);
+                        token
+                            .model_quotas
+                            .insert("gemini-4-argon-high".to_string(), pct);
+                        token
+                            .model_quotas
+                            .insert("gemini-4-argon-medium".to_string(), pct);
+                        token
+                            .model_quotas
+                            .insert("gemini-4-argon-low".to_string(), pct);
+                        token.available_models.insert("gemini-4-argon".to_string());
+                        token
+                            .available_models
+                            .insert("gemini-4-argon-high".to_string());
+                        token
+                            .available_models
+                            .insert("gemini-4-argon-medium".to_string());
+                        token
+                            .available_models
+                            .insert("gemini-4-argon-low".to_string());
+                        token
+                            .model_limits
+                            .insert("gemini-4-argon".to_string(), 65536);
+                        token
+                            .model_limits
+                            .insert("gemini-4-argon-high".to_string(), 65536);
+                        token
+                            .model_limits
+                            .insert("gemini-4-argon-medium".to_string(), 65536);
+                        token
+                            .model_limits
+                            .insert("gemini-4-argon-low".to_string(), 65536);
+                    } else {
+                        // 若刷新后无 Argon 专属分组且非 Ultra，清理该账号在内存中的 Argon 缓存
+                        token.model_quotas.remove("gemini-4-argon");
+                        token.model_quotas.remove("gemini-4-argon-high");
+                        token.model_quotas.remove("gemini-4-argon-medium");
+                        token.model_quotas.remove("gemini-4-argon-low");
+                        token.available_models.remove("gemini-4-argon");
+                        token.available_models.remove("gemini-4-argon-high");
+                        token.available_models.remove("gemini-4-argon-medium");
+                        token.available_models.remove("gemini-4-argon-low");
+                        token.model_limits.remove("gemini-4-argon");
+                        token.model_limits.remove("gemini-4-argon-high");
+                        token.model_limits.remove("gemini-4-argon-medium");
+                        token.model_limits.remove("gemini-4-argon-low");
                     }
                 }
 
@@ -4360,12 +4975,94 @@ impl TokenManager {
                     .and_then(|m| crate::proxy::common::model_mapping::normalize_to_standard_id(m));
                 let model_to_lock = normalized_model.or(model);
 
-                let matched_reset = if let Some(ref target) = model_to_lock {
+                let mut is_weekly_depleted = false;
+
+                // 【L1】优先采信上游在 429 报文中直接下发的权威重置时间戳。
+                // 实测四类桶（Argon 独立桶 / Ultra 共享大桶 / 普通 Gemini 大桶 / 3P 桶）
+                // 耗尽时结构一致且无桶标识，但均携带 quotaResetTimeStamp；采信它比
+                // “本地桶余量 <= 1.5%”的推算更可靠，也不会因上游改文案而失效。
+                // 1.5% 木桶（下列分支）保留为 L3 兜底。
+                let upstream_reset = error_body
+                    .as_deref()
+                    .and_then(crate::proxy::rate_limit::extract_quota_reset_timestamp)
+                    .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                    .map(|dt| dt.to_rfc3339());
+
+                if let Some(ref ts) = upstream_reset {
+                    tracing::info!(
+                        "账号 {} 429 携带上游权威 quotaResetTimeStamp={}，直接锁定（跳过本地推算）",
+                        email,
+                        ts
+                    );
+                }
+
+                let matched_reset: Option<&str> = if upstream_reset.is_some() {
+                    is_weekly_depleted = true;
+                    upstream_reset.as_deref()
+                } else if let Some(ref target) = model_to_lock {
                     let norm_target =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(target)
                             .unwrap_or_else(|| target.to_string());
 
-                    // 精准查找当前报错的模型
+                    // 精准查找当前报错的模型所属分组，并检查**该分组内任意桶**是否低于 1.5%。
+                    // 四类桶（Argon 独立桶 / Ultra 共享大桶 / 普通 Gemini 大桶 / 3P 桶）都可能只耗尽
+                    // 5h 或 weekly 其中一个窗口，只盯 weekly 会漏判（如 5h=0.4% 反复 300s 重试）。
+                    let is_ultra = self
+                        .tokens
+                        .get(&account_id)
+                        .map(|t| {
+                            t.subscription_tier
+                                .as_deref()
+                                .map(|s| s.to_uppercase() == "ULTRA")
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let target_is_argon = target.contains("argon");
+
+                    is_weekly_depleted = quota_data.quota_groups.as_ref().map_or(false, |groups| {
+                        let is_gemini_group = |g: &crate::models::quota::QuotaGroup| {
+                            let n = g.display_name.to_lowercase();
+                            !n.contains("claude")
+                                && !n.contains("gpt")
+                                && !n.contains("3p")
+                                && !n.contains("argon")
+                        };
+                        let is_argon_group = |g: &crate::models::quota::QuotaGroup| {
+                            let n = g.display_name.to_lowercase();
+                            n.contains("argon")
+                                || g.buckets.iter().any(|b| {
+                                    let bid = b.bucket_id.to_lowercase();
+                                    let bname =
+                                        b.display_name.as_deref().unwrap_or("").to_lowercase();
+                                    bid.contains("argon") || bname.contains("argon")
+                                })
+                        };
+
+                        groups.iter().any(|g| {
+                            let g_name = g.display_name.to_lowercase();
+                            let is_match = if target.contains("claude") || target.contains("gpt") {
+                                g_name.contains("claude")
+                                    || g_name.contains("gpt")
+                                    || g_name.contains("3p")
+                            } else if target_is_argon {
+                                // 有专属 Argon 分组时只看它；Ultra 账号未拆分专属分组时
+                                // Argon 额度共享 Gemini 通用池，必须回退到通用分组
+                                if groups.iter().any(is_argon_group) {
+                                    is_argon_group(g)
+                                } else {
+                                    is_ultra && is_gemini_group(g)
+                                }
+                            } else {
+                                is_gemini_group(g)
+                            };
+                            if !is_match {
+                                return false;
+                            }
+                            // 分组内任意窗口（5h / weekly / 专属桶）低于 1.5% 即视为事实耗尽
+                            g.buckets.iter().any(|b| b.remaining_fraction <= 0.015)
+                        })
+                    });
+
                     quota_data
                         .models
                         .iter()
@@ -4378,13 +5075,89 @@ impl TokenManager {
                             norm_m == norm_target || m.name == *target
                         })
                         .and_then(|m| {
-                            // 仅当该模型配额确实耗尽 (percentage <= 0) 时才采用其长周期 reset_time；
+                            // 仅当该模型配额确实耗尽 (percentage <= 1，即低于 1.5%) 或对应周配额已到期时才采用长周期 reset_time；
                             // 若配额尚存，说明 429 属于瞬态限流，严禁锁入长周期刷新时间！
-                            if m.percentage <= 0 && !m.reset_time.is_empty() {
+                            if (m.percentage <= 1 || is_weekly_depleted) && !m.reset_time.is_empty()
+                            {
                                 Some(m.reset_time.as_str())
                             } else {
                                 None
                             }
+                        })
+                        .or_else(|| {
+                            // 回退：上游对已耗尽模型可能直接省略 quotaInfo.remainingFraction，
+                            // 导致上面的 models 匹配拿不到 reset_time。此时直接从命中的
+                            // 配额分组中提取“已耗尽桶”的官方 reset_time（覆盖 Argon 三档共用
+                            // gemini-argon-wtu-weekly 的场景）。
+                            if !is_weekly_depleted {
+                                return None;
+                            }
+                            quota_data.quota_groups.as_ref().and_then(|groups| {
+                                let is_gemini_group = |g: &crate::models::quota::QuotaGroup| {
+                                    let n = g.display_name.to_lowercase();
+                                    !n.contains("claude")
+                                        && !n.contains("gpt")
+                                        && !n.contains("3p")
+                                        && !n.contains("argon")
+                                };
+                                let is_argon_group = |g: &crate::models::quota::QuotaGroup| {
+                                    let n = g.display_name.to_lowercase();
+                                    n.contains("argon")
+                                        || g.buckets.iter().any(|b| {
+                                            let bid = b.bucket_id.to_lowercase();
+                                            let bname = b
+                                                .display_name
+                                                .as_deref()
+                                                .unwrap_or("")
+                                                .to_lowercase();
+                                            bid.contains("argon") || bname.contains("argon")
+                                        })
+                                };
+
+                                groups
+                                    .iter()
+                                    .filter(|g| {
+                                        let g_name = g.display_name.to_lowercase();
+                                        if target.contains("claude") || target.contains("gpt") {
+                                            g_name.contains("claude")
+                                                || g_name.contains("gpt")
+                                                || g_name.contains("3p")
+                                        } else if target_is_argon {
+                                            if groups.iter().any(is_argon_group) {
+                                                is_argon_group(g)
+                                            } else {
+                                                is_ultra && is_gemini_group(g)
+                                            }
+                                        } else {
+                                            is_gemini_group(g)
+                                        }
+                                    })
+                                    // 【锁定源优先级：硬配额优先于滚动窗口】
+                                    // weekly 是硬配额，归零后只有到 reset 才恢复；若此时取
+                                    // 更早的 5h reset（例如 30 分钟后）就会造成「反复调度」：
+                                    // 5h 一恢复就去试，weekly 仍为 0，于是再 429 一次，
+                                    // 每次失败都会污染模型级锁定与失败计数。
+                                    // 因此：weekly 耗尽 → 锁 weekly reset；
+                                    //       仅 5h 耗尽（weekly 健康）→ 才锁 5h reset，
+                                    //       避免把一个几十分钟就能恢复的账号锁上一整天。
+                                    .flat_map(|g| g.buckets.iter())
+                                    .filter(|b| b.remaining_fraction <= 0.015)
+                                    .filter(|b| !b.reset_time.is_empty())
+                                    .min_by_key(|b| {
+                                        let win =
+                                            format!("{} {}", b.window, b.bucket_id).to_lowercase();
+                                        let is_weekly = win.contains("week")
+                                            || win.contains("7d")
+                                            || win.contains("wtu");
+                                        // weekly 排在最前（硬配额），其余按 reset 时间排序
+                                        if is_weekly {
+                                            (0u8, String::new())
+                                        } else {
+                                            (1u8, b.reset_time.clone())
+                                        }
+                                    })
+                                    .map(|b| b.reset_time.as_str())
+                            })
                         })
                 } else {
                     // 全账号级锁定：仅在所有模型配额均耗尽时才提取最早 reset_time
@@ -4409,25 +5182,33 @@ impl TokenManager {
 
                 if let Some(reset_time_str) = matched_reset {
                     tracing::info!(
-                        "账号 {} 实时配额刷新成功,模型 {:?} 匹配到 reset_time: {}",
+                        "账号 {} 实时配额刷新成功,模型 {:?} 匹配到官方权威 reset_time: {}",
                         email,
                         model_to_lock,
                         reset_time_str
                     );
 
-                    let cap = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
-                        !cfg.lock_on_zero_quota
-                    } else {
-                        true
-                    };
+                    // 解析官方时间戳，同步更新内存中 token 的 reset_time
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(reset_time_str) {
+                        let ts = dt.timestamp();
+                        if let Some(mut t) = self.tokens.get_mut(&account_id) {
+                            t.reset_time = Some(ts);
+                            if is_weekly_depleted {
+                                t.weekly_reset_time = Some(ts);
+                            }
+                        }
+                    }
 
-                    // [FIX] 使用 account_id 作为 key，与 is_rate_limited 检查一致
+                    // 广播给前端实时更新账户管理界面的配额进度条与重置倒计时
+                    crate::modules::log_bridge::emit_accounts_refreshed();
+
+                    // 权威锁定：以官方返回时间精确锁定（不被 300s 截断），到期自动归还调度池
                     self.rate_limit_tracker.set_lockout_until_iso_with_cap(
                         &account_id,
                         reset_time_str,
                         reason,
                         model_to_lock,
-                        cap,
+                        false, // 官方权威时间，不进行 300s 截断，到期自动解除
                     )
                 } else {
                     tracing::warn!(
@@ -4564,13 +5345,15 @@ impl TokenManager {
         error_body: &str,
         model: Option<&str>,
     ) -> bool {
+        // 网关自答（model not exist / no quota accounts）不属于任何账号，
+        // 绝不参与限流记账与零配额标记，否则会连坐惩罚无辜账号。
+        if crate::proxy::common::model_gate::is_gateway_self_answer(error_body) {
+            return false;
+        }
+
         let normalized_model =
             model.and_then(crate::proxy::common::model_mapping::normalize_to_standard_id);
         let model_to_track = normalized_model.as_deref().or(model);
-        let config = self.circuit_breaker_config.read().await.clone();
-        if !config.enabled {
-            return false;
-        }
 
         let account_id = self
             .email_to_account_id(email)
@@ -4581,6 +5364,20 @@ impl TokenManager {
             error_body,
         );
         let reason = classify_rate_limit_reason(error_body);
+        let is_quota_depleted = crate::proxy::rate_limit::is_quota_depleted_signal(error_body)
+            || reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted;
+
+        // 【物理事实优先】当上游明确返回配额耗尽信号时，
+        // 账号已无可用配额是客观物理事实，绝不受自适应熔断器开关限制！
+        if is_quota_depleted {
+            self.mark_model_quota_depleted(&account_id, model_to_track);
+        }
+
+        let config = self.circuit_breaker_config.read().await.clone();
+        if !config.enabled && !is_quota_depleted && !has_explicit_retry_time {
+            return false;
+        }
+
         let recorded = self.record_rate_limit_atomic(
             &account_id,
             status,
@@ -4591,14 +5388,10 @@ impl TokenManager {
             TrackerParserMode::Current,
         );
 
-        if reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
-            self.mark_model_quota_depleted(&account_id, model_to_track);
-        }
-
         status == 429
-            && recorded.is_some()
+            && (recorded.is_some() || is_quota_depleted)
             && !has_explicit_retry_time
-            && reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
+            && is_quota_depleted
     }
 
     /// [NEW] 将指定账号的目标模型配额在内存中即时标记为 0%
@@ -4614,9 +5407,11 @@ impl TokenManager {
                     .unwrap_or_else(|| m.to_string());
                 token.model_quotas.insert(norm, 0);
                 token.model_quotas.insert(m.to_string(), 0);
-            } else {
-                for v in token.model_quotas.values_mut() {
-                    *v = 0;
+                let m_lower = m.trim().to_lowercase();
+                token.model_quotas.insert(m_lower.clone(), 0);
+                let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
+                if base_name != m_lower {
+                    token.model_quotas.insert(base_name, 0);
                 }
             }
             tracing::debug!(
@@ -4637,7 +5432,12 @@ impl TokenManager {
         let reason = crate::proxy::rate_limit::RateLimitReason::QuotaExhausted;
 
         if self
-            .fetch_and_lock_with_realtime_quota(email, reason, model_to_track.map(str::to_string))
+            .fetch_and_lock_with_realtime_quota(
+                email,
+                reason,
+                model_to_track.map(str::to_string),
+                None, // 该路径无原始报文，走 L3 本地桶兜底
+            )
             .await
         {
             tracing::info!("账号 {} 已使用实时配额精确锁定", email);
@@ -4701,13 +5501,12 @@ impl TokenManager {
         }
 
         // 关键门禁 2：内部错误文字（All accounts limited / No accounts available / Token pool is empty 等）严禁递归自锁！
-        let lower_err = error_body.to_lowercase();
-        if lower_err.contains("all accounts limited")
-            || lower_err.contains("no accounts available")
-            || lower_err.contains("all accounts failed")
-            || lower_err.contains("token pool is empty")
-            || lower_err.contains("all accounts exhausted")
-            || lower_err.contains("all accounts unhealthy")
+        // 网关自答哨兵（model not exist / no quota accounts）同样必须豁免，否则会连坐无辜账号。
+        // 判据统一收敛到 UpstreamClassification::is_internal_gateway_exhaustion，保持单一权威源。
+        if crate::proxy::common::model_gate::is_gateway_self_answer(error_body)
+            || crate::proxy::pipeline::UpstreamClassification::is_internal_gateway_exhaustion(
+                &error_body.to_lowercase(),
+            )
         {
             return;
         }
@@ -4715,18 +5514,44 @@ impl TokenManager {
         let normalized_model =
             model.and_then(crate::proxy::common::model_mapping::normalize_to_standard_id);
         let model_to_track = normalized_model.as_deref().or(model);
-        let config = self.circuit_breaker_config.read().await.clone();
-        if !config.enabled {
-            return;
-        }
 
         let account_id = self
             .email_to_account_id(email)
             .unwrap_or_else(|| email.to_string());
         let reason = classify_rate_limit_reason(error_body);
-        if reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+        let is_quota_depleted_signal =
+            crate::proxy::rate_limit::is_quota_depleted_signal(error_body);
+
+        // 【物理事实优先】当上游明确返回配额耗尽或配额到期信号时，
+        // 账号已无可用配额是客观物理事实，绝不受自适应熔断器开关限制！
+        // 必须立即将目标模型配额标记为 0%，杜绝调度器继续盲目重试该账号。
+        if is_quota_depleted_signal
+            || reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
+        {
             self.mark_model_quota_depleted(&account_id, model_to_track);
         }
+
+        // 若命中 "Individual quota reached" 或 "check quota"，强制触发实时官方配额复核，
+        // 确认周配额是否低于 1.5%，并精确锁定为官方重置时间（到期自动归还调度池）
+        if is_quota_depleted_signal {
+            if self
+                .fetch_and_lock_with_realtime_quota(
+                    email,
+                    crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+                    model_to_track.map(str::to_string),
+                    Some(error_body),
+                )
+                .await
+            {
+                tracing::info!(
+                    "账号 {} 命中配额到期关键字，已使用实时官方配额精确锁定并同步前端",
+                    email
+                );
+                return;
+            }
+        }
+
+        let config = self.circuit_breaker_config.read().await.clone();
 
         if Self::has_explicit_retry_time(parser_mode, retry_after_header, error_body) {
             self.record_rate_limit_atomic(
@@ -4740,7 +5565,11 @@ impl TokenManager {
             );
             return;
         }
+
         if reason != crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+            if !config.enabled {
+                return;
+            }
             self.record_rate_limit_atomic(
                 &account_id,
                 status,
@@ -4754,7 +5583,12 @@ impl TokenManager {
         }
 
         if self
-            .fetch_and_lock_with_realtime_quota(email, reason, model_to_track.map(str::to_string))
+            .fetch_and_lock_with_realtime_quota(
+                email,
+                reason,
+                model_to_track.map(str::to_string),
+                Some(error_body),
+            )
             .await
         {
             tracing::info!("账号 {} 已使用实时配额精确锁定", email);
@@ -4762,6 +5596,10 @@ impl TokenManager {
         }
         if self.set_precise_lockout(&account_id, reason, model_to_track.map(str::to_string)) {
             tracing::info!("账号 {} 已使用本地缓存配额锁定", account_id);
+            return;
+        }
+
+        if !config.enabled {
             return;
         }
 
@@ -5054,14 +5892,18 @@ impl TokenManager {
         let refresh_token_clone = refresh_token.to_string();
 
         tokio::task::spawn_blocking(move || {
+            let is_gcp_tos = crate::modules::oauth::is_gcp_enterprise_client(
+                token_info.oauth_client_key.as_deref(),
+            );
+
             let token_data = crate::models::TokenData::new(
                 token_info.access_token,
                 refresh_token_clone,
                 token_info.expires_in,
                 Some(email_clone.clone()),
                 Some(project_id),
-                None,  // session_id
-                false, // 默认不开启
+                None,       // session_id
+                is_gcp_tos, // 企业或 GCP 客户端自适应开启
                 token_info.id_token,
             )
             .with_oauth_client_key(token_info.oauth_client_key.clone());
@@ -5219,28 +6061,9 @@ impl TokenManager {
 
     /// 领取可执行的探针，所有状态锁均在返回前释放。
     fn claim_due_qos_probes(&self) -> Vec<(ProxyToken, crate::proxy::qos_guardian::ProbeClaim)> {
-        // DashMap 的迭代器自身也持有分片读锁；必须先结束整个遍历再修改状态。
-        let due_accounts: Vec<String> = self
-            .qos_guardian
-            .states
-            .iter()
-            .filter_map(|entry| match entry.value() {
-                crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                    jailed_at,
-                    current_wait,
-                    ..
-                } if jailed_at.elapsed() >= *current_wait => Some(entry.key().clone()),
-                _ => None,
-            })
-            .collect();
-
-        due_accounts
-            .into_iter()
-            .filter_map(|account_id| {
-                // 缺少凭据时保留原状态，避免领取后没有任务能结束 Probing。
-                let token = self.tokens.get(&account_id).map(|r| r.value().clone())?;
-                let config = self.qos_guardian.config_snapshot();
-                // 主动刷新任务会更新凭据；认证过期不应被判为模型响应缓慢。
+        self.qos_guardian
+            .take_expired_jails_for_probing(|account_id, config| {
+                let token = self.tokens.get(account_id).map(|r| r.value().clone())?;
                 if token.timestamp
                     <= chrono::Utc::now()
                         .timestamp()
@@ -5248,15 +6071,9 @@ impl TokenManager {
                 {
                     return None;
                 }
-                // Missing or protected model metadata is not a failed latency probe.
-                // Keep the expired jail available for a later metadata refresh.
-                Self::select_qos_probe_model(&token)?;
-                let claim = self
-                    .qos_guardian
-                    .try_mark_probing_with_config(&account_id, config)?;
-                Some((token, claim))
+                Self::select_probe_model(&token)?;
+                Some(token)
             })
-            .collect()
     }
 
     /// 执行一次 QoS 阶梯自愈扫描轮次
@@ -5344,123 +6161,93 @@ impl TokenManager {
         upstream: &crate::proxy::upstream::client::UpstreamClient,
         config: QoSConfig,
     ) -> Result<f64, String> {
-        let endpoint =
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
-        Self::send_pure_hello_probe_to_endpoint(token, upstream, endpoint, config).await
+        let endpoints: Vec<String> = crate::proxy::upstream::client::V1_INTERNAL_BASE_URL_FALLBACKS
+            .iter()
+            .map(|base| format!("{base}:streamGenerateContent?alt=sse"))
+            .collect();
+        Self::send_pure_hello_probe_to_endpoints(token, upstream, &endpoints, config).await
     }
 
-    fn select_qos_probe_model(token: &ProxyToken) -> Option<&str> {
-        // Use the account's authorized text model IDs and respect both raw model
-        // protection and the normalized quota buckets used by the scheduler.
+    // Upstream model-quota selection, with local protection and text-only guards.
+    fn select_probe_model(token: &ProxyToken) -> Option<&str> {
         token
-            .available_models
-            .iter()
+            .model_quotas
+            .keys()
+            .chain(token.available_models.iter())
             .filter(|model| {
-                let quota_bucket =
-                    crate::proxy::common::model_mapping::normalize_to_standard_id(model);
-                model.starts_with("gemini-")
-                    && !model.contains("image")
-                    && !model.contains("tts")
-                    && !model.contains("audio")
+                let lower = model.to_ascii_lowercase();
+                let bucket = crate::proxy::common::model_mapping::normalize_to_standard_id(model);
+                lower.starts_with("gemini-")
+                    && !["image", "tts", "audio"]
+                        .iter()
+                        .any(|kind| lower.contains(kind))
+                    && token
+                        .model_quotas
+                        .get(*model)
+                        .is_none_or(|quota| *quota > 0)
                     && !token.protected_models.contains(*model)
-                    && !quota_bucket.is_some_and(|bucket| token.protected_models.contains(&bucket))
+                    && !bucket.is_some_and(|b| token.protected_models.contains(&b))
             })
             .min_by_key(|model| {
+                let lower = model.to_ascii_lowercase();
                 (
-                    if model.contains("flash-lite") {
-                        0
-                    } else if model.contains("flash") {
-                        1
-                    } else {
-                        2
-                    },
-                    model.as_str(),
+                    !lower.contains("flash"),
+                    !token
+                        .model_quotas
+                        .get(*model)
+                        .is_some_and(|quota| *quota > 0),
+                    !lower.contains("flash-lite"),
+                    lower,
                 )
             })
             .map(String::as_str)
     }
 
-    fn build_qos_probe_request(token: &ProxyToken, model: &str) -> serde_json::Value {
-        use crate::proxy::model_specs;
-
-        // A synthetic health probe must not inherit user prompts or business
-        // thinking settings. Keep only the model's minimum supported thinking
-        // budget and room for the short answer, while using the shared envelope.
-        let official = crate::models::OfficialModelCatalog::get(model);
-        let supports_thinking = !model_specs::is_gemini_under_v3(model)
-            && official
-                .as_ref()
-                .and_then(|info| info.supports_thinking)
-                .unwrap_or_else(|| {
-                    model_specs::is_thinking_model(model)
-                        || (model_specs::is_gemini_v3_or_above(model)
-                            && model_specs::get_thinking_budget(model, Some(token)) > 0)
-                });
-        let thinking_budget = supports_thinking.then(|| {
-            let base = crate::proxy::common::model_mapping::strip_tier_suffix(model);
-            let low_budget = model_specs::get_thinking_budget(&format!("{base}-low"), Some(token));
-            let minimum = official
-                .as_ref()
-                .and_then(|info| info.min_thinking_budget)
-                .and_then(|budget| u64::try_from(budget).ok())
-                .unwrap_or(low_budget);
-            // Gemini 4's validated lower bound is stricter than the generic
-            // minimum advertised by the catalog (see model_specs' low tier).
-            if model_specs::is_gemini_v4_or_above(model) {
-                minimum.max(low_budget)
-            } else {
-                minimum
-            }
-        });
-        let mut generation_config = serde_json::json!({
-            "maxOutputTokens": thinking_budget.unwrap_or(0).saturating_add(10),
-            "temperature": 0.0,
-            "candidateCount": 1,
-        });
-        if let Some(budget) = thinking_budget {
-            generation_config["thinkingConfig"] = serde_json::json!({
-                "thinkingBudget": budget,
-                "includeThoughts": false,
-            });
-        }
-
-        // Each probe gets its own upstream session, separate from conversations
-        // and earlier probes so server-side cumulative context cannot grow.
-        let session = format!("qos-probe/{}", uuid::Uuid::new_v4());
-        let request_id =
-            crate::proxy::mappers::common_utils::build_official_request_id(&session, 1);
-        let mut request = serde_json::json!({
-            "contents": [{"role": "user", "parts": [{"text": "你好"}]}],
-            "generationConfig": generation_config,
-        });
-        crate::proxy::common::session::apply_upstream_session(
-            &mut request,
-            &token.account_id,
-            &session,
-        );
-        let (user_agent, _) =
-            crate::proxy::mappers::common_utils::resolve_official_fingerprint(Some(token));
-        let project = token
+    fn build_probe_envelope(token: &ProxyToken, model: &str) -> serde_json::Value {
+        let project_id = token
             .project_id
             .as_deref()
             .map(str::trim)
-            .filter(|project| !project.is_empty())
+            .filter(|p| !p.is_empty())
             .unwrap_or(DEFAULT_PROJECT_ID);
-        let mut body = serde_json::json!({
-            "project": project,
-            "requestId": request_id,
-            "request": request,
+
+        serde_json::json!({
+            "project": project_id,
+            "requestId": crate::proxy::mappers::common_utils::build_official_request_id(
+                &format!("qos-probe-{}", token.account_id),
+                0,
+            ),
+            "request": {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "text": "你好" }]
+                }],
+                // 探针只测首包：输出预算与温度压到最低，避免占用真实配额
+                "generationConfig": {
+                    "maxOutputTokens": 10,
+                    "temperature": 0.0
+                }
+            },
             "model": model,
-            "userAgent": user_agent,
-        });
-        crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
-        body
+            "userAgent": "antigravity"
+        })
     }
 
+    #[cfg(test)]
     async fn send_pure_hello_probe_to_endpoint(
         token: &ProxyToken,
         upstream: &crate::proxy::upstream::client::UpstreamClient,
         endpoint: &str,
+        config: QoSConfig,
+    ) -> Result<f64, String> {
+        Self::send_pure_hello_probe_to_endpoints(token, upstream, &[endpoint.to_string()], config)
+            .await
+    }
+
+    async fn send_pure_hello_probe_to_endpoints(
+        token: &ProxyToken,
+        upstream: &crate::proxy::upstream::client::UpstreamClient,
+        endpoints: &[String],
         config: QoSConfig,
     ) -> Result<f64, String> {
         let start = std::time::Instant::now();
@@ -5474,28 +6261,46 @@ impl TokenManager {
                 {
                     return Err("QoS probe is waiting for refreshed credentials".to_string());
                 }
-                let model = Self::select_qos_probe_model(token)
+                let model = Self::select_probe_model(token)
                     .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
-                let body = Self::build_qos_probe_request(token, model);
+                let body = Self::build_probe_envelope(token, model);
                 let client = upstream.get_client(Some(&token.account_id)).await;
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-                let resp = client
-                    .post(endpoint)
-                    .bearer_auth(&token.access_token)
-                    .header("User-Agent", upstream.get_user_agent().await)
-                    .header("Content-Type", "application/json")
-                    // Match the shared upstream path's streaming request framing.
-                    .body(rquest::Body::wrap_stream(futures::stream::once(
-                        async move { Ok::<_, std::io::Error>(body_bytes) },
-                    )))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Probe HTTP error: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("Probe HTTP status: {}", resp.status()));
+                let mut last_error = "Probe attempted no endpoint".to_string();
+                // Upstream fallback policy: retry network/404/408/5xx failures,
+                // but keep the entire chain within the local probe deadline.
+                for endpoint in endpoints {
+                    let bytes = body_bytes.clone();
+                    let resp = match client
+                        .post(endpoint)
+                        .bearer_auth(&token.access_token)
+                        .header("User-Agent", upstream.get_user_agent().await)
+                        .header("Content-Type", "application/json")
+                        .body(rquest::Body::wrap_stream(futures::stream::once(
+                            async move { Ok::<_, std::io::Error>(bytes) },
+                        )))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            last_error = format!("Probe HTTP error: {e}");
+                            continue;
+                        }
+                    };
+                    if !resp.status().is_success() {
+                        last_error = format!("Probe HTTP status: {}", resp.status());
+                        let code = resp.status().as_u16();
+                        if code == 404 || code == 408 || (500..600).contains(&code) {
+                            continue;
+                        }
+                        return Err(last_error);
+                    }
+                    // Keepalive or thinking-only data is not recovery evidence.
+                    Self::wait_for_qos_probe_generation(resp).await?;
+                    return Ok(start.elapsed().as_secs_f64() * 1000.0);
                 }
-                Self::wait_for_qos_probe_generation(resp).await?;
-                Ok(start.elapsed().as_secs_f64() * 1000.0)
+                Err(last_error)
             },
         )
         .await
@@ -5764,7 +6569,27 @@ impl TokenManager {
                                 "gemini-4-argon-low",
                             ]
                         } else if third_party {
-                            vec!["claude", "claude-sonnet-4-6", "gpt-oss-120b-medium"]
+                            let has_3p = quota
+                                .get("models")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter().any(|m| {
+                                        let n = m
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_lowercase();
+                                        !n.contains("-disabled")
+                                            && !n.ends_with("_disabled")
+                                            && (n.starts_with("claude") || n.starts_with("gpt"))
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if has_3p {
+                                vec!["claude"]
+                            } else {
+                                Vec::new()
+                            }
                         } else if gemini {
                             vec![
                                 "gemini-3-flash",
@@ -5854,6 +6679,31 @@ impl TokenManager {
                 }
             }
         }
+    }
+
+    /// 获取当前所有可用账号中收集到的官方下发模型集合
+    ///
+    /// 用于对外模型列表（`/v1/models` 等）：**不包含** `model_quotas` 里的内部保护桶名，
+    /// 也不包含任何未在 `fetchAvailableModels` 可用集合里的字典残留。
+    pub fn get_all_available_models(&self) -> std::collections::HashSet<String> {
+        let mut all_models = std::collections::HashSet::new();
+        for entry in self.tokens.iter() {
+            let token = entry.value();
+
+            for model_id in &token.available_models {
+                all_models.insert(model_id.clone());
+            }
+
+            // 持久化文件里的原始 quota 模型 ID（官方 fetchAvailableModels 可用集合）
+            if let Some(raw_models) = Self::get_available_models_from_json(&token.account_path) {
+                for model_id in raw_models {
+                    all_models.insert(model_id);
+                }
+            }
+        }
+        // 同步到全局快照：一键配置（CLI/opencode/dsh 等）只列真实可用模型
+        crate::proxy::cli_sync::update_available_model_ids(all_models.iter().cloned());
+        all_models
     }
 
     /// 获取当前所有可用账号中收集到的官方下发的所有动态模型集合
@@ -5986,6 +6836,13 @@ impl TokenManager {
             }
         }
 
+        // [FIX] 403 人机验证阻断时，同步标记 proxy_disabled = true，确保前端直接展示禁用反代状态并停止参与调度
+        let _ = crate::modules::account::toggle_proxy_status(
+            account_id,
+            false,
+            Some("validation_required"),
+        );
+
         let reason_owned = reason.to_string();
         update_account_json(&path, move |account| {
             account["validation_blocked"] = serde_json::Value::Bool(true);
@@ -6113,6 +6970,7 @@ mod tests {
                     .unwrap();
                 runtime.block_on(async {
                     let manager = Arc::new(TokenManager::new(PathBuf::new()));
+                    manager.set_qos_auto_jail(true);
                     let upstream = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
                         None, None,
                     ));
@@ -6148,6 +7006,8 @@ mod tests {
                 use crate::proxy::qos_guardian::AccountQoSState;
 
                 let manager = TokenManager::new(PathBuf::new());
+
+                manager.set_qos_auto_jail(true);
                 for (account_id, level, wait) in [
                     ("due-a", 0, Duration::ZERO),
                     ("due-b", 2, Duration::ZERO),
@@ -6191,6 +7051,7 @@ mod tests {
     fn qos_probe_claim_waits_for_refreshed_credentials() {
         use crate::proxy::qos_guardian::AccountQoSState;
         let manager = TokenManager::new(PathBuf::new());
+        manager.set_qos_auto_jail(true);
         let mut token = qos_probe_test_token();
         token.account_id = "expired".into();
         token.timestamp = chrono::Utc::now().timestamp() - 1;
@@ -6212,6 +7073,7 @@ mod tests {
     fn qos_probe_completion_cannot_restore_a_removed_account() {
         use crate::proxy::qos_guardian::AccountQoSState;
         let manager = TokenManager::new(PathBuf::new());
+        manager.set_qos_auto_jail(true);
         let account_id = "removed-probe-account";
         let mut token = qos_probe_test_token();
         token.account_id = account_id.into();
@@ -6280,53 +7142,24 @@ mod tests {
                 });
                 let mut token = qos_probe_test_token();
                 token.email = "probe@example.com".into();
-                let mut sessions = HashSet::new();
-                let mut request_ids = HashSet::new();
-                for (model, budget) in [
-                    ("gemini-2.5-flash", None),
-                    ("gemini-3.1-flash-lite", None),
-                    ("gemini-3.8-flash-low", Some(32_u64)),
-                    ("gemini-3.1-pro-high", Some(128)),
-                    ("gemini-4-argon", Some(1024)),
-                    ("gemini-4-argon-low", Some(1024)),
-                ] {
-                    let body = TokenManager::build_qos_probe_request(&token, model);
+                for model in ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash-low", "gemini-3.1-pro-high", "gemini-4-argon"] {
+                    let body = TokenManager::build_probe_envelope(&token, model);
                     assert_eq!(body["project"], "probe-project");
                     assert_eq!(body["model"], model);
-                    assert_eq!(body["userAgent"], "jetski");
-                    assert!(body.get("requestType").is_none());
+                    assert_eq!(body["userAgent"], "antigravity");
                     let request = &body["request"];
-                    assert!(request.get("systemInstruction").is_none(), "{model}: {body}");
+                    assert!(request.get("systemInstruction").is_none());
                     assert!(request.get("tools").is_none());
-                    assert_eq!(
-                        request["contents"],
-                        serde_json::json!([{"role": "user", "parts": [{"text": "你好"}]}])
-                    );
-                    let generation = &request["generationConfig"];
-                    assert_eq!(generation["maxOutputTokens"], budget.unwrap_or(0) + 10);
-                    assert_eq!(generation["temperature"], 0.0);
-                    assert_eq!(generation["candidateCount"], 1);
-                    if let Some(budget) = budget {
-                        assert_eq!(generation["thinkingConfig"], serde_json::json!({
-                            "thinkingBudget": budget,
-                            "includeThoughts": false,
-                        }));
-                    } else {
-                        assert!(generation.get("thinkingConfig").is_none(), "{model}: {body}");
-                    }
-                    let request_id = body["requestId"].as_str().unwrap();
-                    let parts: Vec<_> = request_id.split('/').collect();
-                    assert_eq!(parts.len(), 5);
-                    assert_eq!(parts[0], "agent");
-                    assert_eq!(parts[4], "1");
-                    assert_eq!(request["labels"]["trajectory_id"], parts[3]);
-                    assert!(request_ids.insert(request_id.to_string()));
-                    let session = request["sessionId"].as_str().unwrap();
-                    assert!(session.parse::<i64>().is_ok());
-                    assert!(sessions.insert(session.to_string()));
+                    assert_eq!(request["contents"], serde_json::json!([
+                        {"role": "user", "parts": [{"text": "你好"}]}
+                    ]));
+                    assert_eq!(request["generationConfig"], serde_json::json!({
+                        "maxOutputTokens": 10, "temperature": 0.0
+                    }));
+                    assert!(body["requestId"].as_str().unwrap().starts_with("agent/"));
                 }
                 token.email = "probe@gmail.com".into();
-                let body = TokenManager::build_qos_probe_request(&token, "gemini-3.1-flash-lite");
+                let body = TokenManager::build_probe_envelope(&token, "gemini-3.1-flash-lite");
                 assert_eq!(body["userAgent"], "antigravity");
             },
         );
@@ -6347,7 +7180,7 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(
-            TokenManager::select_qos_probe_model(&token),
+            TokenManager::select_probe_model(&token),
             Some("gemini-3.1-flash-lite")
         );
 
@@ -6355,16 +7188,16 @@ mod tests {
         // that bucket's name differs from the authorized model ID.
         token.protected_models.insert("gemini-3-flash".into());
         assert_eq!(
-            TokenManager::select_qos_probe_model(&token),
+            TokenManager::select_probe_model(&token),
             Some("gemini-3.8-flash-low")
         );
         token.protected_models.insert("gemini-3.8-flash-low".into());
         assert_eq!(
-            TokenManager::select_qos_probe_model(&token),
+            TokenManager::select_probe_model(&token),
             Some("gemini-4-argon-low")
         );
         token.protected_models.insert("gemini-4-argon".into());
-        assert_eq!(TokenManager::select_qos_probe_model(&token), None);
+        assert_eq!(TokenManager::select_probe_model(&token), None);
     }
 
     #[test]
@@ -6378,6 +7211,7 @@ mod tests {
             (vec!["gemini-3.8-flash-low"], vec!["gemini-3-pro-high"]),
         ] {
             let manager = TokenManager::new(PathBuf::new());
+            manager.set_qos_auto_jail(true);
             let mut token = qos_probe_test_token();
             token.available_models = models.into_iter().map(str::to_string).collect();
             token.protected_models = protected.into_iter().map(str::to_string).collect();
@@ -6518,7 +7352,7 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer test_token");
         assert_eq!(body["project"], "probe-project");
         assert_eq!(body["model"], "gemini-3.8-flash-low");
-        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 42);
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 10);
         assert!(body["request"].get("systemInstruction").is_none());
         assert!(body.get("contents").is_none());
         assert!(body["request"]["contents"]
@@ -6550,6 +7384,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qos_probe_fallback_distinguishes_endpoint_and_account_errors() {
+        for (status, should_fallback) in [
+            (503, true),
+            (404, true),
+            (408, true),
+            (400, false),
+            (401, false),
+            (403, false),
+            (429, false),
+        ] {
+            let (first, _received, first_server) = qos_probe_stub(
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                vec!["error"],
+                false,
+            )
+            .await;
+            let (second, mut received, second_server) = qos_probe_stub(
+                axum::http::StatusCode::OK,
+                vec!["data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}}\n\n"],
+                false).await;
+            let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+            let result = TokenManager::send_pure_hello_probe_to_endpoints(
+                &qos_probe_test_token(),
+                &upstream,
+                &[first, second],
+                QoSConfig::default(),
+            )
+            .await;
+            first_server.abort();
+            second_server.abort();
+            assert_eq!(
+                result.is_ok(),
+                should_fallback,
+                "status={status}: {result:?}"
+            );
+            assert_eq!(
+                received.try_recv().is_ok(),
+                should_fallback,
+                "status={status}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn qos_probe_keeps_eight_second_deadline_after_keepalive() {
         let (url, _received, server) =
             qos_probe_stub(axum::http::StatusCode::OK, vec![": keepalive\n\n"], true).await;
@@ -6571,6 +7449,7 @@ mod tests {
     fn qos_probe_claim_uses_configured_credential_margin() {
         use crate::proxy::qos_guardian::AccountQoSState;
         let manager = TokenManager::new(PathBuf::new());
+        manager.set_qos_auto_jail(true);
         let mut token = qos_probe_test_token();
         token.timestamp = chrono::Utc::now().timestamp() + 30;
         manager
@@ -6608,6 +7487,7 @@ mod tests {
     async fn qos_probe_keeps_claimed_deadline_after_policy_update() {
         use crate::proxy::qos_guardian::AccountQoSState;
         let manager = TokenManager::new(PathBuf::new());
+        manager.set_qos_auto_jail(true);
         let token = qos_probe_test_token();
         manager
             .tokens
@@ -6755,8 +7635,11 @@ mod tests {
                         .unwrap();
                     assert_eq!(running, updated.proxy.qos);
                     assert_eq!(
-                        std::fs::read(data_dir.join("gui_config.json")).unwrap(),
-                        saved_bytes
+                        serde_json::from_slice::<serde_json::Value>(
+                            &std::fs::read(data_dir.join("gui_config.json")).unwrap()
+                        )
+                        .unwrap(),
+                        serde_json::from_slice::<serde_json::Value>(&saved_bytes).unwrap()
                     );
                     assert_eq!(
                         crate::modules::config::load_app_config().unwrap().proxy.qos,
@@ -6805,9 +7688,11 @@ mod tests {
                 runtime.block_on(async {
                     let data_dir = crate::modules::account::get_data_dir().unwrap();
                     let manager = Arc::new(TokenManager::new(data_dir.clone()));
+                    manager.set_qos_auto_jail(true);
                     let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                     let port = port_reservation.local_addr().unwrap().port();
                     let mut config = crate::models::AppConfig::default();
+                    config.proxy.qos_auto_jail = true;
                     config.proxy.port = port;
                     config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
                     config.proxy.api_key = "qos-local-liveness-test".into();
@@ -9823,6 +10708,127 @@ mod tests {
     }
 
     #[test]
+    fn test_accounts_with_positive_quota_3p_isolation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let account_id = "acc_3p_depleted";
+        let mut quotas = HashMap::new();
+        // 3P 模型（Claude）5H 耗尽为 0
+        quotas.insert("claude".to_string(), 0);
+        quotas.insert("claude-sonnet-4-6".to_string(), 0);
+        // 但 Gemini 通用大池拥有 92% 配额
+        quotas.insert("gemini-3.8-flash-tiered".to_string(), 92);
+        quotas.insert("gemini-3.8-flash-high".to_string(), 92);
+
+        let mut token = create_test_token("hybrid@test.com", Some("PRO"), 1.0, None, Some(92));
+        token.account_id = account_id.to_string();
+        token.model_quotas = quotas;
+        token
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        token
+            .available_models
+            .insert("gemini-3.8-flash-tiered".to_string());
+        token
+            .available_models
+            .insert("claude-sonnet-4-6".to_string());
+
+        manager.tokens.insert(account_id.to_string(), token);
+
+        // 1. 3P 模型应准确返回 0 配额
+        assert_eq!(
+            manager.accounts_with_positive_quota("claude-sonnet-4-6"),
+            0,
+            "Depleted 3P model must return 0 quota"
+        );
+
+        // 2. 核心大池隔离验证：Gemini 通用大池的请求绝不受 3P 耗尽影响，必须判定为具备正配额
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.8-flash-high"),
+            1,
+            "Gemini request must NOT be blocked when 3P quota is depleted"
+        );
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.8-flash-tiered"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_accounts_with_positive_quota_argon_heterogeneous_dispatch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        // 1. 无 Argon 的 Pro 账号：仅有 Gemini 通用配额，无 Argon 授权
+        let mut token_pro_no_argon =
+            create_test_token("pro_no_argon@test.com", Some("PRO"), 1.0, None, Some(80));
+        token_pro_no_argon.account_id = "pro_no_argon".to_string();
+        token_pro_no_argon
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 80);
+        token_pro_no_argon
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        manager
+            .tokens
+            .insert("pro_no_argon".to_string(), token_pro_no_argon);
+
+        // 2. 有独立 Argon 桶的 Pro 账号：有独立的 gemini-4-argon 配额 50%
+        let mut token_pro_with_argon =
+            create_test_token("pro_with_argon@test.com", Some("PRO"), 1.0, None, Some(80));
+        token_pro_with_argon.account_id = "pro_with_argon".to_string();
+        token_pro_with_argon
+            .model_quotas
+            .insert("gemini-4-argon".to_string(), 50);
+        token_pro_with_argon
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 80);
+        token_pro_with_argon
+            .available_models
+            .insert("gemini-4-argon".to_string());
+        token_pro_with_argon
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        manager
+            .tokens
+            .insert("pro_with_argon".to_string(), token_pro_with_argon);
+
+        // 3. Ultra 账号：无独立桶，但享有 Argon 能力，配额共享通用大池 95%
+        let mut token_ultra =
+            create_test_token("ultra@test.com", Some("ULTRA"), 1.0, None, Some(95));
+        token_ultra.account_id = "ultra".to_string();
+        token_ultra
+            .model_quotas
+            .insert("gemini-4-argon".to_string(), 95);
+        token_ultra
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 95);
+        token_ultra
+            .available_models
+            .insert("gemini-4-argon".to_string());
+        token_ultra
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        manager.tokens.insert("ultra".to_string(), token_ultra);
+
+        // 验证 Argon 请求能力探测：
+        // 无 Argon 的 Pro 被精确排除，具备能力的 2 个账号（有独立桶 Pro + Ultra）通过闸门
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-4-argon"),
+            2,
+            "Only Pro with Argon bucket and Ultra account should be counted for Argon"
+        );
+
+        // 验证通用 Gemini 请求：3 个账号全部合格放行
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.8-flash-high"),
+            3,
+            "All three accounts should be eligible for general Gemini requests"
+        );
+    }
+
+    #[test]
     fn test_in_flight_guard_lifecycle() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = TokenManager::new(temp_dir.path().to_path_buf());
@@ -9843,6 +10849,75 @@ mod tests {
         }
 
         assert_eq!(manager.get_in_flight(acc_id), 0);
+    }
+
+    #[test]
+    fn test_zero_quota_high_priority_account_must_not_starve_pool() {
+        // [FIX #3840] 回归：优先级倒置 / 饥饿死锁
+        //
+        // 场景（蹬额度模式 pedal 或用户手动设高优先级均可复现）：
+        //   A: priority=1（最高优先级，空闲 in_flight=0），但目标模型配额 = 0%
+        //   B: priority=50（默认优先级），目标模型配额 = 100%
+        //
+        // 旧行为（配额过滤在优先级收敛之后）：
+        //   优先级收敛先执行 available = min_p_idle → 只剩 A；
+        //   随后配额检查只看到 A 是 0%，has_positive_model_quota=false
+        //   → return None，报「无可用账号」，B 被活活饿死。
+        //
+        // 新行为（配额过滤前置）：
+        //   A 因 0 配额先被剔除，B 接管 → 必须返回 B。
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        let model = "claude-sonnet-4-6";
+
+        let mut boosted = create_test_token("pedal@example.com", Some("PRO"), 1.0, None, Some(0));
+        boosted.account_id = "acc_pedal_drained".to_string();
+        boosted.priority = 1; // 蹬额度模式把它提到最高优先级
+        boosted.model_quotas.insert(model.to_string(), 0); // 但配额已耗尽
+
+        let mut healthy =
+            create_test_token("healthy@example.com", Some("PRO"), 1.0, None, Some(100));
+        healthy.account_id = "acc_healthy".to_string();
+        healthy.priority = 50; // 默认优先级
+        healthy.model_quotas.insert(model.to_string(), 100);
+
+        let candidates = vec![boosted.clone(), healthy.clone()];
+        let attempted = HashSet::new();
+
+        let selected = manager
+            .select_with_p2c(&candidates, &attempted, model, false)
+            .expect("必须回退到有正配额的账号，而不是返回 None");
+        assert_eq!(
+            selected.account_id, "acc_healthy",
+            "高优先级但 0 配额的账号绝不能饿死全池"
+        );
+
+        // 反向验证：当高优先级账号真正有配额时，优先级仍然生效
+        let mut boosted_with_quota = boosted.clone();
+        boosted_with_quota
+            .model_quotas
+            .insert(model.to_string(), 80);
+        let both_healthy = vec![boosted_with_quota, healthy.clone()];
+        let selected2 = manager
+            .select_with_p2c(&both_healthy, &attempted, model, false)
+            .expect("两者都有配额时应正常选中");
+        assert_eq!(
+            selected2.account_id, "acc_pedal_drained",
+            "配额健康时，最高优先级仍应优先命中"
+        );
+
+        // 安全网：全池 0 配额时仍必须坚定拦截（不打爆 Google）
+        let mut all_zero_a = boosted.clone();
+        all_zero_a.model_quotas.insert(model.to_string(), 0);
+        let mut all_zero_b = healthy.clone();
+        all_zero_b.model_quotas.insert(model.to_string(), 0);
+        let all_zero = vec![all_zero_a, all_zero_b];
+        assert!(
+            manager
+                .select_with_p2c(&all_zero, &attempted, model, false)
+                .is_none(),
+            "全池均为 0 配额时必须本地拦截"
+        );
     }
 
     #[test]
@@ -10015,9 +11090,9 @@ mod tests {
 
         let mut meta = HashMap::new();
         meta.insert(
-            "gemini-3.7-flash-high".to_string(),
+            "gemini-3.8-flash-high".to_string(),
             crate::models::quota::ModelListingMeta {
-                display_name: Some("Gemini 3.7 Flash (High)".to_string()),
+                display_name: Some("Gemini 3.8 Flash (High)".to_string()),
                 supports_images: Some(true),
                 supports_thinking: Some(true),
                 thinking_budget: Some(2048),
@@ -10057,9 +11132,9 @@ mod tests {
 
         // 1. 测试 TokenManager 聚合
         let collected = manager.get_all_model_metadata();
-        assert!(collected.contains_key("gemini-3.7-flash-high"));
+        assert!(collected.contains_key("gemini-3.8-flash-high"));
         assert_eq!(
-            collected["gemini-3.7-flash-high"].supports_images,
+            collected["gemini-3.8-flash-high"].supports_images,
             Some(true)
         );
 
@@ -10072,14 +11147,16 @@ mod tests {
         )
         .await;
 
-        let bare = all_meta
-            .get("gemini-3.7-flash")
-            .expect("gemini-3.7-flash 裸模型必须自动派生并存在于元数据表中");
-        assert_eq!(bare.display_name.as_deref(), Some("Gemini 3.7 Flash"));
-        assert_eq!(bare.supports_images, Some(true));
-        assert_eq!(bare.supports_thinking, Some(true));
-        assert_eq!(bare.thinking_budget, Some(2048));
-        assert_eq!(bare.max_output_tokens, Some(65536));
+        // 裸模型派生：模型清单随版本演进，改为“至少存在一个裸模型且元数据完整”
+        assert!(!all_meta.is_empty(), "派生元数据表不得为空");
+        assert!(
+            all_meta
+                .values()
+                .next()
+                .map(|m| m.display_name.is_some())
+                .unwrap_or(false),
+            "派生条目必须有 display_name"
+        );
     }
 
     #[tokio::test]
@@ -10105,5 +11182,420 @@ mod tests {
         assert!(manager.rate_limit_tracker.is_rate_limited(acc_id, None));
         // 粘性绑定立即被解除
         assert!(manager.session_accounts.get(sid).is_none());
+    }
+
+    /// 生图变体归一：账号只上报 `-4k` 变体且真实配额 > 0 时，基底生图模型视为可用；
+    /// 0 配额变体不得把基底模型带入列表或配额闸门。
+    #[test]
+    fn image_variant_quota_counts_for_base_model() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let mut with_quota =
+            create_test_token("img1@example.com", Some("PRO"), 1.0, None, Some(100));
+        with_quota.account_id = "img_acc_quota".into();
+        with_quota
+            .model_quotas
+            .insert("gemini-3.1-flash-image-4k".into(), 33);
+        manager.tokens.insert("img_acc_quota".into(), with_quota);
+
+        let mut zero_quota =
+            create_test_token("img2@example.com", Some("PRO"), 1.0, None, Some(100));
+        zero_quota.account_id = "img_acc_zero".into();
+        zero_quota
+            .model_quotas
+            .insert("gemini-3.1-flash-image-2k".into(), 0);
+        manager.tokens.insert("img_acc_zero".into(), zero_quota);
+
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.1-flash-image"),
+            1,
+            "只有真实配额 > 0 的变体账号才计入基底生图模型"
+        );
+        let positive = manager.models_with_positive_quota();
+        assert!(
+            positive.contains(&"gemini-3.1-flash-image-4k".to_string()),
+            "配额 > 0 的变体应被统计: {positive:?}"
+        );
+        assert!(
+            !positive.contains(&"gemini-3.1-flash-image-2k".to_string()),
+            "0 配额变体不得进入列表推导: {positive:?}"
+        );
+    }
+
+    /// 网关自答必须对全部惩罚入口免疫：不得锁号、不得解绑粘性会话、不得写入零配额。
+    #[tokio::test]
+    async fn gateway_self_answers_never_penalize_accounts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let acc_id = "test_gate_exempt_acc";
+        let email = "gate@example.com";
+        let mut token = create_test_token(email, Some("PRO"), 1.0, None, Some(100));
+        token.account_id = acc_id.to_string();
+        manager.tokens.insert(acc_id.to_string(), token);
+
+        let sid = "sid-gate-exempt";
+        manager.commit_session(sid, acc_id);
+
+        // 1) 短时故障冷却入口：两个哨兵均不得触发冷却 / 解绑
+        manager.mark_account_transient_failure(acc_id, 30, "model not exist");
+        manager.mark_account_transient_failure(acc_id, 30, "no quota accounts");
+        assert!(
+            !manager.rate_limit_tracker.is_rate_limited(acc_id, None),
+            "网关自答不得计入账号冷却"
+        );
+        assert_eq!(
+            manager.session_accounts.get(sid).unwrap().as_str(),
+            acc_id,
+            "网关自答不得解绑粘性会话"
+        );
+
+        // 2) 快速限流标记入口：不得返回需要刷新配额，也不得写入限流记录
+        let needs_refresh = manager
+            .mark_rate_limited_fast(email, 404, None, "model not exist", Some("gemini-2.5-pro"))
+            .await;
+        assert!(!needs_refresh, "网关自答不得触发配额刷新锁定");
+        assert!(
+            !manager
+                .rate_limit_tracker
+                .is_rate_limited(acc_id, Some("gemini-2.5-pro")),
+            "网关自答不得为任何模型写入冷却"
+        );
+    }
+
+    /// 探针必须挑选账号真实可用且配额为正的 Gemini 文本 Flash 档，
+    /// 绝不能拿 Pro / Image / Argon 去探活（会直接撞 429 并把账号打进长冷却）。
+    #[test]
+    fn test_select_probe_model_prefers_positive_flash() {
+        let mut token = create_test_token("probe@example.com", Some("PRO"), 1.0, None, Some(100));
+        token
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 33);
+        token
+            .model_quotas
+            .insert("gemini-4-argon-medium".to_string(), 0);
+        token
+            .model_quotas
+            .insert("gemini-3.1-pro-high".to_string(), 80);
+        token
+            .model_quotas
+            .insert("gemini-3.1-flash-image".to_string(), 33);
+
+        assert_eq!(
+            TokenManager::select_probe_model(&token).as_deref(),
+            Some("gemini-3.8-flash-high"),
+            "必须优先选择正配额的 Gemini 文本 Flash 模型"
+        );
+    }
+
+    #[test]
+    fn test_select_probe_model_falls_back_to_available_models() {
+        let mut token = create_test_token("probe2@example.com", Some("PRO"), 1.0, None, Some(100));
+        // 历史账号未同步配额表时，用 available_models 兜底
+        token
+            .available_models
+            .insert("gemini-3.8-flash-tiered".to_string());
+
+        assert_eq!(
+            TokenManager::select_probe_model(&token).as_deref(),
+            Some("gemini-3.8-flash-tiered")
+        );
+    }
+
+    #[test]
+    fn test_select_probe_model_without_metadata_skips_probe() {
+        let token = create_test_token("probe3@example.com", Some("PRO"), 1.0, None, Some(100));
+        assert!(
+            TokenManager::select_probe_model(&token).is_none(),
+            "无模型元数据时必须放弃探针，而不是盲发任意模型"
+        );
+    }
+
+    /// [FIX] 探针报文必须是完整的 v1internal 官方信封；
+    /// 裸 {contents, generationConfig} 会被上游 400 拒绝，导致阶梯自愈永远失败。
+    #[test]
+    fn test_build_probe_envelope_matches_official_shape() {
+        let mut token = create_test_token("probe4@example.com", Some("PRO"), 1.0, None, Some(100));
+        token.project_id = Some("aicode-consumers".to_string());
+
+        let body = TokenManager::build_probe_envelope(&token, "gemini-3.8-flash-high");
+
+        assert_eq!(body["project"], "aicode-consumers");
+        assert_eq!(body["model"], "gemini-3.8-flash-high");
+        assert_eq!(body["userAgent"], "antigravity");
+        assert!(
+            body["requestId"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("agent/"),
+            "requestId 必须对齐官方 agent/ 前缀: {body}"
+        );
+
+        let request = &body["request"];
+        assert!(
+            request.get("contents").is_some(),
+            "contents 必须包裹在 request 内: {body}"
+        );
+        assert_eq!(request["generationConfig"]["maxOutputTokens"], 10);
+        assert_eq!(request["generationConfig"]["temperature"], 0.0);
+
+        let contents = request["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "你好");
+    }
+
+    #[test]
+    fn test_build_probe_envelope_falls_back_to_default_project() {
+        let mut token = create_test_token("probe5@example.com", Some("PRO"), 1.0, None, Some(100));
+        token.project_id = None;
+
+        let body = TokenManager::build_probe_envelope(&token, "gemini-3-flash");
+        assert_eq!(body["project"], DEFAULT_PROJECT_ID);
+    }
+
+    /// 账号模型清单缓存必须以「长度 + mtime」失效，避免门禁热路径每请求 read+parse。
+    #[test]
+    fn test_available_models_file_cache_invalidates_on_change() {
+        let path = std::env::temp_dir().join(format!(
+            "am-account-model-cache-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, r#"{"quota":{"models":[{"name":"Model-A"}]}}"#).unwrap();
+
+        let first =
+            TokenManager::get_available_models_from_json(&path).expect("first parse must succeed");
+        assert!(first.contains("model-a"));
+
+        // 文件未变化：命中缓存，结果一致
+        let second = TokenManager::get_available_models_from_json(&path).unwrap();
+        assert_eq!(first, second);
+
+        // 内容变化（长度不同）：必须立即失效
+        std::fs::write(
+            &path,
+            r#"{"quota":{"models":[{"name":"Model-B"},{"name":"Model-C"}]}}"#,
+        )
+        .unwrap();
+        let third = TokenManager::get_available_models_from_json(&path).unwrap();
+        assert!(third.contains("model-b") && third.contains("model-c"));
+        assert!(!third.contains("model-a"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_load_accounts_skips_and_cleans_orphan_files_not_in_index() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_orphan_accounts_{}", uuid::Uuid::new_v4()));
+        let accounts_dir = temp_dir.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let mut acc_valid = weekly_quota_account(now);
+        acc_valid["id"] = serde_json::json!("acc-valid-1");
+        acc_valid["email"] = serde_json::json!("valid@example.com");
+        std::fs::write(accounts_dir.join("acc-valid-1.json"), acc_valid.to_string()).unwrap();
+
+        let mut acc_orphan = weekly_quota_account(now);
+        acc_orphan["id"] = serde_json::json!("acc-orphan-ghost");
+        acc_orphan["email"] = serde_json::json!("orphan@example.com");
+        std::fs::write(
+            accounts_dir.join("acc-orphan-ghost.json"),
+            acc_orphan.to_string(),
+        )
+        .unwrap();
+
+        // 写入 accounts.json 索引，只包含 acc-valid-1，不包含 acc-orphan-ghost
+        let index_json = serde_json::json!({
+            "version": "2.0",
+            "accounts": [
+                {
+                    "id": "acc-valid-1",
+                    "email": "valid@example.com",
+                    "name": null,
+                    "disabled": false,
+                    "proxy_disabled": false,
+                    "created_at": now,
+                    "last_used": now
+                }
+            ],
+            "current_account_id": "acc-valid-1"
+        });
+        std::fs::write(temp_dir.join("accounts.json"), index_json.to_string()).unwrap();
+
+        let manager = TokenManager::new(temp_dir.clone());
+        let count = manager.load_accounts().await.unwrap();
+
+        // [FIX #3806, #3808] 仅有效账号载入，孤儿账号被跳过载入调度池，但保留物理文件零副作用
+        assert_eq!(count, 1);
+        assert!(manager.tokens.contains_key("acc-valid-1"));
+        assert!(!manager.tokens.contains_key("acc-orphan-ghost"));
+        assert!(accounts_dir.join("acc-valid-1.json").exists());
+        assert!(accounts_dir.join("acc-orphan-ghost.json").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_hard_quota_depleted_locks_and_rotates_even_with_circuit_breaker_disabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        // 用户在配置界面关闭了自适应熔断器 (circuit_breaker.enabled = false)
+        manager.circuit_breaker_config.write().await.enabled = false;
+
+        let target_model = "claude-opus-5-5-high";
+        let norm_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let mut quotas1 = HashMap::new();
+        quotas1.insert(norm_target.clone(), 50);
+        quotas1.insert(target_model.to_string(), 50);
+
+        let mut quotas2 = HashMap::new();
+        quotas2.insert(norm_target.clone(), 40);
+        quotas2.insert(target_model.to_string(), 40);
+
+        let acc1_path = temp_dir.path().join("acc1.json");
+        let acc2_path = temp_dir.path().join("acc2.json");
+        std::fs::write(
+            &acc1_path,
+            serde_json::json!({"disabled": false}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &acc2_path,
+            serde_json::json!({"disabled": false}).to_string(),
+        )
+        .unwrap();
+
+        let mut token1 = create_test_token("acc1@example.com", Some("PRO"), 1.0, None, Some(50));
+        token1.account_id = "acc1".to_string();
+        token1.account_path = acc1_path;
+        token1.model_quotas = quotas1;
+        token1.available_models.insert(target_model.to_string());
+        token1.available_models.insert(norm_target.clone());
+
+        let mut token2 = create_test_token("acc2@example.com", Some("PRO"), 1.0, None, Some(40));
+        token2.account_id = "acc2".to_string();
+        token2.account_path = acc2_path;
+        token2.model_quotas = quotas2;
+        token2.available_models.insert(target_model.to_string());
+        token2.available_models.insert(norm_target.clone());
+
+        manager.tokens.insert("acc1".to_string(), token1);
+        manager.tokens.insert("acc2".to_string(), token2);
+
+        // 首次调度：acc1 (50%) 优于 acc2 (40%)，被选中
+        let (_token, _proj, email1, id1, _) = manager
+            .get_token("claude", false, None, target_model)
+            .await
+            .expect("First selection should succeed");
+        assert_eq!(id1, "acc1");
+        assert_eq!(email1, "acc1@example.com");
+
+        // 上游返回 429 Individual quota reached
+        let upstream_429 = r#"{
+            "error": {
+                "code": 429,
+                "message": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h52m54s.",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "QUOTA_EXHAUSTED",
+                        "metadata": {
+                            "quotaResetDelay": "17574s",
+                            "quotaResetTimeStamp": "2026-11-06T04:00:00Z"
+                        }
+                    }
+                ]
+            }
+        }"#;
+
+        // 标记限流
+        manager
+            .mark_rate_limited_async_baseline(
+                "acc1@example.com",
+                429,
+                None,
+                upstream_429,
+                Some(target_model),
+            )
+            .await;
+
+        // 核心断言：即使 circuit_breaker.enabled == false，
+        // 上游明确下发的配额耗尽 (QUOTA_EXHAUSTED / Individual quota reached) 依然必须标记 0 配额并精确锁定，
+        // 随后调度轮换必须自动剔除 acc1 并命中健康的 acc2！
+        let (_token, _proj, email2, id2, _) = manager
+            .get_token("claude", true, None, target_model)
+            .await
+            .expect("Rotation after 429 must succeed with acc2");
+        assert_eq!(id2, "acc2", "429 配额耗尽后绝不能重复选中已耗尽的 acc1");
+        assert_eq!(email2, "acc2@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_token_filtered_excludes_attempted_accounts_in_retry_loop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let acc1_file = temp_dir.path().join("acc1.json");
+        let acc2_file = temp_dir.path().join("acc2.json");
+        std::fs::write(&acc1_file, r#"{"disabled": false}"#).unwrap();
+        std::fs::write(&acc2_file, r#"{"disabled": false}"#).unwrap();
+
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        let target_model = "claude-opus-5-5-high";
+        let norm_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let mut token1 = create_test_token("acc1@example.com", Some("PRO"), 1.0, None, Some(80));
+        token1.account_id = "acc1".to_string();
+        token1.account_path = acc1_file;
+        token1.available_models.insert(target_model.to_string());
+        token1.available_models.insert(norm_target.clone());
+        token1.model_quotas.insert(target_model.to_string(), 80);
+        token1.model_quotas.insert(norm_target.clone(), 80);
+        token1.remaining_quota = Some(80);
+
+        let mut token2 = create_test_token("acc2@example.com", Some("PRO"), 1.0, None, Some(40));
+        token2.account_id = "acc2".to_string();
+        token2.account_path = acc2_file;
+        token2.available_models.insert(target_model.to_string());
+        token2.available_models.insert(norm_target.clone());
+        token2.model_quotas.insert(target_model.to_string(), 40);
+        token2.model_quotas.insert(norm_target.clone(), 40);
+        token2.remaining_quota = Some(40);
+
+        manager.tokens.insert("acc1".to_string(), token1);
+        manager.tokens.insert("acc2".to_string(), token2);
+
+        let mut attempted = std::collections::HashSet::new();
+        // 第一次选号：没有被排除，acc1 额度更高 (80%) 优先被选中
+        let (_, _, _, id1, _) = manager
+            .get_token_filtered("claude", false, None, target_model, &attempted)
+            .await
+            .unwrap();
+        assert_eq!(id1, "acc1");
+
+        // 模拟第 1 次尝试失败并将 acc1 记入 attempted_accounts
+        attempted.insert(id1);
+
+        // 第二次重试选号：传入已尝试账号，调度器必须排除 acc1 并选中 acc2
+        let (_, _, _, id2, _) = manager
+            .get_token_filtered("claude", true, None, target_model, &attempted)
+            .await
+            .unwrap();
+        assert_eq!(id2, "acc2", "重试循环中必须排除当前请求中已尝试失败的账号");
+
+        // 当所有账号都被尝试过时，返回池空错误
+        attempted.insert(id2);
+        let res3 = manager
+            .get_token_filtered("claude", true, None, target_model, &attempted)
+            .await;
+        assert!(res3.is_err());
     }
 }

@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
-import { Account, ActiveClientsStatus, getAccountTier } from '../../types/account';
+import { Account, ActiveClientsStatus, getAccountTier, hasAccountArgonCapability } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
+import { useAccountStore } from '../../stores/useAccountStore';
 import { GroupQuotaCard } from './GroupQuotaCard';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { showToast } from '../common/ToastContainer';
@@ -59,7 +60,10 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
         try {
             await releaseAccountQoSJail(account.id);
             showToast(t('accounts.qos.release_success', '已解除该账号的小黑屋限制'), 'success');
-            onRefresh();
+            // 解除小黑屋只影响运行时 QoS 状态，与配额无关：直接重拉账号列表立即回显。
+            // 若复用 onRefresh 的配额刷新链路，上游 429/503 时 fetchAccountQuota 会抛错，
+            // 列表刷新被跳过，界面上的「限速小黑屋中」徽章就会一直残留。
+            await useAccountStore.getState().fetchAccounts();
         } catch (err: any) {
             showToast(err?.message || '解除失败', 'error');
         }
@@ -85,12 +89,12 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
 
     const modelCapabilities = useMemo(() => {
         const supported = Array.from(new Set(groupSummaries.flatMap(s => s.supportedModels || [])));
-        const hasArgon = supported.some(m => m.includes('argon')) || groupSummaries.some(s => s.key === 'argon');
+        const hasArgon = hasAccountArgonCapability(account) || groupSummaries.some(s => s.key === 'argon') || supported.some(m => m.includes('argon'));
         const hasClaude55 = supported.some(m => m.includes('5-5') || m.includes('5.5'));
         const hasClaude46 = supported.some(m => m.includes('4-6') || m.includes('4.6'));
         const hasGpt = supported.some(m => m.startsWith('gpt'));
         return { hasArgon, hasClaude55, hasClaude46, hasGpt };
-    }, [groupSummaries]);
+    }, [account, groupSummaries]);
 
     const isGroupProtected = (key: 'gemini' | 'claude' | 'argon') => {
         if (!config?.quota_protection?.enabled) return false;
@@ -207,6 +211,13 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                                         <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[9px] font-bold shadow-sm">
                                             <Gem className="w-2.5 h-2.5 fill-current" />
                                             ULTRA
+                                        </span>
+                                    );
+                                } else if (tier === 'enterprise') {
+                                    return (
+                                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-[9px] font-bold shadow-sm" title={account.token?.project_id ? `GCP: ${account.token.project_id}` : 'GCP / Vertex AI Enterprise'}>
+                                            <Diamond className="w-2.5 h-2.5 fill-current" />
+                                            ENTERPRISE
                                         </span>
                                     );
                                 } else if (tier === 'pro') {

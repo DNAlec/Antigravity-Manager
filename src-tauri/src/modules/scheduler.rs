@@ -64,8 +64,16 @@ fn parse_reset_time_ts(s: &str) -> Option<i64> {
     None
 }
 
-/// Select a model to ping for a given group, honoring user's monitored_models preference if available
-fn pick_model_for_group(group_name: &str, bucket_id: &str, monitored_models: &[String]) -> String {
+/// Select a model to ping for a given group, honoring user's monitored_models preference if available.
+///
+/// Fallbacks are fully pool-driven: the newest `gemini-<x.x>-flash-low` from the account's own
+/// quota list, then the bare `gemini-<x.x>-flash`. Never falls back to a hardcoded model id.
+fn pick_model_for_group(
+    group_name: &str,
+    bucket_id: &str,
+    monitored_models: &[String],
+    pool_models: &[String],
+) -> String {
     let is_3p = bucket_id.to_lowercase().contains("3p")
         || group_name.to_lowercase().contains("claude")
         || group_name.to_lowercase().contains("gpt");
@@ -77,7 +85,15 @@ fn pick_model_for_group(group_name: &str, bucket_id: &str, monitored_models: &[S
         }) {
             return m.clone();
         }
-        "claude-sonnet-4-6".to_string()
+        // 3P 兜底：同样从当前账号真实拥有的模型中挑选，不再硬编码具体型号
+        pool_models
+            .iter()
+            .find(|m| {
+                let l = m.to_lowercase();
+                l.contains("claude") || l.contains("gpt")
+            })
+            .cloned()
+            .unwrap_or_default()
     } else {
         if let Some(m) = monitored_models.iter().find(|m| {
             let l = m.to_lowercase();
@@ -85,7 +101,9 @@ fn pick_model_for_group(group_name: &str, bucket_id: &str, monitored_models: &[S
         }) {
             return m.clone();
         }
-        "gemini-3-flash".to_string()
+        // Gemini 兜底：取号池最新 flash-low，无 low 档则取无后缀衍生 flash；都没有则返回空串由调用方跳过
+        let pool: std::collections::HashSet<String> = pool_models.iter().cloned().collect();
+        crate::proxy::common::model_gate::pick_background_model(&pool).unwrap_or_default()
     }
 }
 
@@ -189,11 +207,20 @@ pub fn start_scheduler(
 
                                     // 6-day cooldown for the same cycle
                                     if !check_cooldown(&history_key, 6 * 86400) {
+                                        let pool_models: Vec<String> = fresh_quota
+                                            .models
+                                            .iter()
+                                            .map(|m| m.name.clone())
+                                            .collect();
                                         let model_to_ping = pick_model_for_group(
                                             &group.display_name,
                                             &bucket.bucket_id,
                                             &app_config.scheduled_warmup.monitored_models,
+                                            &pool_models,
                                         );
+                                        if model_to_ping.is_empty() {
+                                            continue;
+                                        }
 
                                         tasks_to_run.push((
                                             acc.id.clone(),
@@ -358,11 +385,17 @@ pub async fn trigger_warmup_for_account(account: &Account) {
                         };
 
                         if !check_cooldown(&history_key, 6 * 86400) {
+                            let pool_models: Vec<String> =
+                                fresh_quota.models.iter().map(|m| m.name.clone()).collect();
                             let model_to_ping = pick_model_for_group(
                                 &group.display_name,
                                 &bucket.bucket_id,
                                 &app_config.scheduled_warmup.monitored_models,
+                                &pool_models,
                             );
+                            if model_to_ping.is_empty() {
+                                continue;
+                            }
 
                             let success = quota::warmup_model_directly(
                                 &token,

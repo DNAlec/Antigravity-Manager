@@ -75,11 +75,34 @@ pub fn should_disable_webkit_dmabuf(
         || desktop_is_gnome(xdg_current_desktop)
 }
 
+/// Check if running under a remote virtual desktop environment (xrdp, VNC, etc.)
+/// where physical GPU acceleration / compositing is unavailable or unstable on disconnect.
+pub fn is_remote_virtual_desktop(
+    has_xrdp_env: bool,
+    has_vnc_env: bool,
+    force_software: bool,
+    force_hardware: bool,
+) -> bool {
+    if force_hardware {
+        return false;
+    }
+    force_software || has_xrdp_env || has_vnc_env
+}
+
+/// Determine whether WebKitGTK should use safe software compositing (CPU rendering)
+/// to prevent hardware acceleration crashes when remote desktop sessions disconnect (Issue #3752).
+pub fn should_enable_software_compositing(
+    already_disabled_compositing: bool,
+    is_remote_desktop: bool,
+) -> bool {
+    !already_disabled_compositing && is_remote_desktop
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
-        should_force_x11_backend,
+        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, is_remote_virtual_desktop,
+        should_disable_webkit_dmabuf, should_enable_software_compositing, should_force_x11_backend,
     };
 
     #[test]
@@ -242,5 +265,31 @@ mod tests {
     fn webkit_dmabuf_not_touched_on_x11_session() {
         assert!(!should_disable_webkit_dmabuf(false, false, true, "niri"));
         assert!(!should_disable_webkit_dmabuf(false, false, true, "KDE"));
+    }
+
+    #[test]
+    fn test_is_remote_virtual_desktop() {
+        // xrdp session detected
+        assert!(is_remote_virtual_desktop(true, false, false, false));
+        // VNC session detected
+        assert!(is_remote_virtual_desktop(false, true, false, false));
+        // Force software render flag set
+        assert!(is_remote_virtual_desktop(false, false, true, false));
+        // Force hardware render overrides remote detection
+        assert!(!is_remote_virtual_desktop(true, false, false, true));
+        assert!(!is_remote_virtual_desktop(false, true, false, true));
+        // Normal local physical desktop
+        assert!(!is_remote_virtual_desktop(false, false, false, false));
+    }
+
+    #[test]
+    fn test_should_enable_software_compositing() {
+        // Remote desktop with default settings -> enable software compositing
+        assert!(should_enable_software_compositing(false, true));
+        // Remote desktop but user already set WEBKIT_DISABLE_COMPOSITING_MODE -> do not override
+        assert!(!should_enable_software_compositing(true, true));
+        // Local physical desktop -> keep default GPU acceleration
+        assert!(!should_enable_software_compositing(false, false));
+        assert!(!should_enable_software_compositing(true, false));
     }
 }

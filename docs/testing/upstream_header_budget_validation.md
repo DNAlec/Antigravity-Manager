@@ -1,3 +1,12 @@
+# v5.0.3 合并后的适用范围
+
+本文下方保留早期候选版本的验证记录。合入 v5.0.3 后，响应头看门狗已被上游的
+上传／首字节分阶段预算替代，`ANTIGRAVITY_UPSTREAM_HEADER_PRIMARY_SECS` 和
+`ANTIGRAVITY_UPSTREAM_HEADER_FALLBACK_SECS` 不再生效。请使用
+`proxy.stream_timeouts.initial_ttft_secs` 和 `proxy.upload_timeouts` 配置网络等待；
+仍受上游全局请求预算约束。`ANTIGRAVITY_UPSTREAM_SINGLE_ATTEMPT` 保留。
+下方旧版本测试结论不代表 v5.0.3 的运行验证。
+
 # 大工具响应头等待：验证补丁
 
 基线：`0067fe045ddd77f4462ea8e2c25384839d869f32`（v5.0.0）。

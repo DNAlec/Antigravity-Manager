@@ -48,11 +48,12 @@ import {
     ArrowUp,
     ArrowDown,
 } from 'lucide-react';
-import { type Account, type ActiveClientsStatus, getAccountTier } from '../../types/account';
+import { type Account, type ActiveClientsStatus, getAccountTier, hasAccountArgonCapability } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
+import { useAccountStore } from '../../stores/useAccountStore';
 import { GroupQuotaCard } from './GroupQuotaCard';
 import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
@@ -334,7 +335,10 @@ function AccountRowContent({
         try {
             await releaseAccountQoSJail(account.id);
             showToast(t('accounts.qos.release_success', '已解除该账号的小黑屋限制'), 'success');
-            onRefresh();
+            // 解除小黑屋只影响运行时 QoS 状态，与配额无关：直接重拉账号列表立即回显。
+            // 若复用 onRefresh 的配额刷新链路，上游 429/503 时 fetchAccountQuota 会抛错，
+            // 列表刷新被跳过，界面上的「限速小黑屋中」徽章就会一直残留。
+            await useAccountStore.getState().fetchAccounts();
         } catch (err: any) {
             showToast(err?.message || '解除失败', 'error');
         }
@@ -360,13 +364,13 @@ function AccountRowContent({
 
     const modelCapabilities = useMemo(() => {
         const supported = Array.from(new Set(groupSummaries.flatMap(s => s.supportedModels || [])));
-        const hasArgon = supported.some(m => m.includes('argon')) || groupSummaries.some(s => s.key === 'argon');
+        const hasArgon = hasAccountArgonCapability(account) || groupSummaries.some(s => s.key === 'argon') || supported.some(m => m.includes('argon'));
         const hasClaude55 = supported.some(m => m.includes('5-5') || m.includes('5.5'));
         const hasClaude46 = supported.some(m => m.includes('4-6') || m.includes('4.6'));
         const hasGpt = supported.some(m => m.startsWith('gpt'));
         const hasGemini38 = supported.some(m => m.includes('3.8') || m.includes('3-8'));
         return { hasArgon, hasClaude55, hasClaude46, hasGpt, hasGemini38, supportedCount: supported.length };
-    }, [groupSummaries]);
+    }, [account, groupSummaries]);
 
     return (
         <>
@@ -456,6 +460,13 @@ function AccountRowContent({
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         {t('accounts.ultra')}
+                                    </span>
+                                );
+                            } else if (tier === 'enterprise') {
+                                return (
+                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default" title={account.token?.project_id ? `GCP Project: ${account.token.project_id}` : 'GCP / Vertex AI Enterprise'}>
+                                        <Diamond className="w-2.5 h-2.5 fill-current" />
+                                        ENTERPRISE
                                     </span>
                                 );
                             } else if (tier === 'pro') {
