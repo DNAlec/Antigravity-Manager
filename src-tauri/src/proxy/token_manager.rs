@@ -4771,6 +4771,51 @@ impl TokenManager {
         }
     }
 
+    // A non-empty refresh replaces the raw catalog and routing candidates together.
+    // Empty responses preserve the last usable snapshot.
+    fn refresh_advertised_models(
+        token: &mut ProxyToken,
+        models: &[crate::models::quota::ModelQuota],
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        let previous_metadata = std::mem::take(&mut token.model_metadata);
+        token.available_models.clear();
+        for m in models {
+            let raw = m.name.trim().to_lowercase();
+            if raw.is_empty() || raw.contains("-disabled") || raw.ends_with("_disabled") {
+                continue;
+            }
+            let mut meta = crate::models::quota::ModelListingMeta::from(m);
+            if let Some(previous) = previous_metadata.get(&raw) {
+                meta.merge_from(previous);
+            }
+            token.model_metadata.insert(raw.clone(), meta);
+            let norm_name = crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
+                .unwrap_or_else(|| m.name.clone());
+            let pct_val = m.percentage as i32;
+            token
+                .model_quotas
+                .entry(norm_name)
+                .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                .or_insert(pct_val);
+            token.model_quotas.insert(m.name.clone(), pct_val);
+            let m_lower = raw;
+            token.model_quotas.insert(m_lower.clone(), pct_val);
+            let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
+            if base_name != m_lower {
+                token
+                    .model_quotas
+                    .entry(base_name.clone())
+                    .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                    .or_insert(pct_val);
+                token.available_models.insert(base_name);
+            }
+            token.available_models.insert(m_lower);
+        }
+    }
+
     /// 实时刷新配额并精确锁定账号
     ///
     /// 当 429 发生时调用此方法:
@@ -4818,36 +4863,7 @@ impl TokenManager {
             Ok((quota_data, _project_id)) => {
                 // [NEW] 实时刷新成功后，立即同步最新配额数据与 available_models 至内存缓存
                 if let Some(mut token) = self.tokens.get_mut(&account_id) {
-                    if !quota_data.models.is_empty() {
-                        token.available_models.clear();
-                    }
-                    for m in &quota_data.models {
-                        let norm_name =
-                            crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
-                                .unwrap_or_else(|| m.name.clone());
-                        let pct_val = m.percentage as i32;
-                        token
-                            .model_quotas
-                            .entry(norm_name)
-                            .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
-                            .or_insert(pct_val);
-                        token.model_quotas.insert(m.name.clone(), pct_val);
-                        let m_lower = m.name.to_lowercase();
-                        token.model_quotas.insert(m_lower.clone(), pct_val);
-                        let base_name =
-                            crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
-                        if base_name != m_lower {
-                            token
-                                .model_quotas
-                                .entry(base_name.clone())
-                                .and_modify(|existing: &mut i32| {
-                                    *existing = (*existing).max(pct_val)
-                                })
-                                .or_insert(pct_val);
-                            token.available_models.insert(base_name);
-                        }
-                        token.available_models.insert(m_lower);
-                    }
+                    Self::refresh_advertised_models(&mut token, &quota_data.models);
                     // [NEW] 同步 Argon 配额组能力
                     let argon_bucket = quota_data.quota_groups.as_ref().and_then(|groups| {
                         groups.iter().find_map(|g| {
@@ -6170,10 +6186,15 @@ impl TokenManager {
 
     // Upstream model-quota selection, with local protection and text-only guards.
     fn select_probe_model(token: &ProxyToken) -> Option<&str> {
+        // Loaded metadata contains only advertised wire IDs. The quota and
+        // routing indexes also contain synthetic bucket/base aliases that
+        // must never be sent to the upstream probe endpoint.
         token
-            .model_quotas
-            .keys()
-            .chain(token.available_models.iter())
+            .available_models
+            .iter()
+            .filter(|model| {
+                token.model_metadata.is_empty() || token.model_metadata.contains_key(*model)
+            })
             .filter(|model| {
                 let lower = model.to_ascii_lowercase();
                 let bucket = crate::proxy::common::model_mapping::normalize_to_standard_id(model);
@@ -6250,7 +6271,6 @@ impl TokenManager {
         endpoints: &[String],
         config: QoSConfig,
     ) -> Result<f64, String> {
-        let start = std::time::Instant::now();
         tokio::time::timeout(
             std::time::Duration::from_secs_f64(config.probe_timeout_secs),
             async {
@@ -6270,6 +6290,7 @@ impl TokenManager {
                 // Upstream fallback policy: retry network/404/408/5xx failures,
                 // but keep the entire chain within the local probe deadline.
                 for endpoint in endpoints {
+                    let attempt_start = std::time::Instant::now();
                     let bytes = body_bytes.clone();
                     let resp = match client
                         .post(endpoint)
@@ -6297,8 +6318,10 @@ impl TokenManager {
                         return Err(last_error);
                     }
                     // Keepalive or thinking-only data is not recovery evidence.
-                    Self::wait_for_qos_probe_generation(resp).await?;
-                    return Ok(start.elapsed().as_secs_f64() * 1000.0);
+                    if Self::wait_for_qos_probe_generation(resp).await? {
+                        return Ok(attempt_start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    last_error = format!("Probe received an empty response from {endpoint}");
                 }
                 Err(last_error)
             },
@@ -6312,17 +6335,20 @@ impl TokenManager {
         })?
     }
 
-    async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<(), String> {
+    /// True for generated text; false only for a clean zero-byte response.
+    async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<bool, String> {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
         let mut pending = bytes::BytesMut::new();
         let mut event_data = String::new();
+        let mut saw_bytes = false;
         // Keepalive traffic and arbitrary chunk boundaries must not count as tokens.
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("Probe stream error: {e}"))?;
             if pending.len() + event_data.len() + chunk.len() > 64 * 1024 {
                 return Err("QoS probe SSE event exceeded 64 KiB".to_string());
             }
+            saw_bytes |= !chunk.is_empty();
             pending.extend_from_slice(&chunk);
             while let Some(end) = pending.iter().position(|&byte| byte == b'\n') {
                 let line = pending.split_to(end + 1);
@@ -6331,7 +6357,7 @@ impl TokenManager {
                     .trim_end_matches(['\r', '\n']);
                 if line.is_empty() {
                     if Self::qos_probe_event_has_generation(&event_data)? {
-                        return Ok(());
+                        return Ok(true);
                     }
                     event_data.clear();
                 } else if let Some(data) = line.strip_prefix("data:") {
@@ -6342,7 +6368,11 @@ impl TokenManager {
                 }
             }
         }
-        Err("QoS probe ended without generated text".to_string())
+        if saw_bytes {
+            Err("QoS probe ended without generated text".to_string())
+        } else {
+            Ok(false)
+        }
     }
 
     fn qos_probe_event_has_generation(data: &str) -> Result<bool, String> {
@@ -7165,6 +7195,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn qos_loaded_probe_model_uses_only_advertised_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(dir.path().to_owned());
+        let path = dir.path().join("account.json");
+        for (wire_id, protect, expected) in [
+            ("gemini-3.1-flash-lite", true, None),
+            (
+                "gemini-3.8-flash-high",
+                false,
+                Some("gemini-3.8-flash-high"),
+            ),
+            ("gemini-4-argon-low", false, None), // No eligible Argon quota group.
+            ("gemini-3.1-flash-image", false, None),
+            ("gemini-3-flash-audio", false, None),
+        ] {
+            let account = serde_json::json!({
+                "id":"probe-fixture","email":"fixture@example.com",
+                "token":{"access_token":"fixture","refresh_token":"fixture","expires_in":3600,
+                    "expiry_timestamp":chrono::Utc::now().timestamp()+3600},
+                "quota":{"models":[{"name":wire_id,"percentage":100}],"quota_groups":[]}
+            });
+            std::fs::write(&path, account.to_string()).unwrap();
+            let mut token = manager.load_single_account(&path).await.unwrap().unwrap();
+            if protect {
+                token.protected_models.insert(wire_id.to_string());
+            }
+            assert_eq!(TokenManager::select_probe_model(&token), expected);
+        }
+    }
+
+    #[test]
+    fn qos_realtime_refresh_replaces_raw_probe_candidates() {
+        let mut token = qos_probe_test_token();
+        let initial = "gemini-3.8-flash-high";
+        let refreshed = "gemini-3.8-flash-low";
+        for id in [initial, refreshed] {
+            let model = serde_json::from_value(
+                serde_json::json!({"name":id,"percentage":75,"reset_time":""}),
+            )
+            .unwrap();
+            TokenManager::refresh_advertised_models(&mut token, &[model]);
+            assert_eq!(TokenManager::select_probe_model(&token), Some(id));
+        }
+        TokenManager::refresh_advertised_models(&mut token, &[]);
+        assert_eq!(TokenManager::select_probe_model(&token), Some(refreshed));
+        assert!(!token.model_metadata.contains_key(initial));
+        token.protected_models.insert(refreshed.into());
+        assert_eq!(TokenManager::select_probe_model(&token), None);
+    }
+
     #[test]
     fn qos_probe_model_selection_excludes_non_text_and_protected_models() {
         let mut token = qos_probe_test_token();
@@ -7272,6 +7353,19 @@ mod tests {
         tokio::sync::mpsc::Receiver<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>,
         tokio::task::JoinHandle<()>,
     ) {
+        qos_probe_stub_with_delay(status, chunks, stall, Duration::ZERO).await
+    }
+
+    async fn qos_probe_stub_with_delay(
+        status: axum::http::StatusCode,
+        chunks: Vec<&'static str>,
+        stall: bool,
+        delay: Duration,
+    ) -> (
+        String,
+        tokio::sync::mpsc::Receiver<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use futures::StreamExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -7289,6 +7383,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+                tokio::time::sleep(delay).await;
                 let stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
                     Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(chunk.as_bytes()))
                 }))
@@ -7425,6 +7520,32 @@ mod tests {
                 "status={status}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn qos_empty_endpoint_falls_back_without_inflating_success_ttft() {
+        let delay = Duration::from_millis(300);
+        let (first, _rx1, server1) =
+            qos_probe_stub_with_delay(axum::http::StatusCode::OK, vec![], false, delay).await;
+        let (second, _rx2, server2) = qos_probe_stub(
+            axum::http::StatusCode::OK,
+            vec!["data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n"],
+            false,
+        )
+        .await;
+        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
+        let start = std::time::Instant::now();
+        let ttft = TokenManager::send_pure_hello_probe_to_endpoints(
+            &qos_probe_test_token(),
+            &upstream,
+            &[first, second],
+            QoSConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(start.elapsed().as_secs_f64() * 1000.0 - ttft >= delay.as_millis() as f64);
+        server1.abort();
+        server2.abort();
     }
 
     #[tokio::test]
@@ -11282,6 +11403,14 @@ mod tests {
             .model_quotas
             .insert("gemini-3.1-flash-image".to_string(), 33);
 
+        token.model_metadata = token
+            .model_quotas
+            .keys()
+            .cloned()
+            .map(|name| (name, Default::default()))
+            .collect();
+
+        token.available_models = token.model_metadata.keys().cloned().collect();
         assert_eq!(
             TokenManager::select_probe_model(&token).as_deref(),
             Some("gemini-3.8-flash-high"),
