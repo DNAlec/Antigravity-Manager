@@ -1223,11 +1223,27 @@ impl UpstreamClient {
         cfg: &crate::proxy::config::UploadTimeoutConfig,
         observed_bps: Option<u64>,
     ) -> UpstreamTimeoutPlan {
+        Self::plan_upstream_timeouts_with_policy(
+            media_kind,
+            body_len,
+            cfg,
+            observed_bps,
+            super::request_policy::request_policy(),
+        )
+    }
+
+    fn plan_upstream_timeouts_with_policy(
+        media_kind: PayloadMediaKind,
+        body_len: usize,
+        cfg: &crate::proxy::config::UploadTimeoutConfig,
+        observed_bps: Option<u64>,
+        policy: &super::request_policy::UpstreamRequestPolicy,
+    ) -> UpstreamTimeoutPlan {
         let (upload_budget_secs, budget_source) =
             Self::calculate_upload_budget_secs(body_len, cfg, observed_bps);
 
         let large_body = body_len >= cfg.large_body_threshold_bytes();
-        let max_endpoints = V1_INTERNAL_BASE_URL_FALLBACKS.len();
+        let max_endpoints = policy.account_attempt_limit(V1_INTERNAL_BASE_URL_FALLBACKS.len());
         let endpoint_attempt_limit = if large_body {
             cfg.large_body_endpoint_attempts.clamp(1, max_endpoints)
         } else {
@@ -1512,9 +1528,7 @@ impl UpstreamClient {
         let media_kind = detect_payload_media_kind(&body, method, is_image_gen);
         let upload_cfg = crate::proxy::get_upload_timeout_config();
         let stream_cfg = crate::proxy::config::get_stream_timeout_config();
-        let mut timeout_plan = Self::plan_upstream_timeouts(media_kind, body_bytes.len(), &upload_cfg);
-        timeout_plan.endpoint_attempt_limit = super::request_policy::request_policy()
-            .account_attempt_limit(timeout_plan.endpoint_attempt_limit);
+        let timeout_plan = Self::plan_upstream_timeouts(media_kind, body_bytes.len(), &upload_cfg);
         // [Pipeline Budget] 四大协议共用的请求级硬上限：
         // 已经耗尽就不再发起新的上游尝试（避免带着 0 预算空转一圈又去轮换账号）。
         if crate::proxy::pipeline::budget::exhausted() {
@@ -2655,16 +2669,22 @@ mod tests {
             "stall_secs must not be squeezed down by small body upload budget"
         );
 
-        // 使用当前重放护栏阈值；v5.0.3 已将旧的约 500KB 门槛提高到 4MB。
-        // 上传预算必须有保底（至少 15s），且 stall_secs 不被挤压。
-        let medium_plan = UpstreamClient::plan_upstream_timeouts_with_observed(
-            PayloadMediaKind::TextChat,
-            crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES,
-            &cfg,
-            None,
-        );
-        assert!(medium_plan.upload_budget_secs >= 15);
-        assert_eq!(medium_plan.stall_secs, 45);
+        // Use enough bandwidth for the floor (rather than transfer time) to dominate.
+        let fast_cfg = crate::proxy::config::UploadTimeoutConfig {
+            min_upload_mbps: 100.0,
+            ..cfg.clone()
+        };
+        let threshold = crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES;
+        for (bytes, expected) in [(threshold - 1, 5), (threshold, 15)] {
+            let plan = UpstreamClient::plan_upstream_timeouts_with_observed(
+                PayloadMediaKind::TextChat,
+                bytes,
+                &fast_cfg,
+                None,
+            );
+            assert_eq!(plan.upload_budget_secs, expected);
+            assert_eq!(plan.stall_secs, 45);
+        }
 
         // 大体积请求默认仅允许 1 个端点，抑制同一大 body 重传放大
         let big_plan = UpstreamClient::plan_upstream_timeouts_with_observed(
@@ -2677,6 +2697,29 @@ mod tests {
         assert_eq!(big_plan.endpoint_attempt_limit, 1);
         assert_eq!(big_plan.stall_secs, 45);
         assert!(big_plan.total_budget_secs >= big_plan.upload_budget_secs);
+    }
+
+    #[test]
+    fn single_attempt_only_budgets_one_endpoint_upload() {
+        use crate::proxy::upstream::request_policy::UpstreamRequestPolicy;
+        let config = default_upload_cfg();
+        for (single_attempt, expected_endpoints) in
+            [(true, 1), (false, V1_INTERNAL_BASE_URL_FALLBACKS.len())]
+        {
+            let policy = UpstreamRequestPolicy { single_attempt };
+            let plan = UpstreamClient::plan_upstream_timeouts_with_policy(
+                PayloadMediaKind::TextChat,
+                1024,
+                &config,
+                None,
+                &policy,
+            );
+            assert_eq!(plan.endpoint_attempt_limit, expected_endpoints);
+            assert_eq!(
+                plan.total_budget_secs,
+                plan.first_byte_total_secs + plan.upload_budget_secs * expected_endpoints as u64
+            );
+        }
     }
 
     #[test]
