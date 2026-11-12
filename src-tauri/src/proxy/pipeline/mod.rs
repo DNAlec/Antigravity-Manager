@@ -23,6 +23,7 @@ pub mod stream_peek;
 pub mod terminal;
 pub mod timing;
 pub mod usage;
+pub mod usage_diagnostics;
 
 pub use auto_heal::{
     try_auto_heal, wrap_stream_with_empty_thinking_auto_heal, AutoHealFlags, AutoHealOutcome,

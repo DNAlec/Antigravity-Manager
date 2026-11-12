@@ -29,6 +29,7 @@ pub mod proxy_pool; // 代理池管理器
 pub mod qos_config; // 实例级 QoS 配置与验证
 pub mod qos_guardian; // QoS 智能熔断与阶梯探针守卫
 pub mod rate_limit; // 限流跟踪
+mod session_bindings; // 版本化会话与账号绑定
 pub mod session_manager; // 会话指纹管理
 pub mod signature_cache; // Signature Cache (v3.3.16)
 pub mod stage_trace; // 请求阶段时间线（可观测性）

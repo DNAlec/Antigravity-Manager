@@ -1935,6 +1935,7 @@ pub async fn monitor_middleware(
             // Record User Token Usage
             record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
+            crate::proxy::pipeline::usage_diagnostics::attach_to_log(&mut log, &upstream_holder);
             monitor.log_request(log).await;
         });
 
@@ -2041,6 +2042,10 @@ pub async fn monitor_middleware(
                 // Record User Token Usage
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
+                crate::proxy::pipeline::usage_diagnostics::attach_to_log(
+                    &mut log,
+                    &upstream_holder,
+                );
                 monitor.log_request(log).await;
                 Response::from_parts(parts, Body::from(bytes))
             }
@@ -2050,6 +2055,10 @@ pub async fn monitor_middleware(
                 // Record User Token Usage (even if too large)
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
+                crate::proxy::pipeline::usage_diagnostics::attach_to_log(
+                    &mut log,
+                    &upstream_holder,
+                );
                 monitor.log_request(log).await;
                 Response::from_parts(parts, Body::empty())
             }
@@ -2060,6 +2069,7 @@ pub async fn monitor_middleware(
         // Record User Token Usage
         record_user_token_usage(&user_token_identity, &log, user_agent);
 
+        crate::proxy::pipeline::usage_diagnostics::attach_to_log(&mut log, &upstream_holder);
         monitor.log_request(log).await;
         response
     }

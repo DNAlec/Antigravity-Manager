@@ -330,6 +330,7 @@ where
     if crate::proxy::upstream::request_policy::request_policy().single_attempt {
         return stream;
     }
+    let usage_holder = crate::proxy::monitor::UpstreamRequestBodyHolder::current();
     let stream = async_stream::stream! {
         let mut buffer = BytesMut::new();
         let mut saw_thought = false;
@@ -487,7 +488,14 @@ where
                         "[{}] [Stream-AutoHeal] ✓ Continuation request succeeded (HTTP 200), piping healed stream directly into client connection...",
                         ctx.trace_id
                     );
-                    let mut stream2 = call_success.response.bytes_stream();
+                    let usage_attempt = usage_holder.as_ref().and_then(|holder| {
+                        let model = ctx.original_body.get("model")
+                            .and_then(Value::as_str).unwrap_or("");
+                        holder.begin_usage_attempt(model, ctx.account_id.as_deref().unwrap_or(""), "auto_heal")
+                    });
+                    let mut stream2 = crate::proxy::pipeline::usage_diagnostics::observe_stream(
+                        call_success.response.bytes_stream(), usage_attempt,
+                    );
                     let mut stream2_saw_output = false;
                     let mut s2_buffer = BytesMut::new();
 
