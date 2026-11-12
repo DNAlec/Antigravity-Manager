@@ -3991,26 +3991,17 @@ impl TokenManager {
             );
         }
 
-        // 【优化 Issue #284】添加 15 秒超时，防止死锁（为多账号热路径刷新容灾留足窗口）
-        let timeout_duration = std::time::Duration::from_secs(15);
-        match tokio::time::timeout(
-            timeout_duration,
-            self.get_token_internal(
+        let budget = crate::proxy::pipeline::token_budget::TokenAcquisitionBudget::new();
+        budget
+            .run(self.get_token_internal(
                 quota_group,
                 force_rotate,
                 session_id,
                 target_model,
                 excluded_accounts,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(
-                "Token acquisition timeout (15s) - system too busy or deadlock detected"
-                    .to_string(),
-            ),
-        }
+                &budget,
+            ))
+            .await
     }
 
     /// 内部实现：获取 Token 的核心逻辑
@@ -4021,6 +4012,7 @@ impl TokenManager {
         session_id: Option<&str>,
         target_model: &str,
         excluded_accounts: &HashSet<String>,
+        budget: &crate::proxy::pipeline::token_budget::TokenAcquisitionBudget,
     ) -> Result<LeasedCredentials, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         let account_epochs = self.session_accounts.account_epochs();
@@ -4691,8 +4683,11 @@ impl TokenManager {
                                         rem_secs,
                                         wait_secs
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
-                                        .await;
+                                    budget
+                                        .wait_for_cooldown(std::time::Duration::from_secs(
+                                            wait_secs,
+                                        ))
+                                        .await?;
                                 }
                                 self.validate_cached_account_after_wait(&key, &normalized_target)?;
                                 tracing::info!(
@@ -4735,8 +4730,11 @@ impl TokenManager {
                                         scheduling.max_wait_seconds,
                                         wait_secs
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
-                                        .await;
+                                    budget
+                                        .wait_for_cooldown(std::time::Duration::from_secs(
+                                            wait_secs,
+                                        ))
+                                        .await?;
                                 }
                                 self.validate_cached_account_after_wait(&key, &normalized_target)?;
                                 tracing::info!(
@@ -5036,7 +5034,9 @@ impl TokenManager {
                             );
 
                             // 物理冷却延迟
-                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+                            budget
+                                .wait_for_cooldown(std::time::Duration::from_millis(wait_ms))
+                                .await?;
 
                             // 重新尝试选择账号
                             let mut retry_token = None;
@@ -12554,6 +12554,82 @@ mod tests {
             "60s 窗口必须优先复用最近账号以保住缓存，不得因其他账号配额更高主动解绑"
         );
         assert_eq!(email, "acc1@test.com");
+    }
+
+    #[tokio::test]
+    async fn cooldown_longer_than_work_watchdog_preserves_selection() {
+        async fn scenario(qos: bool, bound: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("account.json");
+            std::fs::write(
+                &path,
+                r#"{"disabled":false,"token":{"project_id":"local-project"}}"#,
+            )
+            .unwrap();
+            let manager = TokenManager::new(dir.path().into());
+            let account = "cooldown-account";
+            let model = "gemini-4-argon";
+            let mut token = create_test_token(account, Some("PRO"), 1.0, None, Some(100));
+            token.account_path = path;
+            token.project_id = Some("local-project".into());
+            token.model_quotas.insert(model.into(), 100);
+            manager.tokens.insert(account.into(), token);
+            manager
+                .update_sticky_config(StickySessionConfig {
+                    mode: crate::proxy::sticky_config::SchedulingMode::CacheFirst,
+                    max_wait_seconds: 60,
+                    ..Default::default()
+                })
+                .await;
+            if bound {
+                manager.commit_session("waiting-session", account);
+            }
+            if qos {
+                manager.set_qos_auto_jail(true);
+                manager.qos_guardian.states.insert(
+                    account.into(),
+                    crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                        level: 0,
+                        jailed_at: std::time::Instant::now(),
+                        current_wait: Duration::from_secs(16),
+                    },
+                );
+            } else {
+                manager.rate_limit_tracker.set_lockout_until(
+                    account,
+                    std::time::SystemTime::now() + Duration::from_secs(16),
+                    crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+                    Some(model.into()),
+                );
+            }
+            let excluded = HashSet::new();
+            let selected = crate::proxy::pipeline::budget::scope(
+                crate::proxy::pipeline::budget::RequestContext::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                ),
+                manager.get_token_filtered(
+                    "chat",
+                    false,
+                    bound.then_some("waiting-session"),
+                    model,
+                    &excluded,
+                ),
+            )
+            .await
+            .expect("planned cooldown must not trigger the 15-second work watchdog");
+            assert_eq!(selected.3, account);
+            if bound {
+                assert_eq!(
+                    manager.session_accounts.get("waiting-session").as_deref(),
+                    Some(account)
+                );
+            }
+        }
+        tokio::join!(
+            scenario(true, true),
+            scenario(false, true),
+            scenario(false, false)
+        );
     }
 
     #[tokio::test]

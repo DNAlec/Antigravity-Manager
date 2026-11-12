@@ -226,7 +226,8 @@ impl QoSGuardian {
             {
                 let elapsed = jailed_at.elapsed();
                 if elapsed < *current_wait {
-                    return Some((*current_wait - elapsed).as_secs());
+                    let remaining = *current_wait - elapsed;
+                    return Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0));
                 } else {
                     return Some(0);
                 }

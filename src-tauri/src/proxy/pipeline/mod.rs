@@ -22,6 +22,7 @@ pub mod stream_lifecycle;
 pub mod stream_peek;
 pub mod terminal;
 pub mod timing;
+pub(crate) mod token_budget;
 pub mod usage;
 pub mod usage_diagnostics;
 
