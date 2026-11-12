@@ -6507,7 +6507,11 @@ mod signature_placement_tests {
         };
         for id in [&first, &second, &other_user] {
             assert!(id.len() <= 128);
-            assert_eq!(winner(id), *id, "the bridge ID must survive without truncation");
+            assert_eq!(
+                winner(id),
+                *id,
+                "the bridge ID must survive without truncation"
+            );
         }
         let affinity = |id: &str| {
             derive_winner_session_id("shared-am-key", Some(extract_root_session_id(id)), "")

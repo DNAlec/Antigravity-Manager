@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.3)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.4)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.3-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.4-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.3**（2026-11-06）：配额归因治理与调度内核重构——网关内部限流判据收敛至 `policy::is_internal_gateway_exhaustion` 单一权威源（根除占全量 5xx 92.6% 的 503 归因污染），新增 403 封禁专用归因 `account_forbidden`；将「上游告知的配额耗尽」与自适应熔断彻底解耦（熔断关闭时仍能锁定 `QuotaExhausted` 账号），重试循环引入 `attempted_accounts` 账号排除防反复锤击，并将配额过滤前置于优先级收敛以消除 0 配额高优账号饥饿全池的优先级倒置死锁 (Fixes #3838, #3841, PR #3845)；蹬额度模式由暴力禁用重构为最高调度优先级竞争，保住 Prompt Cache 并自动外溢并发流量 (PR #3840)；超时契约解除 135s/160s 硬截断，首字基准恢复 180s、多模态上限 270s、全局预算统一下沉 pipeline，Codex / Legacy 流式收敛至统一生命周期并补齐思考期自适应跃迁 (Fixes #3816, #3821, Ref #3763)；模型路由确立自定义映射最高优先级、旧版模型硬下线与先映射后判定、号池自适应暗路由与上游物理模型统一收敛至 `X-Upstream-Model` (Fixes #2065, Ref #3764, #3769, #3815)；多模态坏图 400 就地自愈与指纹黑名单、保鲜滑窗默认开启、Responses 协议日志脱敏与视觉 Token 估算 (Fixes #3758, #3824, #3756)；提示词清洗分轨保护用户正文、CTF 策略自适应剥离与 Gzip 入站解压 (Fixes #3764, #3781)；GCP Vertex AI 企业账号与 Project ID 一键获取、Antigravity IDE 2.6.0+ 三级双写切号与进程身份收敛、账号删除一致性、Web/Docker OAuth 与更新设置修复、DeepSeek Harness 一键同步 (Fixes #3823, #3829, #3806, #3802, #3754)；Linux 远程桌面保活、macOS Mini 视窗主线程调度、界面与字体缩放及托盘交互优化 (Fixes #3752, #3757, #3744)；工具签名缓存写入放大治理与 Token 双视角 + TTFT 统计、QoS 死锁修复 (PR #3765, PR #3774, Fixes #3810, #3749)；多智能体根会话归一化与凭据级强粘性、3P 幽灵配额治理 (Fixes #3789, #3809)。
+> 最新版本 **v5.0.4**（2026-11-12）：集成上游 beta.0–beta.7，保留本仓库的会话租约、QoS 配置与单次尝试控制。CacheFirst 不再提前解除隔离或清除并发更新的冷却记录，明确的冷却等待与 15 秒选号工作看门狗分开计时。上传采用进展驱动软预算，连接重试和流尾部刷新保护会话缓存与完整响应。同步提示词清理规则、请求级 429 处理、账号／配额恢复、模型族优先级、账号操作界面、ACP 集成及 Termux 支持。关联 Issue、贡献者署名和详细变化见[完整更新日志](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

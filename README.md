@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.3)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.4)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.3-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.4-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -528,7 +528,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.3** (2026-11-06): Quota attribution governance and scheduling-core refactor — internal gateway throttling predicates converged into the single source of truth `policy::is_internal_gateway_exhaustion` (eradicating the 503 misattribution that accounted for 92.6% of all 5xx), plus a dedicated 403 ban attribution code `account_forbidden`; upstream-declared quota exhaustion is fully decoupled from the adaptive circuit breaker (so `QuotaExhausted` accounts stay locked even with the breaker disabled), retry loops now carry `attempted_accounts` to stop hammering the same exhausted account, and the positive-quota filter moved ahead of priority convergence to eliminate the zero-quota high-priority pool-starvation deadlock (Fixes #3838, #3841, PR #3845); pedal mode was rebuilt from hard disabling into top-priority competition, preserving Prompt Cache while spilling concurrency over automatically (PR #3840); the timeout contract removed the 135s/160s hard truncation, restoring a 180s first-byte baseline, a 270s multimodal ceiling, and a single pipeline-level global budget, with Codex / Legacy streams converged onto the shared lifecycle and adaptive thinking-phase promotion (Fixes #3816, #3821, Ref #3763); model routing now gives custom mappings absolute precedence, hard-retires legacy models with map-before-judge ordering, adds pool-adaptive dark routing, and converges the physical upstream model onto `X-Upstream-Model` (Fixes #2065, Ref #3764, #3769, #3815); 400 bad-image in-place self-healing with fingerprint blacklisting, default-on freshness sliding window, and Responses protocol log redaction plus vision-token accounting (Fixes #3758, #3824, #3756); prompt sanitization track separation preserving user text, adaptive CTF policy stripping, and inbound Gzip decompression (Fixes #3764, #3781); GCP Vertex AI enterprise accounts with one-click Project ID fetch, Antigravity IDE 2.6.0+ triple-write account switching with process-identity convergence, account deletion consistency, Web/Docker OAuth and update-settings fixes, and DeepSeek Harness one-click sync (Fixes #3823, #3829, #3806, #3802, #3754); Linux remote-desktop keep-alive, macOS Mini HUD main-thread scheduling, UI/font zoom and tray interaction polish (Fixes #3752, #3757, #3744); tool-signature cache write-amplification mitigation, token dual-perspective stats with TTFT, and QoS deadlock fixes (PR #3765, PR #3774, Fixes #3810, #3749); multi-agent root-session normalization with credential-level stickiness, and 3P phantom-quota governance (Fixes #3789, #3809).
+> Latest version **v5.0.4** (2026-11-12): Integrates upstream beta.0–beta.7 with this fork's session leases, QoS configuration, and single-attempt controls. CacheFirst now preserves active cooldowns and probe ownership, and accounts for explicit waits separately from the 15-second selection watchdog. Uploads use progress-driven soft budgets; transport retries and stream-tail flushing protect cached sessions and complete responses. Includes configurable prompt cleanup, request-level 429 handling, account/quota recovery improvements, model-family priorities, refreshed account controls, ACP integration, and Termux support. See the [full release notes](CHANGELOG_EN.md) for linked issues, contributor attribution, and details.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

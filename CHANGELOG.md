@@ -3,6 +3,23 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.4 (2026-11-12)**:
+        -   **[本仓库会话与冷却保护] (Ref [DNAlec/Antigravity-Manager#1](https://github.com/DNAlec/Antigravity-Manager/pull/1), [#2](https://github.com/DNAlec/Antigravity-Manager/pull/2), [#3](https://github.com/DNAlec/Antigravity-Manager/pull/3), [#4](https://github.com/DNAlec/Antigravity-Manager/pull/4), Thanks to @DNAlec)**:
+            -   集成上游 `v5.0.4-beta.0` 至 `beta.7`，保留会话租约代际校验、原始 usage 诊断、实例级 QoS 配置和单次尝试控制。
+            -   CacheFirst 等待后重新核对 QoS 与模型／账号限流状态：隔离未到期或探针仍在运行时不提前放行，不删除并发请求延长的冷却记录；未恢复时保留会话绑定并返回可重试错误。
+            -   将明确的冷却等待与 15 秒账号获取工作看门狗分开计时，统一覆盖 QoS、绑定账号限流和全账号池冷却；请求总截止时间保持不变，避免正常长冷却被误判为死锁并强制换号。
+        -   **[上传、流式响应与前缀缓存] (PR [lbjlaq/Antigravity-Manager#3906](https://github.com/lbjlaq/Antigravity-Manager/pull/3906), [#3899](https://github.com/lbjlaq/Antigravity-Manager/pull/3899), [#3889](https://github.com/lbjlaq/Antigravity-Manager/pull/3889), [#3857](https://github.com/lbjlaq/Antigravity-Manager/pull/3857), Thanks to @mclinyeshi, @wakeupnotfound, @jeikl, @JeikCode)**:
+            -   上传改为进展驱动的软预算，停滞超时和请求总预算仍负责终止；上传失败仅允许同账号原地重试一次，避免跨账号重复上传放大。同步超时设置与生效值展示。
+            -   连接重置按调度模式处理，保护 CacheFirst 绑定；固定多轮开场注入边界并对齐工具调用与回执结构，减少前缀缓存失效。修复文本内嵌媒体的 Token 估算（PR [#3864](https://github.com/lbjlaq/Antigravity-Manager/pull/3864)、[#3866](https://github.com/lbjlaq/Antigravity-Manager/pull/3866)、[#3867](https://github.com/lbjlaq/Antigravity-Manager/pull/3867)）。
+        -   **[提示词清理、限流归因与流尾部修复] (PR [lbjlaq/Antigravity-Manager#3913](https://github.com/lbjlaq/Antigravity-Manager/pull/3913), [#3902](https://github.com/lbjlaq/Antigravity-Manager/pull/3902), Fixes [#3911](https://github.com/lbjlaq/Antigravity-Manager/issues/3911), [#3914](https://github.com/lbjlaq/Antigravity-Manager/issues/3914), Thanks to @jeikl, @lbjlaq, @ThermalEng)**:
+            -   加强身份声明去重与标点归一化，新增可配置提示词清理规则和请求级 429 宽限重试；移除 OpenAI 接口旧 skills 伪指令注入，恢复提示词透传。
+            -   流结束时先刷新尾部缓冲，再判断是否缺少正文，避免丢失无尾换行的正文或工具调用。
+        -   **[账号、配额与调度界面] (PR [lbjlaq/Antigravity-Manager#3852](https://github.com/lbjlaq/Antigravity-Manager/pull/3852), [#3875](https://github.com/lbjlaq/Antigravity-Manager/pull/3875), [#3895](https://github.com/lbjlaq/Antigravity-Manager/pull/3895), [#3879](https://github.com/lbjlaq/Antigravity-Manager/pull/3879), [#3882](https://github.com/lbjlaq/Antigravity-Manager/pull/3882), Thanks to @cubelikeplayDaniel, @jeikl, @vecyang1)**:
+            -   对齐账号封禁、模型级 403、日／周配额及恢复判据；改进数据面探针、启动刷新与可配置滑动并发刷新。
+            -   移除仅因账号配额差异造成的粘性迁移；新增模型族优先级、账号标签与操作面板，修复蹬额度模式重入和 Windows 文件锁竞争。
+        -   **[客户端与平台支持] (PR [lbjlaq/Antigravity-Manager#3844](https://github.com/lbjlaq/Antigravity-Manager/pull/3844), [#3854](https://github.com/lbjlaq/Antigravity-Manager/pull/3854), Ref [#3818](https://github.com/lbjlaq/Antigravity-Manager/issues/3818), Thanks to @Al-Taie, @cubelikeplayDaniel, @lbjlaq)**:
+            -   支持 Antigravity ACP 插件账号切换与状态检测，补齐 CLI／Headless 路径；增加 Termux ARM64 部署支持，完善 Docker 有界健康检查、Tini 进程回收与 macOS universal 打包。
+
     *   **v5.0.4-beta.7 (2026-11-12)**:
         -   **[上游 WAF 429 身份改写根治、请求级限流防连坐与风控提示词清理方案] (Fixes #3904, #3908, #3901, #3915, Ref #3903, #3912, PR #3913, Thanks to @jeikl, @lbjlaq, @sinderson123-afk)**:
             -   **单例身份不变量与多重身份清理**: 跨 `systemInstruction.parts` 全局去重，仅保留首处官方 Antigravity 身份；彻底清除 DSH/pi/OpenCode 等客户端多重身份声明叠加生成的纯空白与重复身份片段，杜绝多身份混合带 tools 时被 Google WAF 判定异常并抛出 429 RESOURCE_EXHAUSTED。(Fixes #3904, #3908)
