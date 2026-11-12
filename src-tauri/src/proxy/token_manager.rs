@@ -6793,7 +6793,7 @@ impl TokenManager {
             return false;
         }
 
-        let recorded = self.record_rate_limit_atomic(
+        self.record_rate_limit_atomic(
             &account_id,
             status,
             retry_after_header,
@@ -6803,10 +6803,7 @@ impl TokenManager {
             TrackerParserMode::Current,
         );
 
-        status == 429
-            && (recorded.is_some() || is_quota_depleted)
-            && !has_explicit_retry_time
-            && is_quota_depleted
+        status == 429 && is_quota_depleted && !has_explicit_retry_time
     }
 
     /// [NEW] 将指定账号的目标模型配额在内存中即时标记为 0%
