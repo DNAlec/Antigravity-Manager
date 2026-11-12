@@ -769,13 +769,17 @@ impl QoSGuardian {
         true
     }
 
-    /// Atomically resume a cached session; stale probe claims cannot overwrite this transition.
+    /// Resume only an expired jail; an active probe owns its own transition.
     pub fn promote_to_half_open(&self, account_id: &str) {
         let Some(mut state) = self.states.get_mut(account_id) else {
             return;
         };
         let level = match *state {
-            AccountQoSState::Jailed { level, .. } | AccountQoSState::Probing { level, .. } => level,
+            AccountQoSState::Jailed {
+                level,
+                jailed_at,
+                current_wait,
+            } if jailed_at.elapsed() >= current_wait => level,
             _ => return,
         };
         *state = AccountQoSState::HalfOpen {
@@ -1516,18 +1520,34 @@ mod tests {
     }
 
     #[test]
-    fn cache_first_promotion_invalidates_in_flight_probe_claim() {
+    fn cache_first_promotion_preserves_live_jails_and_probes() {
         let guardian = QoSGuardian::new();
         guardian.set_auto_jail_enabled(true);
         let claim = jail_for_probe(&guardian, 1);
-
+        let probing = guardian.get_state("account");
         guardian.promote_to_half_open("account");
-        let resumed = guardian.get_state("account");
-        assert!(guardian.is_half_open("account"));
-        assert!(!guardian.mark_probe_passed("account", claim));
-        assert_eq!(guardian.mark_probe_failed("account", claim), None);
-        assert_eq!(guardian.get_state("account"), resumed);
+        assert_eq!(guardian.get_state("account"), probing);
+        assert!(guardian.mark_probe_passed("account", claim));
 
+        let jailed = AccountQoSState::Jailed {
+            level: 2,
+            jailed_at: Instant::now(),
+            current_wait: Duration::from_secs(600),
+        };
+        guardian.states.insert("account".into(), jailed.clone());
+        guardian.promote_to_half_open("account");
+        assert_eq!(guardian.get_state("account"), jailed);
+
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level: 2,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        guardian.promote_to_half_open("account");
+        assert!(guardian.is_half_open("account"));
         guardian.states.remove("account");
         guardian.promote_to_half_open("account");
         assert!(!guardian.states.contains_key("account"));

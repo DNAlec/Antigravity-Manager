@@ -4694,8 +4694,7 @@ impl TokenManager {
                                     tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
                                         .await;
                                 }
-                                self.qos_guardian
-                                    .promote_to_half_open(&bound_token.account_id);
+                                self.validate_cached_account_after_wait(&key, &normalized_target)?;
                                 tracing::info!(
                                     "Sticky Session: Successfully reusing bound account {} for session {} after QoS wait",
                                     bound_token.email,
@@ -4739,9 +4738,7 @@ impl TokenManager {
                                     tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
                                         .await;
                                 }
-                                self.rate_limit_tracker
-                                    .clear_model(&key, &normalized_target);
-                                self.rate_limit_tracker.clear_account_only(&key);
+                                self.validate_cached_account_after_wait(&key, &normalized_target)?;
                                 tracing::info!(
                                     "Sticky Session: Successfully reusing bound account {} for session {} after rate-limit wait",
                                     bound_token.email,
@@ -7169,6 +7166,30 @@ impl TokenManager {
     }
 
     // ===== 调度配置相关方法 =====
+
+    // Waiting is not evidence of recovery: read current state without deleting
+    // cooldowns that another request may have extended while this request slept.
+    fn validate_cached_account_after_wait(
+        &self,
+        account_id: &str,
+        model: &str,
+    ) -> Result<(), String> {
+        self.qos_guardian.promote_to_half_open(account_id);
+        if self.qos_guardian.is_jailed_or_probing(account_id) {
+            return Err(
+                "CacheFirst bound account is still in QoS cooldown or probing; retry later.".into(),
+            );
+        }
+        let remaining = self
+            .rate_limit_tracker
+            .get_remaining_wait(account_id, Some(model));
+        if remaining > 0 {
+            return Err(format!(
+                "CacheFirst bound account is rate-limited. Cooldown wait {remaining}s."
+            ));
+        }
+        Ok(())
+    }
 
     /// 获取当前调度配置
     pub async fn get_sticky_config(&self) -> StickySessionConfig {
@@ -12650,6 +12671,24 @@ mod tests {
             "CacheFirst 模式下进入 QoS 小黑屋时绝不能解除会话绑定"
         );
 
+        let blocked = manager
+            .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
+            .await;
+        assert!(blocked.unwrap_err().contains("QoS cooldown"));
+        assert_eq!(
+            manager.session_accounts.get(session_id).as_deref(),
+            Some(acc1_id)
+        );
+        assert!(manager.qos_guardian.is_jailed_or_probing(acc1_id));
+        manager.qos_guardian.states.insert(
+            acc1_id.into(),
+            crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                level: 0,
+                jailed_at: std::time::Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+
         let (_token, _project_id, email_after_jail, selected_after_jail, _wait) = manager
             .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
             .await
@@ -12662,6 +12701,68 @@ mod tests {
         assert!(
             manager.qos_guardian.is_half_open(acc1_id),
             "CacheFirst 原地等待结束后账号应转入 HalfOpen 观察缓刑期继续服务本会话"
+        );
+        // Another request extends either the model or account cooldown while we wait.
+        for extension_model in [Some(norm_target.clone()), None] {
+            manager.rate_limit_tracker.clear(acc1_id);
+            manager.rate_limit_tracker.set_lockout_until(
+                acc1_id,
+                std::time::SystemTime::now() + Duration::from_millis(200),
+                crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+                Some(norm_target.clone()),
+            );
+            let waiting = manager.get_token_filtered(
+                "chat",
+                false,
+                Some(session_id),
+                target_model,
+                &excluded,
+            );
+            let extension = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                manager.rate_limit_tracker.set_lockout_until(
+                    acc1_id,
+                    std::time::SystemTime::now() + Duration::from_secs(120),
+                    crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+                    extension_model,
+                );
+            };
+            let (result, ()) = tokio::join!(waiting, extension);
+            assert!(result.unwrap_err().contains("rate-limited"));
+            assert!(
+                manager
+                    .rate_limit_tracker
+                    .get_remaining_wait(acc1_id, Some(&norm_target))
+                    > 100
+            );
+            assert_eq!(
+                manager.session_accounts.get(session_id).as_deref(),
+                Some(acc1_id)
+            );
+        }
+
+        // A short request budget must not erase a cooldown when it skips the wait.
+        manager.rate_limit_tracker.clear(acc1_id);
+        manager.rate_limit_tracker.set_lockout_until(
+            acc1_id,
+            std::time::SystemTime::now() + Duration::from_secs(1),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            Some(norm_target.clone()),
+        );
+        let result = crate::proxy::pipeline::budget::scope(
+            crate::proxy::pipeline::budget::RequestContext::new(
+                std::time::Instant::now() + Duration::from_secs(20),
+            ),
+            manager.get_token_filtered("chat", false, Some(session_id), target_model, &excluded),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("rate-limited"));
+        assert!(manager
+            .rate_limit_tracker
+            .is_rate_limited(acc1_id, Some(&norm_target)));
+        assert_eq!(
+            manager.session_accounts.get(session_id).as_deref(),
+            Some(acc1_id)
         );
     }
 
