@@ -9,6 +9,16 @@ pub struct AppConfig {
     pub theme: String,
     pub auto_refresh: bool,
     pub refresh_interval: i32, // minutes
+    /// 启动完成、账号加载就绪后，异步刷新一次全部账号配额
+    #[serde(default = "default_startup_refresh")]
+    pub startup_refresh: bool,
+    /// 批量配额刷新与启动探测时的同时探测账号数（滑动窗口容量），默认 5，范围 1~20
+    #[serde(default = "default_refresh_concurrency")]
+    pub refresh_concurrency: u32,
+    /// 全量配额刷新的滑动窗口延迟（秒）：账号完成后等待该时间再释放槽位给下一个账号。
+    /// 并发上限固定为 5；0 表示完成后立即让位。
+    #[serde(default = "default_refresh_slide_delay_secs")]
+    pub refresh_slide_delay_secs: f64,
     pub auto_sync: bool,
     pub sync_interval: i32, // minutes
     pub default_export_path: Option<String>,
@@ -58,6 +68,18 @@ fn default_tray_click_action() -> String {
 
 fn default_quiet_autostart() -> bool {
     true
+}
+
+fn default_startup_refresh() -> bool {
+    true
+}
+
+fn default_refresh_concurrency() -> u32 {
+    5
+}
+
+fn default_refresh_slide_delay_secs() -> f64 {
+    0.2
 }
 
 /// Scheduled warmup configuration
@@ -249,6 +271,9 @@ impl AppConfig {
             theme: "system".to_string(),
             auto_refresh: true,
             refresh_interval: 10,
+            startup_refresh: true,
+            refresh_concurrency: 5,
+            refresh_slide_delay_secs: 0.2,
             auto_sync: false,
             sync_interval: 5,
             default_export_path: None,
@@ -309,6 +334,39 @@ mod tests {
         let saved = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&saved).unwrap();
         assert!(!restored.quiet_autostart);
+    }
+
+    #[test]
+    fn startup_refresh_defaults_are_backward_compatible() {
+        let config = AppConfig::new();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("startup_refresh");
+        value.as_object_mut().unwrap().remove("refresh_concurrency");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(restored.startup_refresh);
+        assert_eq!(restored.refresh_concurrency, 5);
+
+        let mut config = AppConfig::new();
+        config.startup_refresh = false;
+        config.refresh_concurrency = 10;
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.startup_refresh);
+        assert_eq!(restored.refresh_concurrency, 10);
+    }
+
+    #[test]
+    fn refresh_slide_delay_defaults_to_0_2_seconds() {
+        let config = AppConfig::new();
+        assert!((config.refresh_slide_delay_secs - 0.2).abs() < f64::EPSILON);
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh_slide_delay_secs");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!((restored.refresh_slide_delay_secs - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -3,6 +3,130 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.4-beta.7 (2026-11-12)**:
+        -   **[上游 WAF 429 身份改写根治、请求级限流防连坐与风控提示词清理方案] (Fixes #3904, #3908, #3901, #3915, Ref #3903, #3912, PR #3913, Thanks to @jeikl, @lbjlaq, @sinderson123-afk)**:
+            -   **单例身份不变量与多重身份清理**: 跨 `systemInstruction.parts` 全局去重，仅保留首处官方 Antigravity 身份；彻底清除 DSH/pi/OpenCode 等客户端多重身份声明叠加生成的纯空白与重复身份片段，杜绝多身份混合带 tools 时被 Google WAF 判定异常并抛出 429 RESOURCE_EXHAUSTED。(Fixes #3904, #3908)
+            -   **版本号识别优化与同位语标点规整**: 版本 token 优先匹配完整版本号（如 `gemini-3.8-flash-low`，彻底根除被截断为 `gemini-3` 并残留 `8-flash-low model.` 的缺陷）；规范化 AG 声明后的 ASCII 逗号与同位语续写为句号（`AG, a coding agent harness.` $\to$ `AG. a coding agent harness.`），折叠处理畸形标点（如 `.,`、`。，`），消除上游 WAF 触发特征。(Fixes #3908, #3915)
+            -   **请求级 429 防连坐与智能宽限重试**: 失败计数粒度细化至账号+模型（account + model），避免单一模型限流波及全号；首轮 429 遭遇无 `retryDelay` 的请求级限流时原地执行 GraceRetry 且不锁定账号；新增 `request_429_grace_ms`（首轮请求 429 宽限延迟，默认 1500ms，范围 200–10000ms，支持环境变量 `ABV_REQUEST_429_GRACE_MS` 与热更新）；网关全池冷却规范返回 429 状态码与 `all_accounts_limited`，并通过 `gateway_error.source` 标明来源；优先解析 `QuotaFailure`、`RetryInfo`、`ErrorInfo` 结构化信号，与轮换策略协同。(Fixes #3901)
+            -   **风控提示词清理方案（Prompt Rewrite）与内置推荐预设**: 反代设置新增「风控提示词清理方案」配置与编辑面板，支持单行通配符 `*` 与 `\n/\r/\t/\\/\*` 转义，空替换即为删除，仅作用于首个真实 user 之前的 System 轨并豁免代码块与思考块；默认内置并支持一键载入 6 套实战推荐规则（OpenCode 同位语、DSH 身份声明、WorkBuddy 身份声明、Codex CLI 身份指纹、Anthropic Billing 计费头元数据等），支持规则热重载与配置导入导出。(Ref #3903, #3913)
+            -   **全语言国际化覆盖与多目标编译修复**: 针对提示词清理规则与宽限延迟等新配置项补齐 12 种语言完整国际化覆盖；在 `Cargo.toml` 中显式指定 `default-run = "antigravity-tools"`，彻底消除多 bin 目标时 `cargo run` 或 `tauri dev` 编译报错问题。(Ref #3913)
+        -   **[收敛上传超时策略并消除 504 跨账号重传放大] (PR #3906, Ref #3763, #3821, #3639, #3893, #3899, Thanks to @jeikl, @mclinyeshi, @JeikCode)**:
+            -   **进展驱动上传看门狗**: 将 `upload_budget` 从固定硬时间切断降级为软预算与观测指标，仅在连续 `stall_secs` 无任何数据传输进展时才触发 `UploadStalled` 终态中止；全局总预算兜底硬上限，彻底避免网络平稳但速度较慢的大文件/大上下文上传被中途误掐断。(PR #3906, Ref #3763)
+            -   **杜绝跨账号重传放大**: 全面接入 `TerminalDisposition::plan`，明确 `Upload` 与 `UploadStalled` 在所有文本调度模式（CacheFirst / Balance / PerformanceFirst）下仅允许在同账号原地重连重试 1 次，失败后直接终止（Stop），坚决不解绑粘性会话、不跨账号轮换重放同一份大请求体，彻底消除 504 导致的号池风暴与雪崩。(PR #3906, Ref #3899)
+            -   **端点调度与 large_body 字节判定优化**: 修正 `large_body` 判定，仅依据实际 Body 字节数（>= 2MB）触发，移除 `>= 30k tokens` 的误判；主端点冷却时大请求优先尝试健康的 Sandbox 端点，且端点遍历至末尾时严格打齐终态标记。(PR #3906)
+            -   **EWMA 传输速率采样放宽与 UA 404 短路保护**: EWMA 有效速率采样门槛从 32KB/s 宽限至 4KB/s，并在失败/中止的上传上正常采样以更贴近真实弱网环境；客户端 UA 过旧引发的 404/403 在 Pipeline 统一短路，不再误写 900 秒模型熔断与换号。(PR #3906)
+            -   **前后端超时配置与生效值面板对齐**: 超时配置公式动态对齐后端（`1 + extra_wait_ratio`），前端精确夹取后端取值范围；新增 `get_effective_timeout_config` 命令并在设置面板提供「当前生效值」展示，明确区分单端点尝试次数与跨账号重试。(PR #3906)
+            -   **策略文档与结构化观测落地**: 新增 [`docs/UPLOAD_TIMEOUT_POLICY.md`](UPLOAD_TIMEOUT_POLICY.md) 详细阐释超时策略、终态矩阵、迁移与回滚路径；上传日志增加 `progress_pct`、`upload_budget_extended`、`endpoint_attempts` 等结构化指标。(PR #3906)
+        -   **[粘性会话连接重置原地重试与缓存锁定保护] (PR #3899, Ref #3821, #3893, #3639, Thanks to @mclinyeshi)**:
+            -   **区分底层连接重置与首字超时**: 准确区分预算内底层 TCP 连接中断（如 daily 端点 `client error (SendRequest)`）与真正的首字超时，将预算内断流归类为 `TransportReset`（502）且不惩罚账号，避免被误判为超时故障。(PR #3899, Ref #3821)
+            -   **CacheFirst 模式原地重试与会话缓存锁定**: 在 CacheFirst 调度模式下遭遇 TransportReset 坚决不解绑账号，在原地重试 1 次并维持会话绑定，彻底根除长会话因瞬间断流漂移至其他账号导致昂贵的前缀预填充缓存（KV Cache）雪崩失效的问题；Balance 模式下原地重试 1 次失败后才触发换号容灾；CacheFirst 下生图请求（不携带 KV 缓存）遭遇故障时允许平滑轮换账号且不解绑会话原有的文本绑定。(PR #3899)
+        -   **[身份改写标点清洗与续写保护] (PR #3902, Ref #3508, Thanks to @ThermalEng, @jeikl)**:
+            -   **规整身份声明后续标点拼接**: 仅当官方身份声明紧跟逗号续写时才剥离末尾句号，彻底消除清洗后出现 `.,` 双标点异常，在非续写路径严格保留句号；强化全角逗号与已知客户端开场白的单元测试防御覆盖。(PR #3902, Ref #3508)
+        -   **[OpenAI 协议提示词纯净透传与遗留技能伪指令清除] (Fixes #3914, Thanks to @l10kai)**:
+            -   **拔除遗留技能提示词劫持**: 彻底移除 `enhance_gemini_skills_prompt` 硬编码逻辑，不再无条件劫持 OpenAI 兼容协议（`/v1/chat/completions` 与 `/v1/responses`）中的 `</skills>` 及 `</skills_instructions>` XML 标签；消除向非 Codex 客户端注入虚构的 `shell_command` 工具及 Windows PowerShell 命令的错误伪指令，彻底恢复系统提示词原样纯净透传，杜绝主流 Agent 客户端（Oh My Pi、Cline、Roo Code 等）发生指令冲突与工具调用幻觉。(Fixes #3914)
+        -   **[流式生命周期 EOF 残余缓冲区优先冲刷与误中断消除] (Fixes #3911, Ref #3693, Thanks to @djj532)**:
+            -   **EOF 残余缓冲区优先安全冲刷**: 调整流式生命周期管理（`stream_lifecycle.rs`）在遇到上游 EOF 及跳出主循环时的执行顺序，优先对滞留的尾部数据缓冲区（`buffer`）执行 Trim 与行解析下发，彻底根治思考结束（`thought=true`）后紧跟的无换行符（`\n`）正文或工具调用尾帧因滞留缓冲区而被判空守卫（`!has_content()`）提前拦截并报出 `upstream stream ended after thinking without content` 导致有效帧丢失的问题；冲刷后若确实无有效正文依然如实报错以触发原生重试，兼顾极端分片容错与故障重试契约。(Fixes #3911, Ref #3693)
+
+    *   **v5.0.4-beta.6 (2026-11-09)**:
+        -   **[上游权威数据面封禁探针重构与智能长时冷却闭环] (Ref #3863, #3865, #3875, #3895, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **数据面推理探针与标准 Antigravity 报文对齐**: 封禁探针全面升级为最新官方基准模型 `gemini-3.8-flash-low`（彻底淘汰废弃的 `gemini-2.5-flash`），通过 `wrap_request` 生成具备完整 `sessionId`、`systemInstruction`、`generationConfig.thinkingConfig` (LOW)、官方 `requestId` 与 `userAgent` 的正规请求信封，杜绝因结构残缺或废弃模型被 Google WAF 判定异常并抛出 429 RESOURCE_EXHAUSTED。
+            -   **严格 candidates 实体校验与双端点容灾**: 探针采用 `daily-cloudcode-pa` 与 `cloudcode-pa` 双端点互备，请求显式携带 `Connection: close` 避免底层复用被 Google 403 掐断的残缺 TCP 连接引发假 Unknown / 连接重置；2xx 响应严格校验 `candidates` 实体，杜绝代理拦截错误页或空 200 误解封。
+            -   **解封权限严格收敛与未知状态阻断**: 所有刷新入口统一收敛至 `fetch_quota_with_retry`，探针遇到网络超时或未知状态（Unknown）时，已封禁或 Hard 403 账号坚决阻断日配额接口，绝不被配额接口的 200 满配额反向冲刷洗白。
+            -   **智能长时冷却彻底根除 429 限流**: 正常健康账号在后台自动定时刷新时跳过推理探针（至少 6 小时才顺便核验一次），已封禁账号后台冷却 1 小时，单账号手动刷新、导入新号与启动时才强制探测，彻底解决高频刷新消耗推理配额导致的 429 限流。
+            -   **彻底剔除流量日志记录**: 封禁探针作为内部健康检测，完全不进入流量监控数据库和看板，彻底根除 `/internal/ban_probe` 刷屏，还监控面板纯净业务视图。
+        -   **[粘性会话与 60s 窗口彻底移除配额悬殊解绑，锁定最大化 KV 缓存命中率] (PR #3895, Ref #3639, #3893, Thanks to @cubelikeplayDaniel)**:
+            -   **坚守前缀缓存与零悬殊跳号**: 彻底移除模式 A（粘性会话）与模式 B（60s 窗口）中的 `quota_disparity_migration`（配额悬殊主动迁移）与 `migration_min_quota` 计算。只要绑定账号配额 > 0% 且未被限流/封禁，无条件优先复用，杜绝长会话（100k~300k+ tokens）因号池存在高额度账号频繁跳号导致昂贵的前缀预填充缓存（KV Cache）反复失效。(PR #3895)
+            -   **严密容灾边界与中途封禁无缝转移**: 换号时机严格收敛于真正 0% 耗尽、429 配额用尽，或账号在运行中遭遇模型级 403 / TOS 封禁；补齐 `test_sticky_session_unbinds_and_fails_over_when_bound_account_forbidden_or_banned` 防御用例，确保中途封禁依然秒级解绑、无缝切换可用备选账号续杯。(PR #3895)
+        -   **[滑动窗口并发探测容量可配置化、毫秒级启动与静默流式刷新上屏] (Ref #3726, #3871, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **废除账号上限门槛，引入「同时探测账号数」配置**: 移除冷启动“超过 15 个不刷新”硬门槛，新增 `refresh_concurrency`（同时探测账号数，默认 5，范围 1~20）与 `refresh_slide_delay_secs`（滑动窗口延迟，默认 0.2 秒）配置项，在刷新下拉菜单二级面板与设置页均可自由调节。
+            -   **秒级启动探测**: 启动等待时间由 5 秒缩减至 1 秒，配合滑动窗口安全完成全池探测。
+            -   **静默平滑流式刷新上屏**: 后端滑动窗口每完成一个账号立即推送事件，前端采用 100ms 防抖与 `silent` 静默更新模式，不触发全屏 Loading 转圈、不闪烁、不弹窗，账号列表顺滑流式更新最新状态。
+            -   **根治前端连击手误**: 修复 `Accounts.tsx` 单账号刷新连续调用 3 次 `refreshQuota` 的遗留问题，杜绝多线程并发读写状态竞态。
+        -   **[多语言与协议标签全方位对齐]**:
+            -   12 种语言（中、繁、英、日、韩、西、葡、俄、土、越、阿、马）完整同步滑动延迟、同时探测账号数与启动刷新文案。
+
+    *   **v5.0.4-beta.5 (2026-11-08)**:
+        -   **[跨轮次前缀稳定性与多轮会话 KV 缓存保护] (PR #3889, Ref #3764, #3769, #3867, Thanks to @mclinyeshi, @cubelikeplayDaniel)**:
+            -   **锁定首个 model 轮次前的开场注入边界**: 在 `src-tauri/src/proxy/mappers/prompt_sanitizer.rs` 中将 `leading_injection_boundary` 严格限制在 `&contents[..first_model]` 切片内。首轮 assistant 回答生成后，`first_model` 索引终身固定，彻底根治跨轮次新提问到达时，末尾追加新 user 轮次导致 `cur_turn` 漂移回溯将第 1 轮 user 提问从 `Anchored` 轨篡改为 `System` 轨的严重缺陷，杜绝 100k+ 历史上下文 KV 缓存（Prompt Cache）雪崩失效。(Ref #3764, #3769, #3867, PR #3889)
+            -   **保守型流水线标记清洗**: 在 `strip_pipeline_markers` 中引入变动判定，仅当匹配并剥离真实系统提示词标记或策略文本时才执行 `.trim()`，避免无标记的干净文本末尾空白字符被意外清除导致哈希变动。(PR #3889)
+        -   **[CI 自动化门禁与 Rust 代码格式规范对齐] (Thanks to @cubelikeplayDaniel)**:
+            -   **ACP 集成测试代码格式化**: 规范化 `src-tauri/src/modules/integration.rs` 中的 `test_switch_acp_account_e2e_flow_and_project_id_preservation` 断言逻辑，修复跨平台 CI 任务因 `cargo fmt` 检查导致的构建中断，确保全平台测试链路畅通。(Fixes #3842, Ref #3844)
+
+    *   **v5.0.4-beta.4 (2026-11-08)**:
+        -   **[支持 Antigravity IDE 插件 (antigravity-acp) 账号切换与状态检测] (Fixes #3842, PR #3844, Thanks to @Al-Taie, @cubelikeplayDaniel)**:
+            -   **IDE 插件凭据无缝同步与进程重载**: 新增官方 Google Antigravity IDE 插件 (`antigravity-acp` / JetBrains & Android Studio) 客户端目标。支持将选定账号原子化写入 `$GEMINI_HOME/antigravity-acp/acp_token.json` 与 `settings.json`，并自动同步 macOS 钥匙串凭据 (`service="gemini"`, `account="antigravity-acp"`)，在优雅重启 `agy_acp_server` 后即时生效。(Fixes #3842, PR #3844)
+            -   **多端状态一致性与 CLI 对齐**: 完善 `AccountIndex` 与 `ActiveClientsStatus` 对 ACP 客户端活跃状态的自动探查与感知；CLI `switch`、`list`、`current` 命令与 Headless 运行模式全面支持 `--target acp`。(Fixes #3842, PR #3844)
+        -   **[账号操作区 2×2 胶囊布局重构、二级弹窗单窗状态机与操作列收窄] (Thanks to @cubelikeplayDaniel)**:
+            -   **紧凑 2×2 四按钮布局**: 账号卡片与列表的操作区全面重构为 2 行 2 列按钮（上排：`[切换]`、`[刷新]`；下排：`[启停]`、`[更多]`），大幅增加各操作按钮的点击靶区与水平呼吸感。
+            -   **表格操作列精确收窄**: 将表格端固定操作列宽从 `w-[240px]` 收敛至贴合按钮的 `w-[136px]`，左右内边距收敛为 `px-1`，彻底消除两侧多余留白。
+            -   **单弹窗内部视图状态机消除层叠**: 将三级标签编辑器内嵌收敛为二级管理弹窗（`AccountActionsModal`）的内部视图状态（`menu` ↔ `tags`），顶部提供平滑返回按钮，彻底根除多层 Modal Portal 弹出/关闭动画重叠卡顿与闪烁。
+            -   **弹窗多端切换卡片文本自适应**: 弹窗宽度扩展为 `max-w-2xl`，去除客户端切换卡片的强行单行截断，文本自然自适应换行，完整呈现 `Antigravity IDE 插件 (ACP - JetBrains)` 及其描述信息。
+        -   **[蹬额度模式高额度临期自愈缺陷修复与配额分组详情全面汉化] (Thanks to @cubelikeplayDaniel)**:
+            -   **临期高额度判定自愈缺陷根治**: 修复 `usePedalModeStore.ts` 的 `checkAndAutoRecover` 中误将 `pct >= 90` 作为重置判定条件的致命缺陷，使剩余 90%–100% 临期待消耗账号能够正常启动蹬额度模式，杜绝启动后瞬间被误判退出。
+            -   **账号详情配额分组全方位汉化**: 在账号详情弹窗的配额分组窗口中，对上游 Google API 的 `Gemini Models`、`Claude and GPT models`、`Gemini 4 Argon`、`Models within this group` 以及 `WEEKLY`、`5H`、`1H` 滑动时间窗口完成全量双语映射与优雅格式化。
+
+    *   **v5.0.4-beta.3 (2026-11-08)**:
+        -   **[单账号 Gemini / Claude 模型族独立调度优先级与蹬额度模式自由勾选] (PR #3879, Thanks to @vecyang1, @cubelikeplayDaniel)**:
+            -   **按模型族独立编排调度优先级**: 新增 `Account.model_priorities` 与 `ProxyToken::effective_priority`，支持在单账号内独立设置 `gemini` 与 `claude` 的调度优先级（1–100，未配置时自动继承账号默认优先级），并在账号卡片与表格直观展示 `G:x · C:y` 徽章。(PR #3879)
+            -   **蹬额度模式模型族隔离与账号自由勾选**: 开启蹬额度模式时仅将目标模型族提权至 `1`，保留另一模型族原有优先级，彻底解决跨模型族误抢流问题；弹窗新增各候选账号实际支持的模型代数徽章（如 `Claude 5.5` vs `Claude 4.6`）与复选框勾选功能，支持按需选择要消耗的账号（如跳过 4.6 仅蹬 5.5）。(PR #3879)
+        -   **[Cowork 工具在途压缩避让与粘性会话配额悬殊均衡自愈] (Thanks to @cubelikeplayDaniel)**:
+            -   **回合边界安全自动压缩**: 在 `should_trigger_cowork_auto_compact` 中增加 `is_tool_result_continuation` 工具在途守卫，Agent 工具执行链路未闭合（含 `tool_result`）期间暂缓下发 400 假报警，等待工具链闭环并回到用户新回合边界再优雅触发压缩，根治工具执行中途打崩客户端状态机并弹出 `"Your context window is full"` 模态框的问题。
+            -   **前缀缓存与配额均衡兼顾**: 在粘性会话与 60s 窗口中引入同级优先级配额悬殊迁移（当绑定账号配额 $\le 65\%$ 且池中同级/更高优先级健康账号领先 $\ge 25\%$ 时自动解绑迁移），同时对 401/403/404/429 故障即时解绑。
+        -   **[蹬额度模式重入死循环根除与 Windows 文件锁并发退避] (Fixes #3881, PR #3882, Thanks to @vigarh-netizen, @cubelikeplayDaniel)**:
+            -   **React 状态级联与互斥重入根治**: 在 `usePedalModeStore` 中引入模块级 `isProcessing` 互斥重入锁；在自动恢复与手动退出执行伊始立即重置 `active: false` 并清除本地存储，彻底阻断异步调度期间被外部刷新事件重新误判为激活状态的竞态条件。(Fixes #3881, PR #3882)
+            -   **关键配额指标特征指纹防抖**: 在 `Layout.tsx` 中引入 `prevFingerprintRef` 特征指纹防抖，仅提取账号 ID、代理禁用状态以及 Gemini/Claude 周配额百分比与官方重置时间，账号调度优先级回写不再改变特征指纹，从组件层彻底切断死循环闭环。(Fixes #3881, PR #3882)
+            -   **冗余写盘消除与异常保底重置**: 容错遍历挂起账号时严格比对当前禁用状态，跳过重复写盘；新增 `resetPedalModeState` 保底重置接口，并在 `PedalBanner.tsx` 手动退出增加异常捕获与状态重置降级。(Fixes #3881, PR #3882)
+            -   **Windows 文件系统原子替换瞬态锁指数退避**: 在 `src-tauri/src/utils/fs.rs` 的 `MoveFileExW` 逻辑中针对 `ERROR_ACCESS_DENIED (5)` 与 `ERROR_SHARING_VIOLATION (32)` 增加最大 5 次重试与指数退避（5ms, 10ms, 20ms, 40ms, 80ms），极大提升高频并发原子替换时的抗锁死容错韧性。(Fixes #3881, PR #3882)
+
+    *   **v5.0.4-beta.2 (2026-11-08)**:
+        -   **[账号状态管理与调度收敛：确立优先级模型、模型级 403 作用域与恢复权威闭环] (Ref #3863, #3865, #3875, commit 9850f750, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **状态优先级模型收敛**: 确立 `banned > validation > hard 403 > quota_protection > manual` 统一优先级链条，杜绝账号级封禁被模型级 403 或日配额刷新降级/冲掉，并在读写路径中全链路保持同一套判断逻辑。(Ref #3863, #3875)
+            -   **模型级 403 作用域隔离**: 引入 `forbidden_models` 模型冻结机制，单个模型的 403 仅冻结对应模型与同线通道，账号其余健康模型继续参与调度，杜绝单模型 403 导致整号停用；重构作用域匹配与路径清洗，杜绝具体模型逆向误伤模型族，文本模型不误伤生图模型。(Ref #3863, #3865)
+            -   **恢复权威与防越权解限**: 引入 `probe_intent` 严格区分定向测活与自动预热，禁止后台自动调度越权解封，账号级封禁/403 仅由真实生产探测 `Healthy` 解除；定向测活成功精准解开对应通道模型与验证锁，保持异构模型（Claude/Opus）与 TOS 封禁严格隔离。(Ref #3863, #3875)
+            -   **意图与系统锁物理隔离**: 物理拆分 `manual_proxy_disabled` 与运行时系统锁，系统解限绝不越权恢复用户手动禁用的账号，修复手动开关覆盖系统锁导致的状态不一致。(Ref #3863, #3875)
+            -   **老版本读时自愈与全局写锁索引同步**: 反代调度加载时自动平滑迁移老格式模型 403，统一 `until == 0` 的 24 小时兜底自愈判定；实现 `set_account_index_proxy_disabled` 全局写锁更新，消除并发索引覆盖与控制台漂移日志。(Ref #3863, #3875)
+
+    *   **v5.0.4-beta.1 (2026-11-08)**:
+        -   **[403 封禁锁状态机与配额刷新防覆写：根治日配额 200 OK 冲掉 403 缺陷并新增异常账号一键筛选] (Fixes #3863, Ref #3865, PR #3875, commit fc45775c, a079bdf9, 3010f9e8, Thanks to @cubelikeplayDaniel, @jeikl)**:
+            -   **403 状态硬锁定保持**: 确立 403 封禁状态高于日配额 200 OK 契约。在 `update_quota` 与 `update_account_quota_internal` 中引入锁定守卫，无论后台定时刷新还是手动刷新日配额，现存 403 `is_forbidden` 与 `proxy_disabled` 标记绝对不被冲掉，彻底解决“刷新额度 403 凭空消失，调用一次又报错”的严重缺陷。(Fixes #3863, PR #3875)
+            -   **生产测活精准安全自愈**: 仅当生产端点真实探测返回 `Healthy` 时方可解除非模型级 403 锁；模型定向受限保留模型锁，杜绝拉取普通日配额欺骗解限。(commit a079bdf9, 3010f9e8)
+            -   **账号列表「异常」快捷过滤与直达**: 账号管理页工具栏新增「异常」快捷过滤按钮，一键聚合展示所有 banned / validation_blocked / 403 账号并显示精确计数；仪表盘「健康度 & 风控」卡片支持点击直达异常过滤视图。(Ref #3865, PR #3875)
+        -   **[UI 交互与弹窗层级修复：根治添加账号按钮穿透更新弹窗] (Fixes #3853, PR #3872, Thanks to @cubelikeplayDaniel)**:
+            -   根除添加账号触发按钮残留的 `relative z-[100]` 逃逸层级，防止按钮穿透更新弹窗浮层；将全局版本更新通知卡片层级规范提升至 `z-[200]`，确保始终位于顶层不被遮挡。(Fixes #3853, PR #3872)
+        -   **[启动配额异步刷新与工具栏操作] (Ref #3726, PR #3871, Thanks to @lbjlaq)**:
+            -   客户端启动后按账号配置上限异步静默刷新配额，并在账号工具栏中补齐手动刷新入口。(Ref #3726, PR #3871)
+        -   **[蹬额度模式稳定性与视觉体验优化] (Ref #3870, commit 73d798c5, 0f734f57, Thanks to @cubelikeplayDaniel)**:
+            -   补齐 reset 退出语义测试与 reduced-motion 无障碍兼容；优化浅色主题视觉呈现与待蹬账号高亮状态标识，提升多账号自愈与切换流畅度。(Ref #3870, commit 73d798c5, 0f734f57)
+        -   **[Web 端测活自动调度与安全自愈] (Ref #3861, Ref #3869, PR #3868, commit fb32517a, 8232798c, 2677d8c6, 32735f92, Thanks to @cubelikeplayDaniel)**:
+            -   统合 Web 端测活自动调度选号与凭据刷新，下沉选号逻辑并按目标模型排序，测活成功按模型与受限原因安全自愈，拦截 TOS 封禁与跨模型误解限。(Ref #3861, PR #3868)
+        -   **[分级配额契约与自愈架构重构：根治跨模型重置时间污染与零配额死锁，实现周硬配额绝对优先与安全自愈] (Fixes #3840, #3845, PR #3852, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **Weekly 硬配额优先契约 (P0-1)**: 严格落实周窗口与短期 5 小时滚动窗口的层级约束。当周硬配额耗尽（0%）时，系统严禁仅因短期 5h 窗口重置而误触发账号自愈；多周桶（如 Argon WTU 7d）并发耗尽时需全部桶到期自愈，方可解除配额耗尽锁定并恢复调度准入。(Fixes #3840, PR #3852)
+            -   **模型大类组级隔离 (P0-2)**: 重置时间提取与模型映射全面解耦，按模型大类族群（Argon / 3P / Gemini）维护独立重置映射与窗口快照；当模型重置时间映射非空时，严禁未匹配模型回退至全局全局最早重置时间，彻底杜绝 Argon 重置到期污染普通 Gemini 模型或导致错误提权。(Fixes #3845, PR #3852)
+            -   **准入资格与调度排序解耦 (P1-4)**: 拆分 `has_candidate_quota_admission`（布尔准入资格）与 `get_candidate_quota`（排序权重计算）；自愈到期账号赋予保守正向 sentinel (20)，既能及时参与候选调度竞争，又绝不抢占与压制具备健康正配额（40%~100%）的高可用账号。(PR #3852)
+            -   **实时配额刷新全状态同步 (P1-2, P1-3)**: `fetch_and_lock_with_realtime_quota` 与 `load_single_account` 同步提取 `model_reset_times`、`model_weekly_reset_times` 与详细 `model_quota_windows`，多桶同窗口取最早截止时间戳 (`.min(ts)`)，并在接收新配额组时彻底清空旧映射防止跨窗口陈旧时间戳污染，实现动态模型族映射与快照一致性；同时健壮兼容 camelCase `quotaGroups` 结构。(PR #3852)
+            -   **熔断锁模型级精准解限与 429 退避保护 (P1-6)**: 账号重载与正配额快照恢复时，对各模型分别进行正配额校验并按模型粒度调用 `reconcile_quota_recovery`，防止正向 Gemini 模型提前解禁尚在耗尽状态的 Claude 模型，仅精准释放已恢复的 `QuotaExhausted` 状态，严格保留 429 `RateLimitExceeded` 速率退避时间。(PR #3852)
+            -   **账号级锁与全局兜底边界收敛 (P1-7)**: 任一模型恢复正配额时同步解除账号级“全模型耗尽” `QuotaExhausted` 锁；全局 reset 兜底收紧为仅当短期与周周期两个 per-model map 均为空时才生效，彻底封堵残余跨族时间污染。(PR #3852)
+        -   **[Docker 容器健康检查超时修复与 Tini Init 进程泄漏治理] (Fixes #3850, PR #3854, Thanks to @cubelikeplayDaniel)**:
+            -   修复 Docker 镜像缺少 `tini` init 进程导致僵尸进程堆积缺陷；优化 HEALTHCHECK curl 超时参数，防止每 2-3 小时因检查堆叠造成容器假死 503。(Fixes #3850, PR #3854)
+        -   **[上传带宽语义与预算对齐：根治大请求体 15s 误杀] (Ref #3763, Ref #3821, PR #3857, Thanks to @wakeupnotfound)**:
+            -   上传超时预算只允许随请求体体积放宽，严禁反向收紧导致大请求体被提前 15s 误杀；公式示例改用解析后的实际数值，并在 12 种语言中明确“保守最低上行”语义与推荐范围（0.5-5 Mbps）。(Ref #3763, Ref #3821, PR #3857)
+        -   **[账号封禁识别与无配额门禁卡死修复] (Ref #3525, #3630, #3631, #3840, commit 03c83b10, Thanks to @jeikl)**:
+            -   增加生产端点 `TOS_VIOLATION` 探测与申诉链接提取，封禁账号即时移出调度池；502 门禁前增加磁盘账号池节流重载与映射模型复查，新账号导入后可秒级放行。(Ref #3525, #3630, #3631, #3840)
+        -   **[文本内嵌 Data URL 视觉自愈与超大 Token 计费治理] (PR #3864, Ref #3830, Thanks to @mclinyeshi)**:
+            -   将序列化进纯文本（如 Codex memory 提取的 rollout JSON）中的 Data URL 图像提升为规范 `inlineData` 部件（按内容去重），彻底消除数十万字符 Base64 被上游按文本 Token 逐字计费（输入膨胀至 500k+ tokens 且极度拉长首字延迟）的缺陷；
+            -   日志精简防护：在前端简要视图与后端持久化审计中自动折叠大段 Base64，防止前端与 SQLite 数据库被巨量字符串卡死。(PR #3864)
+        -   **[Responses 协议工具调用与回执相邻性对齐：根治 Claude 400 与 Gemini 缓存跳变] (PR #3866, PR #3867, Thanks to @mclinyeshi)**:
+            -   在统一流水线中将 Codex `/v1/responses` 夹在 `functionCall` 轮与 `functionResponse` 轮之间的纯文本过程说明折回调用轮（全协议通用）：Claude 目标彻底根治上游判定夹层文本为非法 prefill 导致会话中断报 HTTP 400（`This model does not support assistant message prefill`）的缺陷；Gemini 目标消除夹层纯文本轮在相邻轮次间签名闪烁导致的上下文缓存失效，保护长对话缓存命中。(PR #3866, PR #3867)
+
+    *   **v5.0.4-beta.0 (2026-11-06)**:
+        -   **[Android 原生架构支持：Termux ARM64 无容器部署与 Headless 运行环境] (Fixes #3818, Thanks to @sandwitchers)**:
+            -   **Android Termux 原生无容器支持**: 新增 `aarch64-linux-android` (Bionic libc) 原生后端构建目标与一键安装脚本 `scripts/install-termux.sh`，摆脱 PRoot / chroot / Docker 等容器层开销，在 Android 设备上实现超轻量、低功耗的原生 API 网关与 Web 控制台运行。(Fixes #3818, Thanks to @sandwitchers)
+            -   **零账号死锁与仪表盘准入修复**: 修复无账号或服务未就绪时静态资源与鉴权中间件的拦截死锁，确保 0 账号冷启动下 Web 控制台与管理接口正常放行，用户可无阻进入控制台添加账号或配置服务。(Fixes #3818)
+            -   **静态资源智能级联探测**: 新增 `resolve_static_dist_path` 探测算法，支持 `ABV_DIST_PATH` 环境变量优先指定，并级联搜索 `./dist`、`<exe_dir>/dist` 及 `$PREFIX/share/antigravity/dist`，彻底解除对当前执行目录的强依赖。(Fixes #3818)
+            -   **构建流水线与资源包分发补全**: 修正 CI 交叉编译打包流程，将前端 `dist` 完整打包入 `antigravity-server-android-arm64.tar.gz` 归档，安装脚本自动解压并软链接至系统标准路径。(Fixes #3818)
+            -   **服务端命令行帮助拦截修复**: 优先接管 `--help` / `-h` 参数，解决此前被底层通用 CLI 错误捕获导致无法输出 server 参数（`-p`, `-h`, `--no-web`, `--pure-proxy`）的问题。(Fixes #3818)
+            -   **Web 端模型连通性测活端点补齐**: 为 Headless 独立 Web 服务补全注册 `POST /api/proxy/test-model` 路由，修复在网页端点击模型「测活」按钮返回 405 Method Not Allowed 并报错的问题。(Fixes #3818)
+
     *   **v5.0.3 (2026-11-06)**:
         -   **[配额归因治理：根治 503 污染与配额假死，重构大桶调度与优先级竞争] (Fixes #3838, #3841, #3821, PR #3845, Ref #3827, #3840)**:
             -   **根除 503 归因污染（占全量 5xx 的 92.6%）**: 网关内部限流判据统一收敛至 `policy::is_internal_gateway_exhaustion` 单一权威源，补全此前漏判的 `All accounts rate-limited`（旧列表只写 `all accounts limited`），本地号池限流不再被误报为上游 503；同步收敛 `rate_limit.rs` 与 `token_manager.rs` 中另两处漂移实现。(Fixes #3838)

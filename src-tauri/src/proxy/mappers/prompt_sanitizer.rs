@@ -25,20 +25,32 @@
 //!    · Header 轨（`clean_text`）：剥离文本内嵌的计费伪 Header 与高危客户端指纹声明，对**全部文本**
 //!      （systemInstruction / contents / user）一致生效；
 //!    · System 轨（`normalize_system_identity`）：Header 轨之外叠加「身份归属声明句」归一化与竞品厂牌
-//!      归一化，仅作用于 `systemInstruction` 与**注入区**（首个 `role:model` 之前、当前轮之前的内容）；
-//!    · Anchored 轨（`normalize_anchored_regions`）：当前轮 part 只清洗 `<system*>` / `<identity*>`
+//!      归一化，仅作用于 `systemInstruction` 与**注入区**（首个 `role:model` 之前、首轮用户提问之前的内容）；
+//!    · Anchored 轨（`normalize_anchored_regions`）：首轮用户提问 part 只清洗 `<system*>` / `<identity*>`
 //!      锚点标签**内部**的内容，标签之外的用户正文逐字保留。
-//!    当前轮的界定：`contents` 中**最后一条 user 消息**的最后一个 text part（文件/图片不计），
-//!    从根本上杜绝 #3764「翻译/校对/审计类提问被改写成官方身份」的误伤，同时保留对客户端注入
-//!    系统提示词的 WAF 防护。
+//!    首轮用户提问的界定：首个 `role:model` 之前（`&contents[..first_model]`）**最后一条带 text 的 user 消息**的
+//!    最后一个 text part（文件/图片不计）。将其严格锚定在 `first_model` 之前，既从根本上杜绝 #3764
+//!    「翻译/校对/审计类提问被改写成官方身份」的误伤，又保证进入多轮对话后首轮前缀的分轨结果 100% 恒定冻结，
+//!    彻底杜绝第 1 轮结束开启第 2 轮对话时因 `cur_turn` 后移回溯改写首轮用户提问而击穿上游 KV Cache。
 //!    该分治使四协议共享同一份身份归一化规则（AGENTS.md「Pipeline First」：适配层不做协议专用清洗特例）。
 //! 9. 安全策略约束清洗（Issue #3781）：在 System 轨中动态剥离客户端（如 Antigravity）注入的 CTF 与安全约束指令
 //!    （`IMPORTANT: Assist with authorized security testing...`），消除模型风控误拒答（False Positives），
 //!    节省上下文 Token 并保持排版自然过渡。
-
+//! 10. 文本内嵌 data URL 处理：正常上传的媒体在适配层已是结构化 `inlineData`，不经过本节点；
+//!    但客户端把会话转录 / 日志序列化成**纯文本**发送时（如 Codex 后台 memory 生成把 rollout JSON
+//!    原样塞进 prompt），其中的 `data:image/png;base64,...` 会被上游按文本 token 逐字计费（单张截图
+//!    即数十万 token）。本节点把 user 文本中通过校验的媒体提升为真正的 `inlineData`（按内容去重），
+//!    无法承载或校验失败的折叠为长度占位符。`ABV_TEXT_DATA_URL_MODE=attach|omit|keep` 切换策略，
+//!    `ABV_TEXT_DATA_URL_MIN_CHARS` 调整阈值。
+//! 11. 单例身份不变量（Single Canonical Identity）：System 轨最终必须保证 `systemInstruction` 全量最多
+//!     出现一次官方 Antigravity 开场白；跨 part 全局去重，代码块豁免，兼容 #3902 的逗号续写形态。
+//!
+use crate::proxy::config::PromptRewriteConfig;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// 代码块保护正则：隔离多行围栏代码块 ```...``` 与行内反引号 `...`
 static RE_CODE_BLOCK: Lazy<Regex> =
@@ -67,6 +79,91 @@ static RE_MULTI_NEWLINE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap
 /// 代码块占位符单趟还原正则（杜绝顺序字符串替换导致的嵌套膨胀炸弹与 $2^N$ 性能陷阱）
 static RE_CODE_BLOCK_PLACEHOLDER: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"__PROMPT_SANITIZER_CODE_BLOCK_(\d+)__").unwrap());
+
+// ============================ 风控提示词清理规则 ============================
+
+const MAX_PROMPT_REWRITE_RULES: usize = 64;
+const MAX_PROMPT_REWRITE_PATTERN_CHARS: usize = 8192;
+const MAX_PROMPT_REWRITE_REPLACEMENT_CHARS: usize = 16384;
+
+#[derive(Clone)]
+struct CompiledPromptRewriteRule {
+    regex: Regex,
+    replacement: String,
+}
+
+/// 用户自定义清理规则运行时表（配置热更新时整体替换，读路径克隆 Arc）。
+static PROMPT_REWRITE_RUNTIME: Lazy<RwLock<Arc<Vec<CompiledPromptRewriteRule>>>> =
+    Lazy::new(|| RwLock::new(Arc::new(Vec::new())));
+
+/// 内置身份归一化总开关（默认开启，可在“风控提示词清理方案”中关闭）。
+static NORMALIZE_IDENTITY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 解析身份归一化总开关：配置值 && 未被环境变量关闭。
+/// 环境变量 `ABV_NORMALIZE_IDENTITY=off|0|false|no` 作为 headless/CLI 的强制关闭开关。
+fn normalize_identity_effective(config_value: bool, env_value: Option<&str>) -> bool {
+    let env_off = env_value
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false);
+    config_value && !env_off
+}
+
+/// 解码替换文本中的转义：`\n` `\r` `\t` `\\` `\*`。
+/// 未知转义原样保留（例如 Windows 路径 `C:\Users`）。
+fn decode_rewrite_replacement(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('*') => out.push('*'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 把行式匹配规则编译为正则：
+/// - `*` → 同一行内任意字符（不跨 `\n`）；
+/// - `\n` / `\r` / `\t` / `\\` / `\*` 转义；
+/// - 其他字符全部按字面量转义；大小写不敏感。
+fn compile_glob_pattern(pattern: &str) -> Result<Regex, regex::Error> {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    out.push_str("(?i)");
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push_str(r"\\"),
+                Some('*') => out.push_str(r"\*"),
+                Some(other) => out.push_str(&regex::escape(&other.to_string())),
+                None => out.push_str(r"\\"),
+            },
+            '*' => out.push_str("[^\\n]*"),
+            other => out.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    Regex::new(&out)
+}
 
 /// 匹配任意 XML 风格标签候选块 `<tag ...>inner</tag>`
 static RE_XML_TAG_CANDIDATE: Lazy<Regex> = Lazy::new(|| {
@@ -106,12 +203,6 @@ static RE_SECURITY_CTF_POLICY: Lazy<Regex> = Lazy::new(|| {
 // Agent 客户端数以千计且会持续出现，无法穷举，因此归一化必须**广谱**：只要一句自我介绍同时具备
 // 「身份开场白 + 身份名词 + 归属/版本声明」三要素，就整体归一化为中性身份，而非只处理已知厂商。
 
-/// 身份归一化扫描窗口：扫描每个系统提示词块的前 8 句或前 1500 字符。
-/// 扩展窗口能够可靠穿透前置插件上下文/环境垫片（如 OpenClaw 的 plugin-injected context），
-/// 同时限制在头部以确保正文（文档、代码注释、用户需求）中的正常引用 100% 不被误伤。
-const IDENTITY_SCAN_MAX_SENTENCES: usize = 8;
-const IDENTITY_SCAN_MAX_CHARS: usize = 1500;
-
 /// 官方原生 Antigravity 助手身份声明（完全对齐官方 Antigravity IDE 提示词模板）
 pub const OFFICIAL_ANTIGRAVITY_IDENTITY: &str =
     "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
@@ -120,7 +211,49 @@ pub const OFFICIAL_ANTIGRAVITY_IDENTITY: &str =
 #[allow(dead_code)]
 pub const NEUTRAL_IDENTITY: &str = OFFICIAL_ANTIGRAVITY_IDENTITY;
 
-/// 身份声明句归一化正则（广谱匹配，仅在系统提示词头部窗口内生效）。
+/// 官方身份在逗号续写场景下的拼接结果。
+///
+/// `OFFICIAL_ANTIGRAVITY_IDENTITY` 本身以句号结尾；若直接再拼一个逗号会得到 `.,`，
+/// 上游会将其视为异常标点并可能返回 429。这里只去掉句末句号，续写标点由调用方保留。
+fn official_identity_with_continuation(punctuation: &str) -> String {
+    let identity = OFFICIAL_ANTIGRAVITY_IDENTITY
+        .strip_suffix('.')
+        .unwrap_or(OFFICIAL_ANTIGRAVITY_IDENTITY);
+    format!("{identity}{punctuation}")
+}
+
+/// 官方身份句的精确匹配（兼容 #3902 的「去掉句号 + 逗号续写」形态）。
+static RE_OFFICIAL_IDENTITY_SENTENCE: Lazy<Regex> = Lazy::new(|| {
+    let body = OFFICIAL_ANTIGRAVITY_IDENTITY.trim_end_matches('.');
+    Regex::new(&format!(r"{}(?:[.,，。!?！？;；])?", regex::escape(body))).unwrap()
+});
+
+/// 结构化身份行删除 AG 后只剩前缀（`- Identity:` / `* Role:` / `身份：`）时，整行移除。
+static RE_STRUCTURED_IDENTITY_PREFIX_ONLY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^[-*•]?[ \t]*(?:identity|role|name|agent|身份|角色|名称)\s*[:：]\s*$").unwrap()
+});
+
+/// 官方 AG 后紧跟 ASCII 逗号 + 非连词续写（如 `, a coding agent harness.`）。
+/// 上游对 `AG, a ...` 返回 429，对 `AG. a ...` 放行；`, and you must ...` 这类功能续写保留逗号。
+static RE_OFFICIAL_IDENTITY_APPOSITIVE: Lazy<Regex> = Lazy::new(|| {
+    let body = OFFICIAL_ANTIGRAVITY_IDENTITY.trim_end_matches('.');
+    Regex::new(&format!(
+        r"(?i)({})(\.?)(,)([ \t]+)([A-Za-z_][\w'\-]*)",
+        regex::escape(body)
+    ))
+    .unwrap()
+});
+
+/// 折叠由于正则替换、同位语拼接或切词遗留的畸形复合标点（如 `.,`、`. ,`、`。，` 等）。
+/// 解决 Issue #3915：避免上游 WAF 识别出 `Advanced Agentic Coding., a coding agent harness.` 中的 `.,` 报 429。
+static RE_MALFORMED_PUNCTUATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"([.。])\s*([,，])\s*").unwrap());
+
+/// 剥离独立注入在系统提示词中的 Anthropic billing 元数据头行。
+static RE_ANTHROPIC_BILLING_HEADER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?im)^[ \t]*x-anthropic-billing-header:[^\r\n]*(?:\r?\n)?").unwrap());
+
+/// 身份声明句归一化正则（广谱匹配，仅在 System 轨生效；全量扫描，代码块豁免）。
 ///
 /// 形态 = A 身份开场白 + B 身份名词短语 + C 归属/版本/宿主声明 + D 归属对象 + E 句读：
 /// ```text
@@ -145,10 +278,10 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
         // 动词前导桥接段（组 1）：支持包含版本号小数点的模型名/名字 (如 Grok 4.6, GPT-5.2)，避免使用不支持的零宽断言。
         // 铁律：桥接段**不跨行**（`[\t ]` 而非 `\s`，杜绝跨段落吞噬），逗号仅允许紧贴动词前出现；
         // 跨子句的语义校验（并列/从属连词）在替换回调 `is_identity_declaration` 中执行。
-        r"(?i:((?:[^\s.,，!?。！？;；\r\n<>]|\d+\.\d+|[\t ]){0,15}?[ \t,，]*(?:(?:which|that|who)\s+(?:is|was)\s+)?))",
+        r"(?i:((?:\d+(?:\.\d+)+|[^\s.,，!?。！？;；\r\n<>]|[\t ]){0,15}?[ \t,，]*(?:(?:which|that|who)\s+(?:is|was)\s+)?))",
         r"(?i:(?:\b(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided|authored|written)\s+(?:by|on|upon|at|for)\s+|\bby\s+|based\s+on\s+|running\s+(?:inside|in|within|on)\s+|integrated\s+(?:into|in)\s+))",
         // 归属对象：支持跨越数字间的版本号点号 (如 3.8, 4.5) 直到句读边界
-        r"(?:[^\s.,，。!?！？;；\r\n<>]|\d+\.\d+|[\t ])+",
+        r"(?:\d+(?:\.\d+)+|[^\s.,，。!?！？;；\r\n<>]|[\t ])+",
         r"|",
         // 中文支：你是/我是 + 包含开发/制作/构建/基于/推出 等归属特征，整句收敛到句读
         r"(?:你是|我是)[\s,，:：]*[^.!?。！？\r\n<>]{0,50}?(?:由|开发|制作|构建|训练|推出|基于|运行[在于])[^.!?。！？\r\n<>]{1,60}",
@@ -195,6 +328,68 @@ static RE_KNOWN_CLIENT_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     ))
     .unwrap()
 });
+
+/// 结构化身份声明句归一化正则（针对现代 Agent 采用的 Markdown 列表项与键值对身份声明，如 `- Identity: ...`）。
+///
+/// 匹配形态：
+/// ```text
+/// - Identity: JeikCode AI coding Agent, provided by Jeik, running on your underlying model.
+///   → - Identity: You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
+/// * Identity: OpenCode AI assistant, built by ...
+///   → * Identity: You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
+/// Identity: Claude Code, Anthropic's official CLI...
+///   → Identity: You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
+/// - 身份：JeikCode AI 编程助手，由 Jeik 提供，运行于底层模型。
+///   → - 身份: You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
+/// ```
+///
+/// 防误杀与结构保护铁律：
+/// 1. 严格限定在单行内（`^[ \t]*...[^\r\n]*`），绝不跨行，不破坏后续独立的 `- Language:` 等业务指令；
+/// 2. 深度保护代码块（``` 与行内 `），代码块内部 100% 豁免；
+/// 3. 保留前缀（`caps[1]`），确保外层 Markdown 列表排版结构完好无损。
+static RE_STRUCTURED_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?im)",
+        // 组 1：行首及前缀（支持可选的列表符号 - * • 以及属性名 identity/role/name/agent/身份/角色/名称）
+        r"(^[ \t]*[-*•]?[ \t]*(?:identity|role|name|agent|身份|角色|名称)\s*[:：][ \t]*)",
+        // 组 2：身份主体内容（必须包含归属/宿主特征动词，或已知客户端/Harness指纹）
+        r"([^\r\n]*(?:",
+        // 归属/运行宿主动词
+        r"\b(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided|authored|written)\s+(?:by|on|upon|at|for)\b",
+        r"|\bby\s+[a-z0-9_\-]+",
+        r"|\bbased\s+on\b",
+        r"|\brunning\s+(?:inside|in|within|on)\b",
+        r"|\bintegrated\s+(?:into|in)\b",
+        r"|(?:由|开发|制作|构建|训练|推出|基于|运行[在于])",
+        // 已知客户端与平台特征
+        r"|\b(?:jeikcode|opencode|openclaw|claude(?:\s+code|\s+agent)?|cursor|cascade|codeium|cline|roo\s+code|aider|kilocode|hermes|codex|devin|dsh)\b",
+        r"|\b[\w'\-]+(?:code|studio|claw)\b",
+        r")[^\r\n]*)"
+    ))
+    .unwrap()
+});
+
+/// 文本内嵌 data URL 的头部（`data:<mime>[;param]*;base64,`），负载部分由线性扫描截取，
+/// 避免 `{N,}` 计数重复在 regex 引擎中展开成超大 NFA。
+static RE_TEXT_DATA_URL_HEADER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)data:([a-z]+\\{0,3}/[a-z0-9.+\-]+)(?:;[a-z0-9.+_\-]+(?:=[a-z0-9.+_\-]+)?)*;base64,",
+    )
+    .unwrap()
+});
+
+/// 默认折叠阈值（base64 字符数）：约 6 KB 二进制，远大于正常的内联小图标 / 示例片段
+const DEFAULT_TEXT_DATA_URL_MIN_CHARS: usize = 8192;
+/// 单次请求最多从文本中提升的独立媒体数量（去重后）
+const MAX_TEXT_DATA_URL_ATTACHMENTS: usize = 16;
+/// 单次请求从文本中提升的媒体 base64 总长度上限（约 15 MB，低于上游 inline 请求体限制）
+const MAX_TEXT_DATA_URL_ATTACHED_CHARS: usize = 15 * 1024 * 1024;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TextDataUrlMode {
+    Attach,
+    Omit,
+}
 
 /// 身份声明归一化的快速前置特征（命中任一才进入正则流程，规避 33k 级提示词的全量正则开销）
 const IDENTITY_FAST_MARKERS: &[&str] = &[
@@ -273,6 +468,15 @@ const IDENTITY_FAST_MARKERS: &[&str] = &[
     "通义",
     "豆包",
     "混元",
+    // 结构化身份特征标记
+    "identity:",
+    "identity：",
+    "- identity",
+    "role:",
+    "role：",
+    "- role",
+    "身份:",
+    "身份：",
     // 中文特征标记
     "由",
     "基于",
@@ -316,6 +520,137 @@ enum PartScope {
 pub struct PromptSanitizer;
 
 impl PromptSanitizer {
+    /// 内置身份归一化是否启用。
+    fn normalize_identity_enabled() -> bool {
+        NORMALIZE_IDENTITY_ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// 热更新风控提示词清理规则（配置保存/启动时调用）。
+    pub fn update_prompt_rewrite_config(config: &PromptRewriteConfig) {
+        let env_value = std::env::var("ABV_NORMALIZE_IDENTITY").ok();
+        let effective =
+            normalize_identity_effective(config.normalize_identity, env_value.as_deref());
+        NORMALIZE_IDENTITY_ENABLED.store(effective, Ordering::Relaxed);
+        let compiled = Self::compile_prompt_rewrite_rules(config);
+        let count = compiled.len();
+        if let Ok(mut guard) = PROMPT_REWRITE_RUNTIME.write() {
+            *guard = Arc::new(compiled);
+        }
+        tracing::info!(
+            "[Prompt-Sanitizer] Prompt rewrite rules loaded: enabled={}, active={}, normalize_identity={}",
+            config.enabled,
+            count,
+            effective
+        );
+    }
+
+    /// 编译用户规则；非法/空匹配/超长规则跳过并告警，绝不阻断请求。
+    fn compile_prompt_rewrite_rules(
+        config: &PromptRewriteConfig,
+    ) -> Vec<CompiledPromptRewriteRule> {
+        let mut compiled = Vec::new();
+        if !config.enabled {
+            return compiled;
+        }
+        for rule in config.rules.iter().filter(|r| r.enabled) {
+            if rule.pattern.is_empty() {
+                continue;
+            }
+            if rule.pattern.chars().count() > MAX_PROMPT_REWRITE_PATTERN_CHARS {
+                tracing::warn!(
+                    "[Prompt-Sanitizer] Rewrite rule {:?} skipped: pattern too long",
+                    rule.id
+                );
+                continue;
+            }
+            if rule.replacement.chars().count() > MAX_PROMPT_REWRITE_REPLACEMENT_CHARS {
+                tracing::warn!(
+                    "[Prompt-Sanitizer] Rewrite rule {:?} skipped: replacement too long",
+                    rule.id
+                );
+                continue;
+            }
+            match compile_glob_pattern(&rule.pattern) {
+                Ok(regex) if regex.is_match("") => {
+                    tracing::warn!(
+                        "[Prompt-Sanitizer] Rewrite rule {:?} skipped: pattern can match empty text",
+                        rule.id
+                    );
+                }
+                Ok(regex) => compiled.push(CompiledPromptRewriteRule {
+                    regex,
+                    replacement: decode_rewrite_replacement(&rule.replacement),
+                }),
+                Err(err) => {
+                    tracing::warn!(
+                        "[Prompt-Sanitizer] Rewrite rule {:?} skipped: invalid pattern: {}",
+                        rule.id,
+                        err
+                    );
+                }
+            }
+            if compiled.len() >= MAX_PROMPT_REWRITE_RULES {
+                tracing::warn!(
+                    "[Prompt-Sanitizer] Prompt rewrite rule limit ({}) reached; remaining rules ignored",
+                    MAX_PROMPT_REWRITE_RULES
+                );
+                break;
+            }
+        }
+        compiled
+    }
+
+    /// 在代码块占位保护下按顺序应用规则；无命中返回 None，保持原文零改动。
+    fn rewrite_text_with_rules(text: &str, rules: &[CompiledPromptRewriteRule]) -> Option<String> {
+        if rules.is_empty() {
+            return None;
+        }
+        let mut placeholders: Vec<String> = Vec::new();
+        let protected = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
+            let idx = placeholders.len();
+            placeholders.push(caps[0].to_string());
+            format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
+        });
+        let mut current = protected.into_owned();
+        let mut changed = false;
+        for rule in rules {
+            if !rule.regex.is_match(&current) {
+                continue;
+            }
+            current = rule
+                .regex
+                .replace_all(&current, regex::NoExpand(rule.replacement.as_str()))
+                .into_owned();
+            changed = true;
+        }
+        if !changed {
+            return None;
+        }
+        let restored = RE_CODE_BLOCK_PLACEHOLDER
+            .replace_all(&current, |caps: &regex::Captures| {
+                if let Ok(idx) = caps[1].parse::<usize>() {
+                    if let Some(code) = placeholders.get(idx) {
+                        return code.clone();
+                    }
+                }
+                caps[0].to_string()
+            })
+            .into_owned();
+        Some(restored)
+    }
+
+    /// System 轨：身份归一化之前应用用户清理规则。
+    fn apply_prompt_rewrite_rules(text: &str) -> String {
+        let rules = PROMPT_REWRITE_RUNTIME
+            .read()
+            .map(|guard| Arc::clone(&*guard))
+            .unwrap_or_else(|_| Arc::new(Vec::new()));
+        if rules.is_empty() {
+            return text.to_string();
+        }
+        Self::rewrite_text_with_rules(text, &rules).unwrap_or_else(|| text.to_string())
+    }
+
     /// 对单段提示词文本进行通用、高精度的净化：
     /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`），未包含直接原样返回；
     /// 2. 提取并保护所有代码块，使其免受任何正则影响；
@@ -379,48 +714,19 @@ impl PromptSanitizer {
         normalized.trim().to_string()
     }
 
-    /// 计算系统提示词的**头部窗口**：返回从开头起、跨越前 `IDENTITY_SCAN_MAX_SENTENCES` 句或 `IDENTITY_SCAN_MAX_CHARS` 字符的切片。
-    /// 句界 = `.` `!` `?` `。` `！` `？`，或**空行**（连续两个 `\n`，兼容 `\r\n`）；普通折行不计为句界。
-    fn identity_head_region(text: &str) -> &str {
-        let mut sentence_count = 0usize;
-        let mut prev_newline = false;
-
-        for (idx, ch) in text.char_indices() {
-            let is_newline = ch == '\n';
-            let is_terminator = matches!(ch, '.' | '!' | '?' | '。' | '！' | '？');
-
-            if is_terminator || (is_newline && prev_newline) {
-                sentence_count += 1;
-                if sentence_count >= IDENTITY_SCAN_MAX_SENTENCES {
-                    return &text[..idx + ch.len_utf8()];
-                }
-            }
-
-            if is_newline {
-                prev_newline = true;
-            } else if ch != '\r' {
-                prev_newline = false;
-            }
-
-            if idx >= IDENTITY_SCAN_MAX_CHARS {
-                return &text[..idx + ch.len_utf8()];
-            }
-        }
-
-        text
-    }
-
-    /// System 轨：把系统提示词头部窗口内的「身份归属声明句」与已知客户端开场白归一化为官方 Antigravity 身份。
+    /// System 轨：把系统提示词全量文本中的「身份归属声明句」与已知客户端开场白归一化为官方 Antigravity 身份。
     ///
     /// 归一化规则（广谱、协议无关）：命中 `RE_IDENTITY_DECLARATION` 或 `RE_KNOWN_CLIENT_DECLARATION` 的声明句
-    /// 整体替换为 `OFFICIAL_ANTIGRAVITY_IDENTITY`；若原文以逗号续写功能指令，则保留逗号，续写内容逐字不动。
-    /// 代码块（``` 与行内 `）内的身份文本 100% 豁免，头部窗口之后的原文逐字保留。
+    /// 整体替换为 `OFFICIAL_ANTIGRAVITY_IDENTITY`；若原文以逗号续写功能指令，则保留逗号并去掉官方身份末尾句号，
+    /// 避免生成 `.,`，续写内容逐字不动。
+    /// 代码块（``` 与行内 `）内的身份文本 100% 豁免，非身份文本逐字保留。
     /// 归一化一段文本内部的所有身份归属声明句、已知客户端开场白与竞品厂牌为官方 Antigravity / Google 声明
     fn normalize_text_identity(text: &str) -> String {
+        let matches_structured = RE_STRUCTURED_IDENTITY_DECLARATION.is_match(text);
         let matches_broad = RE_IDENTITY_DECLARATION.is_match(text);
         let matches_known = RE_KNOWN_CLIENT_DECLARATION.is_match(text);
         let matches_brands = RE_COMPETITOR_BRANDS.is_match(text);
-        if !matches_broad && !matches_known && !matches_brands {
+        if !matches_structured && !matches_broad && !matches_known && !matches_brands {
             return text.to_string();
         }
 
@@ -433,31 +739,63 @@ impl PromptSanitizer {
         });
 
         // 步骤 2：归一化身份声明句（逗号续写场景保留逗号，避免出现 ", ," 或 ", and" 断裂）
-        // 2.1 广谱归属声明归一化
-        let pass1 =
-            RE_IDENTITY_DECLARATION.replace_all(&protected_text, |caps: &regex::Captures| {
-                // 两道后置护栏：疑问句与跨子句桥接都不属于身份声明
-                if !Self::is_identity_declaration(caps) {
-                    return caps[0].to_string();
-                }
-                match caps.get(2).map(|m| m.as_str()).unwrap_or("") {
-                    "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
-                    _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
-                }
-            });
+        // 2.0 结构化身份声明归一化（Markdown 列表项与键值对形态，保留外层列表结构）
+        let pass0 = RE_STRUCTURED_IDENTITY_DECLARATION.replace_all(
+            &protected_text,
+            |caps: &regex::Captures| {
+                let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                format!("{}{}", prefix, OFFICIAL_ANTIGRAVITY_IDENTITY)
+            },
+        );
 
-        // 2.2 知名特定客户端开场白归一化（如 Claude Code CLI 开场白、*code、*studio、*claw、pi 等）
-        let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, |caps: &regex::Captures| {
-            match caps.get(1).map(|m| m.as_str()).unwrap_or("") {
-                "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
+        // 2.1 广谱归属声明归一化
+        let pass1 = RE_IDENTITY_DECLARATION.replace_all(&pass0, |caps: &regex::Captures| {
+            // 两道后置护栏：疑问句与跨子句桥接都不属于身份声明
+            if !Self::is_identity_declaration(caps) {
+                return caps[0].to_string();
+            }
+            let tail = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            match tail {
+                "," | "，" => official_identity_with_continuation(tail),
                 _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
             }
         });
 
-        // 2.3 竞品厂牌（OpenAI、Anthropic、Qwen、字节跳动、腾讯、小米、华为等）统一归一化为 Google
-        let pass3 = RE_COMPETITOR_BRANDS.replace_all(&pass2, "Google");
+        // 2.2 知名特定客户端开场白归一化（如 Claude Code CLI 开场白、*code、*studio、*claw、pi 等）
+        let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, |caps: &regex::Captures| {
+            let tail = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            match tail {
+                "," | "，" => official_identity_with_continuation(tail),
+                _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+            }
+        });
 
-        let normalized = pass3.into_owned();
+        // 2.2b 官方 AG 后紧跟 ASCII 逗号 + 非连词续写：将逗号归一为句号。
+        // 例：`AG, a coding agent harness.` → `AG. a coding agent harness.`（上游 WAF 放行）
+        // 保留 `AG, and you must ...` 这类功能续写。
+        let pass2b =
+            RE_OFFICIAL_IDENTITY_APPOSITIVE.replace_all(&pass2, |caps: &regex::Captures| {
+                let next = caps
+                    .get(5)
+                    .map(|m| m.as_str().to_lowercase())
+                    .unwrap_or_default();
+                const SAFE_CONTINUATIONS: [&str; 10] = [
+                    "and", "but", "or", "so", "then", "however", "also", "yet", "while", "whereas",
+                ];
+                if SAFE_CONTINUATIONS.contains(&next.as_str()) {
+                    caps[0].to_string()
+                } else {
+                    format!("{}.{}{}", &caps[1], &caps[4], &caps[5])
+                }
+            });
+
+        // 2.3 竞品厂牌（OpenAI、Anthropic、Qwen、字节跳动、腾讯、小米、华为等）统一归一化为 Google
+        let pass3 = RE_COMPETITOR_BRANDS.replace_all(&pass2b, "Google");
+
+        // 2.4 防御性标点折叠（Issue #3915）：消除由于拼接或切词遗留的 `.,` / `. ,` / `。，` 畸形复合标点
+        let pass4 = RE_MALFORMED_PUNCTUATION.replace_all(&pass3, ". ");
+
+        let normalized = pass4.into_owned();
 
         // 步骤 3：单趟无递归还原受保护的代码块
         let restored = RE_CODE_BLOCK_PLACEHOLDER
@@ -499,6 +837,14 @@ impl PromptSanitizer {
     /// 2. 深入检测任意 `<xxx ...> ... </xxx>` 标签内部的内容，若包含客户端身份声明同样归一化；
     /// 3. 全程深度保护代码块（``` 与行内 `），标签本身及后续业务指令逐字完整保留。
     pub fn normalize_system_identity(text: &str) -> String {
+        Self::normalize_system_identity_with_enabled(text, Self::normalize_identity_enabled())
+    }
+
+    /// 纯函数版本：便于单测关闭开关，不依赖全局原子状态。
+    fn normalize_system_identity_with_enabled(text: &str, enabled: bool) -> String {
+        if !enabled {
+            return text.to_string();
+        }
         let lower = text.to_lowercase();
 
         // 核心铁律：快速前置短路检查（无任何归属类或已知客户端特征词则零开销返回）
@@ -564,6 +910,9 @@ impl PromptSanitizer {
     /// 4. `scope_of` 按 part 下标裁定清洗强度（System / Anchored / Content）。
     /// 客户端身份归一化：已知客户端身份（Claude Agent SDK / Claude Code CLI）对齐为官方 Antigravity 身份。
     pub fn normalize_client_identity(text: &str) -> &str {
+        if !Self::normalize_identity_enabled() {
+            return text;
+        }
         if text == CLAUDE_AGENT_SDK_IDENTITY
             || text == CLAUDE_CODE_CLI_IDENTITY
             || text == CLAUDE_AGENT_SDK_CLI_IDENTITY
@@ -572,6 +921,136 @@ impl PromptSanitizer {
         } else {
             text
         }
+    }
+
+    /// System 轨最终节点：保证整个 `systemInstruction` 最多只保留一处官方 AG。
+    ///
+    /// 设计铁律：
+    /// 1. **跨 part 全局去重**：第一处 AG 保留，后续命中全部删除；
+    /// 2. **代码块豁免**：``` 与行内 ` 内的 AG 不参与匹配；
+    /// 3. **结构化行清理**：`- Identity: AG` 删除后只剩前缀时整行移除；
+    /// 4. **续写保留**：`AG, and you must ...` 只删 AG 本身，保留后续功能指令；
+    /// 5. **幂等确定性**：重复运行结果不变，不破坏多轮 KV Cache 前缀。
+    fn dedupe_official_identity(parts: &mut Vec<Value>) -> usize {
+        let mut seen = false;
+        let mut changed = 0usize;
+
+        for part in parts.iter_mut() {
+            // 思考块受签名保护，绝不能参与身份去重或空 part 剔除
+            if crate::proxy::thinking_store::is_thought_part(part) {
+                continue;
+            }
+            let Some(text) = part.get("text").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if !text.contains("You are Antigravity") {
+                continue;
+            }
+
+            // 1. 保护代码块，确保代码/文档示例中的 AG 不被删除
+            let mut placeholders: Vec<String> = Vec::new();
+            let protected = RE_CODE_BLOCK.replace_all(&text, |caps: &regex::Captures| {
+                let idx = placeholders.len();
+                placeholders.push(caps[0].to_string());
+                format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
+            });
+
+            let mut out = String::with_capacity(protected.len());
+            let mut last = 0usize;
+            let mut local_changed = false;
+
+            for m in RE_OFFICIAL_IDENTITY_SENTENCE.find_iter(&protected) {
+                if m.start() < last {
+                    continue;
+                }
+                if !seen {
+                    seen = true; // 第一处保留
+                    continue;
+                }
+
+                // 2. 行感知：结构化身份行删除后只剩前缀时整行移除
+                let line_start = protected[..m.start()]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let line_end = protected[m.end()..]
+                    .find('\n')
+                    .map(|i| m.end() + i)
+                    .unwrap_or(protected.len());
+                let before = &protected[line_start..m.start()];
+                let after = &protected[m.end()..line_end];
+                let remainder = format!("{before}{after}");
+                let only_prefix = {
+                    let trimmed = remainder.trim();
+                    trimmed.is_empty() || RE_STRUCTURED_IDENTITY_PREFIX_ONLY.is_match(trimmed)
+                };
+
+                if only_prefix {
+                    out.push_str(&protected[last..line_start]);
+                    last = if line_end < protected.len() {
+                        line_end + 1
+                    } else {
+                        line_end
+                    };
+                } else {
+                    out.push_str(&protected[last..m.start()]);
+                    last = m.end();
+                    while last < protected.len()
+                        && matches!(protected.as_bytes()[last], b' ' | b'\t')
+                    {
+                        last += 1;
+                    }
+                }
+
+                local_changed = true;
+                changed += 1;
+            }
+
+            if local_changed {
+                out.push_str(&protected[last..]);
+
+                // 3. 单趟无递归还原代码块
+                let restored = RE_CODE_BLOCK_PLACEHOLDER
+                    .replace_all(&out, |caps: &regex::Captures| {
+                        if let Ok(idx) = caps[1].parse::<usize>() {
+                            if let Some(code) = placeholders.get(idx) {
+                                return code.clone();
+                            }
+                        }
+                        caps[0].to_string()
+                    })
+                    .into_owned();
+
+                // 4. 收拢多余空行并写回（保留行尾空格，避免吞掉 `System: ` 等前缀）
+                let collapsed = RE_MULTI_NEWLINE.replace_all(&restored, "\n\n");
+                let normalized = collapsed
+                    .trim_matches(|c| c == '\n' || c == '\r')
+                    .to_string();
+                if let Some(obj) = part.as_object_mut() {
+                    obj.insert("text".to_string(), Value::String(normalized));
+                }
+            }
+        }
+
+        // 5. 去重后可能产生空文本 part，物理剔除（思考块与非文本 part 保留）
+        parts.retain(|part| {
+            if crate::proxy::thinking_store::is_thought_part(part) {
+                return true;
+            }
+            part.get("text")
+                .and_then(Value::as_str)
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(true)
+        });
+
+        if changed > 0 {
+            tracing::info!(
+                "[Prompt-Sanitizer] Deduplicated {} duplicate official Antigravity identity statement(s) in systemInstruction",
+                changed
+            );
+        }
+
+        changed
     }
 
     /// 是否为客户端注入的单行计费元数据（issue #3452：与大量工具组合会触发上游 429）。
@@ -586,16 +1065,34 @@ impl PromptSanitizer {
     /// 注意：不含 `clean_text` —— Header 轨已在 `sanitize_parts_core` 中统一执行，避免重复。
     pub fn strip_pipeline_markers(text: &str) -> String {
         let mut s = text.to_string();
+        let mut modified = false;
         for marker in SYSTEM_PROMPT_END_MARKERS {
             if s.contains(marker) {
                 s = s.replace(marker, "");
+                modified = true;
             }
         }
         if s.contains(SELF_IDENTITY_BLOCK) {
             s = s.replace(SELF_IDENTITY_BLOCK, "");
+            modified = true;
         }
-        s = Self::strip_security_policy_prompt(&s);
-        s.trim().to_string()
+        if s.contains("x-anthropic-billing-header") {
+            let after_billing = RE_ANTHROPIC_BILLING_HEADER.replace_all(&s, "");
+            if after_billing != s {
+                s = after_billing.into_owned();
+                modified = true;
+            }
+        }
+        let after_sec = Self::strip_security_policy_prompt(&s);
+        if after_sec != s {
+            s = after_sec;
+            modified = true;
+        }
+        if modified {
+            s.trim().to_string()
+        } else {
+            s
+        }
     }
 
     /// 剥离客户端（如 Antigravity）在系统提示词中注入的 CTF 与安全策略测试约束指令（Issue #3781）。
@@ -736,6 +1233,269 @@ impl PromptSanitizer {
         before - parts.len()
     }
 
+    /// 读取文本内嵌 data URL 的处理策略；环境变量覆盖与 GUI 无关，无头 / CLI / Docker 一致生效：
+    /// - `ABV_TEXT_DATA_URL_MODE`：`attach`（默认，有效媒体转为真正的 `inlineData` 部件）/
+    ///   `omit`（一律折叠为长度占位符）/ `keep`（原样保留，关闭本节点）；
+    /// - `ABV_TEXT_DATA_URL_MIN_CHARS`：触发处理的最小 base64 负载长度。
+    fn text_data_url_policy() -> Option<(TextDataUrlMode, usize)> {
+        let mode = match std::env::var("ABV_TEXT_DATA_URL_MODE")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str()
+        {
+            "keep" | "off" | "0" | "false" => return None,
+            "omit" | "strip" => TextDataUrlMode::Omit,
+            _ => TextDataUrlMode::Attach,
+        };
+        let min = std::env::var("ABV_TEXT_DATA_URL_MIN_CHARS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_TEXT_DATA_URL_MIN_CHARS);
+        Some((mode, min))
+    }
+
+    /// 在文本中定位负载长度 >= `min_chars` 的内联 data URL，并用 `replace(mime, payload)` 的返回值
+    /// 替换**整个** data URL。只替换匹配片段本身，不跨越引号 / 换行 / 其它字段；末尾的转义反斜杠
+    /// 回退保留，防止破坏外层 JSON 字符串中的 `\"` 转义。返回 `None` 表示没有改动。
+    fn rewrite_text_data_urls(
+        text: &str,
+        min_chars: usize,
+        mut replace: impl FnMut(&str, &str) -> String,
+    ) -> Option<String> {
+        if text.len() < min_chars || !text.contains("base64,") {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len().min(64 * 1024));
+        let mut last = 0usize;
+        let mut changed = false;
+        for caps in RE_TEXT_DATA_URL_HEADER.captures_iter(text) {
+            let m = caps.get(0).expect("whole match");
+            if m.start() < last {
+                continue;
+            }
+            let start = m.end();
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric()
+                    || matches!(bytes[end], b'+' | b'/' | b'=' | b'\\' | b'-' | b'_'))
+            {
+                end += 1;
+            }
+            while end > start && bytes[end - 1] == b'\\' {
+                end -= 1;
+            }
+            if end - start < min_chars {
+                continue;
+            }
+            // JSON 转义后的 `\/` 还原为 `/`，得到真实 MIME 与 base64 负载
+            let mime = caps[1].replace('\\', "");
+            let payload = text[start..end].replace('\\', "");
+            out.push_str(&text[last..m.start()]);
+            out.push_str(&replace(&mime, &payload));
+            last = end;
+            changed = true;
+        }
+        if !changed {
+            return None;
+        }
+        out.push_str(&text[last..]);
+        Some(out)
+    }
+
+    fn omitted_data_url_placeholder(mime: &str, payload_len: usize, reason: &str) -> String {
+        format!(
+            "[inline {} data omitted{}: {} base64 chars]",
+            mime, reason, payload_len
+        )
+    }
+
+    /// 把文本中的大段内联 data URL 折叠为长度占位符（不转图片）。供 systemInstruction、
+    /// `functionResponse`、model 轮次以及日志精简使用。
+    pub fn collapse_text_data_urls(text: &str, min_chars: usize) -> Option<String> {
+        Self::rewrite_text_data_urls(text, min_chars, |mime, payload| {
+            Self::omitted_data_url_placeholder(mime, payload.len(), "")
+        })
+    }
+
+    /// 递归折叠 JSON 值中所有字符串叶子的内联 data URL，返回改动的叶子数。
+    fn collapse_data_urls_in_value(value: &mut Value, min_chars: usize) -> usize {
+        match value {
+            Value::String(s) => match Self::collapse_text_data_urls(s, min_chars) {
+                Some(collapsed) => {
+                    *s = collapsed;
+                    1
+                }
+                None => 0,
+            },
+            Value::Array(items) => items
+                .iter_mut()
+                .map(|v| Self::collapse_data_urls_in_value(v, min_chars))
+                .sum(),
+            Value::Object(map) => map
+                .values_mut()
+                .map(|v| Self::collapse_data_urls_in_value(v, min_chars))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    fn is_attachable_mime(mime: &str) -> bool {
+        let m = mime.to_ascii_lowercase();
+        m.starts_with("image/")
+            || m.starts_with("audio/")
+            || m.starts_with("video/")
+            || m == "application/pdf"
+    }
+
+    /// 文本内嵌 data URL 处理节点（Pipeline First，协议无关）：
+    /// 正常上传的媒体在适配层就已是结构化字段（`input_image` / `image_url` / `source` / `inlineData`），
+    /// 到这里已经是 `inlineData`，**不经过本节点**。本节点只处理“被序列化进文本字符串”的 data URL：
+    /// - user 轮次的 text part：通过魔数与结构完整性校验的媒体提升为紧跟其后的 `inlineData` 部件，
+    ///   原位置替换为 `[inline <mime> data attached as media #N]`；整包内容相同的媒体只附加一次；
+    /// - 校验失败、超出数量 / 体积上限、`omit` 模式，以及 systemInstruction / model 轮次 /
+    ///   `functionResponse`（这些位置不能承载 inlineData）一律折叠为长度占位符；
+    /// - 思考块（受签名保护）与已有 `inlineData` 原样不动。
+    fn process_text_data_urls(body: &mut Value) -> usize {
+        let Some((mode, min_chars)) = Self::text_data_url_policy() else {
+            return 0;
+        };
+        let mut changed = 0usize;
+        let collapse_part = |part: &mut Value| -> usize {
+            if crate::proxy::thinking_store::is_thought_part(part)
+                || part.get("thoughtSignature").is_some()
+            {
+                return 0;
+            }
+            let Some(obj) = part.as_object_mut() else {
+                return 0;
+            };
+            let mut n = 0;
+            let collapsed = obj
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|t| Self::collapse_text_data_urls(t, min_chars));
+            if let Some(collapsed) = collapsed {
+                obj.insert("text".to_string(), Value::String(collapsed));
+                n += 1;
+            }
+            for key in ["functionResponse", "function_response"] {
+                if let Some(resp) = obj.get_mut(key) {
+                    n += Self::collapse_data_urls_in_value(resp, min_chars);
+                }
+            }
+            n
+        };
+
+        for key in ["systemInstruction", "system_instruction"] {
+            if let Some(parts) = body
+                .get_mut(key)
+                .and_then(|s| s.get_mut("parts"))
+                .and_then(Value::as_array_mut)
+            {
+                for part in parts.iter_mut() {
+                    changed += collapse_part(part);
+                }
+            }
+        }
+
+        let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) else {
+            return changed;
+        };
+        // 已附加媒体：(base64 负载, 编号)；按整包内容去重，同一张截图在转录中反复出现时只附加一次
+        let mut attached: Vec<String> = Vec::new();
+        let mut attached_chars = 0usize;
+        for turn in contents.iter_mut() {
+            let is_user = turn.get("role").and_then(Value::as_str) == Some("user");
+            let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if !is_user || mode == TextDataUrlMode::Omit {
+                for part in parts.iter_mut() {
+                    changed += collapse_part(part);
+                }
+                continue;
+            }
+            let mut rebuilt: Vec<Value> = Vec::with_capacity(parts.len());
+            for mut part in std::mem::take(parts) {
+                let is_protected = crate::proxy::thinking_store::is_thought_part(&part)
+                    || part.get("thoughtSignature").is_some();
+                let text = (!is_protected)
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string);
+                let Some(text) = text else {
+                    changed += collapse_part(&mut part);
+                    rebuilt.push(part);
+                    continue;
+                };
+                let mut new_media: Vec<Value> = Vec::new();
+                let rewritten = Self::rewrite_text_data_urls(&text, min_chars, |mime, payload| {
+                    if let Some(idx) = attached.iter().position(|d| d == payload) {
+                        return format!("[inline {} data attached as media #{}]", mime, idx + 1);
+                    }
+                    if !Self::is_attachable_mime(mime) {
+                        return Self::omitted_data_url_placeholder(mime, payload.len(), "");
+                    }
+                    if attached.len() >= MAX_TEXT_DATA_URL_ATTACHMENTS
+                        || attached_chars + payload.len() > MAX_TEXT_DATA_URL_ATTACHED_CHARS
+                    {
+                        return Self::omitted_data_url_placeholder(
+                            mime,
+                            payload.len(),
+                            " (attachment limit reached)",
+                        );
+                    }
+                    match crate::proxy::mappers::common_utils::validate_and_sanitize_inline_data(
+                        Some(mime),
+                        payload,
+                    ) {
+                        Some((valid_mime, valid_data)) => {
+                            attached.push(payload.to_string());
+                            attached_chars += payload.len();
+                            new_media.push(serde_json::json!({
+                                "inlineData": { "mimeType": valid_mime, "data": valid_data }
+                            }));
+                            format!(
+                                "[inline {} data attached as media #{}]",
+                                mime,
+                                attached.len()
+                            )
+                        }
+                        None => Self::omitted_data_url_placeholder(
+                            mime,
+                            payload.len(),
+                            " (invalid or corrupted)",
+                        ),
+                    }
+                });
+                match rewritten {
+                    Some(new_text) => {
+                        tracing::info!(
+                            "[Prompt-Sanitizer] Rewrote inline base64 data URL embedded in text (len: {} -> {}, attached: {})",
+                            text.len(),
+                            new_text.len(),
+                            new_media.len()
+                        );
+                        if let Some(obj) = part.as_object_mut() {
+                            obj.insert("text".to_string(), Value::String(new_text));
+                        }
+                        changed += 1;
+                        rebuilt.push(part);
+                        rebuilt.extend(new_media);
+                    }
+                    None => {
+                        changed += collapse_part(&mut part);
+                        rebuilt.push(part);
+                    }
+                }
+            }
+            *parts = rebuilt;
+        }
+        changed
+    }
+
     fn sanitize_parts_core(parts: &mut Vec<Value>, scope_of: impl Fn(usize) -> PartScope) -> usize {
         // 0. 物理剔除客户端注入的计费元数据 Part（下标必须在选轨道之前定格）
         let mut cleaned_count = Self::drop_billing_parts(parts);
@@ -762,7 +1522,9 @@ impl PromptSanitizer {
                     // 轨道叠加：System 全量 / Anchored 仅锚点内全量 / Content 仅 Header
                     let cleaned = match scope {
                         PartScope::System => {
-                            Self::normalize_system_identity(&Self::strip_pipeline_markers(&cleaned))
+                            let stripped = Self::strip_pipeline_markers(&cleaned);
+                            let rewritten = Self::apply_prompt_rewrite_rules(&stripped);
+                            Self::normalize_system_identity(&rewritten)
                         }
                         PartScope::Anchored => Self::normalize_anchored_regions(&cleaned),
                         PartScope::Content => cleaned,
@@ -811,30 +1573,42 @@ impl PromptSanitizer {
         Self::sanitize_parts_core(parts, |_| PartScope::System)
     }
 
-    /// 注入区终点裁定：返回 `(turn_idx, cur_text_part)`。
+    /// 注入区终点裁定：在首个 `role:model` 之前的开场切片（`leading_contents = &contents[..first_model]`）内，
+    /// 返回 `(turn_idx, cur_text_part)`。
     ///
     /// - `turn_idx < cur_turn` 或同一轮中 part 下标 `< cur_text_part`：注入区 → System 轨；
-    /// - part 下标 `== cur_text_part`：当前轮消息 → Anchored 轨（仅标签内清洗）；
+    /// - `turn_idx == cur_turn` 且 part 下标 `== cur_text_part`：首轮用户提问消息 → Anchored 轨（仅标签内清洗）；
     /// - 其余（首个 model 轮及之后、当前 part 之后）：→ Content 轨。
     ///
-    /// “当前轮” = `contents` 中**最后一条 user 消息**，其**最后一个带 text 的 part**。
-    /// 取“最后一个 text part”而非“最后一个 part”：客户端常把图片/文件追加在文本之后，
-    /// 简单取末位会把用户正文误判为注入区。
-    fn leading_injection_boundary(contents: &[Value]) -> (usize, Option<usize>) {
-        let cur_turn = contents
+    /// “首轮用户提问” = `leading_contents`（即 `&contents[..first_model]`）中**最后一条带 text 的 user 消息**，
+    /// 其**最后一个带 text 的 part**。
+    ///
+    /// 核心前缀不变量（跨轮次 KV Cache 保全）：
+    /// 扫描范围必须严格限制在 `&contents[..first_model]` 内，绝不可越过 `first_model` 扫描后续对话轮次。
+    /// 原因：在第 1 轮对话及第 1 轮内的多次工具调用期间（Antigravity Gemini 协议下 `functionCall` 与
+    /// `functionResponse` 的 role 均为 `"model"`），`first_model` 之后不存在 `role: "user"`，开场用户提问走
+    /// `Anchored` 轨；若扫描全量 `contents`，一旦第 1 轮对话结束、用户发送第 2 轮新消息（末尾新增 `role: "user"`），
+    /// `cur_turn` 会跨过 `first_model` 跳至末尾，导致第 1 轮开头的用户提问在第 2 轮被回溯改判为 `System` 轨，
+    /// 直接篡改历史前缀并击穿整段对话的 KV Cache。
+    fn leading_injection_boundary(leading_contents: &[Value]) -> (usize, Option<usize>) {
+        for (ti, turn) in leading_contents.iter().enumerate().rev() {
+            if turn.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            if let Some(parts) = turn.get("parts").and_then(Value::as_array) {
+                if let Some(pi) = parts
+                    .iter()
+                    .rposition(|p| p.get("text").and_then(Value::as_str).is_some())
+                {
+                    return (ti, Some(pi));
+                }
+            }
+        }
+        let fallback_turn = leading_contents
             .iter()
-            .rposition(|t| t.get("role").and_then(Value::as_str) == Some("user"));
-        let cur_text_part = cur_turn.and_then(|ti| {
-            contents[ti]
-                .get("parts")
-                .and_then(Value::as_array)
-                .and_then(|parts| {
-                    parts
-                        .iter()
-                        .rposition(|p| p.get("text").and_then(Value::as_str).is_some())
-                })
-        });
-        (cur_turn.unwrap_or(0), cur_text_part)
+            .rposition(|t| t.get("role").and_then(Value::as_str) == Some("user"))
+            .unwrap_or(0);
+        (fallback_turn, None)
     }
 
     /// 首个 `role:model` 的下标（不存在时返回 `contents.len()`）。
@@ -893,6 +1667,9 @@ impl PromptSanitizer {
     fn sanitize_gemini_payload_inner(body: &mut Value) -> usize {
         let mut cleaned_count = 0;
 
+        // 0. 文本内嵌 data URL：有效媒体提升为 inlineData，其余折叠（须早于轨道划分与 token 估算）
+        cleaned_count += Self::process_text_data_urls(body);
+
         // 1. 清洗系统提示词 (systemInstruction)
         //    走 System 轨：Header 轨之外叠加身份声明归一化（协议无关，四协议共用）
         if let Some(sys) = body
@@ -901,6 +1678,9 @@ impl PromptSanitizer {
         {
             if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
                 cleaned_count += Self::sanitize_system_parts(parts);
+                if Self::normalize_identity_enabled() {
+                    cleaned_count += Self::dedupe_official_identity(parts);
+                }
             }
 
             // 若清洗后 parts 为空，物理移除整个 systemInstruction，避免向 Google 发送空的系统提示词结构
@@ -929,7 +1709,8 @@ impl PromptSanitizer {
             }
 
             let first_model = Self::first_model_turn(contents);
-            let (cur_turn, cur_text_part) = Self::leading_injection_boundary(contents);
+            let (cur_turn, cur_text_part) =
+                Self::leading_injection_boundary(&contents[..first_model]);
 
             for (turn_idx, turn) in contents.iter_mut().enumerate() {
                 let is_user = turn.get("role").and_then(Value::as_str) == Some("user");
@@ -998,6 +1779,131 @@ impl PromptSanitizer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn fake_b64(len: usize) -> String {
+        "iVBORw0KGgoAAAANSUhEUg+/"
+            .chars()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+
+    /// 一张结构完整的 PNG（签名 + IHDR + IDAT 填充 + IEND），base64 长度可控，能通过魔数与完整性校验
+    fn valid_png_b64(min_b64_len: usize) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[
+            0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        bytes.extend(std::iter::repeat(0u8).take(min_b64_len * 3 / 4));
+        bytes.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]);
+        STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn test_collapse_text_data_urls_in_serialized_rollout_json() {
+        let b64 = fake_b64(20_000);
+        let text = format!(
+            r#"Analyze this rollout.\n{{\"type\":\"input_image\",\"image_url\":\"data:image\/png;base64,{b64}\"}},{{\"type\":\"input_text\",\"text\":\"next\"}}"#
+        );
+        let out = PromptSanitizer::collapse_text_data_urls(&text, 8192).expect("must collapse");
+        assert!(!out.contains(&b64));
+        assert!(out
+            .contains(r#"\"image_url\":\"[inline image/png data omitted: 20000 base64 chars]\"}"#));
+        assert!(out.starts_with("Analyze this rollout."));
+        assert!(out.ends_with(r#"{\"type\":\"input_text\",\"text\":\"next\"}"#));
+    }
+
+    #[test]
+    fn test_collapse_text_data_urls_keeps_small_and_plain_text() {
+        let small = format!("icon: data:image/png;base64,{}", fake_b64(200));
+        assert!(PromptSanitizer::collapse_text_data_urls(&small, 8192).is_none());
+        let plain = "x".repeat(20_000);
+        assert!(PromptSanitizer::collapse_text_data_urls(&plain, 8192).is_none());
+    }
+
+    #[test]
+    fn test_text_data_url_attached_as_inline_data_once_per_unique_image() {
+        let png = valid_png_b64(20_000);
+        let rollout = format!(
+            r#"Analyze this rollout: {{\"image_url\":\"data:image/png;base64,{png}\"}} ... again {{\"image_url\":\"data:image/png;base64,{png}\"}} end"#
+        );
+        let mut payload = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": rollout }] }]
+        });
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let parts = payload["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(
+            parts.len(),
+            2,
+            "same screenshot must be attached only once: {parts:?}"
+        );
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(!text.contains(&png));
+        assert_eq!(
+            text.matches("[inline image/png data attached as media #1]")
+                .count(),
+            2
+        );
+        assert!(text.starts_with("Analyze this rollout:") && text.ends_with(" end"));
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"].as_str().unwrap(), png);
+    }
+
+    #[test]
+    fn test_text_data_url_collapsed_where_inline_data_cannot_live_or_invalid() {
+        let png = valid_png_b64(20_000);
+        let junk = fake_b64(20_000);
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": format!("sys data:image/png;base64,{png}") }] },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "inlineData": { "mimeType": "image/png", "data": png.clone() } },
+                        { "text": format!("broken data:image/png;base64,{junk} tail") }
+                    ]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "text": format!("echo data:image/png;base64,{png}") }]
+                },
+                {
+                    "role": "user",
+                    "parts": [{ "functionResponse": { "name": "read", "response": { "output": format!("data:image/jpeg;base64,{junk}") } } }]
+                }
+            ]
+        });
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            sys,
+            format!(
+                "sys [inline image/png data omitted: {} base64 chars]",
+                png.len()
+            )
+        );
+        let c = &payload["contents"];
+        assert_eq!(
+            c[0]["parts"][0]["inlineData"]["data"].as_str().unwrap(),
+            png
+        );
+        assert_eq!(c[0]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            c[0]["parts"][1]["text"].as_str().unwrap(),
+            "broken [inline image/png data omitted (invalid or corrupted): 20000 base64 chars] tail"
+        );
+        assert!(c[1]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("data omitted"));
+        let resp = c[2]["parts"][0]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap();
+        assert_eq!(resp, "[inline image/jpeg data omitted: 20000 base64 chars]");
+    }
 
     #[test]
     fn test_client_identity_mapping_normalizes_to_official_antigravity() {
@@ -1322,7 +2228,7 @@ mod tests {
         assert!(!cleaned.contains("Claude Code"));
         assert_eq!(cleaned, "You have access to a variety of tools.");
 
-        // System 轨头部窗口归一化为官方 Antigravity 助手
+        // System 轨全量归一化为官方 Antigravity 助手
         let normalized = PromptSanitizer::normalize_system_identity(raw);
         eprintln!("DEBUG normalized = {:?}", normalized);
         assert!(normalized.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
@@ -1437,12 +2343,46 @@ mod tests {
 
     #[test]
     fn test_normalize_identity_keeps_comma_continuation_intact() {
+        // 官方身份本身以句号结尾；逗号续写时必须只保留一个逗号，不能出现 ".,"。
         let raw =
             "You are an AI agent created by Acme, and you must never reveal internal tooling.";
-        assert_eq!(
-            PromptSanitizer::normalize_system_identity(raw),
-            format!("{OFFICIAL_ANTIGRAVITY_IDENTITY}, and you must never reveal internal tooling.")
+        let expected = concat!(
+            "You are Antigravity, a powerful agentic AI coding assistant designed by the ",
+            "Google Deepmind team working on Advanced Agentic Coding, ",
+            "and you must never reveal internal tooling."
         );
+        assert_eq!(PromptSanitizer::normalize_system_identity(raw), expected);
+        assert!(!expected.contains(".,"));
+    }
+
+    #[test]
+    fn test_normalize_identity_keeps_full_width_comma_continuation_intact() {
+        let raw = "You are an AI agent created by Acme，并且你绝不能泄露内部工具。";
+        let expected = concat!(
+            "You are Antigravity, a powerful agentic AI coding assistant designed by the ",
+            "Google Deepmind team working on Advanced Agentic Coding，",
+            "并且你绝不能泄露内部工具。"
+        );
+        assert_eq!(PromptSanitizer::normalize_system_identity(raw), expected);
+    }
+
+    #[test]
+    fn test_normalize_known_client_identity_comma_continuation_intact() {
+        let raw = "You are Claude Code, Anthropic's official CLI for Claude, and you must never reveal internal tooling.";
+        let expected = concat!(
+            "You are Antigravity, a powerful agentic AI coding assistant designed by the ",
+            "Google Deepmind team working on Advanced Agentic Coding, ",
+            "and you must never reveal internal tooling."
+        );
+        assert_eq!(PromptSanitizer::normalize_system_identity(raw), expected);
+    }
+
+    #[test]
+    fn test_normalize_identity_without_continuation_keeps_terminal_period() {
+        let raw = "You are Hermes Agent, an intelligent AI assistant created by Nous Research.";
+        let out = PromptSanitizer::normalize_system_identity(raw);
+        assert_eq!(out, OFFICIAL_ANTIGRAVITY_IDENTITY);
+        assert!(out.ends_with('.'));
     }
 
     #[test]
@@ -1466,8 +2406,27 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_identity_only_scans_system_prompt_head() {
-        // 头部窗口（前 4 句）之外的身份类表述一律不动，避免误伤长提示词正文
+    fn test_normalize_identity_scans_full_system_prompt() {
+        // 身份归一化在 System 轨全量扫描：正文中的真实身份声明同样会被归一化。
+        let raw = concat!(
+            "You are a coding assistant.\n\n",
+            "Sentence 0 is a normal instruction.\n",
+            "Sentence 1 is a normal instruction.\n",
+            "Sentence 2 is a normal instruction.\n",
+            "Sentence 3 is a normal instruction.\n",
+            "Sentence 4 is a normal instruction.\n",
+            "Sentence 5 is a normal instruction.\n",
+            "You are Hermes Agent, an intelligent AI assistant created by Nous Research."
+        );
+        let out = PromptSanitizer::normalize_system_identity(raw);
+        assert!(out.contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(!out.contains("Hermes Agent"));
+        assert!(out.contains("Sentence 0 is a normal instruction."));
+    }
+
+    #[test]
+    fn test_normalize_identity_preserves_non_identity_attribution_text() {
+        // 不含 "You are ..." 身份开场白的普通归属文本不得被改写（正则要求身份开场白）。
         let mut raw = String::from("You are a coding assistant.\n\n");
         for i in 0..6 {
             raw.push_str(&format!("Sentence {i} is a normal instruction.\n"));
@@ -1591,6 +2550,7 @@ mod tests {
                 "systemInstruction": { "role": "user", "parts": [{ "text": jeik }] },
                 "contents": [
                     { "role": "user", "parts": [{ "text": jeik }] },
+                    { "role": "user", "parts": [{ "text": "Initial question about JeikCode.\n" }] },
                     { "role": "model", "parts": [{ "text": "Model answer." }] },
                     { "role": "user", "parts": [{ "text": "Follow-up question about JeikCode." }] }
                 ]
@@ -1607,15 +2567,19 @@ mod tests {
         assert!(sys_text.contains("=== AGENTS.md ==="));
         assert!(sys_text.contains("User custom provisions."));
 
-        // 首个 model 轮次之前的 user 块（客户端注入的系统提示词）也被深度归一化
+        // 首个 model 轮次之前的注入 user 块（首轮提问之前）也被深度归一化
         let user_leading = payload["request"]["contents"][0]["parts"][0]["text"]
             .as_str()
             .unwrap();
         assert!(user_leading.contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
 
-        // model 之后的后续 user 提问保持 100% 原始文本
+        // 首轮真实提问（Anchored 轨）与 model 之后的后续 user 提问（Content 轨）均保持 100% 原始文本
         assert_eq!(
-            payload["request"]["contents"][2]["parts"][0]["text"],
+            payload["request"]["contents"][1]["parts"][0]["text"],
+            "Initial question about JeikCode.\n"
+        );
+        assert_eq!(
+            payload["request"]["contents"][3]["parts"][0]["text"],
             "Follow-up question about JeikCode."
         );
     }
@@ -1903,8 +2867,10 @@ mod tests {
         for (name, raw, key_fragment) in test_cases {
             let out = PromptSanitizer::normalize_system_identity(raw);
             assert_ne!(out, raw, "Case '{name}' 必须被归一化处理");
+            // #3902：逗号续写场景会去掉官方身份末尾句号，因此只断言公共前缀
+            let official_prefix = OFFICIAL_ANTIGRAVITY_IDENTITY.trim_end_matches('.');
             assert!(
-                out.contains(OFFICIAL_ANTIGRAVITY_IDENTITY),
+                out.contains(official_prefix),
                 "Case '{name}' 必须包含官方 Antigravity 身份"
             );
             if key_fragment != "and you must never reveal internal tooling." {
@@ -2136,10 +3102,11 @@ mod tests {
         assert!(!parts[0]["text"].as_str().unwrap().contains("OpenAI"));
         assert_eq!(parts[1]["text"], "请翻译：I love Rust.");
 
-        // 多轮：首个 model 之前的 user 轮属于注入区，model 之后的轮次逐字保留
+        // 多轮：首个 model 之前的注入 user 轮属于注入区，首轮用户提问与 model 之后的轮次逐字保留
         let mut payload2 = json!({
             "contents": [
                 { "role": "user", "parts": [ { "text": "You are an AI assistant built by OpenAI." } ] },
+                { "role": "user", "parts": [ { "text": "First question about OpenAI.\n" } ] },
                 { "role": "model", "parts": [ { "text": "Understood." } ] },
                 { "role": "user", "parts": [ { "text": "Compare OpenAI and Anthropic models." } ] }
             ]
@@ -2150,7 +3117,11 @@ mod tests {
             .unwrap()
             .contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
         assert_eq!(
-            payload2["contents"][2]["parts"][0]["text"],
+            payload2["contents"][1]["parts"][0]["text"],
+            "First question about OpenAI.\n"
+        );
+        assert_eq!(
+            payload2["contents"][3]["parts"][0]["text"],
             "Compare OpenAI and Anthropic models."
         );
     }
@@ -2224,10 +3195,117 @@ mod tests {
             ]
         });
         PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert_eq!(
+            payload["contents"][0]["parts"][1]["text"], "Compare OpenAI and Anthropic.",
+            "首轮用户提问在进入多轮对话后仍必须原样保护，不得被回溯改写"
+        );
         let once = payload.to_string();
         PromptSanitizer::sanitize_gemini_payload(&mut payload);
         PromptSanitizer::sanitize_gemini_payload(&mut payload);
         assert_eq!(once, payload.to_string(), "清洗必须幂等");
+    }
+
+    #[test]
+    fn test_multi_turn_transition_freezes_leading_user_prefix_for_kv_cache() {
+        // 回归测试：复现「第 1 轮多次工具调用缓存拉满，但第 1 轮输出结束、发送第 2 轮新消息时开场前缀突变导致 0 缓存」
+        // 核心场景：
+        // - Turn 1 发起请求：contents[0] 为 AGENTS.md 注入，contents[1] 为 <system-reminder>，
+        //   contents[2] 为首轮用户提问（末尾带 \n 且正文提及竞品名 OpenAI/Anthropic）；
+        // - Turn 1 工具调用循环：追加多个 role:model 的 functionCall 与 functionResponse 轮次；
+        // - Turn 2 用户发送新消息：追加 role:model 最终回复与 role:user 的第 2 轮提问。
+        // 铁律：contents[0..3] 在 Turn 1 初次请求、Turn 1 工具调用、Turn 2 新提问三阶段必须 100% 字节级恒等！
+        let leading_turns = vec![
+            json!({
+                "role": "user",
+                "parts": [{ "text": "# AGENTS.md instructions\nYou are Codex, an AI coding agent built by OpenAI." }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "text": "<system-reminder>\n<codex_apps_client_time_context><current_date>2026-11-08</current_date></codex_apps_client_time_context>\n</system-reminder>" }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "text": "帮我研究一下这个 XUI 的 node 逻辑，对比一下 OpenAI 和 Anthropic 的缓存策略，是不是只能这样做了\n" }]
+            }),
+        ];
+
+        // 阶段 1：Turn 1 初始请求（尚无 model 轮次）
+        let mut turn1_initial = json!({
+            "contents": leading_turns.clone()
+        });
+        PromptSanitizer::sanitize_gemini_payload(&mut turn1_initial);
+        let prefix_stage1 = turn1_initial["contents"].as_array().unwrap().clone();
+
+        // 验证注入块已归一化，而首轮用户提问保留了原始品牌词与末尾 \n
+        assert!(prefix_stage1[0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert_eq!(
+            prefix_stage1[2]["parts"][0]["text"],
+            "帮我研究一下这个 XUI 的 node 逻辑，对比一下 OpenAI 和 Anthropic 的缓存策略，是不是只能这样做了\n"
+        );
+
+        // 阶段 2：Turn 1 内部多次工具调用（Antigravity Gemini 协议下 functionCall 与 functionResponse 均为 role:model）
+        let mut turn1_tool_loop = json!({
+            "contents": [
+                leading_turns[0].clone(),
+                leading_turns[1].clone(),
+                leading_turns[2].clone(),
+                {
+                    "role": "model",
+                    "parts": [{ "thoughtSignature": "sig_1", "functionCall": { "name": "exec_command", "id": "call_1", "args": { "cmd": "ls" } } }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "functionResponse": { "name": "exec_command", "id": "call_1", "response": { "output": "ok\n" } } }]
+                }
+            ]
+        });
+        PromptSanitizer::sanitize_gemini_payload(&mut turn1_tool_loop);
+        let prefix_stage2 = &turn1_tool_loop["contents"].as_array().unwrap()[..3];
+        assert_eq!(
+            prefix_stage1.as_slice(),
+            prefix_stage2,
+            "Turn 1 工具调用期间开场前缀必须字节级一致"
+        );
+
+        // 阶段 3：Turn 1 结束，用户发送 Turn 2 新消息（末尾出现新的 role:user）
+        let mut turn2_new_user = json!({
+            "contents": [
+                leading_turns[0].clone(),
+                leading_turns[1].clone(),
+                leading_turns[2].clone(),
+                {
+                    "role": "model",
+                    "parts": [{ "thoughtSignature": "sig_1", "functionCall": { "name": "exec_command", "id": "call_1", "args": { "cmd": "ls" } } }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "functionResponse": { "name": "exec_command", "id": "call_1", "response": { "output": "ok\n" } } }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "text": "我已经帮你排查清楚了。" }]
+                },
+                {
+                    "role": "user",
+                    "parts": [{ "text": "那我们采用方式一继续修改吧\n" }]
+                }
+            ]
+        });
+        PromptSanitizer::sanitize_gemini_payload(&mut turn2_new_user);
+        let turn2_contents = turn2_new_user["contents"].as_array().unwrap();
+        let prefix_stage3 = &turn2_contents[..3];
+        assert_eq!(
+            prefix_stage1.as_slice(),
+            prefix_stage3,
+            "进入 Turn 2 新对话时，Turn 1 开场前缀必须 100% 字节级冻结，严禁回溯改写导致 KV Cache 失效"
+        );
+        assert_eq!(
+            turn2_contents[6]["parts"][0]["text"],
+            "那我们采用方式一继续修改吧\n"
+        );
     }
 
     #[test]
@@ -2347,5 +3425,575 @@ mod tests {
         assert!(!text.contains("C2 frameworks"));
         assert!(text.contains("# Harness"));
         assert!(text.contains("Please fix the gateway bug."));
+    }
+
+    #[test]
+    fn test_normalize_structured_identity_declarations() {
+        // 结构化 Markdown 列表与键值对形态（包括英文与中文、带前缀符号与不带）
+        let cases = [
+            (
+                "- Identity: JeikCode AI coding Agent, provided by Jeik, running on your underlying model.",
+                format!("- Identity: {OFFICIAL_ANTIGRAVITY_IDENTITY}"),
+            ),
+            (
+                "* Identity: OpenCode AI assistant, built by Community.",
+                format!("* Identity: {OFFICIAL_ANTIGRAVITY_IDENTITY}"),
+            ),
+            (
+                "Identity: Claude Code, Anthropic's official CLI for Claude.",
+                format!("Identity: {OFFICIAL_ANTIGRAVITY_IDENTITY}"),
+            ),
+            (
+                "- Role: Cursor agent integrated into Cursor editor.",
+                format!("- Role: {OFFICIAL_ANTIGRAVITY_IDENTITY}"),
+            ),
+            (
+                "- 身份：JeikCode AI 编程助手，由 Jeik 提供，运行于底层模型。",
+                format!("- 身份：{OFFICIAL_ANTIGRAVITY_IDENTITY}"),
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let out = PromptSanitizer::normalize_system_identity(raw);
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn test_user_reported_new_agent_environment_template() {
+        let raw_environment = concat!(
+            "<environment>\n",
+            "## Identity & Interaction\n",
+            "- Identity: JeikCode AI coding Agent, provided by Jeik, running on your underlying model.\n",
+            "- Language: Always answer in the language used by the user.\n",
+            "- Model identity: When asked about your model identity, answer based on your actual underlying model code.\n",
+            "- No proactive configuration reads: When the user asks about current tools, MCP, Skills, rules, what we have discussed, or similar, answer directly from the interaction history visible in your current context and from the visible `<available_skills>`, `<mcp_server_instructions>`, `<system_rules>`, `<memory>`, `<user_preferences>`, `<project_instructions>`, etc. Read configuration proactively only when the user explicitly asks to inspect the configured models, query session file records, troubleshoot JeikCode logs, or makes another equally explicit request.\n\n",
+            "## Configuration Directories\n",
+            "- Global configuration, sessions, and logs live under `~/.jeikcode/`; project configuration lives under `./` or `./.jeikcode/`. Do not read configuration proactively unless the user has a clear intent for you to do so.\n",
+            "- Preference and rule files (for example, `AGENTS.md`, `JEIKCODE.md`, `CLAUDE.md`, `rules.md`, `glossary.md`, `dbwords.md`, `memory.md`) take effect immediately upon modification. When the user asks you to change project standards, only scan and modify `./AGENTS.md`.\n\n",
+            "## PRECEDENCE:\n",
+            "- Content inside `<system_rules>`: default system rules.\n",
+            "- Content inside `<user_preferences>` or `<memory>`: global user preferences.\n",
+            "- Content inside `<project_instructions>`: project standards and constraints.\n",
+            "- When the rule sets do not conflict, all three apply simultaneously.\n",
+            "- When they conflict, apply the precedence `project_instructions >> memory > user_preferences > system_rules`.\n",
+            "- When a rule governs normative work directed at others (for example, opinions on others' work, requests, code review, coding standards, or PR review), apply only the public `project_instructions` rules; do not include user personal preferences from `user_preferences`, `memory`, etc. In all other cases, determine the effective scope of each rule by whether the work conflicts.\n",
+            "- Tool invocation precedence: when built-in tools, Skills, and MCP tools can all solve the user's problem, invoke them in this strict order: `Skills > MCP > Built-in Tools > Custom Scripts`.\n\n",
+            "## Runtime Environment\n",
+            "- Platform: Windows 11 Pro (x64, AMD64).\n",
+            "- Project working directory: `E:/code/jeikcode`.\n",
+            "- Git branch: `beta`.\n",
+            "- Command habit: On Windows, use forward slashes \"/\" in all scenarios, and locate executables with `where`.\n",
+            "- Temp files: use `\"$TMPDIR\"` instead of hardcoding `/tmp`; it works for shell-internal paths and as an argument to native Windows programs (python / node / curl, etc.); use `\"$TMPDIR_WIN\"` for nested non-bash shells.\n",
+            "- Desktop: use `\"$DESKTOP\"` instead of assuming ~/Desktop; it honors a relocated or redirected desktop; `\"$DESKTOP_WIN\"` is the equivalent alias.\n",
+            "</environment>"
+        );
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": raw_environment }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Help me write a Python script." }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+
+        // 1. 验证身份已被成功归一化为官方 Antigravity 身份
+        assert!(sys_text.contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(sys_text.contains(&format!("- Identity: {OFFICIAL_ANTIGRAVITY_IDENTITY}")));
+
+        // 2. 验证第三方身份归属指纹已彻底清除
+        assert!(!sys_text.contains("JeikCode AI coding Agent"));
+        assert!(!sys_text.contains("provided by Jeik"));
+
+        // 3. 验证 XML 标签与业务指令完好保留 (Zero Delimiter Touch)
+        assert!(sys_text.contains("<environment>"));
+        assert!(sys_text.contains("</environment>"));
+        assert!(sys_text.contains("## Identity & Interaction"));
+        assert!(sys_text.contains("- Language: Always answer in the language used by the user."));
+        assert!(sys_text.contains("- Model identity: When asked about your model identity, answer based on your actual underlying model code."));
+        assert!(sys_text.contains("## Configuration Directories"));
+        assert!(sys_text.contains("~/.jeikcode/"));
+        assert!(sys_text.contains("## PRECEDENCE:"));
+        assert!(sys_text.contains("## Runtime Environment"));
+        assert!(sys_text.contains("E:/code/jeikcode"));
+    }
+
+    // ============================ issue #3904：官方身份单例不变量 ============================
+
+    fn count_official_identity(text: &str) -> usize {
+        text.matches("You are Antigravity").count()
+    }
+
+    fn system_instruction_text(payload: &Value) -> String {
+        payload["systemInstruction"]["parts"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_issue_3904_dsh_duplicate_identity_single_part() {
+        let raw = concat!(
+            "You are an AI agent powered by DeepSeek Harness.\n\n",
+            "You are a coding agent powered by the gemini-3.8-flash-low model."
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }],
+            "tools": [{ "functionDeclarations": [{
+                "name": "ping",
+                "description": "ping",
+                "parameters": { "type": "OBJECT", "properties": {} }
+            }] }]
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(count_official_identity(&sys), 1, "systemInstruction={sys}");
+        assert!(!sys.contains("8-flash-low"), "残渣泄漏: {sys}");
+        assert!(!sys.contains("DeepSeek Harness"), "第三方身份残留: {sys}");
+    }
+
+    #[test]
+    fn test_issue_3904_duplicate_identity_across_parts() {
+        let mut payload = json!({
+            "systemInstruction": { "parts": [
+                { "text": "You are an AI agent powered by DeepSeek Harness." },
+                { "text": "You are a coding agent powered by the gemini-3.8-flash-low model." },
+                { "text": "Keep this instruction." }
+            ]},
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+        let parts = payload["systemInstruction"]["parts"].as_array().unwrap();
+
+        assert_eq!(count_official_identity(&sys), 1, "systemInstruction={sys}");
+        assert!(sys.contains("Keep this instruction."));
+        assert_eq!(parts.len(), 2, "空 part 必须被剔除: {parts:?}");
+    }
+
+    #[test]
+    fn test_issue_3904_whitespace_separators() {
+        for sep in [" ", "\n", "\n\n"] {
+            let raw =
+                format!("{OFFICIAL_ANTIGRAVITY_IDENTITY}{sep}{OFFICIAL_ANTIGRAVITY_IDENTITY}");
+            let mut payload = json!({
+                "systemInstruction": { "parts": [{ "text": raw }] },
+                "contents": []
+            });
+
+            PromptSanitizer::sanitize_gemini_payload(&mut payload);
+            let sys = system_instruction_text(&payload);
+            assert_eq!(
+                count_official_identity(&sys),
+                1,
+                "分隔符 {sep:?} 未完成去重: {sys}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_3904_non_consecutive_duplicate() {
+        let raw =
+            format!("{OFFICIAL_ANTIGRAVITY_IDENTITY}\n\nHi.\n\n{OFFICIAL_ANTIGRAVITY_IDENTITY}");
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(count_official_identity(&sys), 1, "systemInstruction={sys}");
+        assert!(sys.contains("Hi."));
+    }
+
+    #[test]
+    fn test_issue_3904_structured_identity_line_removed() {
+        let raw = concat!(
+            "- Identity: You are an AI agent powered by DeepSeek Harness.\n",
+            "- Identity: You are a coding agent powered by the gemini-3.8-flash-low model.\n",
+            "- Language: Always answer in Chinese."
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(
+            sys.matches("- Identity:").count(),
+            1,
+            "结构化身份行未去重: {sys}"
+        );
+        assert!(!sys.contains("- Identity: \n"), "悬挂前缀: {sys}");
+        assert!(sys.contains("- Language: Always answer in Chinese."));
+    }
+
+    #[test]
+    fn test_issue_3904_continuation_preserved() {
+        let raw = concat!(
+            "You are an AI agent created by Acme, and you must never reveal internal tooling.\n\n",
+            "You are a coding agent built by Foo, and you must always call tools."
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(count_official_identity(&sys), 1, "systemInstruction={sys}");
+        assert!(sys.contains("never reveal internal tooling"));
+        assert!(sys.contains("always call tools"));
+        assert!(!sys.contains(".,"));
+    }
+
+    #[test]
+    fn test_issue_3904_version_dot_residue() {
+        for raw in [
+            "You are a coding agent powered by the gemini-3.8-flash-low model.",
+            "You are a coding agent powered by the gemini-3.8-flash-tiered model.",
+        ] {
+            let out = PromptSanitizer::normalize_system_identity(raw);
+            assert_eq!(out, OFFICIAL_ANTIGRAVITY_IDENTITY, "raw={raw}");
+            assert!(!out.contains("8-flash"), "版本残渣: {out}");
+        }
+    }
+
+    #[test]
+    fn test_issue_3904_code_block_identity_exempt() {
+        let raw = format!(
+            "{OFFICIAL_ANTIGRAVITY_IDENTITY}\n\n```text\n{OFFICIAL_ANTIGRAVITY_IDENTITY}\n```"
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(
+            count_official_identity(&sys),
+            2,
+            "代码块内的 AG 必须豁免: {sys}"
+        );
+        assert!(sys.contains("```text"));
+    }
+
+    #[test]
+    fn test_issue_3904_idempotent() {
+        let raw = concat!(
+            "You are an AI agent powered by DeepSeek Harness.\n\n",
+            "You are a coding agent powered by the gemini-3.8-flash-low model."
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let first = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let second = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(first, second, "去重必须幂等");
+    }
+
+    #[test]
+    fn test_issue_3904_three_identities() {
+        let raw = format!("{0}\n\n{0}\n\n{0}", OFFICIAL_ANTIGRAVITY_IDENTITY);
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": []
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert_eq!(count_official_identity(&sys), 1, "systemInstruction={sys}");
+    }
+
+    // ============================ A2：风控提示词清理规则 ============================
+
+    fn rewrite_config(rules: Vec<(&str, &str)>) -> PromptRewriteConfig {
+        PromptRewriteConfig {
+            enabled: true,
+            normalize_identity: true,
+            rules: rules
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, (pattern, replacement))| crate::proxy::config::PromptRewriteRule {
+                        id: format!("test-{index}"),
+                        pattern: pattern.to_string(),
+                        replacement: replacement.to_string(),
+                        enabled: true,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn apply_rules_for_test(text: &str, rules: &[(&str, &str)]) -> String {
+        let compiled =
+            PromptSanitizer::compile_prompt_rewrite_rules(&rewrite_config(rules.to_vec()));
+        PromptSanitizer::rewrite_text_with_rules(text, &compiled)
+            .unwrap_or_else(|| text.to_string())
+    }
+
+    #[test]
+    fn test_prompt_rewrite_literal_and_empty_replacement() {
+        let out = apply_rules_for_test(
+            "RFC 2119 keywords: MUST. DELETE-ME tail",
+            &[
+                ("RFC 2119 keywords:", "Normative keywords:"),
+                ("DELETE-ME ", ""),
+            ],
+        );
+        assert_eq!(out, "Normative keywords: MUST. tail");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_wildcard_same_line_and_newline_escape() {
+        let out = apply_rules_for_test(
+            "You are omp's trusted assistant.\nSecond line",
+            &[("You are *", "You are Antigravity.")],
+        );
+        assert_eq!(out, "You are Antigravity.\nSecond line");
+
+        let out = apply_rules_for_test("line1\nline2", &[("line1\\nline2", "joined")]);
+        assert_eq!(out, "joined");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_escaped_star_is_literal() {
+        let out = apply_rules_for_test("a*b and aZZb", &[("a\\*b", "X")]);
+        assert_eq!(out, "X and aZZb");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_code_block_exempt() {
+        let input = "SECRET\n```\nSECRET\n```";
+        let out = apply_rules_for_test(input, &[("SECRET", "CLEAN")]);
+        assert_eq!(out, "CLEAN\n```\nSECRET\n```");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_rules_apply_in_order() {
+        let out = apply_rules_for_test("A", &[("A", "B"), ("B", "C")]);
+        assert_eq!(out, "C");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_pattern_matching_empty_is_skipped() {
+        let config = rewrite_config(vec![("*", "X")]);
+        let compiled = PromptSanitizer::compile_prompt_rewrite_rules(&config);
+        assert!(
+            compiled.is_empty(),
+            "pattern * can match empty and must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_prompt_rewrite_scope_is_pre_user_system_track_only() {
+        PromptSanitizer::update_prompt_rewrite_config(&rewrite_config(vec![(
+            "WAF-MARKER",
+            "CLEANED",
+        )]));
+
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": "WAF-MARKER" }] },
+            "contents": [
+                { "role": "user", "parts": [{ "text": "WAF-MARKER" }] },
+                { "role": "user", "parts": [{ "text": "WAF-MARKER" }] },
+                { "role": "model", "parts": [{ "text": "WAF-MARKER" }] },
+                { "role": "user", "parts": [{ "text": "WAF-MARKER" }] }
+            ]
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+
+        assert_eq!(payload["systemInstruction"]["parts"][0]["text"], "CLEANED");
+        assert_eq!(payload["contents"][0]["parts"][0]["text"], "CLEANED");
+        assert_eq!(payload["contents"][1]["parts"][0]["text"], "WAF-MARKER");
+        assert_eq!(payload["contents"][2]["parts"][0]["text"], "WAF-MARKER");
+        assert_eq!(payload["contents"][3]["parts"][0]["text"], "WAF-MARKER");
+
+        PromptSanitizer::update_prompt_rewrite_config(&PromptRewriteConfig::default());
+    }
+
+    // ============================ issue #3908：opencode 单段身份 + 同位语续写 ============================
+
+    #[test]
+    fn test_issue_3908_opencode_appositive_continuation_is_normalized() {
+        let raw = concat!(
+            "You are an AI agent running in OpenCode, a coding agent harness. ",
+            "Help the user accomplish their goals using the tools you have available."
+        );
+        let out = PromptSanitizer::normalize_system_identity(raw);
+
+        assert!(out.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(!out.contains("Coding.,"), "不得留下 AG.,: {out}");
+        assert!(
+            !out.contains("Coding, a coding agent harness"),
+            "不得留下逗号同位语: {out}"
+        );
+        assert!(
+            out.contains("Coding. a coding agent harness."),
+            "同位语续写必须归一为句号: {out}"
+        );
+        assert!(out.contains("Help the user accomplish their goals"));
+    }
+
+    #[test]
+    fn test_issue_3908_opencode_request_with_tools_has_no_residue() {
+        let raw = concat!(
+            "You are an AI agent running in OpenCode, a coding agent harness. ",
+            "Help the user accomplish their goals using the tools you have available."
+        );
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": raw }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }],
+            "tools": [{ "functionDeclarations": [{
+                "name": "ping",
+                "description": "ping",
+                "parameters": { "type": "OBJECT", "properties": {} }
+            }] }]
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        let sys = system_instruction_text(&payload);
+
+        assert!(!sys.contains("Coding.,"), "systemInstruction={sys}");
+        assert!(
+            !sys.contains("Coding, a coding agent harness"),
+            "systemInstruction={sys}"
+        );
+        assert!(
+            sys.contains("Coding. a coding agent harness."),
+            "systemInstruction={sys}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_identity_toggle_preserves_client_identity() {
+        let raw = "You are WAF-TOGGLE-TEST, an agent created by Example Corp.";
+        assert_eq!(
+            PromptSanitizer::normalize_system_identity_with_enabled(raw, true),
+            OFFICIAL_ANTIGRAVITY_IDENTITY
+        );
+        assert_eq!(
+            PromptSanitizer::normalize_system_identity_with_enabled(raw, false),
+            raw
+        );
+    }
+
+    #[test]
+    fn test_normalize_identity_env_override() {
+        assert!(normalize_identity_effective(true, None));
+        assert!(!normalize_identity_effective(true, Some("off")));
+        assert!(!normalize_identity_effective(true, Some("0")));
+        assert!(!normalize_identity_effective(true, Some("false")));
+        assert!(normalize_identity_effective(true, Some("on")));
+        assert!(!normalize_identity_effective(false, None));
+    }
+
+    #[test]
+    fn test_issue_3915_malformed_period_comma_punctuation_collapsed() {
+        // Issue #3915: 验证拼接或切词产生的 `.,` 或 `. ,` 畸形标点必须被折叠为 `. `
+        let input = "You are an AI agent running in OpenCode, a coding agent harness. Advanced Agentic Coding., a coding agent harness.";
+        let out = PromptSanitizer::normalize_system_identity(input);
+        assert!(!out.contains(".,"), "不得包含 ., 标点: {out}");
+        assert!(!out.contains(". ,"), "不得包含 . , 标点: {out}");
+        assert!(!out.contains("。，"), "不得包含 。， 标点: {out}");
+    }
+
+    #[test]
+    fn test_strip_anthropic_billing_header() {
+        let raw = "x-anthropic-billing-header: cc_version=2.1.28; client=claude_code\nYou are a helpful assistant.";
+        let cleaned = PromptSanitizer::strip_pipeline_markers(raw);
+        assert!(
+            !cleaned.contains("x-anthropic-billing-header"),
+            "billing header 必须被剥离"
+        );
+        assert!(cleaned.contains("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn test_recommended_preset_rules_execution() {
+        use crate::proxy::config::PromptRewriteConfig;
+
+        let preset_config = PromptRewriteConfig {
+            enabled: true,
+            normalize_identity: true,
+            rules: PromptRewriteConfig::recommended_preset_rules(),
+        };
+
+        let compiled = PromptSanitizer::compile_prompt_rewrite_rules(&preset_config);
+
+        // 1. OpenCode 整行清除
+        let opencode_raw = "You are an AI agent running in OpenCode, a coding agent harness.\nHelp user write code.";
+        let rewritten = PromptSanitizer::rewrite_text_with_rules(opencode_raw, &compiled)
+            .unwrap_or_else(|| opencode_raw.to_string());
+        assert!(!rewritten.contains("OpenCode"));
+        assert!(rewritten.contains("Help user write code."));
+
+        // 2. DSH 身份整行清除
+        let dsh_raw = "You are an AI agent powered by DeepSeek Harness.\nYou are a coding agent powered by the gemini-3.8-flash-high model.\nDo tasks.";
+        let rewritten_dsh = PromptSanitizer::rewrite_text_with_rules(dsh_raw, &compiled)
+            .unwrap_or_else(|| dsh_raw.to_string());
+        assert!(!rewritten_dsh.contains("DeepSeek Harness"));
+        assert!(!rewritten_dsh.contains("gemini-3.8-flash-high"));
+        assert!(rewritten_dsh.contains("Do tasks."));
+
+        // 3. WorkBuddy 指纹清除
+        let wb_raw = "Prefix.\n*WorkBuddy environment initialized*\nSuffix.";
+        let rewritten_wb = PromptSanitizer::rewrite_text_with_rules(wb_raw, &compiled)
+            .unwrap_or_else(|| wb_raw.to_string());
+        assert!(!rewritten_wb.contains("WorkBuddy"));
+        assert!(rewritten_wb.contains("Prefix."));
+        assert!(rewritten_wb.contains("Suffix."));
+
+        // 4. Anthropic billing header 清除
+        let billing_raw = "x-anthropic-billing-header: test\nSystem prompt.";
+        let rewritten_billing = PromptSanitizer::rewrite_text_with_rules(billing_raw, &compiled)
+            .unwrap_or_else(|| billing_raw.to_string());
+        assert!(!rewritten_billing.contains("x-anthropic-billing-header"));
+        assert!(rewritten_billing.contains("System prompt."));
     }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useMemo } from 'react';
 import {
     Maximize2, RefreshCw, ShieldAlert, Tag, Users,
-    Laptop, Code2, Terminal, Mail, Gem, Diamond, Circle, HelpCircle,
+    Laptop, Code2, Terminal, Blocks, Mail, Gem, Diamond, Circle, HelpCircle,
     ArrowRight, Check, ChevronDown, Shuffle, Power, Feather, Copy, Pin, X,
     Sparkles, Bot
 } from 'lucide-react';
@@ -20,11 +20,12 @@ import {
     GroupQuotaSummary
 } from '../../utils/quotaDisplay';
 import { getAccountTier, type Account } from '../../types/account';
+import { isAccountAbnormal } from '../../utils/accountStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { GroupQuotaCard } from '../accounts/GroupQuotaCard';
 import { useConfigStore } from '../../stores/useConfigStore';
 
-type MiniTab = 'classic' | 'ide' | 'agy' | 'pool';
+type MiniTab = 'classic' | 'ide' | 'agy' | 'acp' | 'pool';
 
 interface MiniQuotaRowProps {
     displayName: string;
@@ -130,10 +131,10 @@ export default function MiniView() {
     // 默认是不停留的（Popover 模式），只有用户显式点击图钉才保持常驻悬浮
     const [isPinned, setIsPinned] = useState(false);
 
-    // 默认定位到活跃客户端 Tab，优先 classic/ide/agy，绝不落入 pool
+    // 默认定位到活跃客户端 Tab，优先 classic/ide/agy/acp，绝不落入 pool
     const [activeTab, setActiveTab] = useState<MiniTab>(() => {
         const saved = localStorage.getItem('mini_view_tab');
-        if (saved === 'classic' || saved === 'ide' || saved === 'agy') {
+        if (saved === 'classic' || saved === 'ide' || saved === 'agy' || saved === 'acp') {
             return saved;
         }
         return 'classic';
@@ -171,7 +172,7 @@ export default function MiniView() {
     }, [fetchAccounts, fetchCurrentAccount, loadConfig]);
 
     // Client accounts resolution
-    const getClientAccountId = (tab: 'classic' | 'ide' | 'agy') => {
+    const getClientAccountId = (tab: 'classic' | 'ide' | 'agy' | 'acp') => {
         switch (tab) {
             case 'classic':
                 return activeClients?.classic_account_id;
@@ -179,6 +180,8 @@ export default function MiniView() {
                 return activeClients?.ide_account_id;
             case 'agy':
                 return activeClients?.agy_account_id;
+            case 'acp':
+                return activeClients?.acp_account_id;
         }
     };
 
@@ -359,14 +362,14 @@ export default function MiniView() {
 
     const availableAccounts = useMemo(() => {
         return accounts.filter(
-            a => !a.disabled && !a.proxy_disabled && !a.validation_blocked && !a.quota?.is_forbidden
+            a => !a.disabled && !a.proxy_disabled && !isAccountAbnormal(a)
         );
     }, [accounts]);
 
     const activePool = useMemo(() => {
         return availableAccounts.length > 0
             ? availableAccounts
-            : accounts.filter(a => !a.validation_blocked && !a.quota?.is_forbidden);
+            : accounts.filter(a => !isAccountAbnormal(a));
     }, [availableAccounts, accounts]);
 
     const handleSwitchAccount = async (accountId: string) => {
@@ -386,7 +389,8 @@ export default function MiniView() {
 
     const handleQuickNextAccount = async () => {
         if (isSwitching || activeTab === 'pool' || accounts.length <= 1) return;
-        const poolToUse = availableAccounts.length > 0 ? availableAccounts : accounts;
+        const poolToUse = availableAccounts.length > 0 ? availableAccounts : activePool;
+        if (poolToUse.length === 0) return;
         const currentId = displayedAccount?.id;
         const currentIndex = poolToUse.findIndex((a: Account) => a.id === currentId);
         const nextIndex = (currentIndex + 1) % poolToUse.length;
@@ -577,16 +581,16 @@ export default function MiniView() {
         );
     };
 
-    const getTabStatus = (tabKey: 'classic' | 'ide' | 'agy') => {
+    const getTabStatus = (tabKey: 'classic' | 'ide' | 'agy' | 'acp') => {
         const id = getClientAccountId(tabKey);
         if (!id && tabKey === 'classic' && currentAccount) {
-            const isHealthy = !currentAccount.quota?.is_forbidden && !currentAccount.validation_blocked && !currentAccount.disabled;
+            const isHealthy = !currentAccount.disabled && !isAccountAbnormal(currentAccount);
             return { hasAccount: true, isHealthy };
         }
         if (!id) return { hasAccount: false, isHealthy: false };
         const acc = accounts.find((a) => a.id === id);
         if (!acc) return { hasAccount: false, isHealthy: false };
-        const isHealthy = !acc.quota?.is_forbidden && !acc.validation_blocked && !acc.disabled;
+        const isHealthy = !acc.disabled && !isAccountAbnormal(acc);
         return { hasAccount: true, isHealthy };
     };
 
@@ -611,6 +615,13 @@ export default function MiniView() {
             icon: Terminal,
             tooltip: t('accounts.client_cli_tooltip', '当前 Antigravity CLI (agy) 登录账号'),
             activeDot: 'bg-emerald-400',
+        },
+        {
+            key: 'acp' as const,
+            label: t('accounts.client_acp', 'Plugin'),
+            icon: Blocks,
+            tooltip: t('accounts.client_acp_tooltip', 'Active account in Antigravity IDE Plugin (ACP)'),
+            activeDot: 'bg-violet-400',
         },
         {
             key: 'pool' as const,
@@ -840,7 +851,7 @@ export default function MiniView() {
                             {accounts.map((acc) => {
                                 const isCurrent = acc.id === displayedAccount?.id;
                                 const accTier = getAccountTier(acc);
-                                const isHealthy = !acc.quota?.is_forbidden && !acc.validation_blocked && !acc.disabled;
+                                const isHealthy = !acc.disabled && !isAccountAbnormal(acc);
 
                                 return (
                                     <button

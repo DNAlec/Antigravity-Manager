@@ -2508,20 +2508,12 @@ pub async fn handle_chat_completions(
                         );
                             break;
                         }
-                        // [Issue #3414] Attach headers with Retry-After if temporary cooldown exists
-                        let headers = crate::proxy::handlers::common::build_token_error_headers(
-                            Some(mapped_model.as_str()),
+                        return Ok(crate::proxy::handlers::common::build_token_error_response(
+                            "openai",
+                            mapped_model.as_str(),
                             None,
                             &e,
-                        );
-                        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
-                            "openai",
-                            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                            mapped_model.as_str(),
-                            &e,
-                        );
-                        return Ok((StatusCode::SERVICE_UNAVAILABLE, headers, Json(dual_err))
-                            .into_response());
+                        ));
                     }
                 }
             };
@@ -2699,18 +2691,52 @@ pub async fn handle_chat_completions(
                         handling.terminal.as_str(),
                         crate::proxy::upstream::client::strip_internal_markers(&e)
                     );
-                    if handling.disposition.abandon_sticky_account {
+                    // 终态都不是账号故障：解绑 / 换号 / 原地重放统一由 pipeline 按调度模式裁决。
+                    // CacheFirst 下文本请求绝不解绑 / 换号；Balance 下传输层断连先原地重连一次。
+                    let terminal_plan = retry_state.plan_terminal(
+                        &account_id,
+                        handling.disposition,
+                        token_manager.get_scheduling_mode().await,
+                        config.request_type != "image_gen",
+                    );
+                    if terminal_plan.abandon_sticky_account {
                         token_manager.abandon_session_lease(&mut session_lease);
                         tracing::debug!(
-                            "[OpenAI] Unbound session {} from account {} due to terminal {}",
+                            "Unbound session {} from account {} due to terminal {}",
                             affinity_key,
                             email,
                             handling.terminal.as_str()
                         );
                     }
-                    if handling.disposition.stop_rotation {
-                        break;
+                    match terminal_plan.next {
+                        crate::proxy::pipeline::TerminalNextStep::Stop => break,
+                        crate::proxy::pipeline::TerminalNextStep::RetrySameAccount => {
+                            tracing::info!(
+                                "Upstream terminal {} on account {} (attempt {}/{}): keeping session {} bound and retrying the same account in-place to preserve KV cache",
+                                handling.terminal.as_str(),
+                                email,
+                                attempt + 1,
+                                max_attempts,
+                                affinity_key
+                            );
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                                session_lease.clone(),
+                            ));
+                            continue;
+                        }
+                        crate::proxy::pipeline::TerminalNextStep::Rotate => {}
                     }
+                    crate::proxy::pipeline::rotation::record_attempted_account(
+                        &mut attempted_accounts,
+                        &account_id,
+                        pool_size,
+                        &mut force_rotate,
+                    );
                     continue;
                 }
 
@@ -2726,6 +2752,12 @@ pub async fn handle_chat_completions(
                 // 非终态（连接失败 / 调度异常）：冷却该账号并继续轮换
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
                 debug!(
                     "OpenAI Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -2894,7 +2926,7 @@ pub async fn handle_chat_completions(
                             crate::proxy::handlers::common::report_qos_ttft(
                                 &token_manager,
                                 &account_id,
-                                Some(&session_id),
+                                Some(affinity_key.as_str()),
                                 ttft_ms,
                                 is_thinking,
                                 Some(estimated_input_tokens),
@@ -3022,7 +3054,7 @@ pub async fn handle_chat_completions(
                     let ttft_start = effective_attempt_start;
                     let ttft_tm = token_manager.clone();
                     let ttft_account = account_id.clone();
-                    let ttft_session = session_id.clone();
+                    let ttft_session = affinity_key.clone();
                     let ttft_lease = session_lease.clone();
                     let ttft_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
                         &gemini_body,
@@ -3380,11 +3412,17 @@ pub async fn handle_chat_completions(
         }
 
         if classification.is_model_not_found() {
-            // [Pipeline Policy] 单模型临时熔断 + 是否换号的决策已下沉
-            let can_rotate =
-                crate::proxy::pipeline::policy::apply_model_not_found(attempt, pool_size, || {
-                    token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900))
-                });
+            // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策已下沉
+            let custom_ua = state.upstream.get_user_agent_override().await;
+            let can_rotate = crate::proxy::pipeline::policy::apply_model_not_found_with_ua(
+                &mapped_model,
+                status_code,
+                &error_text,
+                custom_ua.as_deref(),
+                attempt,
+                pool_size,
+                || token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900)),
+            );
 
             if can_rotate {
                 tracing::warn!(
@@ -3399,11 +3437,12 @@ pub async fn handle_chat_completions(
                 "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Pool exhausted without account-level lockout.",
                 trace_id, mapped_model, status_code
             );
-            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error_with_ua(
                 "openai",
                 status_code,
                 &mapped_model,
                 &error_text,
+                custom_ua.as_deref(),
             );
             return Ok((
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND),
@@ -3437,7 +3476,12 @@ pub async fn handle_chat_completions(
             }
         }
 
-        let should_mark_limited = classification.should_lock_account();
+        let should_mark_limited = classification.should_lock_account_on_attempt(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            attempt,
+        );
         let needs_quota_refresh = if should_mark_limited {
             token_manager
                 .mark_rate_limited_fast(
@@ -3486,8 +3530,16 @@ pub async fn handle_chat_completions(
                         tracing::error!("Failed to set validation block: {}", e);
                     }
                 } else {
-                    // 设置 is_forbidden 状态并持久化（仅当真正非人机验证类 403 时才进入永久禁用）
-                    if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
+                    // 设置 is_forbidden 状态并持久化（同时传入请求模型与映射模型，彻底消除动态改写盲区）
+                    if let Err(e) = token_manager
+                        .set_forbidden_with_models(
+                            &acc_id,
+                            &error_text,
+                            Some(&mapped_model),
+                            Some(&config.final_model),
+                        )
+                        .await
+                    {
                         tracing::error!("Failed to set forbidden status: {}", e);
                     }
                 }
@@ -3533,13 +3585,12 @@ pub async fn handle_chat_completions(
                 );
                 force_rotate = false;
             } else {
-                force_rotate = true;
-                if pool_size > 1 && attempted_accounts.len() < pool_size {
-                    attempted_accounts.insert(account_id.clone());
-                } else if pool_size > 1 && attempted_accounts.len() >= pool_size {
-                    attempted_accounts.clear();
-                    attempted_accounts.insert(account_id.clone());
-                }
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
             }
 
             tracing::warn!(
@@ -4563,17 +4614,17 @@ pub async fn handle_completions(
                         );
                             break;
                         }
-                        let headers = crate::proxy::handlers::common::build_token_error_headers(
-                            Some(mapped_model.as_str()),
+                        let protocol = if is_responses_api {
+                            "responses"
+                        } else {
+                            "openai"
+                        };
+                        return crate::proxy::handlers::common::build_token_error_response(
+                            protocol,
+                            mapped_model.as_str(),
                             None,
                             &e,
                         );
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            headers,
-                            format!("Token error: {}", e),
-                        )
-                            .into_response();
                     }
                 }
             };
@@ -4646,6 +4697,7 @@ pub async fn handle_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        let estimated_input_tokens = crate::proxy::pipeline::estimate_tokens(&gemini_body);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
@@ -4766,18 +4818,52 @@ pub async fn handle_completions(
                         handling.terminal.as_str(),
                         crate::proxy::upstream::client::strip_internal_markers(&e)
                     );
-                    if handling.disposition.abandon_sticky_account {
+                    // 终态都不是账号故障：解绑 / 换号 / 原地重放统一由 pipeline 按调度模式裁决。
+                    // CacheFirst 下文本请求绝不解绑 / 换号；Balance 下传输层断连先原地重连一次。
+                    let terminal_plan = retry_state.plan_terminal(
+                        &account_id,
+                        handling.disposition,
+                        token_manager.get_scheduling_mode().await,
+                        config.request_type != "image_gen",
+                    );
+                    if terminal_plan.abandon_sticky_account {
                         token_manager.abandon_session_lease(&mut session_lease);
                         tracing::debug!(
-                            "[Codex] Unbound session {} from account {} due to terminal {}",
+                            "Unbound session {} from account {} due to terminal {}",
                             affinity_key,
                             email,
                             handling.terminal.as_str()
                         );
                     }
-                    if handling.disposition.stop_rotation {
-                        break;
+                    match terminal_plan.next {
+                        crate::proxy::pipeline::TerminalNextStep::Stop => break,
+                        crate::proxy::pipeline::TerminalNextStep::RetrySameAccount => {
+                            tracing::info!(
+                                "Upstream terminal {} on account {} (attempt {}/{}): keeping session {} bound and retrying the same account in-place to preserve KV cache",
+                                handling.terminal.as_str(),
+                                email,
+                                attempt + 1,
+                                max_attempts,
+                                affinity_key
+                            );
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                                session_lease.clone(),
+                            ));
+                            continue;
+                        }
+                        crate::proxy::pipeline::TerminalNextStep::Rotate => {}
                     }
+                    crate::proxy::pipeline::rotation::record_attempted_account(
+                        &mut attempted_accounts,
+                        &account_id,
+                        pool_size,
+                        &mut force_rotate,
+                    );
                     continue;
                 }
 
@@ -4793,6 +4879,12 @@ pub async fn handle_completions(
                 // 非终态（连接失败 / 调度异常）：冷却该账号并继续轮换
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
                 debug!(
                     "Codex Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -4915,7 +5007,7 @@ pub async fn handle_completions(
                     let ttft_start = effective_attempt_start;
                     let ttft_tm = token_manager.clone();
                     let ttft_account = account_id.clone();
-                    let ttft_session = session_id_str.clone();
+                    let ttft_session = affinity_key.clone();
                     let ttft_lease = session_lease.clone();
                     let ttft_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
                         &gemini_body,
@@ -4923,6 +5015,7 @@ pub async fn handle_completions(
                     ) || openai_req.thinking.is_some()
                         || openai_req.reasoning.is_some()
                         || openai_req.reasoning_effort.is_some();
+                    let ttft_tokens = estimated_input_tokens;
                     let combined_stream =
                         crate::proxy::pipeline::stream_peek::wrap_stream_with_ttft_probe(
                             openai_stream,
@@ -4934,13 +5027,14 @@ pub async fn handle_completions(
                                 )
                             },
                             move |ttft| {
+                                let _ = ttft_seen_cb.set(ttft);
                                 crate::proxy::handlers::common::report_qos_ttft(
                                     &ttft_tm,
                                     &ttft_account,
                                     Some(ttft_session.as_str()),
                                     ttft,
                                     ttft_is_thinking,
-                                    None,
+                                    Some(ttft_tokens),
                                     ttft_lease.as_ref(),
                                 );
                             },
@@ -5058,7 +5152,7 @@ pub async fn handle_completions(
                             false,
                             config.request_type == "image_gen",
                             is_thinking,
-                            None,
+                            Some(estimated_input_tokens),
                         ),
                     );
                     match crate::proxy::pipeline::stream_peek::peek_first_data(
@@ -5082,10 +5176,10 @@ pub async fn handle_completions(
                             crate::proxy::handlers::common::report_qos_ttft(
                                 &token_manager,
                                 &account_id,
-                                Some(session_id_str.as_str()),
+                                Some(affinity_key.as_str()),
                                 ttft_ms,
                                 is_thinking,
-                                None,
+                                Some(estimated_input_tokens),
                                 session_lease.as_ref(),
                             );
                             if let Some(effective_item) =
@@ -5553,11 +5647,17 @@ pub async fn handle_completions(
         // [FIX Corrupted Image] 已由 `pipeline::auto_heal::try_auto_heal` 统一处理（见上）
 
         if classification.is_model_not_found() {
-            // [Pipeline Policy] 单模型临时熔断 + 是否换号的决策已下沉（与 chat 路径同构）
-            let can_rotate =
-                crate::proxy::pipeline::policy::apply_model_not_found(attempt, pool_size, || {
-                    token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900))
-                });
+            // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策已下沉（与 chat 路径同构）
+            let custom_ua = state.upstream.get_user_agent_override().await;
+            let can_rotate = crate::proxy::pipeline::policy::apply_model_not_found_with_ua(
+                &mapped_model,
+                status_code,
+                &error_text,
+                custom_ua.as_deref(),
+                attempt,
+                pool_size,
+                || token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900)),
+            );
             if can_rotate {
                 tracing::warn!(
                     "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
@@ -5575,11 +5675,12 @@ pub async fn handle_completions(
             } else {
                 "openai"
             };
-            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error_with_ua(
                 protocol,
                 status_code,
                 &mapped_model,
                 &error_text,
+                custom_ua.as_deref(),
             );
             return Response::builder()
                 .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND))
@@ -5592,7 +5693,12 @@ pub async fn handle_completions(
                 .into_response();
         }
 
-        if classification.should_lock_account() {
+        if classification.should_lock_account_on_attempt(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            attempt,
+        ) {
             let needs_quota_refresh = token_manager
                 .mark_rate_limited_fast(
                     &email,
@@ -5649,12 +5755,12 @@ pub async fn handle_completions(
             }
             force_rotate = should_rotate_account(status_code, Some(&strategy));
             if force_rotate {
-                if pool_size > 1 && attempted_accounts.len() < pool_size {
-                    attempted_accounts.insert(account_id.clone());
-                } else if pool_size > 1 && attempted_accounts.len() >= pool_size {
-                    attempted_accounts.clear();
-                    attempted_accounts.insert(account_id.clone());
-                }
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
             }
             continue;
         } else {

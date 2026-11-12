@@ -138,10 +138,11 @@ pub async fn add_account(
         crate::modules::integration::SystemManager::Desktop(app.clone()),
     );
 
-    let mut account = service.add_account(&refresh_token).await?;
+    let account = service.add_account(&refresh_token).await?;
 
-    // 自动刷新配额
-    let _ = internal_refresh_account_quota(&app, &mut account).await;
+    // 配额刷新（含封号探针）已由 AccountService 内部统一走 fetch_quota_with_retry，
+    // 这里只同步托盘与反代账号池，避免重复探针/重复拉取配额。
+    crate::modules::tray::update_tray_menus(&app);
 
     // 重载账号池
     let _ = crate::commands::proxy::reload_proxy_accounts(
@@ -329,8 +330,8 @@ pub async fn fetch_account_quota(
     let mut account =
         modules::load_account(&account_id).map_err(crate::error::AppError::Account)?;
 
-    // 使用带重试的查询 (Shared logic)
-    let mut quota = modules::account::fetch_quota_with_retry(&mut account).await?;
+    // 单账号手动刷新（显式用户意图）：强制执行最新封禁探针
+    let mut quota = modules::account::fetch_quota_with_retry_forced(&mut account).await?;
 
     // 4. 更新账号配额
     modules::update_account_quota(&account_id, quota.clone())
@@ -553,6 +554,9 @@ pub async fn save_config(
     );
     crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
     crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::update_prompt_rewrite_config(
+        &config.proxy.prompt_rewrite,
+    );
     crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
     crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
@@ -609,6 +613,9 @@ pub async fn save_config(
         crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
         // [NEW] 更新全局系统提示词配置
         crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::update_prompt_rewrite_config(
+            &config.proxy.prompt_rewrite,
+        );
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
         crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
@@ -857,11 +864,14 @@ pub async fn sync_account_from_db(
     let index = modules::account::load_account_index()?;
     let current_target = index.current_target_ide.as_deref();
     let is_agy = current_target == Some("agy");
+    let is_acp = modules::integration::is_acp_target(current_target);
 
-    // 1. Read the credential source used by the selected client. For agy, do
-    // not mistake an older file credential for the active keyring account.
+    // 1. Read the credential source used by the selected client. For agy/acp, do
+    // not mistake an older file/DB credential for the active client account.
     let credential = if is_agy {
         modules::integration::read_from_system_keyring_only().map(|state| state.refresh_token)
+    } else if is_acp {
+        modules::integration::read_acp_credentials().map(|state| state.refresh_token)
     } else {
         modules::migration::get_refresh_token_from_db(current_target)
     };
@@ -890,7 +900,7 @@ pub async fn sync_account_from_db(
 
     // 4. For the CLI, reconcile only the matching managed account; importing
     // all local sources could select an unrelated IDE account if refresh fails.
-    let mut account = if is_agy {
+    let mut account = if is_agy || is_acp {
         modules::account::find_agy_account(modules::account::list_accounts()?, &db_refresh_token)?
     } else {
         modules::migration::import_from_db(current_target).await?
@@ -1237,15 +1247,23 @@ pub async fn show_mini_view(app: tauri::AppHandle) -> Result<(), String> {
 /// 设置窗口主题（用于同步 Windows 标题栏按钮颜色）
 #[tauri::command]
 pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<(), String> {
-    use tauri::Theme;
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri::Theme;
 
-    let tauri_theme = match theme.as_str() {
-        "dark" => Some(Theme::Dark),
-        "light" => Some(Theme::Light),
-        _ => None, // system default
-    };
+        let tauri_theme = match theme.as_str() {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None, // system default
+        };
 
-    window.set_theme(tauri_theme).map_err(|e| e.to_string())
+        window.set_theme(tauri_theme).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (window, theme);
+        Ok(())
+    }
 }
 
 /// 获取 Antigravity 可执行文件路径
@@ -1532,43 +1550,26 @@ pub async fn update_account_priority(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     account_id: String,
     priority: u8,
+    model_priorities: Option<std::collections::HashMap<String, u8>>,
 ) -> Result<(), String> {
-    modules::account::update_account_priority(&account_id, priority)?;
+    let has_model_override = model_priorities.is_some();
+    let saved_model_priorities = modules::account::update_account_priority_with_models(
+        &account_id,
+        priority,
+        model_priorities,
+    )?;
     if let Some(instance) = proxy_state.instance.read().await.as_ref() {
-        instance
-            .token_manager
-            .update_account_priority(&account_id, priority);
+        instance.token_manager.update_account_model_priorities(
+            &account_id,
+            priority,
+            if has_model_override {
+                Some(saved_model_priorities)
+            } else {
+                None
+            },
+        );
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn update_account_project_id(
-    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
-    account_id: String,
-    project_id: Option<String>,
-) -> Result<(), String> {
-    modules::account::update_account_project_id(&account_id, project_id.clone())?;
-    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
-        instance
-            .token_manager
-            .update_account_project_id(&account_id, project_id);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn auto_fetch_account_project_id(
-    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
-    account_id: String,
-) -> Result<String, String> {
-    let pid = modules::account::auto_fetch_account_project_id(&account_id).await?;
-    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
-        instance
-            .token_manager
-            .update_account_project_id(&account_id, Some(pid.clone()));
-    }
-    Ok(pid)
 }
 
 /// 更新账号自定义标签

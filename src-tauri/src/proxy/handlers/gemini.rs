@@ -333,17 +333,12 @@ pub async fn handle_generate(
                         );
                             break;
                         }
-                        let headers = build_token_error_headers(
-                            Some(mapped_model.as_str()),
+                        return Ok(crate::proxy::handlers::common::build_token_error_response(
+                            "gemini",
+                            mapped_model.as_str(),
                             last_email.as_deref(),
                             &e,
-                        );
-                        return Ok((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            headers,
-                            format!("Token error: {}", e),
-                        )
-                            .into_response());
+                        ));
                     }
                 }
             };
@@ -497,18 +492,52 @@ pub async fn handle_generate(
                         handling.terminal.as_str(),
                         crate::proxy::upstream::client::strip_internal_markers(&e)
                     );
-                    if handling.disposition.abandon_sticky_account {
+                    // 终态都不是账号故障：解绑 / 换号 / 原地重放统一由 pipeline 按调度模式裁决。
+                    // CacheFirst 下文本请求绝不解绑 / 换号；Balance 下传输层断连先原地重连一次。
+                    let terminal_plan = retry_state.plan_terminal(
+                        &account_id,
+                        handling.disposition,
+                        token_manager.get_scheduling_mode().await,
+                        config.request_type != "image_gen",
+                    );
+                    if terminal_plan.abandon_sticky_account {
                         token_manager.abandon_session_lease(&mut session_lease);
                         tracing::debug!(
-                            "[Gemini] Unbound session {} from account {} due to terminal {}",
+                            "Unbound session {} from account {} due to terminal {}",
                             affinity_key,
                             email,
                             handling.terminal.as_str()
                         );
                     }
-                    if handling.disposition.stop_rotation {
-                        break;
+                    match terminal_plan.next {
+                        crate::proxy::pipeline::TerminalNextStep::Stop => break,
+                        crate::proxy::pipeline::TerminalNextStep::RetrySameAccount => {
+                            tracing::info!(
+                                "Upstream terminal {} on account {} (attempt {}/{}): keeping session {} bound and retrying the same account in-place to preserve KV cache",
+                                handling.terminal.as_str(),
+                                email,
+                                attempt + 1,
+                                max_attempts,
+                                affinity_key
+                            );
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                                session_lease.clone(),
+                            ));
+                            continue;
+                        }
+                        crate::proxy::pipeline::TerminalNextStep::Rotate => {}
                     }
+                    crate::proxy::pipeline::rotation::record_attempted_account(
+                        &mut attempted_accounts,
+                        &account_id,
+                        pool_size,
+                        &mut force_rotate,
+                    );
                     continue;
                 }
 
@@ -525,6 +554,12 @@ pub async fn handle_generate(
                 // 非终态（连接失败 / 调度异常）：冷却该账号并继续轮换
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
                 debug!(
                     "Gemini Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -1007,8 +1042,16 @@ pub async fn handle_generate(
                         tracing::error!("Failed to set validation block: {}", e);
                     }
                 } else {
-                    // 设置 is_forbidden 状态并持久化（仅当真正非人机验证类 403 时才进入永久禁用）
-                    if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
+                    // 设置 is_forbidden 状态并持久化（同时传入映射前目标模型与改写后实际上游模型，彻底消除动态改写盲区）
+                    if let Err(e) = token_manager
+                        .set_forbidden_with_models(
+                            &acc_id,
+                            &error_text,
+                            Some(&config.final_model),
+                            Some(&mapped_model),
+                        )
+                        .await
+                    {
                         tracing::error!("Failed to set forbidden status: {}", e);
                     }
                 }
@@ -1081,11 +1124,17 @@ pub async fn handle_generate(
         }
 
         if classification.is_model_not_found() {
-            // [Pipeline Policy] 单模型临时熔断 + 是否换号的决策已下沉；这里只构造协议响应。
-            let can_rotate =
-                crate::proxy::pipeline::policy::apply_model_not_found(attempt, pool_size, || {
-                    token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900))
-                });
+            // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策已下沉；这里只构造协议响应。
+            let custom_ua = state.upstream.get_user_agent_override().await;
+            let can_rotate = crate::proxy::pipeline::policy::apply_model_not_found_with_ua(
+                &mapped_model,
+                status_code,
+                &error_text,
+                custom_ua.as_deref(),
+                attempt,
+                pool_size,
+                || token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900)),
+            );
 
             if can_rotate {
                 tracing::warn!(
@@ -1100,11 +1149,12 @@ pub async fn handle_generate(
                 "[Gemini] Target model [{}] not found on upstream (HTTP {}). Pool exhausted without account-level lockout.",
                 mapped_model, status_code
             );
-            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error_with_ua(
                 "gemini",
                 status_code,
                 &mapped_model,
                 &error_text,
+                custom_ua.as_deref(),
             );
             return Ok((
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND),
@@ -1137,7 +1187,12 @@ pub async fn handle_generate(
             }
         }
 
-        let should_mark_limited = classification.should_lock_account();
+        let should_mark_limited = classification.should_lock_account_on_attempt(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            attempt,
+        );
         let needs_quota_refresh = if should_mark_limited {
             token_manager
                 .mark_rate_limited_fast(
@@ -1200,13 +1255,12 @@ pub async fn handle_generate(
             );
                 force_rotate = false;
             } else {
-                force_rotate = true;
-                if pool_size > 1 && attempted_accounts.len() < pool_size {
-                    attempted_accounts.insert(account_id.clone());
-                } else if pool_size > 1 && attempted_accounts.len() >= pool_size {
-                    attempted_accounts.clear();
-                    attempted_accounts.insert(account_id.clone());
-                }
+                crate::proxy::pipeline::rotation::record_attempted_account(
+                    &mut attempted_accounts,
+                    &account_id,
+                    pool_size,
+                    &mut force_rotate,
+                );
             }
 
             continue;

@@ -138,7 +138,9 @@ pub async fn internal_start_proxy_service(
                 } else {
                     None
                 };
-            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
+            let monitor = Arc::new(ProxyMonitor::new(1000, app_handle));
+            crate::proxy::monitor::register_global_monitor(&monitor);
+            *monitor_lock = Some(monitor);
         }
         // Sync enabled state from config
         if let Some(monitor) = monitor_lock.as_ref() {
@@ -278,7 +280,9 @@ async fn ensure_admin_server_inner(
                 } else {
                     None
                 };
-            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
+            let monitor = Arc::new(ProxyMonitor::new(1000, app_handle));
+            crate::proxy::monitor::register_global_monitor(&monitor);
+            *monitor_lock = Some(monitor);
         }
         monitor_lock.as_ref().unwrap().clone()
     };
@@ -324,6 +328,12 @@ async fn ensure_admin_server_inner(
     crate::proxy::update_thinking_budget_config(config.thinking_budget.clone());
     // [NEW] 初始化全局系统提示词配置
     crate::proxy::update_global_system_prompt_config(config.global_system_prompt.clone());
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::update_prompt_rewrite_config(
+        &config.prompt_rewrite,
+    );
+    crate::proxy::pipeline::rotation::set_request_429_grace_ms(
+        config.scheduling.resolve_request_429_grace_ms(),
+    );
     // [NEW] 初始化全局图像思维模式配置
     crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.multimodal.clone());
@@ -898,20 +908,25 @@ pub async fn test_model_connectivity(
 
     let accounts = crate::modules::account::list_accounts().unwrap_or_default();
 
-    let (chosen_account, token, pid) = if let Some(ref acc_id) = target_account_id {
-        if !acc_id.is_empty() {
-            let acc = accounts
-                .iter()
-                .find(|a| &a.id == acc_id)
-                .cloned()
-                .ok_or_else(|| "未找到指定的账号".to_string())?;
-            let (t, p) = crate::modules::quota::get_valid_token_for_warmup(&acc).await?;
-            (acc, t, p)
-        } else {
-            pick_auto_test_account(&accounts).await?
-        }
+    let (chosen_account, token, pid) = if let Some(acc_id) = target_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let acc = accounts
+            .iter()
+            .find(|a| a.id == acc_id)
+            .cloned()
+            .ok_or_else(|| "未找到指定的账号".to_string())?;
+        let (t, p) = crate::modules::quota::get_valid_token_for_warmup(&acc).await?;
+        (acc, t, p)
     } else {
-        pick_auto_test_account(&accounts).await?
+        // 桌面端探活是诊断入口，允许包含手动禁用反代的账号；
+        // Web 端自动调度走反代号池语义，见 proxy/server.rs。
+        let probe = crate::modules::probe::pick_auto_probe_account(&accounts, &model, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        (probe.account, probe.access_token, probe.project_id)
     };
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
@@ -920,7 +935,8 @@ pub async fn test_model_connectivity(
         "model": model,
         "access_token": token,
         "project_id": pid,
-        "account_id": chosen_account.id
+        "account_id": chosen_account.id,
+        "probe_intent": true
     });
 
     let client = rquest::Client::builder()
@@ -943,51 +959,6 @@ pub async fn test_model_connectivity(
         .map_err(|e| format!("解析预热检测结果失败: {}", e))?;
 
     Ok(result)
-}
-
-async fn pick_auto_test_account(
-    accounts: &[crate::models::account::Account],
-) -> Result<(crate::models::account::Account, String, String), String> {
-    let candidates: Vec<_> = accounts
-        .iter()
-        .filter(|a| !a.disabled && !a.proxy_disabled)
-        .cloned()
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(
-            "当前没有开启反代的可用账号，请先在账号页面开启至少一个账号的反代，或指定具体账号测试"
-                .to_string(),
-        );
-    }
-
-    // 优先选择配额充足且健康的账号 (按各模型中最高剩余配额从大到小排序)
-    let mut sorted_candidates = candidates;
-    sorted_candidates.sort_by(|a, b| {
-        let quota_a = a
-            .quota
-            .as_ref()
-            .and_then(|q| q.models.iter().map(|m| m.percentage).max())
-            .unwrap_or(0);
-        let quota_b = b
-            .quota
-            .as_ref()
-            .and_then(|q| q.models.iter().map(|m| m.percentage).max())
-            .unwrap_or(0);
-        quota_b.cmp(&quota_a)
-    });
-
-    let mut last_err = None;
-    for acc in sorted_candidates {
-        match crate::modules::quota::get_valid_token_for_warmup(&acc).await {
-            Ok((t, p)) => return Ok((acc, t, p)),
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| "无法获取候选账号的有效凭证".to_string()))
 }
 
 /// 获取当前生效的官方 Hub 指纹信息
@@ -1044,6 +1015,107 @@ pub struct FirstByteTimeouts {
     pub aux: u64,
     /// 基准硬上限
     pub cap: u64,
+}
+
+/// 单个 body 样本在当前配置下实际生效的上传预算。
+#[derive(serde::Serialize)]
+pub struct EffectiveTimeoutSample {
+    pub label: String,
+    pub body_len: usize,
+    pub upload_budget_secs: u64,
+    pub large_body: bool,
+    pub endpoint_attempt_limit: usize,
+}
+
+/// 超时配置的“配置值 + 生效值 + 来源”快照，供前端显示单一真源。
+#[derive(serde::Serialize)]
+pub struct EffectiveTimeoutConfig {
+    pub upload: crate::proxy::config::UploadTimeoutConfig,
+    pub stream: crate::proxy::config::StreamTimeoutConfig,
+    /// 被环境变量覆盖的字段名（用于前端提示“界面值 ≠ 生效值”）。
+    pub env_overridden: Vec<String>,
+    pub samples: Vec<EffectiveTimeoutSample>,
+    pub global_budget_secs: u64,
+    pub replay_guard_threshold_mb: u64,
+}
+
+#[tauri::command]
+pub fn get_effective_timeout_config() -> EffectiveTimeoutConfig {
+    use crate::proxy::upstream::client::{
+        current_upload_throughput_bps, PayloadMediaKind, UpstreamClient,
+    };
+
+    let upload = crate::proxy::get_upload_timeout_config();
+    let stream = crate::proxy::get_stream_timeout_config();
+    let observed = current_upload_throughput_bps();
+
+    let env_keys = [
+        ("ANTIGRAVITY_TIMEOUT_CONNECT_SECS", "connect_secs"),
+        ("ANTIGRAVITY_TIMEOUT_UPLOAD_MIN_MBPS", "min_upload_mbps"),
+        (
+            "ANTIGRAVITY_TIMEOUT_UPLOAD_EXTRA_WAIT_RATIO",
+            "extra_wait_ratio",
+        ),
+        ("ANTIGRAVITY_TIMEOUT_UPLOAD_STALL_SECS", "stall_secs"),
+        (
+            "ANTIGRAVITY_TIMEOUT_LARGE_BODY_MB",
+            "large_body_threshold_mb",
+        ),
+        (
+            "ANTIGRAVITY_TIMEOUT_LARGE_BODY_ENDPOINT_ATTEMPTS",
+            "large_body_endpoint_attempts",
+        ),
+        ("ANTIGRAVITY_TIMEOUT_TTFT_SECS", "initial_ttft_secs"),
+        ("ANTIGRAVITY_TIMEOUT_TRANSITION_SECS", "transition_secs"),
+        (
+            "ANTIGRAVITY_TIMEOUT_STREAMING_SLIDING_SECS",
+            "streaming_sliding_secs",
+        ),
+        (
+            "ANTIGRAVITY_GATEWAY_REQUEST_BUDGET_SECS",
+            "gateway_request_budget_secs",
+        ),
+    ];
+    let env_overridden = env_keys
+        .iter()
+        .filter(|(key, _)| std::env::var(*key).is_ok())
+        .map(|(_, field)| (*field).to_string())
+        .collect();
+
+    let samples = [
+        ("512KB", 512 * 1024usize),
+        ("1MB", 1024 * 1024usize),
+        ("2MB", 2 * 1024 * 1024usize),
+        ("8MB", 8 * 1024 * 1024usize),
+        ("47MB", 47 * 1024 * 1024usize),
+    ]
+    .into_iter()
+    .map(|(label, body_len)| {
+        let plan = UpstreamClient::plan_upstream_timeouts_with_observed(
+            PayloadMediaKind::TextChat,
+            body_len,
+            &upload,
+            observed,
+        );
+        EffectiveTimeoutSample {
+            label: label.to_string(),
+            body_len,
+            upload_budget_secs: plan.upload_budget_secs,
+            large_body: plan.large_body,
+            endpoint_attempt_limit: plan.endpoint_attempt_limit,
+        }
+    })
+    .collect();
+
+    EffectiveTimeoutConfig {
+        upload,
+        stream,
+        env_overridden,
+        samples,
+        global_budget_secs: crate::proxy::pipeline::budget::gateway_request_budget_secs(),
+        replay_guard_threshold_mb: (crate::proxy::pipeline::budget::replay_guard_threshold_bytes()
+            / (1024 * 1024)) as u64,
+    }
 }
 
 #[tauri::command]

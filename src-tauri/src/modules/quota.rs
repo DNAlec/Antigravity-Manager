@@ -1,3 +1,4 @@
+use crate::models::AccountBanInfo;
 use crate::models::QuotaData;
 use crate::modules::config;
 use once_cell::sync::Lazy;
@@ -136,6 +137,174 @@ struct Tier {
     name: Option<String>,
     #[allow(dead_code)]
     slug: Option<String>,
+}
+
+/// 账号状态探测结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanProbeOutcome {
+    /// 数据面推理端点明确返回封禁证据。
+    Banned(AccountBanInfo),
+    /// 数据面推理端点返回 2xx：账号当前未被 TOS 封禁。
+    NotBanned,
+    /// 网络错误 / 429 / 5xx / 非封禁类 403 等，无法判断（绝不能据此解封）。
+    Unknown,
+}
+
+/// 数据面推理端点（权威封禁探针：Daily 主力 + Prod 兜底互备）。
+///
+/// 实测：控制面端点（`loadCodeAssist` / `fetchAvailableModels` /
+/// `retrieveUserQuotaSummary` / `countTokens`）对被 TOS 封禁的账号仍返回 200；
+/// 只有真正的推理入口 `v1internal:generateContent` 会在鉴权层直接返回
+/// `403 PERMISSION_DENIED` + `TOS_VIOLATION`。
+///
+/// 因此封禁探测必须发送一个最小推理请求，且不能复用配额端点或控制面元数据接口。
+const BAN_PROBE_ENDPOINTS: [&str; 2] = [
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent",
+    "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+];
+
+/// 探针模型：使用官方最新基准轻量级模型 gemini-3.8-flash-low，彻底淘汰 gemini-2.5-flash，
+/// 结合完整的 Antigravity 正式转出请求体（含 systemInstruction 与 thinkingConfig），
+/// 确保与真实客户端出站报文 100% 结构一致，杜绝因报文残缺/模型废弃被上游 WAF 误限流 (429 RESOURCE_EXHAUSTED)。
+const BAN_PROBE_MODEL: &str = "gemini-3.8-flash-low";
+
+/// 纯函数：把一次探针响应归类为封禁 / 未封禁 / 未知。
+///
+/// 只有「403 + 高置信账号级封禁证据」才算封禁；
+/// 2xx 必须包含真实的 Google 模型响应结构（`candidates`），避免代理拦截页或假 200 误解封；
+/// 验证挑战、区域限制、模型级 403、429、5xx 等一律保持 `Unknown`，避免误伤正常账号。
+pub(crate) fn classify_ban_probe_response(status: u16, body: &str) -> BanProbeOutcome {
+    if (200..300).contains(&status) {
+        if body.contains("\"candidates\"") {
+            return BanProbeOutcome::NotBanned;
+        }
+        return BanProbeOutcome::Unknown;
+    }
+    if status != 403 {
+        return BanProbeOutcome::Unknown;
+    }
+
+    let text_lower = body.to_lowercase();
+    // 验证挑战不是账号封禁，交给配额/代理层的验证锁路径处理。
+    // 否则同一份 403 在“配额刷新”和“代理请求”两条路径上会得到不同结论。
+    if text_lower.contains("validation_required")
+        || text_lower.contains("validation_url")
+        || text_lower.contains("verify your account")
+        || text_lower.contains("further action is required")
+    {
+        return BanProbeOutcome::Unknown;
+    }
+    // 区域限制 / 模型级权限拒绝不是 TOS 封禁；`classify_upstream` 只认高置信封禁词，
+    // 这里不需要额外硬编码关键词。
+    match AccountBanInfo::classify_upstream(403, body) {
+        Some(info) => BanProbeOutcome::Banned(info),
+        None => BanProbeOutcome::Unknown,
+    }
+}
+
+/// 探测账号是否被上游封禁。
+///
+/// 发送一个 `maxOutputTokens = 1` 的最小 `generateContent` 请求：
+/// - 2xx ⇒ `NotBanned`（可作为解封权威依据）；
+/// - 403 + TOS 证据 ⇒ `Banned`；
+/// - 其余 ⇒ `Unknown`，必须保持现有封禁状态，绝不能据此解封。
+///
+/// `project_id` 缺失时仍会发请求：封禁账号在鉴权层即被拦截，不影响 403 识别；
+/// 正常账号若因缺少 project 返回 400，会落到 `Unknown`，由后续配额刷新补齐 project 后重试。
+pub async fn probe_account_ban(
+    access_token: &str,
+    project_id: Option<&str>,
+    account_id: Option<&str>,
+    _account_email: Option<&str>,
+) -> BanProbeOutcome {
+    let client = create_standard_client(account_id).await;
+    // 使用官方 wrap_request 生成 100% 完整的 Antigravity 正式出站报文（含 sessionId,
+    // systemInstruction, generationConfig.thinkingConfig, 官方 requestId 与 userAgent），
+    // 彻底解决报文结构不完整被 Google WAF 判定为异常流量导致 429 RESOURCE_EXHAUSTED 的缺陷。
+    let session_id = format!(
+        "ban_probe_{}_{}",
+        chrono::Utc::now().timestamp_millis(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+
+    let base_request = json!({
+        "model": BAN_PROBE_MODEL,
+        "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        "systemInstruction": {
+            "role": "user",
+            "parts": [{ "text": "You are Antigravity, a helpful assistant." }]
+        },
+        "generationConfig": {
+            "maxOutputTokens": 32000,
+            "thinkingConfig": {
+                "includeThoughts": true,
+                "thinkingLevel": "LOW"
+            }
+        },
+        "session_id": session_id
+    });
+
+    let payload = crate::proxy::mappers::gemini::wrapper::wrap_request(
+        &base_request,
+        project_id.unwrap_or(""),
+        BAN_PROBE_MODEL,
+        account_id,
+        Some(&session_id),
+        None,
+    );
+
+    let mut last_outcome = BanProbeOutcome::Unknown;
+
+    for ep_url in BAN_PROBE_ENDPOINTS {
+        let response = client
+            .post(ep_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .bearer_auth(access_token)
+            .header(
+                rquest::header::USER_AGENT,
+                crate::constants::current_egress_user_agent().as_str(),
+            )
+            // 显式声明 Connection: close，禁止复用 Google 403 封号后被切断的 TCP 连接，
+            // 彻底根除短时连续探测时的 UNEXPECTED_EOF / 假 Unknown 异常
+            .header(rquest::header::CONNECTION, "close")
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let text = response.text().await.unwrap_or_default();
+                let outcome = classify_ban_probe_response(status, &text);
+                tracing::debug!(
+                    account = account_id.unwrap_or("<unknown>"),
+                    endpoint = ep_url,
+                    %status,
+                    outcome = ?outcome,
+                    "Ban probe completed"
+                );
+                // 封禁探针为纯后台健康诊断，绝不写入流量日志，保持监控面板清爽纯净
+                match outcome {
+                    BanProbeOutcome::Banned(_) | BanProbeOutcome::NotBanned => return outcome,
+                    BanProbeOutcome::Unknown => {
+                        last_outcome = outcome;
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    account = account_id.unwrap_or("<unknown>"),
+                    endpoint = ep_url,
+                    error = %e,
+                    "Ban probe endpoint failed, trying next"
+                );
+                continue;
+            }
+        }
+    }
+
+    last_outcome
 }
 
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
@@ -281,6 +450,18 @@ async fn fetch_project_id(
     }
 
     (None, None)
+}
+
+/// 解析账号的 project_id（控制面查询，被封禁账号同样会返回 200）。
+///
+/// 仅用于给数据面封禁探针补齐 project 上下文：探针必须携带真实 project，
+/// 正常账号才能返回 2xx；被封禁账号无论 project 是否存在都会在鉴权层被 403 拦截。
+pub async fn resolve_project_id(
+    access_token: &str,
+    email: &str,
+    account_id: Option<&str>,
+) -> Option<String> {
+    fetch_project_id(access_token, email, account_id).await.0
 }
 
 /// Unified entry point for fetching account quota
@@ -990,14 +1171,26 @@ pub async fn get_valid_token_for_warmup(
         }
     }
 
-    // Fetch project_id
-    let (project_id, _) = fetch_project_id(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
-    )
-    .await;
-    let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+    // 探活只需要 project_id，不需要每次重新拉取订阅等级。已有缓存时直接复用，
+    // 避免自动选号遍历多个候选时重复请求 loadCodeAssist。
+    // 注意：fetch_quota_with_cache 仍必须每次调用 loadCodeAssist 作为 tier 权威源。
+    let final_pid = if let Some(pid) = account
+        .token
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|pid| !pid.is_empty())
+    {
+        pid.to_string()
+    } else {
+        let (project_id, _) = fetch_project_id(
+            &account.token.access_token,
+            &account.email,
+            Some(&account.id),
+        )
+        .await;
+        project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string())
+    };
 
     Ok((account.token.access_token, final_pid))
 }
@@ -1009,7 +1202,8 @@ pub async fn warmup_model_directly(
     project_id: &str,
     email: &str,
     percentage: i32,
-    _account_id: Option<&str>,
+    account_id: Option<&str>,
+    probe_intent: bool,
 ) -> bool {
     // Get currently configured proxy port
     let port = config::load_app_config()
@@ -1017,12 +1211,16 @@ pub async fn warmup_model_directly(
         .unwrap_or(8045);
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
-    let body = json!({
+    let mut body = json!({
         "email": email,
         "model": model_name,
         "access_token": access_token,
-        "project_id": project_id
+        "project_id": project_id,
+        "probe_intent": probe_intent
     });
+    if let Some(acc_id) = account_id {
+        body["account_id"] = json!(acc_id);
+    }
 
     // Use a no-proxy client for local loopback requests
     // This prevents Docker environments from routing localhost through external proxies
@@ -1072,10 +1270,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
     loop {
         let all_accounts = crate::modules::account::list_accounts().unwrap_or_default();
-        // [FIX] 过滤掉禁用反代的账号
+        // [FIX] 过滤掉禁用反代 / 已被上游封禁的账号
         let target_accounts: Vec<_> = all_accounts
             .into_iter()
-            .filter(|a| !a.disabled && !a.proxy_disabled)
+            .filter(|a| !a.disabled && !a.proxy_disabled && !a.banned)
             .collect();
 
         if target_accounts.is_empty() {
@@ -1231,9 +1429,16 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                         for (idx, (id, email, model, token, pid, pct)) in
                             items.into_iter().enumerate()
                         {
-                            let ok =
-                                warmup_model_directly(&token, &model, &pid, &email, pct, Some(&id))
-                                    .await;
+                            let ok = warmup_model_directly(
+                                &token,
+                                &model,
+                                &pid,
+                                &email,
+                                pct,
+                                Some(&id),
+                                false,
+                            )
+                            .await;
                             if ok {
                                 local_success += 1;
                                 let history_key = format!("{}:{}:100", email, model);
@@ -1294,7 +1499,7 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         .cloned()
         .ok_or_else(|| "Account not found".to_string())?;
 
-    if account_owned.disabled || account_owned.proxy_disabled {
+    if account_owned.disabled || account_owned.proxy_disabled || account_owned.banned {
         return Err("Account is disabled".to_string());
     }
 
@@ -1358,8 +1563,16 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
 
     tokio::spawn(async move {
         for (name, pct) in models_to_warm {
-            if warmup_model_directly(&token, &name, &pid, &email, pct, Some(&account_id_clone))
-                .await
+            if warmup_model_directly(
+                &token,
+                &name,
+                &pid,
+                &email,
+                pct,
+                Some(&account_id_clone),
+                true,
+            )
+            .await
             {
                 let history_key = format!("{}:{}:100", email, name);
                 let now_ts = chrono::Utc::now().timestamp();
@@ -1403,24 +1616,7 @@ mod tests {
         // 标记 Daily 故障（如日常请求中发生超时或连接失败）
         tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
 
-        // 所有相关接口都应自动跳过 Daily，优先尝试备用的 Sandbox
-        assert_eq!(
-            tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS)[0],
-            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist"
-        );
-        assert_eq!(
-            tracker.get_ordered_endpoints(&QUOTA_API_ENDPOINTS)[0],
-            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels"
-        );
-        assert_eq!(
-            tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS)[0],
-            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary"
-        );
-
-        // 若 Sandbox 也发生故障，所有接口自动降级到 Prod 兜底
-        tracker.mark_failure(
-            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
-        );
+        // 所有相关接口自动跳过 Daily，优先尝试健康的主端点 Prod（沙箱备用端点永远排在主端点之后）
         assert_eq!(
             tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS)[0],
             "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
@@ -1432,6 +1628,72 @@ mod tests {
         assert_eq!(
             tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS)[0],
             "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+        );
+    }
+
+    #[test]
+    fn test_ban_probe_classifies_only_high_confidence_tos_403_as_banned() {
+        let tos = r#"{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudcode-pa.googleapis.com"}]}}"#;
+        match classify_ban_probe_response(403, tos) {
+            BanProbeOutcome::Banned(info) => {
+                assert_eq!(info.code, "TOS_VIOLATION");
+                assert!(info.message.to_lowercase().contains("terms of service"));
+            }
+            other => panic!("expected Banned, got {:?}", other),
+        }
+
+        // 数据面 2xx 且包含 candidates：账号未被 TOS 封禁，可作为解封权威依据。
+        assert_eq!(
+            classify_ban_probe_response(
+                200,
+                r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#
+            ),
+            BanProbeOutcome::NotBanned
+        );
+
+        // 假 200（如代理报错页、空白页等）绝不作为解封依据，必须保持 Unknown。
+        assert_eq!(
+            classify_ban_probe_response(200, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(200, "<html>Proxy Error</html>"),
+            BanProbeOutcome::Unknown
+        );
+
+        // 验证挑战 / 区域限制 / 模型级权限拒绝一律 Unknown，绝不能据此封号或解封。
+        for body in [
+            r#"{"error":{"code":403,"message":"validation_required"}}"#,
+            r#"{"error":{"code":403,"message":"User location is not supported for the API use."}}"#,
+            r#"{"error":{"code":403,"message":"Model not found or not available for this account"}}"#,
+            r#"{"error":{"code":403,"message":"Permission denied for model gemini-3-pro"}}"#,
+        ] {
+            assert_eq!(
+                classify_ban_probe_response(403, body),
+                BanProbeOutcome::Unknown,
+                "403 without high-confidence TOS evidence must stay Unknown: {body}"
+            );
+        }
+        assert_eq!(
+            classify_ban_probe_response(429, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(500, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(400, "{}"),
+            BanProbeOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_ban_probe_does_not_treat_generic_permission_denied_as_ban() {
+        let body = r#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#;
+        assert_eq!(
+            classify_ban_probe_response(403, body),
+            BanProbeOutcome::Unknown
         );
     }
 }
