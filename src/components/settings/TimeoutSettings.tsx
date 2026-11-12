@@ -209,13 +209,16 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         }
     };
 
-    // 最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
+    // 与后端上传预算保持一致；实际尝试仍受全链路剩余预算约束。
     const estimateUploadSecs = (mb: number): number => {
-        const mbps = Math.max(parseFloat(uploadRaw.min_upload_mbps) || DEFAULT_UPLOAD.min_upload_mbps, 0.1);
-        const ratio = Math.max(parseFloat(uploadRaw.extra_wait_ratio) || DEFAULT_UPLOAD.extra_wait_ratio, 0);
-        const bytesPerSec = (mbps * 1_000_000) / 8;
+        const mbps = Math.min(Math.max(parseUpload("min_upload_mbps"), 0.1), 1000);
+        const ratio = Math.min(Math.max(parseUpload("extra_wait_ratio"), 0), 10);
+        const stall = Math.min(Math.max(parseUpload("stall_secs"), 5), 600);
+        const connect = Math.min(Math.max(parseUpload("connect_secs"), 3), 120);
+        const bytesPerSec = Math.round(mbps * 125_000);
         const transferSecs = (mb * 1_000_000) / bytesPerSec;
-        return Math.round(transferSecs * (1 + ratio));
+        const sizeFloor = mb * 1_000_000 >= 4 * 1024 * 1024 ? 15 : 5;
+        return Math.max(Math.ceil(transferSecs * (1 + ratio)), sizeFloor, stall, connect);
     };
 
     const handleResetDefaults = () => {

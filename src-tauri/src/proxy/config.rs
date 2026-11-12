@@ -867,7 +867,8 @@ pub struct UploadTimeoutConfig {
     #[serde(default = "default_extra_wait_ratio")]
     pub extra_wait_ratio: f64,
 
-    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断；若最大等待时间更短则取较短者
+    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断。
+    /// 同时作为上传总预算的最低宽限；全链路剩余预算仍可提前终止请求。
     #[serde(default = "default_upload_stall_secs")]
     pub stall_secs: u64,
 

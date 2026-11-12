@@ -209,15 +209,12 @@ fn adaptive_ttft_secs(estimated_tokens: u32) -> u64 {
 pub enum UploadBudgetSource {
     /// 按请求体大小 ÷ 上传带宽估算
     AdaptiveSize,
-    /// 按体积 ÷ 被动实测上行速度估算
-    AdaptiveObserved,
 }
 
 impl UploadBudgetSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AdaptiveSize => "adaptive_size",
-            Self::AdaptiveObserved => "adaptive_observed_speed",
         }
     }
 }
@@ -243,7 +240,7 @@ pub struct UpstreamTimeoutPlan {
     pub budget_source: UploadBudgetSource,
     /// 是否属于大体积请求
     pub large_body: bool,
-    /// 计划生成时采到的被动上行速度样本（bytes/s）
+    /// 计划生成时采到的本地消费速度样本（bytes/s），仅用于诊断。
     pub observed_bps: Option<u64>,
 }
 
@@ -354,8 +351,11 @@ impl UploadProgress {
         self.total
     }
 
-    /// 上传完成后的有效平均速度（bytes/s）
+    /// Body 消费完成后的平均消费速度（bytes/s），不是远端接收确认。
     pub fn completed_throughput_bps(&self, upload_elapsed: std::time::Duration) -> Option<u64> {
+        if !self.is_finished() {
+            return None;
+        }
         let secs = upload_elapsed.as_secs_f64();
         if secs < 0.5 {
             return None;
@@ -368,7 +368,8 @@ impl UploadProgress {
     }
 }
 
-/// 被动上行吞吐估计器：仅在真实请求上传成功后更新，不发起任何测速请求
+/// 本地 body 消费吞吐估计器，仅用于诊断，不代表远端接收速度。
+/// 跨线路共享的样本不得用于收紧上传预算。
 static UPLOAD_THROUGHPUT_EWMA_BPS: once_cell::sync::Lazy<parking_lot::RwLock<Option<f64>>> =
     once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
 
@@ -938,29 +939,26 @@ impl UpstreamClient {
     pub fn calculate_upload_budget_secs(
         body_len: usize,
         cfg: &crate::proxy::config::UploadTimeoutConfig,
-        observed_bps: Option<u64>,
     ) -> (u64, UploadBudgetSource) {
         // Mbps（十进制）→ B/s：1 Mbps = 1_000_000 bit/s ÷ 8 = 125_000 B/s
         let floor_bps = ((cfg.min_upload_mbps.max(0.1)) * 125_000.0).round() as u64;
         let floor_bps = floor_bps.max(1);
-        let ceiling_bps = floor_bps.saturating_mul(4);
-        let (effective_bps, source) = match observed_bps {
-            Some(bps) if bps > floor_bps => {
-                (bps.min(ceiling_bps), UploadBudgetSource::AdaptiveObserved)
-            }
-            _ => (floor_bps, UploadBudgetSource::AdaptiveSize),
-        };
-
         // 最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
-        let transfer_secs = (body_len as f64) / (effective_bps as f64);
+        // Body 被本地传输层消费的速度不是远端接收速度，也不能跨代理推断。
+        let transfer_secs = (body_len as f64) / (floor_bps as f64);
         let wait_secs = transfer_secs * (1.0 + cfg.extra_wait_ratio.max(0.0));
         let min_floor = if body_len >= crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES {
             15
         } else {
             5
         };
-        let budget = (wait_secs.ceil() as u64).max(min_floor);
-        (budget, source)
+        // 给所有体积的请求保留配置的上传宽限，避免 5s 总预算抢先截断
+        // 尚未达到停滞阈值的上传；全链路 hard_deadline 仍可提前终止。
+        let budget = (wait_secs.ceil() as u64)
+            .max(min_floor)
+            .max(cfg.stall_secs)
+            .max(cfg.connect_secs);
+        (budget, UploadBudgetSource::AdaptiveSize)
     }
 
     /// 计算「统一首字延迟（TTFT）」预算（秒）
@@ -1060,7 +1058,7 @@ impl UpstreamClient {
                 res = &mut send_future => {
                     let (sent, finished, _) = progress.snapshot();
                     let upload_elapsed = upload_done_at.map(|t| t.duration_since(attempt_start));
-                    if finished {
+                    if finished && res.is_ok() {
                         let elapsed = upload_elapsed.unwrap_or_else(|| attempt_start.elapsed());
                         if let Some(bps) = progress.completed_throughput_bps(elapsed) {
                             observe_upload_throughput(bps);
@@ -1240,7 +1238,7 @@ impl UpstreamClient {
         policy: &super::request_policy::UpstreamRequestPolicy,
     ) -> UpstreamTimeoutPlan {
         let (upload_budget_secs, budget_source) =
-            Self::calculate_upload_budget_secs(body_len, cfg, observed_bps);
+            Self::calculate_upload_budget_secs(body_len, cfg);
 
         let large_body = body_len >= cfg.large_body_threshold_bytes();
         let max_endpoints = policy.account_attempt_limit(V1_INTERNAL_BASE_URL_FALLBACKS.len());
@@ -2504,34 +2502,57 @@ mod tests {
     }
 
     #[test]
-    fn test_upload_budget_adaptive_manual_and_caps() {
+    fn upload_budget_preserves_configured_grace() {
         let cfg = default_upload_cfg();
+        for bytes in [1024, 400_000, 1_079_448, 3_500_000] {
+            let (budget, source) = UpstreamClient::calculate_upload_budget_secs(bytes, &cfg);
+            assert!(budget >= cfg.stall_secs.max(cfg.connect_secs));
+            assert_eq!(source, UploadBudgetSource::AdaptiveSize);
+        }
 
-        // 1) 小文本：预算收敛在 5~10s 级别，保留小请求的快速故障切换能力
-        let (small, small_source) = UpstreamClient::calculate_upload_budget_secs(1024, &cfg, None);
-        assert_eq!(small_source, UploadBudgetSource::AdaptiveSize);
-        assert_eq!(small, 5, "small body budget should clamp to minimum 5s");
+        let (big_budget, _) = UpstreamClient::calculate_upload_budget_secs(47_374_672, &cfg);
+        assert_eq!(big_budget, 664);
 
-        // 2) 47.4MB 大视频：公式 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
-        // 47_374_672 / 100_000 ≈ 473.7s * 1.4 ≈ 663s (min_upload_mbps=0.8)
-        let big = 47_374_672usize;
-        let (big_budget, _) = UpstreamClient::calculate_upload_budget_secs(big, &cfg, None);
-        assert!(
-            big_budget >= 650 && big_budget <= 680,
-            "47MB body budget should be around 660-670s with 0.8Mbps, got {big_budget}"
+        let configured = crate::proxy::config::UploadTimeoutConfig {
+            stall_secs: 90,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            UpstreamClient::calculate_upload_budget_secs(1_079_448, &configured).0,
+            90
         );
+        let configured = crate::proxy::config::UploadTimeoutConfig {
+            connect_secs: 60,
+            ..cfg
+        };
+        assert_eq!(
+            UpstreamClient::calculate_upload_budget_secs(1_079_448, &configured).0,
+            60
+        );
+    }
 
-        // 3) 实测速度高于下限时参与估算：预算可收紧，仍受下限与停滞检测约束
-        let (fast_budget, fast_source) =
-            UpstreamClient::calculate_upload_budget_secs(big, &cfg, Some(1000 * 1024));
-        assert_eq!(fast_source, UploadBudgetSource::AdaptiveObserved);
-        assert!(fast_budget < big_budget);
-        assert!(fast_budget >= 5);
-
-        // 4) 低速实测样本（低于下限）回退到体积估算，避免把预算压得过紧
-        let (_, slow_source) =
-            UpstreamClient::calculate_upload_budget_secs(big, &cfg, Some(8 * 1024));
-        assert_eq!(slow_source, UploadBudgetSource::AdaptiveSize);
+    #[test]
+    fn fast_shared_sample_cannot_shorten_another_routes_upload_budget() {
+        let cfg = default_upload_cfg();
+        for observed in [None, Some(8 * 1024), Some(400_000), Some(100_000_000)] {
+            let plan = UpstreamClient::plan_upstream_timeouts_with_observed(
+                PayloadMediaKind::TextChat,
+                1_079_448,
+                &cfg,
+                observed,
+            );
+            assert_eq!(plan.upload_budget_secs, 45);
+            assert_eq!(plan.budget_source, UploadBudgetSource::AdaptiveSize);
+            assert!(plan.total_budget_secs <= MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS);
+        }
+        let mitigated = crate::proxy::config::UploadTimeoutConfig {
+            extra_wait_ratio: 5.0,
+            ..cfg
+        };
+        assert_eq!(
+            UpstreamClient::calculate_upload_budget_secs(1_079_448, &mitigated).0,
+            65
+        );
     }
 
     #[test]
@@ -2675,14 +2696,14 @@ mod tests {
             ..cfg.clone()
         };
         let threshold = crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES;
-        for (bytes, expected) in [(threshold - 1, 5), (threshold, 15)] {
+        for bytes in [threshold - 1, threshold] {
             let plan = UpstreamClient::plan_upstream_timeouts_with_observed(
                 PayloadMediaKind::TextChat,
                 bytes,
                 &fast_cfg,
                 None,
             );
-            assert_eq!(plan.upload_budget_secs, expected);
+            assert_eq!(plan.upload_budget_secs, fast_cfg.stall_secs);
             assert_eq!(plan.stall_secs, 45);
         }
 
@@ -2717,7 +2738,8 @@ mod tests {
             assert_eq!(plan.endpoint_attempt_limit, expected_endpoints);
             assert_eq!(
                 plan.total_budget_secs,
-                plan.first_byte_total_secs + plan.upload_budget_secs * expected_endpoints as u64
+                (plan.first_byte_total_secs + plan.upload_budget_secs * expected_endpoints as u64)
+                    .min(MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS)
             );
         }
     }
@@ -2761,6 +2783,9 @@ mod tests {
         let (sent, finished, _) = progress.snapshot();
         assert_eq!(sent, 40);
         assert!(!finished);
+        assert!(progress
+            .completed_throughput_bps(std::time::Duration::from_secs(2))
+            .is_none());
 
         progress.record(60);
         let (sent, finished, _) = progress.snapshot();
