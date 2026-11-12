@@ -6493,6 +6493,35 @@ mod signature_placement_tests {
     }
 
     #[test]
+    fn sub2api_bridge_identity_preserves_root_and_branch_contract() {
+        // sub2api hashes authenticated user/key identity before forwarding this
+        // bounded composite ID. Even identical content must not merge branches.
+        let root = format!("s2a-v1-{}", "a".repeat(32));
+        let first = format!("{}:agent:{}", root, "b".repeat(32));
+        let second = format!("{}:agent:{}", root, "c".repeat(32));
+        let other_user = format!("s2a-v1-{}:agent:{}", "d".repeat(32), "b".repeat(32));
+        let winner = |id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", id.parse().unwrap());
+            stable_session_winner(&headers, None, None).unwrap()
+        };
+        for id in [&first, &second, &other_user] {
+            assert!(id.len() <= 128);
+            assert_eq!(winner(id), *id, "the bridge ID must survive without truncation");
+        }
+        let affinity = |id: &str| {
+            derive_winner_session_id("shared-am-key", Some(extract_root_session_id(id)), "")
+        };
+        assert_eq!(affinity(&first), affinity(&second));
+        assert_ne!(affinity(&first), affinity(&other_user));
+        assert_ne!(
+            derive_winner_session_id("shared-am-key", Some(&first), "same-content"),
+            derive_winner_session_id("shared-am-key", Some(&second), "same-content"),
+            "the full branch ID must isolate thinking history even with the same anchor"
+        );
+    }
+
+    #[test]
     fn test_session_scope_root_normalization_shares_affinity_key_while_keeping_store_key_isolated()
     {
         let mut h1 = HeaderMap::new();

@@ -228,15 +228,14 @@ fn parse_sse_stream(raw: &str) -> (String, String) {
     (thinking_parts.join(""), content_parts.join(""))
 }
 
-pub fn wrap_stream_with_debug<S, E>(
-    stream: std::pin::Pin<Box<S>>,
+pub fn wrap_stream_with_debug<E>(
+    stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, E>> + Send>>,
     cfg: DebugLoggingConfig,
     trace_id: String,
     prefix: &'static str,
     meta: Value,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, E>> + Send>>
 where
-    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
     if !is_enabled(&cfg) {

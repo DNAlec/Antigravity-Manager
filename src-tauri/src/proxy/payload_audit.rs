@@ -652,6 +652,11 @@ pub fn simplify_payload_json(value: &Value) -> Value {
         concise.insert("usageMetadata".into(), usage.clone());
     }
 
+    // Raw upstream usage diagnostics are local log metadata, independent of client usage.
+    if let Some(diagnostics) = value.get("_usage_diagnostics") {
+        concise.insert("_usage_diagnostics".into(), diagnostics.clone());
+    }
+
     // 9.5 耗时诊断指标 (_timing)
     if let Some(timing) = inner.get("_timing").or_else(|| value.get("_timing")) {
         concise.insert("_timing".into(), timing.clone());

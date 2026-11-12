@@ -68,6 +68,7 @@ pub fn report_qos_ttft(
     ttft_ms: f64,
     is_deep_thinking: bool,
     input_tokens: Option<u32>,
+    session_lease: Option<&crate::proxy::session_bindings::SessionLease>,
 ) {
     let tier = token_manager
         .get_account_tier(account_id)
@@ -80,6 +81,7 @@ pub fn report_qos_ttft(
         ttft_ms,
         is_deep_thinking,
         unified_tokens,
+        session_lease,
     );
 }
 

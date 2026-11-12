@@ -170,7 +170,7 @@ pub async fn handle_generate(
     let mut last_email: Option<String> = None;
     let mut force_rotate = false;
     let mut retry_state = RequestRetryState::default();
-    let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
+    let mut retry_credentials: Option<crate::proxy::token_manager::LeasedCredentials> = None;
     let mut attempted_accounts: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut image_permit = None;
@@ -268,86 +268,85 @@ pub async fn handle_generate(
         let client_session_id = session_scope.client_id.clone();
 
         // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
-        let (access_token, project_id, email, account_id, _wait_ms) = if let Some(credentials) =
-            retry_credentials.take()
-        {
-            credentials
-        } else if config.request_type == "image_gen" {
-            drop(image_permit.take());
-            match token_manager
-                .get_image_token(
-                    force_rotate,
-                    Some(&affinity_key),
-                    &config.final_model,
-                    &image_scheduler,
-                    request_timeout,
-                )
-                .await
-            {
-                Ok((access_token, project_id, email, account_id, wait_ms, permit)) => {
-                    image_permit = Some(permit);
-                    (access_token, project_id, email, account_id, wait_ms)
+        let (access_token, project_id, email, account_id, _wait_ms, mut session_lease) =
+            if let Some(credentials) = retry_credentials.take() {
+                credentials
+            } else if config.request_type == "image_gen" {
+                drop(image_permit.take());
+                match token_manager
+                    .get_image_token_with_lease(
+                        force_rotate,
+                        Some(&affinity_key),
+                        &config.final_model,
+                        &image_scheduler,
+                        request_timeout,
+                    )
+                    .await
+                {
+                    Ok((access_token, project_id, email, account_id, wait_ms, permit, lease)) => {
+                        image_permit = Some(permit);
+                        (access_token, project_id, email, account_id, wait_ms, lease)
+                    }
+                    Err((status, message)) => {
+                        failure_statuses.record(status);
+                        last_error = message;
+                        break;
+                    }
                 }
-                Err((status, message)) => {
-                    failure_statuses.record(status);
-                    last_error = message;
-                    break;
-                }
-            }
-        } else {
-            let mut token_result = token_manager
-                .get_token_filtered(
-                    &config.request_type,
-                    force_rotate,
-                    Some(&affinity_key),
-                    &config.final_model,
-                    &attempted_accounts,
-                )
-                .await;
+            } else {
+                let mut token_result = token_manager
+                    .get_token_filtered_with_lease(
+                        &config.request_type,
+                        force_rotate,
+                        Some(&affinity_key),
+                        &config.final_model,
+                        &attempted_accounts,
+                    )
+                    .await;
 
-            if let Err(ref e) = token_result {
-                if is_transient_token_error(e) {
-                    tracing::warn!(
+                if let Err(ref e) = token_result {
+                    if is_transient_token_error(e) {
+                        tracing::warn!(
                             "Token acquisition transient error ({}), retrying once with force_rotate...",
                             e
                         );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    token_result = token_manager
-                        .get_token_filtered(
-                            &config.request_type,
-                            true,
-                            Some(&affinity_key),
-                            &config.final_model,
-                            &attempted_accounts,
-                        )
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        token_result = token_manager
+                            .get_token_filtered_with_lease(
+                                &config.request_type,
+                                true,
+                                Some(&affinity_key),
+                                &config.final_model,
+                                &attempted_accounts,
+                            )
+                            .await;
+                    }
                 }
-            }
 
-            match token_result {
-                Ok(t) => t,
-                Err(e) => {
-                    if !failure_statuses.is_empty() {
-                        tracing::warn!(
+                match token_result {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if !failure_statuses.is_empty() {
+                            tracing::warn!(
                             "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
                             trace_id
                         );
-                        break;
+                            break;
+                        }
+                        let headers = build_token_error_headers(
+                            Some(mapped_model.as_str()),
+                            last_email.as_deref(),
+                            &e,
+                        );
+                        return Ok((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            headers,
+                            format!("Token error: {}", e),
+                        )
+                            .into_response());
                     }
-                    let headers = build_token_error_headers(
-                        Some(mapped_model.as_str()),
-                        last_email.as_deref(),
-                        &e,
-                    );
-                    return Ok((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        headers,
-                        format!("Token error: {}", e),
-                    )
-                        .into_response());
                 }
-            }
-        };
+            };
 
         let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
 
@@ -499,7 +498,7 @@ pub async fn handle_generate(
                         crate::proxy::upstream::client::strip_internal_markers(&e)
                     );
                     if handling.disposition.abandon_sticky_account {
-                        token_manager.abandon_session(&affinity_key, &account_id);
+                        token_manager.abandon_session_lease(&mut session_lease);
                         tracing::debug!(
                             "[Gemini] Unbound session {} from account {} due to terminal {}",
                             affinity_key,
@@ -589,7 +588,7 @@ pub async fn handle_generate(
         if status.is_success() {
             let track_image_success = config.request_type == "image_gen";
             if !track_image_success {
-                token_manager.commit_session(&affinity_key, &account_id);
+                token_manager.commit_session_lease(&mut session_lease);
                 // [智能限流] 请求成功，重置该账号的连续失败计数
                 token_manager.mark_account_success(&account_id);
             }
@@ -610,7 +609,14 @@ pub async fn handle_generate(
                     "upstream_url": upstream_url,
                 });
                 let response_stream = debug_logger::wrap_stream_with_debug(
-                    Box::pin(response.bytes_stream()),
+                    crate::proxy::pipeline::usage_diagnostics::observe_stream(
+                        response.bytes_stream(),
+                        crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
+                            &config.final_model,
+                            &account_id,
+                            "gemini",
+                        ),
+                    ),
                     debug_cfg.clone(),
                     trace_id.clone(),
                     "upstream_response",
@@ -697,6 +703,7 @@ pub async fn handle_generate(
                 let ttft_tm = token_manager.clone();
                 let ttft_account = account_id.clone();
                 let ttft_session = affinity_key.clone();
+                let ttft_lease = session_lease.clone();
                 let ttft_tokens = estimated_input_tokens;
                 let stream = crate::proxy::pipeline::stream_peek::wrap_stream_with_ttft_probe(
                     stream,
@@ -716,6 +723,7 @@ pub async fn handle_generate(
                             ttft,
                             is_thinking,
                             Some(ttft_tokens),
+                            ttft_lease.as_ref(),
                         );
                     },
                 );
@@ -766,7 +774,7 @@ pub async fn handle_generate(
                                 .unwrap_or(crate::proxy::pipeline::stream_peek::TTFT_UNKNOWN_MS);
                             let unwrapped = unwrap_response(&gemini_resp);
                             if track_image_success && response_has_inline_image_data(&unwrapped) {
-                                token_manager.commit_session(&affinity_key, &account_id);
+                                token_manager.commit_session_lease(&mut session_lease);
                                 token_manager.mark_account_success(&account_id);
                                 token_manager
                                     .clear_persisted_live_limit(&account_id, Some(&mapped_model));
@@ -862,8 +870,15 @@ pub async fn handle_generate(
             let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
                 holder.set_attempts(fallback_attempts.clone());
             });
-            let mut gemini_resp: Value = response
-                .json()
+            let mut gemini_resp: Value =
+                crate::proxy::pipeline::usage_diagnostics::read_json_response(
+                    response,
+                    crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
+                        &config.final_model,
+                        &account_id,
+                        "gemini_json",
+                    ),
+                )
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
@@ -1056,7 +1071,7 @@ pub async fn handle_generate(
         }
 
         if classification.abandons_sticky_account() {
-            token_manager.abandon_session(&affinity_key, &account_id);
+            token_manager.abandon_session_lease(&mut session_lease);
             tracing::debug!(
                 "[Gemini] Unbound session {} from account {} due to status {}",
                 affinity_key,
@@ -1163,6 +1178,7 @@ pub async fn handle_generate(
                     email.clone(),
                     account_id.clone(),
                     0,
+                    session_lease.clone(),
                 ));
             }
             // [NEW] Apply Client Adapter "let_it_crash" strategy

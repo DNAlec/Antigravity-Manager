@@ -1,3 +1,5 @@
+use crate::proxy::session_bindings::{SessionBindings, SessionLease};
+pub type LeasedCredentials = (String, String, String, String, u64, Option<SessionLease>);
 // 移除冗余的顶层导入，因为这些在代码中已由 full path 或局部导入处理
 use axum::http::StatusCode;
 use dashmap::DashMap;
@@ -192,7 +194,7 @@ pub struct TokenManager {
     data_dir: PathBuf,
     rate_limit_tracker: Arc<RateLimitTracker>, // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
-    session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
+    session_accounts: Arc<SessionBindings>,    // Versioned session/account bindings
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
@@ -249,7 +251,7 @@ impl TokenManager {
             data_dir,
             rate_limit_tracker: Arc::new(RateLimitTracker::new()),
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
-            session_accounts: Arc::new(DashMap::new()),
+            session_accounts: Arc::new(SessionBindings::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
             health_scores: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
@@ -913,7 +915,15 @@ impl TokenManager {
 
         // 阶段 2：零停机平滑原子同步到 self.tokens
         // 剔除已在磁盘删除或停用的账号
-        self.tokens.retain(|k, _| new_tokens.contains_key(k));
+        let removed: Vec<String> = self
+            .tokens
+            .iter()
+            .filter(|entry| !new_tokens.contains_key(entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for id in removed {
+            self.remove_account(&id);
+        }
         // 更新或插入新载入的有效账号
         for (k, v) in new_tokens {
             self.tokens.insert(k, v);
@@ -1019,9 +1029,11 @@ impl TokenManager {
     /// 从内存中彻底移除指定账号及其关联数据 (Issue #1477)
     pub fn remove_account(&self, account_id: &str) {
         // ... (省略原有逻辑)
-        if self.tokens.remove(account_id).is_some() {
-            tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
-        }
+        self.session_accounts.invalidate_account(account_id, || {
+            if self.tokens.remove(account_id).is_some() {
+                tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
+            }
+        });
         // Invalidate any in-flight probe before the account can be re-enabled.
         self.qos_guardian.states.remove(account_id);
         self.qos_guardian.samples.remove(account_id);
@@ -1036,7 +1048,6 @@ impl TokenManager {
         self.project_id_locks.remove(account_id);
         self.project_id_failures.remove(account_id);
         self.in_flight_requests.remove(account_id);
-        self.session_accounts.retain(|_, v| v != account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -2753,6 +2764,36 @@ impl TokenManager {
         scheduler: &Arc<ImageScheduler>,
         request_timeout: u64,
     ) -> Result<(String, String, String, String, u64, ImagePermit), (StatusCode, String)> {
+        self.get_image_token_with_lease(
+            force_rotate,
+            session_id,
+            target_model,
+            scheduler,
+            request_timeout,
+        )
+        .await
+        .map(|(a, p, e, id, wait, permit, _)| (a, p, e, id, wait, permit))
+    }
+
+    pub async fn get_image_token_with_lease(
+        &self,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        scheduler: &Arc<ImageScheduler>,
+        request_timeout: u64,
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            String,
+            u64,
+            ImagePermit,
+            Option<SessionLease>,
+        ),
+        (StatusCode, String),
+    > {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(request_timeout);
         let mut scheduler_changes = scheduler.subscribe_changes();
@@ -2764,7 +2805,7 @@ impl TokenManager {
             loop {
                 let selection = wait_for_image_token_selection(
                     deadline,
-                    self.get_token_filtered(
+                    self.get_token_filtered_with_lease(
                         "image_gen",
                         force_rotate,
                         session_id,
@@ -2780,7 +2821,7 @@ impl TokenManager {
                             "图片队列等待超时".to_string(),
                         ));
                     }
-                    Some(Ok((access_token, project_id, email, account_id, wait_ms))) => {
+                    Some(Ok((access_token, project_id, email, account_id, wait_ms, lease))) => {
                         if let Some(permit) = scheduler.try_acquire(&account_id) {
                             return Ok((
                                 access_token,
@@ -2789,6 +2830,7 @@ impl TokenManager {
                                 account_id,
                                 wait_ms,
                                 permit,
+                                lease,
                             ));
                         }
                         busy_accounts.insert(account_id);
@@ -2846,6 +2888,25 @@ impl TokenManager {
         target_model: &str,
         excluded_accounts: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
+        self.get_token_filtered_with_lease(
+            quota_group,
+            force_rotate,
+            session_id,
+            target_model,
+            excluded_accounts,
+        )
+        .await
+        .map(|(a, p, e, id, wait, _)| (a, p, e, id, wait))
+    }
+
+    pub async fn get_token_filtered_with_lease(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        excluded_accounts: &HashSet<String>,
+    ) -> Result<LeasedCredentials, String> {
         // [FIX] 检查并处理待重新加载的账号（配额保护同步）
         let pending_reload = crate::proxy::server::take_pending_reload_accounts();
         for account_id in pending_reload {
@@ -2899,7 +2960,9 @@ impl TokenManager {
         session_id: Option<&str>,
         target_model: &str,
         excluded_accounts: &HashSet<String>,
-    ) -> Result<(String, String, String, String, u64), String> {
+    ) -> Result<LeasedCredentials, String> {
+        let session_id = session_id.filter(|id| !id.is_empty());
+        let account_epochs = self.session_accounts.account_epochs();
         let now_ts = chrono::Utc::now().timestamp();
         let mut tokens_snapshot: Vec<ProxyToken> = self
             .tokens
@@ -3323,6 +3386,24 @@ impl TokenManager {
 
                                 // 直接使用优先账号，跳过轮询逻辑
                                 let mut token = preferred_token.clone();
+                                let session_lease =
+                                    if scheduling.mode != SchedulingMode::PerformanceFirst {
+                                        session_id.map(|sid| {
+                                            let snapshot = self.session_accounts.snapshot(sid);
+                                            let mut lease = self
+                                                .session_accounts
+                                                .candidate(&snapshot, &token.account_id);
+                                            lease.set_account_epoch(
+                                                account_epochs
+                                                    .get(&token.account_id)
+                                                    .copied()
+                                                    .unwrap_or(0),
+                                            );
+                                            lease
+                                        })
+                                    } else {
+                                        None
+                                    };
 
                                 // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
                                 const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
@@ -3367,6 +3448,7 @@ impl TokenManager {
                                     token.email,
                                     token.account_id,
                                     0,
+                                    session_lease,
                                 ));
                             } else {
                                 if is_rate_limited {
@@ -3398,6 +3480,12 @@ impl TokenManager {
         let mut need_update_last_used: Option<(String, std::time::Instant)> = None;
 
         for attempt in 0..total {
+            let mut binding_snapshot = if scheduling.mode != SchedulingMode::PerformanceFirst {
+                session_id.map(|sid| self.session_accounts.snapshot(sid))
+            } else {
+                None
+            };
+            let mut session_lease = None;
             let rotate = force_rotate || attempt > 0;
 
             // ===== 【核心】粘性会话与智能调度逻辑 =====
@@ -3416,7 +3504,8 @@ impl TokenManager {
                 let sid = session_id.unwrap();
 
                 // 1. 检查会话是否已绑定账号
-                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                if let Some(bound_lease) = self.session_accounts.bound_lease(sid) {
+                    let bound_id = bound_lease.account_id().to_string();
                     // 【修复】先通过 account_id 找到对应的账号，获取其 email
                     // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) =
@@ -3462,13 +3551,17 @@ impl TokenManager {
                                 "Sticky Session: Bound account {} is VALIDATION BLOCKED, unbinding and switching.",
                                 bound_token.email
                             );
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         } else if is_qos_jailed {
                             tracing::warn!(
                                 "Sticky Session: Bound account {} is JAILED in QoS Guardian, unbinding and switching.",
                                 bound_token.email
                             );
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         } else if reset_sec > 0 {
                             // 【修复 Issue #284】立即解绑并切换账号，不再阻塞等待
                             // 原因：阻塞等待会导致并发请求时客户端 socket 超时 (UND_ERR_SOCKET)
@@ -3476,7 +3569,9 @@ impl TokenManager {
                                 "Sticky Session: Bound account {} is rate-limited for {} ({}s), unbinding and switching.",
                                 bound_token.email, normalized_target, reset_sec
                             );
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         } else if bound_zero_quota && has_healthy_alternative {
                             // [FIX #3639] 粘性绑定的账号目标模型额度已归零且号池有可用账号，无缝解绑并自动迁移至健康账号
                             tracing::info!(
@@ -3484,7 +3579,9 @@ impl TokenManager {
                                 bound_token.email,
                                 normalized_target
                             );
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         } else if !attempted.contains(&bound_id)
                             && !(quota_protection_enabled
                                 && bound_token.protected_models.contains(&normalized_target))
@@ -3498,11 +3595,15 @@ impl TokenManager {
                             && bound_token.protected_models.contains(&normalized_target)
                         {
                             tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         } else if attempted.contains(&bound_id) {
                             // [FIX] 绑定的账号在当前轮次请求中已尝试失败，立即解绑避免死锁
                             tracing::debug!("Sticky Session: Bound account {} already attempted in current request, unbinding", bound_token.email);
-                            self.session_accounts.remove(sid);
+                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                                binding_snapshot = Some(renewed.snapshot());
+                            }
                         }
                     } else {
                         // 绑定的账号已不存在（可能被删除），解绑
@@ -3510,7 +3611,9 @@ impl TokenManager {
                             "Sticky Session: Bound account not found for session {}, unbinding",
                             sid
                         );
-                        self.session_accounts.remove(sid);
+                        if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
+                            binding_snapshot = Some(renewed.snapshot());
+                        }
                     }
                 }
             }
@@ -3654,40 +3757,57 @@ impl TokenManager {
                 }
             }
 
-            // 同一会话的并发第一次绑定归到已经写下的账号，后到的请求改用赢家。
-            if let Some(ref selected) = target_token {
-                if let Some(sid) = session_id {
-                    if scheduling.mode != SchedulingMode::PerformanceFirst && !rotate {
-                        let bound = {
-                            self.session_accounts
-                                .entry(sid.to_string())
-                                .or_insert_with(|| selected.account_id.clone())
-                                .clone()
-                        };
-                        if bound != selected.account_id {
-                            if let Some(winner) =
-                                tokens_snapshot.iter().find(|t| t.account_id == bound)
-                            {
-                                let winner_limited = self
-                                    .is_rate_limited(&winner.account_id, Some(&normalized_target))
-                                    .await;
-                                if !winner_limited {
-                                    tracing::info!(
-                                        "Sticky Session: Adopted concurrent binding {} for session {}",
-                                        winner.email,
-                                        sid
-                                    );
-                                    target_token = Some(winner.clone());
-                                }
-                            }
+            // Capture a lease before refresh/project lookup can yield. Concurrent first
+            // selections adopt one winner; rotations retain the observed generation.
+            if let (Some(selected), Some(snapshot)) =
+                (target_token.as_ref(), binding_snapshot.as_ref())
+            {
+                let proposed = self
+                    .session_accounts
+                    .candidate(snapshot, &selected.account_id);
+                let lease = if !rotate {
+                    self.session_accounts
+                        .claim(
+                            snapshot,
+                            &selected.account_id,
+                            account_epochs
+                                .get(&selected.account_id)
+                                .copied()
+                                .unwrap_or(0),
+                        )
+                        // A clear/removal may have won during selection. Continue the
+                        // request with its stale lease, which cannot publish or commit.
+                        .unwrap_or_else(|| proposed.clone())
+                } else {
+                    proposed.clone()
+                };
+                if lease.account_id() != selected.account_id {
+                    if let Some(winner) = tokens_snapshot
+                        .iter()
+                        .find(|t| t.account_id == lease.account_id())
+                    {
+                        if !self
+                            .is_rate_limited(&winner.account_id, Some(&normalized_target))
+                            .await
+                            && !self.qos_guardian.is_jailed_or_probing(&winner.account_id)
+                            && !(quota_protection_enabled
+                                && winner.protected_models.contains(&normalized_target))
+                            && !winner
+                                .model_quotas
+                                .get(&normalized_target)
+                                .copied()
+                                .is_some_and(|q| q <= 0)
+                        {
+                            target_token = Some(winner.clone());
+                            session_lease = Some(lease);
                         } else {
-                            tracing::info!(
-                                "Sticky Session: Ensured binding account {} to session {}",
-                                selected.email,
-                                sid
-                            );
+                            session_lease = Some(proposed);
                         }
+                    } else {
+                        session_lease = Some(proposed);
                     }
+                } else {
+                    session_lease = Some(lease);
                 }
             }
 
@@ -3778,6 +3898,15 @@ impl TokenManager {
 
             // Safety net: avoid selecting an account that has been disabled on disk but still
             // exists in the in-memory snapshot (e.g. stale cache + sticky session binding).
+            if session_lease.is_none() {
+                session_lease = binding_snapshot
+                    .as_ref()
+                    .map(|snapshot| self.session_accounts.candidate(snapshot, &token.account_id));
+            }
+            if let Some(lease) = session_lease.as_mut() {
+                lease
+                    .set_account_epoch(account_epochs.get(&token.account_id).copied().unwrap_or(0));
+            }
             match Self::get_account_state_on_disk(&token.account_path).await {
                 OnDiskAccountState::Disabled => {
                     tracing::warn!(
@@ -3830,9 +3959,7 @@ impl TokenManager {
                         );
                         last_error = Some(format!("Token refresh failed: {}", e));
                         attempted.insert(token.account_id.clone());
-                        if let Some(sid) = session_id {
-                            self.abandon_session(sid, &token.account_id);
-                        }
+                        self.abandon_session_lease(&mut session_lease);
                         if quota_group != "image_gen"
                             && matches!(&last_used_account_id, Some((id, _)) if id == &token.account_id)
                         {
@@ -3874,6 +4001,7 @@ impl TokenManager {
                 token.email,
                 token.account_id,
                 0,
+                session_lease,
             ));
         }
 
@@ -4290,7 +4418,8 @@ impl TokenManager {
             None,
         );
         // 主动解除绑定到该故障账号的粘性会话，使后续请求即刻迁移至其他健康账号
-        self.session_accounts.retain(|_, v| *v != resolved_id);
+        self.session_accounts
+            .invalidate_account(&resolved_id, || {});
         tracing::warn!(
             account_id = %resolved_id,
             cooldown_secs = %effective_secs,
@@ -5798,28 +5927,48 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
-    /// 比较并删除：只有映射里仍然是这个账号才清掉当前会话。
-    pub fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
-        let still_bound = self
-            .session_accounts
-            .get(session_id)
-            .map(|bound| bound.as_str() == account_id)
-            .unwrap_or(false);
-        if still_bound {
-            self.session_accounts.remove(session_id);
+    /// Release only the generation selected by this request. A grace retry may
+    /// reclaim the renewed vacant generation if no other request has claimed it.
+    pub fn abandon_session_lease(&self, lease: &mut Option<SessionLease>) -> bool {
+        let Some(current) = lease.as_ref() else {
+            return false;
+        };
+        if let Some(next) = self.session_accounts.abandon(current) {
+            *lease = Some(next);
             true
         } else {
+            // A rotating candidate may not yet own the published binding. Keep
+            // its generation for GraceRetry; stale generations still fail CAS.
             false
         }
     }
 
-    /// 上游成功后写下真正用过的账号。轮换成功的新账号也从这里进入粘性表。
-    pub fn commit_session(&self, session_id: &str, account_id: &str) {
-        if session_id.is_empty() || account_id.is_empty() {
-            return;
-        }
+    /// Publish the successful selection, rejecting stale generations and accounts.
+    pub fn commit_session_lease(&self, lease: &mut Option<SessionLease>) -> bool {
+        let Some(current) = lease.as_ref() else {
+            return false;
+        };
+        let next = self
+            .session_accounts
+            .commit(current, || self.tokens.contains_key(current.account_id()));
+        let changed = next.is_some();
+        *lease = next;
+        changed
+    }
+
+    #[cfg(test)]
+    fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
+        let mut lease = self
+            .session_accounts
+            .bound_lease(session_id)
+            .filter(|l| l.account_id() == account_id);
+        self.abandon_session_lease(&mut lease)
+    }
+
+    #[cfg(test)]
+    fn commit_session(&self, session_id: &str, account_id: &str) {
         self.session_accounts
-            .insert(session_id.to_string(), account_id.to_string());
+            .insert(session_id.to_owned(), account_id.to_owned());
     }
 
     /// 解绑当前会话。不清全局 last_used，避免一个租户的失败打散别人的 60 秒窗口。
@@ -5983,6 +6132,7 @@ impl TokenManager {
         ttft_ms: f64,
         is_deep_thinking: bool,
         input_tokens: Option<u32>,
+        session_lease: Option<&SessionLease>,
     ) {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
@@ -6007,8 +6157,8 @@ impl TokenManager {
                 level,
                 wait_duration,
             } => {
-                if let Some(sid) = session_id {
-                    self.unbind_session(sid);
+                if let Some(lease) = session_lease {
+                    self.session_accounts.abandon(lease);
                 }
                 tracing::warn!(
                     "🚨 [QoS Guardian] Account {} jailed to Level {} (wait {:?}), active session unbound",
@@ -6021,8 +6171,8 @@ impl TokenManager {
                 escalated_level,
                 wait_duration,
             } => {
-                if let Some(sid) = session_id {
-                    self.unbind_session(sid);
+                if let Some(lease) = session_lease {
+                    self.session_accounts.abandon(lease);
                 }
                 tracing::warn!(
                     "💥 [QoS Guardian] Account {} Half-Open probe probation failed. Escalated to Level {} ({:?})",
@@ -6886,7 +7036,7 @@ impl TokenManager {
         .await?;
 
         // Clear sticky session if blocked
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.invalidate_account(account_id, || {});
 
         tracing::info!(
             "🚫 Account {} validation blocked until {} (reason: {})",
@@ -6915,7 +7065,7 @@ impl TokenManager {
         crate::modules::account::mark_account_forbidden(account_id, reason)?;
 
         // Clear sticky session if forbidden
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.invalidate_account(account_id, || {});
 
         // [FIX] 从内存池中移除账号，避免重试时再次选中
         self.remove_account(account_id);
@@ -10258,6 +10408,125 @@ mod tests {
         assert!(
             !manager.rate_limit_tracker.is_rate_limited("acc_tracked_1", None),
             "Calling mark_account_success with email must resolve to account_id and clear tracker limit"
+        );
+    }
+
+    fn leased_token_manager() -> (tempfile::TempDir, TokenManager, &'static str) {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp.path().to_path_buf());
+        let model = "claude-sonnet-4-6";
+        let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+            .unwrap_or_else(|| model.to_owned());
+        for id in ["lease-a", "lease-b"] {
+            let path = temp.path().join(format!("{id}.json"));
+            std::fs::write(&path, r#"{"disabled":false}"#).unwrap();
+            let mut token = create_test_token(id, Some("PRO"), 1.0, None, Some(100));
+            token.account_path = path;
+            token.project_id = Some("lease-project".to_owned());
+            token.model_quotas.insert(normalized.clone(), 100);
+            manager.tokens.insert(id.to_owned(), token);
+        }
+        (temp, manager, model)
+    }
+
+    #[tokio::test]
+    async fn sticky_lease_rotation_blocks_late_success_and_failure() {
+        let (_temp, manager, model) = leased_token_manager();
+        let excluded = HashSet::from(["lease-b".to_owned()]);
+        let (_, _, _, a, _, mut old) = manager
+            .get_token_filtered_with_lease("chat", false, Some("lease-session"), model, &excluded)
+            .await
+            .unwrap();
+        assert_eq!(a, "lease-a");
+        let excluded = HashSet::from([a]);
+        let (_, _, _, b, _, mut next) = manager
+            .get_token_filtered_with_lease("chat", true, Some("lease-session"), model, &excluded)
+            .await
+            .unwrap();
+        assert_eq!(b, "lease-b");
+        assert!(manager.commit_session_lease(&mut next));
+        assert!(!manager.abandon_session_lease(&mut old));
+        assert!(!manager.commit_session_lease(&mut old));
+        assert_eq!(manager.session_accounts.get("lease-session"), Some(b));
+    }
+
+    #[tokio::test]
+    async fn sticky_lease_fixed_account_and_performance_mode() {
+        let (_temp, manager, model) = leased_token_manager();
+        manager
+            .set_preferred_account(Some("lease-a".to_owned()))
+            .await;
+        let (_, _, _, account, _, mut lease) = manager
+            .get_token_filtered_with_lease(
+                "chat",
+                false,
+                Some("fixed-session"),
+                model,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(account, "lease-a");
+        assert!(manager.commit_session_lease(&mut lease));
+        assert_eq!(manager.session_accounts.get("fixed-session"), Some(account));
+        let mut config = manager.get_sticky_config().await;
+        config.mode = crate::proxy::sticky_config::SchedulingMode::PerformanceFirst;
+        manager.update_sticky_config(config).await;
+        let (_, _, _, _, _, mut lease) = manager
+            .get_token_filtered_with_lease(
+                "chat",
+                false,
+                Some("performance-session"),
+                model,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(lease.is_none());
+        assert!(!manager.commit_session_lease(&mut lease));
+        assert!(manager
+            .session_accounts
+            .get("performance-session")
+            .is_none());
+    }
+
+    #[test]
+    fn sticky_lease_removed_rotating_candidate_cannot_reappear() {
+        let (_temp, manager, _) = leased_token_manager();
+        manager
+            .session_accounts
+            .claim(&manager.session_accounts.snapshot("s"), "lease-a", 0)
+            .unwrap();
+        let mut lease = Some(
+            manager
+                .session_accounts
+                .candidate(&manager.session_accounts.snapshot("s"), "lease-b"),
+        );
+        manager.remove_account("lease-b");
+        assert!(!manager.commit_session_lease(&mut lease));
+        assert_eq!(
+            manager.session_accounts.get("s").as_deref(),
+            Some("lease-a")
+        );
+    }
+
+    #[test]
+    fn sticky_lease_rotation_grace_retry_keeps_unpublished_candidate() {
+        let (_temp, manager, _) = leased_token_manager();
+        manager
+            .session_accounts
+            .claim(&manager.session_accounts.snapshot("s"), "lease-a", 0)
+            .unwrap();
+        let mut lease = Some(
+            manager
+                .session_accounts
+                .candidate(&manager.session_accounts.snapshot("s"), "lease-b"),
+        );
+        assert!(!manager.abandon_session_lease(&mut lease));
+        assert!(manager.commit_session_lease(&mut lease));
+        assert_eq!(
+            manager.session_accounts.get("s").as_deref(),
+            Some("lease-b")
         );
     }
 
