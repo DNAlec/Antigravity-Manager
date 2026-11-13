@@ -974,6 +974,26 @@ impl ThinkingStore {
             }
         }
 
+        // Legacy rows have no prefix identity. Preserve their established
+        // ordered full-history migration, but never infer an ordering from a
+        // shortened replay or a conflicting explicit signed generation.
+        let mut legacy_replay_slots = HashMap::<String, usize>::new();
+        let mut legacy_replay_conflicts = HashSet::new();
+        for turn in &model_turns {
+            if !turn.tool_ids.is_empty()
+                || !turn.tool_names.is_empty()
+                || turn.matched_record_idx.is_some()
+            {
+                continue;
+            }
+            let key = base_fingerprint(&turn.fp).to_owned();
+            if turn.existing_sig.as_deref().is_some_and(is_real_signature) {
+                legacy_replay_conflicts.insert(key);
+            } else if !turn.already_complete && !turn.ambiguous_context {
+                *legacy_replay_slots.entry(key).or_default() += 1;
+            }
+        }
+
         // Phase 2: 完整指纹匹配（正向保序匹配，杜绝修剪后逆向滑窗相位错位）
         for turn in model_turns.iter_mut() {
             if turn.already_complete || turn.ambiguous_context || turn.matched_record_idx.is_some()
@@ -1046,8 +1066,35 @@ impl ThinkingStore {
                 turn.ambiguous_context = true;
                 continue;
             }
-            let matched = exact_match
-                .or_else(|| legacy.into_iter().flatten().copied().find(|&i| eligible(i)));
+            let legacy_candidates: Vec<_> = legacy
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| eligible(i))
+                .collect();
+            let authority = turn.existing_sig.as_deref().or_else(|| {
+                (last_model_content_idx == Some(turn.content_idx))
+                    .then_some(latest_session_sig.as_deref())
+                    .flatten()
+            });
+            let legacy_match =
+                select_contextual_text_record(&records, &legacy_candidates, authority).or_else(
+                    || {
+                        let key = base_fingerprint(&turn.fp);
+                        (!legacy_replay_conflicts.contains(key)
+                            && legacy_replay_slots.get(key).copied().unwrap_or(0)
+                                >= legacy_candidates.len())
+                        .then(|| legacy_candidates.first().copied())
+                        .flatten()
+                    },
+                );
+            if exact_match.is_none() && !legacy_candidates.is_empty() && legacy_match.is_none() {
+                // Old rows lack prefix fingerprints, but differing signatures
+                // still prove that text alone cannot select a generation.
+                turn.ambiguous_context = true;
+                continue;
+            }
+            let matched = exact_match.or(legacy_match);
             if let Some(rec_idx) = matched {
                 turn.matched_record_idx = Some(rec_idx);
                 used[rec_idx] = true;
@@ -8118,13 +8165,28 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_legacy_text_generations_are_not_selected_by_order() {
+        let store = ThinkingStore::new();
+        let key = format!("legacy-conflict-{}", uuid::Uuid::new_v4());
+        store.record(&key, rec("think-turn1", "same answer", None));
+        store.record(&key, rec("think-turn2", "same answer", None));
+        let mut contents = vec![
+            json!({"role":"model","parts":[{"text":"another generation","thought":true,"thoughtSignature":"s".repeat(60)},{"text":"same answer"}]}),
+            json!({"role":"model","parts":[{"text":"same answer"}]}),
+        ];
+        let original = contents.clone();
+        assert_eq!(store.restore_gemini_contents(&key, &mut contents), 0);
+        assert_eq!(contents, original);
+    }
+
+    #[test]
     fn tail_first_match_uses_latest_record_for_latest_incomplete_turn() {
         let store = ThinkingStore::new();
         let key = "t:tail-hello";
-        store.record(key, rec("think-turn1", "你好", None));
+        let first = rec("think-turn1", "你好", None);
+        let sig = first.signature.clone().unwrap();
+        store.record(key, first);
         store.record(key, rec("think-turn2", "你好", None));
-
-        let sig = "s".repeat(60);
         let mut contents = vec![
             json!({
                 "role": "model",

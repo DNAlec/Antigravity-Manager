@@ -41,7 +41,12 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
     }
 
     fn process_line(&mut self, line: &str) -> Vec<Bytes> {
-        process_sse_line(line, &mut self.state, &self.trace_id, &self.email).unwrap_or_default()
+        let frames = process_sse_line(line, &mut self.state, &self.trace_id, &self.email)
+            .unwrap_or_default();
+        if self.state.upstream_finished {
+            self.on_finish();
+        }
+        frames
     }
 
     fn is_terminal(&self) -> bool {
@@ -150,8 +155,21 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
     }
 
     fn on_finish(&mut self) {
+        if !self.state.upstream_finished {
+            return;
+        }
         if let Some(sid) = self.state.session_id.clone() {
             let acc = std::mem::take(&mut self.state.thinking_acc);
+            if let Some(sig) = acc.observed_signature() {
+                crate::proxy::SignatureCache::global().cache_session_signature(
+                    &sid,
+                    sig.to_owned(),
+                    self.state.message_count,
+                );
+            }
+            for (id, sig) in std::mem::take(&mut self.state.pending_tool_signatures) {
+                crate::proxy::SignatureCache::global().cache_tool_signature(&sid, &id, sig);
+            }
             acc.commit(&sid);
         }
     }
@@ -389,6 +407,10 @@ fn process_sse_line(
         });
 
     if let Some(finish_reason) = finish_reason {
+        state.upstream_finished |= raw_json
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
         if state.has_thinking
             && !state.has_content
             && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)

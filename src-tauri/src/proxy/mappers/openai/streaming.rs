@@ -105,6 +105,7 @@ pub struct OpenAIChatStreamHandler {
     pub usage_metadata: Option<Value>,
     pub tool_call_index: usize,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
+    upstream_finished: bool,
     pub has_content: bool,
     pub has_thinking: bool,
     pub is_thinking_active: bool,
@@ -176,13 +177,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                 } else {
                                     content_out.push_str(text);
                                 }
-                            }
-                            if let Some(sig) = part
-                                .get("thoughtSignature")
-                                .or(part.get("thought_signature"))
-                                .and_then(|s| s.as_str())
-                            {
-                                store_thought_signature(sig, &self.session_id, self.message_count);
                             }
                             if let Some(img) = part.get("inlineData") {
                                 let mime_type = img
@@ -322,6 +316,8 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         }
                     }
 
+                    self.upstream_finished |=
+                        crate::proxy::mappers::gemini::has_successful_candidate_finish(candidate);
                     let raw_finish_reason = candidate
                         .get("finishReason")
                         .or_else(|| candidate.get("finish_reason"))
@@ -426,6 +422,11 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             );
         }
 
+        // Publish before exposing an upstream finish to a client that may stop
+        // consuming immediately, without polling the transport to EOF.
+        if self.upstream_finished {
+            self.on_finish();
+        }
         chunks
     }
 
@@ -593,7 +594,13 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     }
 
     fn on_finish(&mut self) {
+        if !self.upstream_finished {
+            return;
+        }
         let acc = std::mem::take(&mut self.thinking_acc);
+        if let Some(sig) = acc.observed_signature() {
+            store_thought_signature(sig, &self.session_id, self.message_count);
+        }
         acc.commit(&self.session_id);
     }
 }
@@ -672,6 +679,7 @@ where
         has_content: false,
         has_thinking: false,
         is_thinking_active: false,
+        upstream_finished: false,
         has_emitted_finish_reason: false,
         has_emitted_done: false,
         refused: false,
@@ -702,6 +710,7 @@ pub struct LegacyCompletionStreamHandler {
     has_thinking: bool,
     is_thinking_active: bool,
     thinking_committed: bool,
+    upstream_finished: bool,
 }
 
 impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
@@ -780,23 +789,21 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
                                 content_out.push_str(text);
                             }
                         }
-                        if let Some(sig) = part
-                            .get("thoughtSignature")
-                            .or(part.get("thought_signature"))
-                            .and_then(|s| s.as_str())
-                        {
-                            store_thought_signature(sig, &self.session_id, self.message_count);
-                        }
                     }
                 }
             }
         }
 
+        self.upstream_finished |= actual_data
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
         let finish_reason = actual_data
             .get("candidates")
             .and_then(|c| c.as_array())
             .and_then(|c| c.first())
-            .and_then(|c| c.get("finishReason"))
+            .and_then(|c| c.get("finishReason").or_else(|| c.get("finish_reason")))
             .and_then(|f| f.as_str())
             .or_else(|| response_has_prompt_refusal(&actual_data).then_some("SAFETY"))
             .map(|f| match f {
@@ -818,6 +825,9 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
         }
         if finish_reason.is_some() {
             self.final_usage = None;
+        }
+        if self.upstream_finished {
+            self.on_finish();
         }
         frames.push(Bytes::from(format!(
             "data: {}\n\n",
@@ -871,11 +881,14 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
     }
 
     fn on_finish(&mut self) {
-        if self.thinking_committed {
+        if self.thinking_committed || !self.upstream_finished {
             return;
         }
         self.thinking_committed = true;
         let acc = std::mem::take(&mut self.thinking_acc);
+        if let Some(sig) = acc.observed_signature() {
+            store_thought_signature(sig, &self.session_id, self.message_count);
+        }
         acc.commit(&self.session_id);
     }
 }
@@ -935,6 +948,7 @@ where
         has_thinking: false,
         is_thinking_active: false,
         thinking_committed: false,
+        upstream_finished: false,
     };
     let config =
         StreamLifecycleConfig::new("openai-legacy", "create_legacy_sse_stream", trace_info);
@@ -1364,14 +1378,6 @@ impl CodexResponsesStreamHandler {
             }
         }
 
-        if let Some(sig) = part
-            .get("thoughtSignature")
-            .or(part.get("thought_signature"))
-            .and_then(|s| s.as_str())
-        {
-            store_thought_signature(sig, &self.session_id, self.message_count);
-        }
-
         if let Some(func_call) = part.get("functionCall") {
             self.handle_tool_call(func_call, part, frames);
         }
@@ -1547,6 +1553,9 @@ impl CodexResponsesStreamHandler {
             return;
         }
         self.thinking_committed = true;
+        if let Some(sig) = self.thinking_acc.observed_signature() {
+            store_thought_signature(sig, &self.session_id, self.message_count);
+        }
         self.thinking_acc.clone().commit(&self.session_id);
         if self.session_id != self.response_id {
             self.thinking_acc.clone().commit(&self.response_id);
@@ -1628,10 +1637,8 @@ impl CodexResponsesStreamHandler {
             .is_some_and(is_refusal_finish_reason);
         let mut terminal_status = if missing_actionable_output
             || refused
-            || matches!(
-                self.final_finish_reason.as_deref(),
-                Some("MAX_TOKENS") | None
-            ) {
+            || self.final_finish_reason.as_deref() != Some("STOP")
+        {
             "incomplete"
         } else {
             "completed"
@@ -1654,6 +1661,11 @@ impl CodexResponsesStreamHandler {
             json!({"code":"empty_response","message":"Gemini stream ended without a final assistant message or tool call."})
         } else if self.final_finish_reason.is_none() {
             json!({"code":"upstream_interrupted","message":"Gemini stream ended without finishReason."})
+        } else if !matches!(
+            self.final_finish_reason.as_deref(),
+            Some("STOP" | "MAX_TOKENS")
+        ) {
+            json!({"code":"upstream_finish_error","message":format!("Gemini generation ended with {}", self.final_finish_reason.as_deref().unwrap_or_default())})
         } else {
             Value::Null
         };
@@ -1693,7 +1705,12 @@ impl CodexResponsesStreamHandler {
             }
         }
 
-        self.commit_thinking();
+        if terminal_status == "completed" || resumable_truncation {
+            self.commit_thinking();
+        } else {
+            // Failed output can be rendered to the caller but is not replayable history.
+            self.thinking_committed = true;
+        }
 
         let mut completed_ev = json!({
             "type": terminal_type,
@@ -1824,7 +1841,9 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
                     .or_else(|| candidate.get("finish_reason"))
                     .and_then(Value::as_str)
                 {
-                    self.final_finish_reason = Some(reason.to_string());
+                    if crate::proxy::mappers::gemini::has_candidate_finish(candidate) {
+                        self.final_finish_reason = Some(reason.to_string());
+                    }
                 }
                 if let Some(parts) = candidate
                     .get("content")

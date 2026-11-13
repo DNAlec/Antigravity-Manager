@@ -562,7 +562,6 @@ impl InboundThinkingPipeline {
                 // 1. 若客户端回传的 functionCall.args 为 JSON 字符串，尝试反序列化为 Object，防上游 400
                 // 2. 若客户端回传的 functionResponse.response 为非 Object，自动包装为 {"output": response}
                 // 3. 多模态工具响应深度解构：确保全协议 (OpenAI / Claude / Gemini / Responses) 的工具结果中夹带的图片均被提升为独立的 inlineData 视觉感知输入
-                let mut extra_inline_parts = Vec::new();
                 for part in parts.iter_mut() {
                     if let Some(fc) = part.get_mut("functionCall") {
                         if let Some(args_val) = fc.get_mut("args") {
@@ -576,6 +575,7 @@ impl InboundThinkingPipeline {
                         }
                     }
                     if let Some(fr) = part.get_mut("functionResponse") {
+                        let mut extra_inline_parts = Vec::new();
                         // 不按工具名豁免。名字会随协议改写（local_shell_call → shell）。
                         // 日志里的 data:image 由 extract_multimodal_from_tool_text 按形态拒绝。
                         if let Some(resp) = fr.get_mut("response") {
@@ -612,9 +612,16 @@ impl InboundThinkingPipeline {
                                 }
                             }
                         }
+                        if !extra_inline_parts.is_empty() {
+                            if let Some(obj) = fr.as_object_mut() {
+                                let media = obj.entry("parts").or_insert_with(|| json!([]));
+                                if let Some(media) = media.as_array_mut() {
+                                    media.extend(extra_inline_parts);
+                                }
+                            }
+                        }
                     }
                 }
-                parts.extend(extra_inline_parts);
             }
         }
 
@@ -664,14 +671,10 @@ impl InboundThinkingPipeline {
             );
         }
 
-        // 4. 工具回执 role 归一化（对齐官方 Antigravity 形态，Gemini -> model, Claude -> user）。
-        //    必须放在**末位**：若前置，回执轮会进入上面的 `is_model` 分支，
-        //    从而跳过 `role == "user"` 分支里的多模态解构（图片提升为 inlineData）。
-        Self::normalize_function_response_roles(contents, target_model);
-
-        // 5. 全协议多模态保鲜滑动窗口与累积容量治理（Pipeline First）：
+        // Prune while media still belongs to its tool result. Legacy projection
+        // below numbers only the surviving images, including parallel calls.
         let multimodal_cfg = crate::proxy::config::get_multimodal_config();
-        Self::apply_multimodal_sliding_window_and_limits(contents, &multimodal_cfg);
+        Self::finalize_tool_media(contents, target_model, &multimodal_cfg);
     }
 
     /// [Signature-Retry] 流水线统一处理签名（协议无关）。
@@ -874,6 +877,15 @@ impl InboundThinkingPipeline {
         stripped
     }
 
+    fn finalize_tool_media(
+        contents: &mut Vec<Value>,
+        target_model: &str,
+        config: &crate::proxy::config::MultimodalConfig,
+    ) {
+        Self::apply_multimodal_sliding_window_and_limits(contents, config);
+        Self::normalize_function_response_roles(contents, target_model);
+    }
+
     /// Apply one chronological count or decoded-byte window to top-level images
     /// and anonymous tool attachments. Keep the newest image; remote URLs are
     /// removed only when configured. Nested media cannot contain text markers.
@@ -917,7 +929,7 @@ impl InboundThinkingPipeline {
                 } else {
                     "image/jpeg"
                 });
-            if (inline.is_some() || nested) && !mime.starts_with("image/") && !mime.is_empty() {
+            if !mime.starts_with("image/") && !mime.is_empty() {
                 return None;
             }
             if inline.is_some() {
@@ -1425,7 +1437,10 @@ impl InboundThinkingPipeline {
         }
         /// part 是否仅为随行媒体（无文本、无回执、无调用）。
         fn is_media(p: &Value) -> bool {
-            (p.get("inlineData").is_some() || p.get("inline_data").is_some())
+            (p.get("inlineData").is_some()
+                || p.get("inline_data").is_some()
+                || p.get("fileData").is_some()
+                || p.get("file_data").is_some())
                 && p.get("text").is_none()
                 && !has_fr(p)
                 && p.get("functionCall").is_none()
@@ -1725,8 +1740,8 @@ impl InboundThinkingPipeline {
         rewritten
     }
 
-    /// The legacy wire puts images after the whole group of results. Add
-    /// one-based image positions to the owning result when this is ambiguous.
+    /// The legacy wire puts anonymous media after the whole group of results.
+    /// Add one-based media positions to the owning result when ambiguous.
     /// Never detach a named attachment (a tool may refer to its displayName).
     fn project_legacy_tool_images(parts: &mut Vec<Value>) {
         let parallel = parts
@@ -1736,7 +1751,12 @@ impl InboundThinkingPipeline {
             > 1;
         let existing_media = parts
             .iter()
-            .filter(|p| p.get("inlineData").is_some() || p.get("inline_data").is_some())
+            .filter(|p| {
+                p.get("inlineData").is_some()
+                    || p.get("inline_data").is_some()
+                    || p.get("fileData").is_some()
+                    || p.get("file_data").is_some()
+            })
             .count();
         let mut lifted = Vec::new();
         for part in parts.iter_mut() {
@@ -1752,16 +1772,37 @@ impl InboundThinkingPipeline {
                 .is_some_and(|items| {
                     !items.is_empty()
                         && items.iter().all(|p| {
-                            p.as_object().is_some_and(|obj| obj.len() == 1)
-                                && p.get("inlineData")
-                                    .and_then(Value::as_object)
-                                    .is_some_and(|d| {
-                                        d.len() == 2
-                                            && d.get("data").is_some_and(Value::is_string)
-                                            && d.get("mimeType")
-                                                .and_then(Value::as_str)
-                                                .is_some_and(|mime| mime.starts_with("image/"))
-                                    })
+                            if !p.as_object().is_some_and(|obj| obj.len() == 1) {
+                                return false;
+                            }
+                            let (data, payload) = if let Some(data) =
+                                p.get("inlineData").or_else(|| p.get("inline_data"))
+                            {
+                                (data, "data")
+                            } else if let Some(data) =
+                                p.get("fileData").or_else(|| p.get("file_data"))
+                            {
+                                (
+                                    data,
+                                    if data.get("fileUri").is_some() {
+                                        "fileUri"
+                                    } else {
+                                        "file_uri"
+                                    },
+                                )
+                            } else {
+                                return false;
+                            };
+                            data.as_object().is_some_and(|d| {
+                                d.len() == 2
+                                    && d.get(payload)
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                                    && d.get("mimeType")
+                                        .or_else(|| d.get("mime_type"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                            })
                         })
                 })
             {
@@ -3000,6 +3041,138 @@ impl InboundThinkingPipeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_mixed_tool_documents_and_images_keep_owner_on_legacy_targets() {
+        let media = vec![
+            json!({"inlineData":{"mimeType":"application/pdf","data":"JVBERg=="}}),
+            json!({"inlineData":{"mimeType":"image/png","data":"AQ=="}}),
+            json!({"fileData":{"mimeType":"application/pdf","fileUri":"https://example.org/report.pdf"}}),
+        ];
+        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
+            let mut turns = vec![
+                json!({"role":"user","parts":[{"text":"go"}]}),
+                json!({"role":"model","parts":[{"functionCall":{"name":"inspect","id":"a","args":{}}},{"functionCall":{"name":"inspect","id":"b","args":{}}}]}),
+                json!({"role":"user","parts":[{"functionResponse":{"id":"a","name":"inspect","response":{"output":"done"},"parts":media}},{"functionResponse":{"id":"b","name":"inspect","response":{"output":"done"}}}]}),
+            ];
+            super::InboundThinkingPipeline::finalize_tool_media(
+                &mut turns,
+                model,
+                &crate::proxy::config::MultimodalConfig::default(),
+            );
+            let parts: Vec<_> = turns
+                .iter()
+                .flat_map(|t| t["parts"].as_array().unwrap())
+                .collect();
+            let responses: Vec<_> = parts
+                .iter()
+                .filter_map(|p| p.get("functionResponse"))
+                .collect();
+            if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
+                assert_eq!(responses[0]["parts"], json!(media));
+            } else {
+                assert_eq!(
+                    responses[0]["response"]["attached_media_positions"],
+                    json!([1, 2, 3])
+                );
+                assert!(responses[0].get("parts").is_none());
+                let delivered: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p.get("inlineData").is_some() || p.get("fileData").is_some())
+                    .map(|p| (*p).clone())
+                    .collect();
+                assert_eq!(delivered, media);
+                if model.starts_with("gemini") {
+                    assert_eq!(turns.last().unwrap()["role"], "user");
+                }
+            }
+            assert!(responses[1].get("parts").is_none());
+            assert!(responses[1]["response"]
+                .get("attached_media_positions")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn r19_document_urls_do_not_consume_image_window_capacity() {
+        let mut turns = vec![json!({"role":"user","parts":[
+            {"inlineData":{"mimeType":"image/png","data":"AQ=="}},
+            {"fileData":{"mimeType":"application/pdf","fileUri":"https://example.org/a.pdf"}}
+        ]})];
+        let original = turns.clone();
+        let count = super::InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(
+            &mut turns,
+            &crate::proxy::config::MultimodalConfig {
+                max_fresh_images: 1,
+                strip_remote_urls: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(count, 0);
+        assert_eq!(turns, original);
+    }
+
+    #[test]
+    fn r19_media_window_numbers_surviving_attachments_by_owner() {
+        let image = |data| json!({"inlineData":{"mimeType":"image/png","data":data}});
+        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
+            for limit in [1, 2] {
+                let mut turns = vec![
+                    json!({"role":"user","parts":[{"text":"go"}]}),
+                    json!({"role":"model","parts":[{"functionCall":{"name":"inspect","id":"a","args":{}}},{"functionCall":{"name":"inspect","id":"b","args":{}}}]}),
+                    json!({"role":"user","parts":[{"functionResponse":{"name":"inspect","id":"a","response":{"output":"A"},"parts":[image("red")]}},{"functionResponse":{"name":"inspect","id":"b","response":{"output":"B"},"parts":[image("blue")]}}]}),
+                ];
+                super::InboundThinkingPipeline::finalize_tool_media(
+                    &mut turns,
+                    model,
+                    &crate::proxy::config::MultimodalConfig {
+                        max_fresh_images: limit,
+                        ..Default::default()
+                    },
+                );
+                let parts: Vec<_> = turns
+                    .iter()
+                    .flat_map(|t| t["parts"].as_array().unwrap())
+                    .collect();
+                let results: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| p.get("functionResponse"))
+                    .collect();
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0]["response"]["output"], "A");
+                assert_eq!(results[1]["response"]["output"], "B");
+                if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
+                    assert_eq!(
+                        results[0]["parts"][0]["inlineData"]["data"].as_str(),
+                        (limit == 2).then_some("red")
+                    );
+                    assert_eq!(results[1]["parts"][0]["inlineData"]["data"], "blue");
+                } else {
+                    let images: Vec<_> = parts.iter().filter_map(|p| p.get("inlineData")).collect();
+                    assert_eq!(images.len(), limit);
+                    assert_eq!(images.last().unwrap()["data"], "blue");
+                    if limit == 1 {
+                        assert!(results[0]["response"]
+                            .get("attached_media_positions")
+                            .is_none());
+                        assert_eq!(
+                            results[1]["response"]["attached_media_positions"],
+                            json!([1])
+                        );
+                    } else {
+                        assert_eq!(
+                            results[0]["response"]["attached_media_positions"],
+                            json!([1])
+                        );
+                        assert_eq!(
+                            results[1]["response"]["attached_media_positions"],
+                            json!([2])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

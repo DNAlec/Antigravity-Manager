@@ -135,6 +135,15 @@ fn extract_openai_content_summary(content: &OpenAIContent) -> String {
                         let fmt = input_audio.format.as_deref().unwrap_or("audio");
                         parts.push(format!("[audio:{}:{}]", fmt, input_audio.data.len()));
                     }
+                    crate::proxy::mappers::openai::models::OpenAIContentBlock::File { file } => {
+                        use sha2::{Digest, Sha256};
+                        let data = file
+                            .file_data
+                            .as_deref()
+                            .or(file.file_url.as_deref())
+                            .unwrap_or_default();
+                        parts.push(format!("[file:{:x}]", Sha256::digest(data.as_bytes())));
+                    }
                     crate::proxy::mappers::openai::models::OpenAIContentBlock::VideoUrl {
                         video_url,
                     } => {

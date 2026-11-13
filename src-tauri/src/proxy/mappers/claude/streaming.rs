@@ -95,6 +95,8 @@ pub struct StreamingState {
     // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
     pub text_delta_emitted_this_turn: bool,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
+    pub(super) upstream_finished: bool,
+    pub(super) pending_tool_signatures: Vec<(String, String)>,
     /// Merged cumulative usage, including fields omitted by later sparse frames.
     pub last_usage: Option<UsageMetadata>,
     pub(super) usage_metadata: Option<serde_json::Value>,
@@ -131,6 +133,8 @@ impl StreamingState {
             registered_tool_names: Vec::new(),
             text_delta_emitted_this_turn: false,
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
+            upstream_finished: false,
+            pending_tool_signatures: Vec::new(),
             last_usage: None,
             usage_metadata: None,
             defer_finish_for_usage: false,
@@ -684,26 +688,6 @@ impl<'a> PartProcessor<'a> {
                 SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
             }
 
-            // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
-            if let Some(session_id) = &self.state.session_id {
-                // If FIFO strategy is enabled, use a unique index for each signature (e.g. timestamp or counter)
-                // However, our cache implementation currently keys by session_id.
-                // For FIFO, we might just rely on the fact that we are processing in order.
-                // But specifically for opencode, it might be calling tools in parallel or sequence.
-
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-                tracing::debug!(
-                    "[Claude-SSE] Cached signature to session {} (length: {}) [FIFO: {}]",
-                    session_id,
-                    sig.len(),
-                    use_fifo
-                );
-            }
-
             tracing::debug!(
                 "[Claude-SSE] Captured thought_signature from thinking block (length: {})",
                 sig.len()
@@ -1094,19 +1078,9 @@ impl<'a> PartProcessor<'a> {
         if let Some(ref sig) = signature {
             tool_use["signature"] = json!(sig);
 
-            // 2. Cache tool signature (Layer 1 recovery)
-            if let Some(sid) = self.state.session_id.as_deref() {
-                SignatureCache::global().cache_tool_signature(sid, &tool_id, sig.clone());
-            }
-
-            // 3. [NEW v3.3.17] Cache to session-based storage
-            if let Some(session_id) = &self.state.session_id {
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-            }
+            self.state
+                .pending_tool_signatures
+                .push((tool_id.clone(), sig.clone()));
 
             tracing::debug!(
                 "[Claude-SSE] Captured thought_signature for function call (length: {})",

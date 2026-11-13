@@ -771,7 +771,7 @@ fn inspect_gemini_candidate_parts(
                     *saw_content = true;
                 }
             }
-            if part.get("inlineData").is_some() || part.get("inline_data").is_some() {
+            if crate::proxy::mappers::gemini::has_media(part) {
                 *saw_content = true;
             }
             if part.get("functionCall").is_some() {

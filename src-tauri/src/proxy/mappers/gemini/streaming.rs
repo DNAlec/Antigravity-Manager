@@ -23,6 +23,7 @@ pub struct GeminiStreamHandler {
     image_success_account: String,
     image_success_model: String,
     capture_template: TurnAccumulator,
+    tool_ids: super::wrapper::ResponseToolIds,
     candidates: std::collections::BTreeMap<u64, CandidateState>,
     expected_candidates: usize,
     marked_multi_candidate: bool,
@@ -98,6 +99,7 @@ impl GeminiStreamHandler {
             image_success_account,
             image_success_model,
             capture_template: thinking_acc,
+            tool_ids: Default::default(),
             candidates: Default::default(),
             expected_candidates: 1,
             marked_multi_candidate: false,
@@ -189,6 +191,8 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             crate::proxy::pipeline::stream_error::response_has_prompt_refusal(&json);
         self.blocked_prompt |= crate::proxy::pipeline::stream_error::response_is_refusal(&json);
 
+        self.tool_ids.inject(&mut json, &self.model_name);
+
         // v1internal 响应可能包一层 "response"
         let parts_snapshot = json
             .get("response")
@@ -240,9 +244,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                         self.has_content = true;
                         // 工具调用是明确的行动输出，必然意味着思考阶段已结束。
                         self.is_thinking_active = false;
-                    } else if (!is_thought && part.get("text").is_some())
-                        || part.get("inlineData").is_some()
-                        || part.get("inline_data").is_some()
+                    } else if (!is_thought && part.get("text").is_some()) || super::has_media(part)
                     {
                         self.has_content = true;
                     }
@@ -254,7 +256,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             // Publish before yielding the terminal event: the client can start the
             // next request immediately, without reading a usage trailer or EOF.
             // Taking the accumulator also makes a repeated terminal idempotent.
-            if state.finish {
+            if state.finish && super::has_successful_candidate_finish(cand) {
                 if let Some(thinking) = state.thinking.take() {
                     if multiple && !self.marked_multi_candidate {
                         crate::proxy::SignatureCache::global()
@@ -278,8 +280,6 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             .candidates
             .values()
             .any(|c| c.active_thought && !c.finish);
-        // 注入工具调用 ID
-        crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &self.model_name);
 
         // 解包 v1internal 信封
         if let Some(inner) = json.get_mut("response").map(|v| v.take()) {

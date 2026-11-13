@@ -78,7 +78,10 @@ pub(crate) fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str
     if child.is_empty() || ns.is_empty() || child.starts_with("mcp__") {
         return child.to_string();
     }
-    if child.strip_prefix(ns).is_some_and(|rest| ns.ends_with("__") || rest.starts_with("__")) {
+    if child
+        .strip_prefix(ns)
+        .is_some_and(|rest| ns.ends_with("__") || rest.starts_with("__"))
+    {
         return child.to_string();
     }
     if ns.ends_with("__") {
@@ -662,6 +665,11 @@ pub fn transform_openai_request_with_session(
                                         }
                                     }
                                 }
+                                OpenAIContentBlock::File { file } => {
+                                    if let Some(part) = file.to_gemini_part() {
+                                        parts.push(part);
+                                    }
+                                }
                                 OpenAIContentBlock::AudioUrl { audio_url } => {
                                     // [NEW] audio_url -> Gemini inlineData / fileData
                                     match crate::proxy::audio::audio_part_from_source(
@@ -865,6 +873,11 @@ pub fn transform_openai_request_with_session(
                                         texts.push("[image link]".to_string());
                                     }
                                 }
+                                OpenAIContentBlock::File { file } => {
+                                    if let Some(part) = file.to_gemini_part() {
+                                        extra_parts.push(part);
+                                    }
+                                }
                                 OpenAIContentBlock::AudioUrl { audio_url } => {
                                     match crate::proxy::audio::audio_part_from_source(
                                         &audio_url.url,
@@ -901,7 +914,7 @@ pub fn transform_openai_request_with_session(
                 };
 
                 // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉与 Gemini 400 校验异常
-                let final_content = if content_val.trim().is_empty() {
+                let mut final_content = if content_val.trim().is_empty() {
                     "Command executed successfully.".to_string()
                 } else {
                     content_val
@@ -919,11 +932,22 @@ pub fn transform_openai_request_with_session(
                     obj.remove("thoughtSignature");
                     obj.remove("thought_signature");
                 }
-                parts.push(fr_part);
-
-                for extra in extra_parts {
-                    parts.push(extra);
+                // Retain ownership until the shared pipeline selects the target
+                // layout. Sibling media cannot distinguish parallel same-name calls.
+                extra_parts.retain(|part| {
+                    if let Some(notice) = part.get("text").and_then(Value::as_str) {
+                        final_content.push('\n');
+                        final_content.push_str(notice);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                fr_part["functionResponse"]["response"]["output"] = json!(final_content);
+                if !extra_parts.is_empty() {
+                    fr_part["functionResponse"]["parts"] = Value::Array(extra_parts);
                 }
+                parts.push(fr_part);
             }
 
             // Ensure user role message is not dropped if parts is empty, preserving role rotation
@@ -1473,6 +1497,11 @@ pub fn enforce_uppercase_types(value: &mut Value) {
         if let Some(items) = map.get_mut("items") {
             enforce_uppercase_types(items);
         }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(branches) = map.get_mut(key) {
+                enforce_uppercase_types(branches);
+            }
+        }
     } else if let Value::Array(arr) = value {
         for item in arr {
             enforce_uppercase_types(item);
@@ -1482,6 +1511,53 @@ pub fn enforce_uppercase_types(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_parallel_chat_results_keep_media_owner() {
+        const PNG:&str="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
+            for owner in ["a", "b"] {
+                let mut messages = vec![
+                    json!({"role":"user","content":"inspect"}),
+                    json!({"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"inspect","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"inspect","arguments":"{}"}}]}),
+                ];
+                for id in ["a", "b"] {
+                    let mut content = vec![json!({"type":"text","text":"done"})];
+                    if id == owner {
+                        content.push(json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}));
+                    }
+                    messages.push(json!({"role":"tool","tool_call_id":id,"content":content}));
+                }
+                let req: OpenAIRequest =
+                    serde_json::from_value(json!({"model":model,"messages":messages})).unwrap();
+                let (body, _, _, _) = transform_openai_request(&req, "p", model, None);
+                let parts: Vec<_> = body["request"]["contents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|t| t["parts"].as_array().unwrap())
+                    .collect();
+                let responses: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| p.get("functionResponse"))
+                    .collect();
+                assert_eq!(responses.len(), 2);
+                for result in responses {
+                    if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
+                        assert_eq!(
+                            result["parts"][0]["inlineData"]["data"].as_str(),
+                            (result["id"] == owner).then_some(PNG)
+                        );
+                    } else {
+                        assert_eq!(
+                            result["response"].get("attached_media_positions").is_some(),
+                            result["id"] == owner
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

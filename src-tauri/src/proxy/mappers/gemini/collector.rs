@@ -62,6 +62,8 @@ where
     let mut blocked_prompt = false;
     let mut collected_response = json!({});
     let mut grouped: BTreeMap<u64, (Value, Vec<Value>)> = BTreeMap::new();
+    let mut media_positions =
+        BTreeMap::<u64, std::collections::HashMap<(bool, [u8; 32]), Vec<usize>>>::new();
     let mut usage_metadata: Option<Value> = None;
     let mut stream_error: Option<Value> = None;
     let mut line_buffer = bytes::BytesMut::new();
@@ -164,7 +166,30 @@ where
                                 .and_then(|c| c.get("parts"))
                                 .and_then(|p| p.as_array())
                             {
+                                // Retain occurrence positions across frames so text trailers do
+                                // not repeatedly hash every already-collected image payload.
+                                let prior_media = media_positions.entry(index).or_default();
+                                let mut frame_media = std::collections::HashMap::new();
                                 for part in parts {
+                                    if super::has_media(part) {
+                                        let key = media_identity(part);
+                                        let count = frame_media.entry(key).or_insert(0usize);
+                                        *count += 1;
+                                        if let Some(position) = prior_media
+                                            .get(&key)
+                                            .and_then(|positions| positions.get(*count - 1))
+                                        {
+                                            merge_media_metadata(
+                                                &mut content_parts[*position],
+                                                part,
+                                            );
+                                            continue;
+                                        }
+                                        prior_media
+                                            .entry(key)
+                                            .or_default()
+                                            .push(content_parts.len());
+                                    }
                                     // Collect part
                                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                         let is_part_thought = part
@@ -203,8 +228,10 @@ where
                                             } else if is_part_thought
                                                 && is_last_thought
                                                 && last.get("text").is_some()
+                                                && plain_text_mergeable(last)
+                                                && thinking_fragment_mergeable(part)
                                             {
-                                                // Merge thinking text [FIX #3697]
+                                                // Merge only unsigned thinking fragments [FIX #3697]
                                                 if let Some(last_text) =
                                                     last.get_mut("text").and_then(|v| v.as_str())
                                                 {
@@ -215,7 +242,9 @@ where
                                                             Value::String(new_text),
                                                         );
                                                         if let Some(sig) =
-                                                            part.get("thoughtSignature")
+                                                            part.get("thoughtSignature").or_else(
+                                                                || part.get("thought_signature"),
+                                                            )
                                                         {
                                                             obj.insert(
                                                                 "thoughtSignature".to_string(),
@@ -232,10 +261,14 @@ where
                                                             "text".to_string(),
                                                             Value::String(new_text),
                                                         );
-                                                        if let Some(sig) =
-                                                            part.get("thoughtSignature").or_else(
-                                                                || last.get("thoughtSignature"),
-                                                            )
+                                                        if let Some(sig) = part
+                                                            .get("thoughtSignature")
+                                                            .or_else(|| {
+                                                                part.get("thought_signature")
+                                                            })
+                                                            .or_else(|| {
+                                                                last.get("thoughtSignature")
+                                                            })
                                                         {
                                                             obj.insert(
                                                                 "thoughtSignature".to_string(),
@@ -312,7 +345,7 @@ where
         {
             continue;
         }
-        if !parts.is_empty() && super::has_candidate_finish(&candidate) {
+        if !parts.is_empty() && super::has_successful_candidate_finish(&candidate) {
             if singleton {
                 for part in &parts {
                     if let Some(sig) = part
@@ -347,6 +380,51 @@ where
     }
 
     Ok(collected_response)
+}
+
+fn merge_media_metadata(previous: &mut Value, current: &Value) {
+    let (Some(previous), Some(current)) = (previous.as_object_mut(), current.as_object()) else {
+        return;
+    };
+    for (key, value) in current {
+        match key.as_str() {
+            "inlineData" | "inline_data" | "fileData" | "file_data" => {}
+            "thoughtSignature" | "thought_signature" => {
+                previous.remove("thought_signature");
+                previous.insert("thoughtSignature".into(), value.clone());
+            }
+            _ => {
+                previous.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+// An unsigned incremental thought may acquire its closing signature. Once a
+// signed block is closed, subsequent thought text starts a separate block.
+fn thinking_fragment_mergeable(part: &Value) -> bool {
+    part.as_object().is_some_and(|object| {
+        object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "text" | "thought" | "thoughtSignature" | "thought_signature"
+            )
+        })
+    })
+}
+
+// Content identity is independent of JSON key order, protocol aliases, and
+// incidental signature/video metadata attached by a cumulative terminal frame.
+fn media_identity(part: &Value) -> (bool, [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
+    let file = part.get("fileData").or_else(|| part.get("file_data"));
+    let data = inline
+        .and_then(|value| value.get("data"))
+        .or_else(|| file.and_then(|value| value.get("fileUri").or_else(|| value.get("file_uri"))))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    (inline.is_none(), Sha256::digest(data.as_bytes()).into())
 }
 
 // Native signed parts must round-trip without moving their signature onto

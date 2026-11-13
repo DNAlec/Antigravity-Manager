@@ -41,3 +41,23 @@ pub(crate) fn has_candidate_finish(candidate: &serde_json::Value) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|s| !s.is_empty() && s != "FINISH_REASON_UNSPECIFIED")
 }
+
+/// Both inline media and provider-hosted files are visible Gemini output.
+pub(crate) fn has_media(part: &serde_json::Value) -> bool {
+    ["inlineData", "inline_data", "fileData", "file_data"]
+        .iter()
+        .any(|key| part.get(*key).is_some())
+}
+
+/// Error/refusal terminals finish transport, but cannot authorize replaying
+/// partial reasoning. A model output limit is a valid resumable truncation.
+pub(crate) fn has_successful_candidate_finish(candidate: &serde_json::Value) -> bool {
+    has_candidate_finish(candidate)
+        && matches!(
+            candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("STOP" | "MAX_TOKENS")
+        )
+}

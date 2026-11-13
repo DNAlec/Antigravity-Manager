@@ -164,22 +164,30 @@ pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
-/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
-///
-/// 用于处理嵌套结构和非标准位置的 cache_control。
-/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
+/// Strip cache hints only from protocol envelopes. Tool schemas, arguments,
+/// and result payloads are caller-owned JSON and may use the same property name.
 fn deep_clean_cache_control(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            if map.remove("cache_control").is_some() {
-                tracing::debug!("[DEBUG-593] Removed cache_control from nested JSON object");
-            }
-            for (_, v) in map.iter_mut() {
-                deep_clean_cache_control(v);
+            map.remove("cache_control");
+            map.remove("prompt_cache_breakpoint");
+            for key in [
+                "request",
+                "contents",
+                "systemInstruction",
+                "parts",
+                "tools",
+                "functionDeclarations",
+                "functionCall",
+                "functionResponse",
+            ] {
+                if let Some(child) = map.get_mut(key) {
+                    deep_clean_cache_control(child);
+                }
             }
         }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
+        Value::Array(items) => {
+            for item in items {
                 deep_clean_cache_control(item);
             }
         }
@@ -713,10 +721,7 @@ pub fn transform_claude_request_in_timed(
 
     crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
 
-    // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
-    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
     deep_clean_cache_control(&mut body);
-    tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
     // [DEFENSE] 净化所有 contents 中的 inlineData，过滤或降级空数据/损坏数据
     if let Some(inner) = body.get_mut("request") {
@@ -1657,6 +1662,7 @@ fn build_tools(
                 "type": "object",
                 "properties": {}
             }));
+            crate::proxy::common::json_schema::validate_tool_schema(&input_schema)?;
             crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
             crate::proxy::mappers::openai::request::enforce_uppercase_types(&mut input_schema);
 
@@ -1813,6 +1819,45 @@ use crate::proxy::mappers::common_utils::is_model_compatible;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_cache_hints_do_not_erase_tool_business_fields() {
+        for color in ["red", "blue"] {
+            let req:ClaudeRequest=serde_json::from_value(json!({
+                "model":"claude-sonnet-4-6",
+                "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
+                    "cache_control":{"type":"string"},"choice":{"anyOf":[{"type":"string"},{"type":"integer"}]},
+                    "items":{"type":"array","minItems":2,"items":{"type":"string"}}
+                },"required":["cache_control","choice"]}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"inspect","input":{"cache_control":color,"choice":3}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"done"}]}]
+            })).unwrap();
+            let body =
+                transform_claude_request_in(&req, "p", false, None, "r19-schema", None).unwrap();
+            let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+            assert_eq!(schema["properties"]["cache_control"]["type"], "STRING");
+            assert_eq!(
+                schema["properties"]["choice"]["anyOf"],
+                json!([{"type":"STRING"},{"type":"INTEGER"}])
+            );
+            assert_eq!(schema["properties"]["items"]["minItems"], 2);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("cache_control")));
+            let parts: Vec<_> = body["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|t| t["parts"].as_array().unwrap())
+                .collect();
+            let call = parts.iter().find_map(|p| p.get("functionCall")).unwrap();
+            assert_eq!(call["args"]["cache_control"], color);
+            assert_eq!(call["args"]["choice"], 3);
+            assert!(parts.iter().all(|p| p.get("cache_control").is_none()));
+        }
+    }
+
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::ThinkingBudgetConfig;
@@ -2054,7 +2099,7 @@ mod tests {
         // Check removed fields
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("additionalProperties").is_none());
-        assert!(schema["properties"]["location"].get("minLength").is_none());
+        assert_eq!(schema["properties"]["location"]["minLength"], 1);
         assert!(schema["properties"]["unit"].get("default").is_none());
         assert!(schema["properties"]["date"].get("format").is_none());
 
@@ -3179,17 +3224,31 @@ mod tests {
             tool_choice: None,
         };
 
-        let result =
+        let mut result =
             transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
                 .expect("Transform should succeed");
 
+        crate::proxy::thinking_store::finalize_request_text_context(
+            "",
+            result["request"]["contents"].as_array_mut().unwrap(),
+            "claude-sonnet-4-6",
+            true,
+            false,
+        );
         let contents = result["request"]["contents"]
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        // 新规则：无签名思考块出站前丢弃，仅保留正文
-        assert_eq!(assistant_parts.len(), 1);
-        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
+        // The final pipeline preserves unsigned reasoning as ordinary text.
+        assert_eq!(assistant_parts.len(), 2);
+        assert_eq!(
+            assistant_parts[0]["text"],
+            "Considering the question deeply..."
+        );
+        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
+        assert!(assistant_parts
+            .iter()
+            .all(|part| part.get("thought").is_none() && part.get("thoughtSignature").is_none()));
     }
 
     #[test]

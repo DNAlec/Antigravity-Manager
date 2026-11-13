@@ -27,6 +27,32 @@ use axum::http::HeaderMap;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 
+fn validate_gemini_tool_schemas(body: &Value) -> Result<(), String> {
+    let request = body.get("request").unwrap_or(body);
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            if let Some(declarations) = tool
+                .get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array)
+            {
+                for declaration in declarations {
+                    for key in [
+                        "parameters",
+                        "parametersJsonSchema",
+                        "parameters_json_schema",
+                    ] {
+                        if let Some(schema) = declaration.get(key) {
+                            crate::proxy::common::json_schema::validate_tool_schema(schema)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
 pub async fn handle_generate(
@@ -42,6 +68,8 @@ pub async fn handle_generate(
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let clean_start = std::time::Instant::now();
+
+    validate_gemini_tool_schemas(&body).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
     // 解析 model:method
     let (model_name, method) = if let Some((m, action)) = model_action.rsplit_once(':') {
@@ -1891,4 +1919,28 @@ pub async fn execute_count_tokens(
         Json(json!({ "totalTokens": total_tokens })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod r19_schema_validation_tests {
+    use super::validate_gemini_tool_schemas;
+    use serde_json::json;
+
+    #[test]
+    fn rejects_ambiguous_tool_union_before_native_wrapping() {
+        for field in ["parameters", "parametersJsonSchema"] {
+            for wrapped in [false, true] {
+                let tool = json!({"name":"lookup",field:{"type":"object","properties":{"value":{"oneOf":[{"type":"number"},{"type":"integer"}]}}}});
+                let body = json!({"tools":[{"functionDeclarations":[tool]}]});
+                let body = if wrapped {
+                    json!({"request":body})
+                } else {
+                    body
+                };
+                assert!(validate_gemini_tool_schemas(&body).is_err());
+            }
+        }
+        let valid = json!({"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object","properties":{"oneOf":{"type":"string"},"value":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}]}]});
+        assert!(validate_gemini_tool_schemas(&valid).is_ok());
+    }
 }

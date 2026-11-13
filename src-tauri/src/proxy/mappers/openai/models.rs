@@ -148,6 +148,8 @@ pub enum OpenAIContentBlock {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: OpenAIImageUrl },
+    #[serde(rename = "file")]
+    File { file: OpenAIInputFile },
     #[serde(rename = "audio_url")]
     AudioUrl { audio_url: AudioUrlContent },
     // [NEW] OpenAI 官方多模态音频入参: {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
@@ -156,6 +158,73 @@ pub enum OpenAIContentBlock {
     // [NEW] 视频多模态输入: {"type":"video_url","video_url":{"url":"..."}}
     #[serde(rename = "video_url")]
     VideoUrl { video_url: OpenAIVideoUrl },
+}
+
+/// A representable Responses document, independent of an external Files API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAIInputFile {
+    pub file_data: Option<String>,
+    pub file_url: Option<String>,
+    pub filename: Option<String>,
+    #[serde(default, alias = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+impl OpenAIInputFile {
+    pub fn to_gemini_part(&self) -> Option<Value> {
+        let inferred = || {
+            let source = self
+                .filename
+                .as_deref()
+                .or(self.file_url.as_deref())
+                .unwrap_or_default();
+            let path = source
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(source)
+                .to_ascii_lowercase();
+            match path.rsplit('.').next().unwrap_or_default() {
+                "pdf" => "application/pdf",
+                "txt" | "md" => "text/plain",
+                "csv" => "text/csv",
+                "json" => "application/json",
+                "html" | "htm" => "text/html",
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                _ => "application/octet-stream",
+            }
+        };
+        match (self.file_data.as_deref(), self.file_url.as_deref()) {
+            (Some(source), None) if !source.is_empty() => {
+                let (mime, data) = if let Some(source) = source.strip_prefix("data:") {
+                    let (header, data) = source.split_once(',')?;
+                    let mime = header.strip_suffix(";base64")?;
+                    if mime.is_empty() {
+                        return None;
+                    }
+                    (mime, data)
+                } else {
+                    (self.mime_type.as_deref().unwrap_or_else(inferred), source)
+                };
+                if data.is_empty() {
+                    return None;
+                }
+                Some(json!({"inlineData":{"mimeType":mime,"data":data}}))
+            }
+            (None, Some(uri)) => {
+                let parsed = url::Url::parse(uri).ok()?;
+                if !matches!(parsed.scheme(), "http" | "https" | "gs")
+                    || parsed.host_str().is_none()
+                {
+                    return None;
+                }
+                Some(
+                    json!({"fileData":{"fileUri":uri,"mimeType":self.mime_type.as_deref().unwrap_or_else(inferred)}}),
+                )
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

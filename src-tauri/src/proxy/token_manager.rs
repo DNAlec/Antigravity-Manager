@@ -8933,6 +8933,7 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::SchedulingMode;
     use std::cmp::Ordering;
     use std::time::Duration;
 

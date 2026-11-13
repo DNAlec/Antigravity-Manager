@@ -107,7 +107,7 @@ pub trait ProtocolStreamHandler: Send + 'static {
         Bytes::from(": ping\n\n")
     }
 
-    /// 可选钩子：流终止前提交会话状态（如 thinking_acc.commit(session_id)）
+    /// Commit successful upstream state only; failed or interrupted streams never call this hook.
     fn on_finish(&mut self) {}
 }
 
@@ -552,7 +552,6 @@ where
 
         // 协议守卫：如果因错误退出，严格禁止追加发送终结帧，防止破坏客户端状态机
         if error_emitted {
-            handler.on_finish();
             return;
         }
 
@@ -574,7 +573,6 @@ where
                 for out_chunk in chunks { yield Ok(out_chunk); }
                 if let Some(error) = failure {
                     if !emitted_error_frame { yield Err(error); }
-                    handler.on_finish();
                     return;
                 }
             }
@@ -603,7 +601,6 @@ where
                 report.client_message()
             );
             yield Err(report.client_message());
-            handler.on_finish();
             return;
         }
 
@@ -624,7 +621,9 @@ where
             }
         }
 
-        handler.on_finish();
+        if abnormal_error_report.is_none() {
+            handler.on_finish();
+        }
     })
 }
 
@@ -1105,3 +1104,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "stream_completion_tests.rs"]
+mod stream_completion_tests;

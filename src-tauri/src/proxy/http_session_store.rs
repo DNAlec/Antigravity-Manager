@@ -65,8 +65,15 @@ impl HttpSessionStore {
     }
 
     fn get(&mut self, response_id: &str) -> Option<(HttpSessionEntry, SessionParent)> {
+        let now = Instant::now();
+        if self.sessions.get(response_id).is_some_and(|stored| {
+            now.duration_since(stored.last_accessed) >= Duration::from_secs(SESSION_TTL_SECS)
+        }) {
+            self.sessions.remove(response_id);
+            return None;
+        }
         let stored = self.sessions.get_mut(response_id)?;
-        stored.last_accessed = Instant::now();
+        stored.last_accessed = now;
         let node = stored.node.clone();
         Some((
             HttpSessionEntry {
@@ -254,6 +261,27 @@ pub(crate) fn media_placeholder(part: &serde_json::Map<String, Value>) -> Option
     use sha2::{Digest, Sha256};
     let label = match part.get("type")?.as_str()? {
         "input_image" | "image_url" => "[historical image omitted]",
+        "input_file"
+            if ["file_data", "file_url", "file_id"].iter().any(|key| {
+                part.get(*key)
+                    .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            }) =>
+        {
+            "[historical file omitted]"
+        }
+        "file"
+            if part
+                .get("file")
+                .and_then(Value::as_object)
+                .is_some_and(|file| {
+                    ["file_data", "file_url", "file_id"].iter().any(|key| {
+                        file.get(*key)
+                            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    })
+                }) =>
+        {
+            "[historical file omitted]"
+        }
         "input_audio" | "audio" | "audio_url" => "[historical audio omitted]",
         _ => return None,
     };
@@ -301,7 +329,54 @@ fn same_replay_content(old: &Value, new: &Value) -> bool {
         (Value::Object(a), Value::Object(b)) if a.contains_key("_am_media_digest") => {
             media_placeholder(b).as_ref() == Some(old)
         }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.get(key)
+                        .is_some_and(|other| same_replay_content(value, other))
+                })
+        }
         _ => false,
+    }
+}
+
+/// References identify an existing entity; they must never replace its body.
+/// Only resolve within the supplied parent and this request, never a global cache.
+pub fn resolve_input_references(
+    history: &[Value],
+    incoming: Vec<Value>,
+) -> Result<Vec<Value>, String> {
+    let reset_parent = incoming.iter().any(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("compaction" | "compaction_summary")
+        )
+    });
+    let history = if reset_parent { &[][..] } else { history };
+    let known: std::collections::HashSet<&str> = history
+        .iter()
+        .chain(&incoming)
+        .filter(|item| item["type"] != "item_reference")
+        .filter_map(|item| item["id"].as_str().filter(|id| !id.is_empty()))
+        .collect();
+    for item in &incoming {
+        if item["type"] == "item_reference"
+            && !item["id"].as_str().is_some_and(|id| known.contains(id))
+        {
+            return Err("Referenced input item was not found in this conversation".to_owned());
+        }
+    }
+    Ok(incoming
+        .into_iter()
+        .filter(|item| item["type"] != "item_reference")
+        .collect())
+}
+
+fn replay_payload_field(item: &Value) -> Option<&'static str> {
+    match item["type"].as_str() {
+        Some("function_call_output" | "custom_tool_call_output") => Some("output"),
+        None | Some("message") if item.get("role").is_some() => Some("content"),
+        _ => None,
     }
 }
 
@@ -342,17 +417,24 @@ pub fn prepare_session_input_with_storage(
         if let (Some(old_id), Some(new_id)) = (item_id(old), item_id(new)) {
             return old_id == new_id;
         }
-        // Only messages have role/content semantics. Tool outputs with different
-        // call_ids and arguments must not match just because neither has content.
-        let message = |v: &Value| {
-            v.get("role").is_some()
-                && v.get("type").is_none_or(|ty| ty == "message")
-                && v.get("content").is_some()
+        let Some(field) = replay_payload_field(old) else {
+            return false;
         };
-        message(old)
-            && message(new)
-            && old["role"] == new["role"]
-            && same_replay_content(&old["content"], &new["content"])
+        if replay_payload_field(new) != Some(field) {
+            return false;
+        }
+        let same_identity = if field == "output" {
+            old["type"] == new["type"]
+                && old["call_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && new["call_id"] == id)
+        } else {
+            old["role"] == new["role"]
+        };
+        same_identity
+            && old.get(field).is_some()
+            && new.get(field).is_some()
+            && same_replay_content(&old[field], &new[field])
     };
     let mut replayed = 0;
     if !reset_parent && !history.is_empty() {
@@ -388,11 +470,16 @@ pub fn prepare_session_input_with_storage(
     for (old, mut new) in history[start..].iter_mut().zip(incoming.by_ref()) {
         // Only upgrade verified, equivalent content; ID-based deduplication alone
         // does not authorize replacing an existing message with edited content.
-        if old.get("content").is_some()
-            && old["content"] != new["content"]
-            && same_replay_content(&old["content"], &new["content"])
-        {
-            old["content"] = new["content"].take();
+        if let Some(field) = replay_payload_field(old) {
+            let same_identity = field != "output"
+                || (old["type"] == new["type"] && old["call_id"] == new["call_id"]);
+            if same_identity
+                && old.get(field).is_some()
+                && old[field] != new[field]
+                && same_replay_content(&old[field], &new[field])
+            {
+                old[field] = new[field].take();
+            }
         }
     }
     let new_items: Vec<Value> = incoming.collect();
@@ -939,5 +1026,124 @@ mod continuation_delta_tests {
             prepare_session_input(vec![first.clone()], vec![next.clone()], &Default::default());
         assert_eq!(prep.merged, vec![first, next.clone()]);
         assert_eq!(prep.delta, vec![next]);
+    }
+}
+
+#[cfg(test)]
+mod r19_regressions {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn expired_cursor_cannot_be_revived_by_reading() {
+        let mut store = HttpSessionStore::new();
+        store.insert_delta(
+            "expired".into(),
+            None,
+            vec![json!({"role":"user","content":"old"})],
+            vec![],
+            String::new(),
+            "g".into(),
+            None,
+        );
+        store.sessions.get_mut("expired").unwrap().last_accessed =
+            Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        assert!(store.get("expired").is_none());
+        assert!(!store.sessions.contains_key("expired"));
+    }
+
+    #[test]
+    fn tool_replay_restores_output_media_with_and_without_item_ids() {
+        for ty in ["function_call_output", "custom_tool_call_output"] {
+            for has_id in [false, true] {
+                for nested in [false, true] {
+                    let image =
+                        json!({"type":"input_image","image_url":"data:image/png;base64,AQ=="});
+                    let parts = json!([{"type":"input_text","text":"dot"}, image]);
+                    let mut output = json!({"type":ty,"call_id":"call-one","output":if nested {json!({"content":parts})} else {parts}});
+                    if has_id {
+                        output["id"] = json!("output-one");
+                    }
+                    let mut old = output.clone();
+                    let placeholder = media_placeholder(image.as_object().unwrap()).unwrap();
+                    if nested {
+                        old["output"]["content"][1] = placeholder;
+                    } else {
+                        old["output"][1] = placeholder;
+                    }
+                    let first = json!({"role":"user","content":"inspect"});
+                    let next = json!({"role":"user","content":"continue"});
+                    let restored = prepare_session_input_with_storage(
+                        vec![first.clone(), old],
+                        vec![first.clone(), output.clone(), next.clone()],
+                        &Default::default(),
+                        true,
+                    );
+                    assert_eq!(restored.merged, vec![first, output, next]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_replay_never_matches_a_different_call_or_changed_image() {
+        let first = json!({"role":"user","content":"inspect"});
+        let image = json!({"type":"input_image","image_url":"data:image/png;base64,AQ=="});
+        let old = json!({"type":"function_call_output","call_id":"one","output":[media_placeholder(image.as_object().unwrap()).unwrap()]});
+        for incoming in [
+            json!({"type":"function_call_output","call_id":"two","output":[image]}),
+            json!({"type":"function_call_output","call_id":"one","output":[{"type":"input_image","image_url":"data:image/png;base64,Ag=="}]}),
+        ] {
+            let result = prepare_session_input(
+                vec![first.clone(), old.clone()],
+                vec![first.clone(), incoming.clone()],
+                &Default::default(),
+            );
+            assert!(result.merged.contains(&old));
+            assert!(result.merged.contains(&incoming));
+        }
+    }
+
+    #[test]
+    fn business_file_records_are_not_protocol_media_placeholders() {
+        for record in [
+            json!({"type":"file","name":"report.pdf","size":12}),
+            json!({"type":"input_file","name":"report.pdf","size":12}),
+        ] {
+            assert!(media_placeholder(record.as_object().unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn compaction_cannot_resolve_references_from_the_discarded_parent() {
+        let parent =
+            vec![json!({"type":"message","id":"answer","role":"assistant","content":"seven"})];
+        let incoming = vec![
+            json!({"type":"compaction_summary","id":"compact"}),
+            json!({"type":"item_reference","id":"answer"}),
+        ];
+        assert!(resolve_input_references(&parent, incoming).is_err());
+    }
+
+    #[test]
+    fn known_item_reference_keeps_parent_entity_and_unknown_reference_fails() {
+        let answer = json!({"id":"answer","type":"message","role":"assistant","content":"seven"});
+        let parent = vec![answer.clone(), json!({"role":"user","content":"next"})];
+        let input = resolve_input_references(
+            &parent,
+            vec![
+                json!({"type":"item_reference","id":"answer"}),
+                json!({"role":"user","content":"explain"}),
+            ],
+        )
+        .unwrap();
+        let merged = prepare_session_input(parent, input, &Default::default()).merged;
+        assert!(merged.contains(&answer));
+        assert!(!merged.iter().any(|item| item["type"] == "item_reference"));
+        assert!(resolve_input_references(
+            &[],
+            vec![json!({"type":"item_reference","id":"missing"})]
+        )
+        .is_err());
     }
 }
