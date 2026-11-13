@@ -470,7 +470,8 @@ struct CacheEntry<T> {
 /// Specialized entry for session-based signatures to track message count
 #[derive(Clone, Debug)]
 struct SessionSignatureEntry {
-    signature: String,
+    // None marks a multi-candidate turn: no session-wide branch was selected.
+    signature: Option<String>,
     message_count: usize,
 }
 
@@ -1153,7 +1154,10 @@ impl SignatureCache {
                 None => true,
                 Some(existing) => {
                     // Same message count: only update if the new signature is longer (more complete)
-                    signature.len() > existing.signature.len()
+                    existing
+                        .signature
+                        .as_ref()
+                        .is_some_and(|old| signature.len() > old.len())
                 }
             };
 
@@ -1167,7 +1171,7 @@ impl SignatureCache {
                 entry.data.insert(
                     message_count,
                     SessionSignatureEntry {
-                        signature,
+                        signature: Some(signature),
                         message_count,
                     },
                 );
@@ -1190,6 +1194,28 @@ impl SignatureCache {
         }
     }
 
+    /// A multi-candidate turn cannot endorse a single signature, even when
+    /// siblings share visible content. Block weaker hints at this depth
+    /// without deleting later concurrent turns or changing stored generations.
+    pub(crate) fn mark_multi_candidate_turn(&self, session_id: &str, message_count: usize) {
+        if let Ok(mut cache) = self.session_signatures.lock() {
+            if cache.len() > SESSION_CACHE_LIMIT {
+                cache.retain(|_, v| !v.is_expired());
+            }
+            let entry = cache
+                .entry(session_id.to_owned())
+                .or_insert_with(|| CacheEntry::new(HashMap::new()));
+            entry.timestamp = SystemTime::now();
+            entry.data.insert(
+                message_count,
+                SessionSignatureEntry {
+                    signature: None,
+                    message_count,
+                },
+            );
+        }
+    }
+
     /// Retrieve the latest thinking signature for a session.
     /// Returns None if not found or expired.
     pub fn get_session_signature(&self, session_id: &str) -> Option<String> {
@@ -1203,9 +1229,9 @@ impl SignatureCache {
                             "[SignatureCache] Session {} (latest, msg_count={}) -> HIT (len={})",
                             session_id,
                             sig_entry.message_count,
-                            sig_entry.signature.len()
+                            sig_entry.signature.as_ref().map_or(0, String::len)
                         );
-                        return Some(sig_entry.signature.clone());
+                        return sig_entry.signature.clone();
                     }
                 } else {
                     tracing::debug!("[SignatureCache] Session {} -> EXPIRED", session_id);
@@ -1242,9 +1268,9 @@ impl SignatureCache {
                             "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",
                             session_id,
                             message_count,
-                            sig_entry.signature.len()
+                            sig_entry.signature.as_ref().map_or(0, String::len)
                         );
-                        return Some(sig_entry.signature.clone());
+                        return sig_entry.signature.clone();
                     }
                 }
             }

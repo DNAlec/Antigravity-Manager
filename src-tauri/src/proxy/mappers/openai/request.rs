@@ -72,13 +72,13 @@ fn should_preserve_tool_output(tool_name: &str, output: &str) -> bool {
         || output.contains("Expected update hunk")
 }
 
-fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String {
+pub(crate) fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String {
     let child = child_name.trim();
     let ns = namespace_name.trim();
     if child.is_empty() || ns.is_empty() || child.starts_with("mcp__") {
         return child.to_string();
     }
-    if child.starts_with(ns) {
+    if child.strip_prefix(ns).is_some_and(|rest| ns.ends_with("__") || rest.starts_with("__")) {
         return child.to_string();
     }
     if ns.ends_with("__") {
@@ -125,6 +125,93 @@ fn flatten_tools(tools: &[Value]) -> Vec<Value> {
         }
     }
     flat
+}
+
+/// Resolve the Responses wire type by the qualified name actually sent to
+/// Gemini. Keep all declared functions as negative entries too: a function
+/// called "shell" is still a function even when its only parameter is input.
+#[derive(Clone, Default)]
+pub struct ResponsesToolKinds {
+    declarations_present: bool,
+    // Qualified Gemini name -> (wire name, explicitly declared namespace, kind).
+    declarations: std::collections::HashMap<String, (String, Option<String>, bool)>,
+}
+
+impl ResponsesToolKinds {
+    pub fn from_tools(tools: Option<&[Value]>) -> Self {
+        fn collect(tools: &[Value], namespaces: &mut Vec<String>, result: &mut ResponsesToolKinds) {
+            for tool in tools {
+                if tool["type"] == "namespace" {
+                    if let (Some(ns), Some(children)) =
+                        (tool["name"].as_str(), tool["tools"].as_array())
+                    {
+                        namespaces.push(ns.to_owned());
+                        collect(children, namespaces, result);
+                        namespaces.pop();
+                    }
+                } else if let Some(name) = tool["function"]["name"]
+                    .as_str()
+                    .or_else(|| tool["name"].as_str())
+                {
+                    let qualified = namespaces.iter().rev().fold(name.to_owned(), |child, ns| {
+                        qualify_namespace_tool_name(ns, &child)
+                    });
+                    let namespace = namespaces
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .reduce(|child, ns| qualify_namespace_tool_name(&ns, &child));
+                    result.declarations.insert(
+                        qualified,
+                        (name.to_owned(), namespace, tool["type"] == "custom"),
+                    );
+                }
+            }
+        }
+        let tools = tools.unwrap_or_default();
+        let mut result = Self {
+            declarations_present: !tools.is_empty(),
+            declarations: Default::default(),
+        };
+        collect(tools, &mut Vec::new(), &mut result);
+        result
+    }
+    pub(crate) fn wire_identity(&self, name: &str) -> Option<(String, Option<String>, bool)> {
+        self.declarations_present.then(|| {
+            self.declarations
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| (name.to_owned(), None, false))
+        })
+    }
+}
+
+// Responses free-form custom tool input is represented in Gemini by one
+// required string. Preserve its grammar as instructions, never as structured
+// business arguments or persisted wire data.
+fn gemini_custom_tool_declaration(tool: &Value) -> Option<Value> {
+    if tool["type"] != "custom" {
+        return None;
+    }
+    let name = tool.get("name")?.as_str()?;
+    let mut decl = json!({"name":name,"parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}});
+    let description = tool["description"].as_str().unwrap_or_default();
+    if let Some(definition) = tool
+        .pointer("/format/definition")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let syntax = tool
+            .pointer("/format/syntax")
+            .and_then(Value::as_str)
+            .unwrap_or("custom");
+        decl["description"] = json!(format!(
+            "{description}\nFree-form input must follow this {syntax} grammar:\n{definition}"
+        ));
+    } else if !description.is_empty() {
+        decl["description"] = json!(description);
+    }
+    Some(decl)
 }
 
 pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections::HashSet<String> {
@@ -175,6 +262,31 @@ pub fn transform_openai_request(
     )
 }
 
+// Responses reasoning summaries are protocol metadata. A non-thinking target
+// must never see a summary as part of the visible assistant answer. Preserve
+// the older Chat fallback for clients that intentionally rely on it.
+fn openai_history_reasoning_part(
+    msg: &OpenAIMessage,
+    thinking: bool,
+    responses: bool,
+) -> Option<Value> {
+    let text = msg.reasoning_content.as_deref()?.trim();
+    if text.is_empty() || crate::proxy::thinking_store::is_placeholder_thought(text) {
+        return None;
+    }
+    if thinking {
+        let mut part = json!({"text":text,"thought":true});
+        if let Some(signature) = &msg.signature {
+            part["thoughtSignature"] = json!(signature);
+        }
+        Some(part)
+    } else if responses {
+        None
+    } else {
+        Some(json!({"text":text}))
+    }
+}
+
 pub fn transform_openai_request_with_session(
     request: &OpenAIRequest,
     project_id: &str,
@@ -182,7 +294,7 @@ pub fn transform_openai_request_with_session(
     token: Option<&ProxyToken>,
     routing_session_id: &str,
     signature_read_key: Option<&str>,
-    _is_responses_api: bool,
+    is_responses_api: bool,
     is_retry: bool,
 ) -> (Value, String, usize, String) {
     let remember_cwd =
@@ -437,35 +549,11 @@ pub fn transform_openai_request_with_session(
 
             let mut parts = Vec::new();
 
-            let client_reasoning = msg
-                .reasoning_content
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-
             if role == "model" {
-                // [2026-09-27] 占位/缺失 reasoning 不再写 "..." 思考块。
-                // 官方样本 9/24 轮是「无思考块 + 锚点带签名」，空/占位思考不出站；
-                // 签名归位由流水线终审 place_turn_signature 按锚点规则处理。
-                if actual_include_thinking {
-                    if let Some(rc) = client_reasoning {
-                        if !crate::proxy::thinking_store::is_placeholder_thought(rc) {
-                            // 纯净线缆透传：客户端若自带签名则无损透传；缺失签名全权委托流水线统一对齐与回填
-                            let mut thought_part = json!({
-                                "text": rc,
-                                "thought": true,
-                            });
-                            if let Some(ref sig) = msg.signature {
-                                thought_part["thoughtSignature"] = json!(sig);
-                            }
-                            parts.push(thought_part);
-                        }
-                    }
-                } else if let Some(rc) = client_reasoning {
-                    // 思考关闭时，非占位思考降级为普通文本；占位/空直接跳过
-                    if !crate::proxy::thinking_store::is_placeholder_thought(rc) {
-                        parts.push(json!({ "text": rc }));
-                    }
+                if let Some(part) =
+                    openai_history_reasoning_part(msg, actual_include_thinking, is_responses_api)
+                {
+                    parts.push(part);
                 }
             }
 
@@ -855,7 +943,7 @@ pub fn transform_openai_request_with_session(
     // 并不要求严格交替；实测（2026-09-26，`gemini-3.8-flash-tiered` @ daily）
     // 两种形态均 200 且上下文理解一致。
     let mut merged_contents = contents;
-    crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+    crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
         &mut merged_contents,
         mapped_model,
         actual_include_thinking,
@@ -1108,7 +1196,9 @@ pub fn transform_openai_request_with_session(
         if let Some(original_tools) = &request.tools {
             let tools = flatten_tools(original_tools);
             for tool in tools.iter() {
-                let mut gemini_func = if let Some(func) = tool.get("function") {
+                let mut gemini_func = if let Some(custom) = gemini_custom_tool_declaration(tool) {
+                    custom
+                } else if let Some(func) = tool.get("function") {
                     func.clone()
                 } else {
                     let mut func = tool.clone();
@@ -1393,6 +1483,44 @@ pub fn enforce_uppercase_types(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_custom_tool_and_ordinary_shell_keep_distinct_gemini_schemas() {
+        let req:OpenAIRequest=serde_json::from_value(json!({
+            "model":"gemini-pro","messages":[{"role":"user","content":"Read"}],
+            "tools":[{"type":"namespace","name":"scope","tools":[{"type":"custom","name":"mytool","description":"Use this tool","format":{"type":"grammar","syntax":"lark","definition":"start: WORD"}}]},
+                {"type":"function","name":"shell","parameters":{"type":"object","properties":{"input":{"type":"integer"}},"required":["input"]}}]
+        })).unwrap();
+        let (body, _, _, _) = transform_openai_request_with_session(
+            &req,
+            "project",
+            "gemini-3-pro",
+            None,
+            "scope",
+            None,
+            true,
+            false,
+        );
+        let tools = body
+            .pointer("/request/tools/0/functionDeclarations")
+            .expect("actual Gemini declarations");
+        let custom = &tools[0];
+        assert_eq!(custom["name"], "scope__mytool");
+        assert_eq!(
+            custom["parameters"]["properties"]["input"]["type"],
+            "STRING"
+        );
+        assert_eq!(custom["parameters"]["required"], json!(["input"]));
+        assert!(custom["description"]
+            .as_str()
+            .unwrap()
+            .contains("start: WORD"));
+        assert_eq!(tools[1]["name"], "shell");
+        assert_eq!(
+            tools[1]["parameters"]["properties"]["input"]["type"],
+            "INTEGER"
+        );
+    }
 
     #[test]
     fn test_openai_aliases_max_completion_tokens_and_reasoning_max_tokens() {
@@ -3442,6 +3570,30 @@ mod tests {
         assert_eq!(
             fc_part["thoughtSignature"], valid_gemini_sig,
             "OpenAI adapter and pipeline must recover real tool signature from SignatureCache"
+        );
+    }
+}
+
+#[cfg(test)]
+mod responses_reasoning_replay_tests {
+    use super::*;
+    #[test]
+    fn separate_reasoning_is_never_downgraded_to_answer_text_on_responses() {
+        let msg: OpenAIMessage = serde_json::from_value(json!({"role":"assistant","content":"Visible answer","reasoning_content":"Distinct summary","thoughtSignature":"distinct-signature"})).unwrap();
+        assert_eq!(openai_history_reasoning_part(&msg, false, true), None);
+        assert_eq!(
+            openai_history_reasoning_part(&msg, true, true),
+            Some(
+                json!({"text":"Distinct summary","thought":true,"thoughtSignature":"distinct-signature"})
+            )
+        );
+        assert_eq!(
+            openai_history_reasoning_part(&msg, false, false),
+            Some(json!({"text":"Distinct summary"}))
+        );
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap()["content"],
+            "Visible answer"
         );
     }
 }

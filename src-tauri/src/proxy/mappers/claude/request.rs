@@ -195,75 +195,29 @@ fn deep_clean_cache_control(value: &mut Value) {
 /// thinking/redacted_thinking blocks always come before other block types.
 fn sort_thinking_blocks_first(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if msg.role == "assistant" {
-            if let MessageContent::Array(blocks) = &mut msg.content {
-                // [FIX #709] Triple-stage partition: [Thinking, Text, ToolUse]
-                // This ensures protocol compliance while maintaining logical order.
-
-                let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
-                let mut text_blocks: Vec<ContentBlock> = Vec::new();
-                let mut tool_blocks: Vec<ContentBlock> = Vec::new();
-                let mut other_blocks: Vec<ContentBlock> = Vec::new();
-
-                let original_len = blocks.len();
-                let mut needs_reorder = false;
-                let mut saw_non_thinking = false;
-
-                for (_i, block) in blocks.iter().enumerate() {
-                    match block {
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            if saw_non_thinking {
-                                needs_reorder = true;
-                            }
-                        }
-                        ContentBlock::Text { .. } => {
-                            saw_non_thinking = true;
-                        }
-                        ContentBlock::ToolUse { .. } => {
-                            saw_non_thinking = true;
-                            // Check if tool is after text (this is normal, but we want a strict group order)
-                        }
-                        _ => saw_non_thinking = true,
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let MessageContent::Array(blocks) = &mut msg.content {
+            // Only thought blocks have an ordering constraint. Moving text past a
+            // tool call changes both the conversation and its cached prefix.
+            if blocks.len() <= 1 {
+                continue;
+            }
+            let mut thinking = Vec::new();
+            let mut rest = Vec::new();
+            for block in blocks.drain(..) {
+                match &block {
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                        thinking.push(block);
                     }
-                }
-
-                if needs_reorder || original_len > 1 {
-                    // For safety, we always perform the triple partition if there's more than one block.
-                    // This also handles empty text block filtering.
-                    for block in blocks.drain(..) {
-                        match &block {
-                            ContentBlock::Thinking { .. }
-                            | ContentBlock::RedactedThinking { .. } => {
-                                thinking_blocks.push(block);
-                            }
-                            ContentBlock::Text { text } => {
-                                // Filter out purely empty or structural text like "(no content)"
-                                if !text.trim().is_empty() && text != "(no content)" {
-                                    text_blocks.push(block);
-                                }
-                            }
-                            ContentBlock::ToolUse { .. } => {
-                                tool_blocks.push(block);
-                            }
-                            _ => {
-                                other_blocks.push(block);
-                            }
-                        }
-                    }
-
-                    // Reconstruct in strict order: Thinking -> Text/Other -> Tool
-                    blocks.extend(thinking_blocks);
-                    blocks.extend(text_blocks);
-                    blocks.extend(other_blocks);
-                    blocks.extend(tool_blocks);
-
-                    if needs_reorder {
-                        tracing::warn!(
-                            "[FIX #709] Reordered assistant messages to [Thinking, Text, Tool] structure."
-                        );
-                    }
+                    ContentBlock::Text { text }
+                        if text.trim().is_empty() || text == "(no content)" => {}
+                    _ => rest.push(block),
                 }
             }
+            blocks.extend(thinking);
+            blocks.extend(rest);
         }
     }
 }
@@ -999,7 +953,6 @@ fn build_contents(
             }
         }
         MessageContent::Array(blocks) => {
-            let mut turn_tool_media_parts = Vec::new();
             for item in blocks {
                 match item {
                     ContentBlock::Text { text } => {
@@ -1333,6 +1286,20 @@ fn build_contents(
                             _ => content.to_string(),
                         };
 
+                        // FunctionResponsePart accepts media, not text. Keep validation
+                        // notices with the same result instead of emitting orphan parts.
+                        extra_parts.retain(|part| {
+                            if let Some(notice) = part.get("text").and_then(Value::as_str) {
+                                if !merged_content.is_empty() {
+                                    merged_content.push('\n');
+                                }
+                                merged_content.push_str(notice);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
                         // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
                         if merged_content.trim().is_empty() {
                             if is_error.unwrap_or(false) {
@@ -1343,19 +1310,20 @@ fn build_contents(
                             }
                         }
 
-                        let part = json!({
-                            "functionResponse": {
-                                "name": func_name,
-                                "response": {"output": merged_content},
-                                "id": tool_use_id
-                            }
+                        let result_key = if is_error.unwrap_or(false) {
+                            "error"
+                        } else {
+                            "output"
+                        };
+                        let mut response = json!({
+                            "name": func_name,
+                            "response": { (result_key): merged_content },
+                            "id": tool_use_id
                         });
-
-                        // 危险测试分支法则：ToolResult (functionResponse) 绝不携带签名
-                        parts.push(part);
-
-                        // 暂存随行媒体 parts，确保同一轮中所有 functionResponse 置顶连续，多模态媒体统一延后追加
-                        turn_tool_media_parts.extend(extra_parts);
+                        if !extra_parts.is_empty() {
+                            response["parts"] = Value::Array(extra_parts);
+                        }
+                        parts.push(json!({ "functionResponse": response }));
 
                         // 标记状态，用于下一条 User 消息的去重判断
                         *previous_was_tool_result = true;
@@ -1368,7 +1336,6 @@ fn build_contents(
                     }
                 }
             }
-            parts.extend(turn_tool_media_parts);
         }
     }
 
@@ -1608,7 +1575,7 @@ fn build_google_contents(
         is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model);
 
     let think_start = std::time::Instant::now();
-    crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+    crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
         &mut contents,
         mapped_model,
         should_finalize_thinking,
@@ -2542,6 +2509,70 @@ mod tests {
             }
         } else {
             panic!("Expected Array content");
+        }
+    }
+
+    #[test]
+    fn test_thinking_sort_preserves_text_tool_order_and_signatures() {
+        let cases = [
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
+                {"type":"text","text":"after"}
+            ]),
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
+                {"type":"thinking","thinking":"reason","signature":"stable-signature"},
+                {"type":"text","text":"after"},
+                {"type":"redacted_thinking","data":"opaque-redacted"}
+            ]),
+        ];
+        for original in cases {
+            let expected_rest: Vec<_> = original
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| {
+                    !matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+                .cloned()
+                .collect();
+            let expected_thought: Vec<_> = original
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+                .cloned()
+                .collect();
+            let mut messages: Vec<Message> = serde_json::from_value(json!([
+                {"role":"assistant","content":original},
+                {"role":"user","content":[{"type":"text","text":"untouched"}]}
+            ]))
+            .unwrap();
+            let user_before = serde_json::to_value(&messages[1]).unwrap();
+            sort_thinking_blocks_first(&mut messages);
+            let actual = serde_json::to_value(&messages[0]).unwrap();
+            let blocks = actual["content"].as_array().unwrap();
+            assert_eq!(&blocks[expected_thought.len()..], expected_rest);
+            for (actual, expected) in blocks.iter().zip(&expected_thought) {
+                assert_eq!(actual["type"], expected["type"]);
+                assert_eq!(actual["signature"], expected["signature"]);
+                assert_eq!(actual["thinking"], expected["thinking"]);
+                assert_eq!(actual["data"], expected["data"]);
+            }
+            assert_eq!(serde_json::to_value(&messages[1]).unwrap(), user_before);
+            let once = serde_json::to_value(&messages).unwrap();
+            sort_thinking_blocks_first(&mut messages);
+            assert_eq!(serde_json::to_value(&messages).unwrap(), once);
         }
     }
 
@@ -3578,6 +3609,72 @@ mod tests {
             .any(|t| t.contains("x-anthropic-billing-header:")));
         // Normal prompt must be preserved
         assert!(system_texts.contains(&"You are a helpful assistant."));
+    }
+
+    #[test]
+    fn parallel_tool_images_and_errors_keep_the_result_identity() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        for model in [
+            "claude-sonnet-4-6",
+            "gemini-2.5-flash",
+            "gemini-3.8-flash-high",
+        ] {
+            for owner in ["a", "b"] {
+                let results = ["b", "a"].map(|id| {
+                    let mut content = vec![json!({"type":"text","text":"done"})];
+                    if id == owner {
+                        content.push(json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png}}));
+                    }
+                    json!({"type":"tool_result","tool_use_id":id, "is_error":id=="b", "content":content})
+                });
+                let req: ClaudeRequest = serde_json::from_value(json!({"model":model, "messages":[
+                    {"role":"user","content":"inspect"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"a","name":"inspect","input":{}},
+                        {"type":"tool_use","id":"b","name":"inspect","input":{}}]},
+                    {"role":"user","content":results}]}))
+                .unwrap();
+                let body = transform_claude_request_in(&req, "p", false, None, "s", None).unwrap();
+                let turns = body["request"]["contents"].as_array().unwrap();
+                let parts: Vec<_> = turns
+                    .iter()
+                    .flat_map(|turn| turn["parts"].as_array().unwrap())
+                    .collect();
+                let responses: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| p.get("functionResponse"))
+                    .collect();
+                assert_eq!(responses.len(), 2);
+                assert_eq!(responses[0]["id"], "b");
+                assert_eq!(responses[0]["response"]["error"], "done");
+                assert!(responses[0]["response"].get("output").is_none());
+                assert_eq!(responses[1]["response"]["output"], "done");
+                let nested = crate::proxy::model_specs::is_gemini_v3_or_above(model);
+                for fr in responses {
+                    if nested {
+                        assert_eq!(
+                            fr["parts"][0]["inlineData"]["data"].as_str(),
+                            (fr["id"] == owner).then_some(png)
+                        );
+                    } else {
+                        assert_eq!(
+                            fr["response"].get("attached_media_positions").is_some(),
+                            fr["id"] == owner
+                        );
+                        if fr["id"] == owner {
+                            assert_eq!(fr["response"]["attached_media_positions"], json!([1]));
+                        }
+                    }
+                }
+                assert_eq!(
+                    parts
+                        .iter()
+                        .filter(|p| p["inlineData"]["data"] == png)
+                        .count(),
+                    usize::from(!nested)
+                );
+            }
+        }
     }
 
     #[test]

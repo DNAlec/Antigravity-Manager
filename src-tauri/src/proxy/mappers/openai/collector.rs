@@ -54,6 +54,14 @@ where
                 }
 
                 if let Ok(json) = serde_json::from_str::<Value>(data_str) {
+                    if let Some(error) = crate::proxy::pipeline::stream_error::error_envelope(&json)
+                    {
+                        return Err(error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Upstream stream failed")
+                            .to_owned());
+                    }
                     // Update meta fields
                     if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
                         response.id = id.to_string();
@@ -216,7 +224,9 @@ where
         Some(calls.into_iter().map(|(_, tc)| tc).collect())
     };
 
-    let final_finish_reason = if final_tool_calls.is_some() {
+    let final_finish_reason = if final_tool_calls.is_some()
+        && matches!(finish_reason.as_deref(), None | Some("stop" | "function_call"))
+    {
         Some("tool_calls".to_string())
     } else {
         finish_reason.or(Some("stop".to_string()))

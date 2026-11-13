@@ -153,7 +153,8 @@ impl RequestRetryState {
     /// A bound account still cooling down is an intentional CacheFirst stop, not
     /// pool exhaustion. The TokenManager generates this prefix internally.
     pub fn preserve_token_error(&mut self, error: &str) {
-        self.preserve_cache_affinity = error.starts_with("CacheFirst bound account ");
+        self.preserve_cache_affinity = error.starts_with("CacheFirst bound account ")
+            || crate::proxy::session_bindings::is_session_binding_changed_error(error);
     }
 
     /// Collection may already have consumed output: preserve affinity without replaying.

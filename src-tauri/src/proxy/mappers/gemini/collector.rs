@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use tracing::debug;
+use std::collections::BTreeMap;
 
 use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::SignatureCache; // Assuming this is available at crate root or re-exported
@@ -32,7 +32,7 @@ where
 }
 
 pub async fn collect_stream_to_json_with_anchor_and_count<S, E>(
-    mut stream: S,
+    stream: S,
     session_id: &str,
     anchor: Option<&str>,
     message_count: usize,
@@ -41,22 +41,28 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    let mut collected_response = json!({
-        "candidates": [
-            {
-                "content": {
-                    "parts": [],
-                    "role": "model"
-                },
-                "finishReason": "STOP",
-                "index": 0
-            }
-        ]
-    });
+    collect_stream_to_json_with_context(stream, session_id, anchor, message_count, None).await
+}
 
-    let mut content_parts: Vec<Value> = Vec::new(); // To accumulate parts
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_stream_to_json_with_context<S, E>(
+    stream: S,
+    session_id: &str,
+    anchor: Option<&str>,
+    message_count: usize,
+    text_context_anchor: Option<String>,
+) -> Result<Value, String>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    // Route an unterminated final data line through the same content/usage path.
+    let mut stream = stream.chain(futures::stream::iter([Ok(Bytes::from("\n"))]));
+    let mut prompt_feedback = None;
+    let mut blocked_prompt = false;
+    let mut collected_response = json!({});
+    let mut grouped: BTreeMap<u64, (Value, Vec<Value>)> = BTreeMap::new();
     let mut usage_metadata: Option<Value> = None;
-    let mut finish_reason: Option<String> = None;
     let mut stream_error: Option<Value> = None;
     let mut line_buffer = bytes::BytesMut::new();
 
@@ -92,6 +98,11 @@ where
                             json
                         };
 
+                    // Counters can accompany the terminal error itself.
+                    if let Some(usage) = actual_data.get("usageMetadata") {
+                        merge_cumulative_usage(&mut usage_metadata, usage);
+                    }
+
                     // Check for error payload (e.g. 504 Deadline Exceeded, 503 Overloaded, 429)
                     if let Some(err) = actual_data.get("error") {
                         let err_val = if actual_data.as_object().is_some_and(|m| m.len() == 1) {
@@ -103,46 +114,57 @@ where
                         break;
                     }
 
-                    // 1. Capture Usage
-                    if let Some(usage) = actual_data.get("usageMetadata") {
-                        merge_cumulative_usage(&mut usage_metadata, usage);
+                    if let Some(feedback) = actual_data.get("promptFeedback") {
+                        let blocking = feedback
+                            .get("blockReason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| {
+                                !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED"
+                            });
+                        if blocking || !blocked_prompt {
+                            prompt_feedback = Some(feedback.clone());
+                        }
+                        blocked_prompt |= blocking;
                     }
 
-                    // 2. Capture Content & Signature
+                    // Capture Content & Signature
                     if let Some(candidates) =
                         actual_data.get("candidates").and_then(|c| c.as_array())
                     {
-                        if let Some(candidate) = candidates.first() {
-                            // Update finish reason if present
-                            if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str())
-                            {
-                                finish_reason = Some(fr.to_string());
+                        let Some(indices) = super::candidate_indices(candidates) else {
+                            stream_error = Some(
+                                json!({"error":{"code":502,"status":"INTERNAL","message":"Invalid or duplicate Gemini candidate index"}}),
+                            );
+                            break;
+                        };
+                        for (index, candidate) in indices.into_iter().zip(candidates) {
+                            let (meta, content_parts) = grouped.entry(index).or_insert_with(|| {
+                                (
+                                    json!({"index":index,"content":{"role":"model"}}),
+                                    Vec::new(),
+                                )
+                            });
+                            if let Some(fields) = candidate.as_object() {
+                                for (k, v) in fields {
+                                    if k == "content" {
+                                        if let Some(content) = v.as_object() {
+                                            for (k, v) in content {
+                                                if k != "parts" {
+                                                    meta["content"][k] = v.clone();
+                                                }
+                                            }
+                                        }
+                                    } else if k != "index" {
+                                        meta[k] = v.clone();
+                                    }
+                                }
                             }
-
                             if let Some(parts) = candidate
                                 .get("content")
                                 .and_then(|c| c.get("parts"))
                                 .and_then(|p| p.as_array())
                             {
                                 for part in parts {
-                                    // Signature Caching
-                                    if let Some(sig) =
-                                        part.get("thoughtSignature").and_then(|s| s.as_str())
-                                    {
-                                        // Cache it!
-                                        SignatureCache::global().cache_session_signature(
-                                            session_id,
-                                            sig.to_string(),
-                                            message_count.max(1),
-                                        );
-                                        debug!(
-                                            "[Gemini-AutoConverter] Cached signature (len: {}) for session: {} at count {}",
-                                            sig.len(),
-                                            session_id,
-                                            message_count.max(1)
-                                        );
-                                    }
-
                                     // Collect part
                                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                         let is_part_thought = part
@@ -159,8 +181,11 @@ where
                                             if !is_part_thought
                                                 && !is_last_thought
                                                 && last.get("text").is_some()
+                                                && plain_text_mergeable(last)
+                                                && plain_text_mergeable(part)
                                             {
-                                                // Merge regular text
+                                                // Merge only plain unsigned text; signatures and
+                                                // provider metadata belong to their original part.
                                                 if let Some(last_text) =
                                                     last.get_mut("text").and_then(|v| v.as_str())
                                                 {
@@ -241,40 +266,24 @@ where
         }
     }
 
-    // Flush leftover buffer if any
-    if stream_error.is_none() && !line_buffer.is_empty() {
-        let line_str = String::from_utf8_lossy(&line_buffer);
-        let line = line_str.trim();
-        if line.starts_with("data: ") {
-            let json_part = line.trim_start_matches("data: ").trim();
-            if json_part != "[DONE]" {
-                if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                    let actual_data =
-                        if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                            inner
-                        } else {
-                            json
-                        };
-                    if let Some(err) = actual_data.get("error") {
-                        let err_val = if actual_data.as_object().is_some_and(|m| m.len() == 1) {
-                            actual_data
-                        } else {
-                            json!({ "error": err })
-                        };
-                        stream_error = Some(err_val);
-                    }
-                }
-            }
-        }
-    }
-
-    // If stream contained an error event/payload, return it directly without polluting state
-    if let Some(err_val) = stream_error {
+    // Preserve measured work on failure without publishing partial content or
+    // committing it as a completed model response.
+    if let Some(mut err_val) = stream_error {
+        crate::proxy::pipeline::stream_error::attach_usage_metadata(
+            &mut err_val,
+            usage_metadata.as_ref(),
+        );
         return Ok(err_val);
     }
 
     // Stream finished without content parts or finish reason -> premature interruption
-    if content_parts.is_empty() && finish_reason.is_none() {
+    if grouped.values().all(|(m, p)| {
+        p.is_empty()
+            && m.get("finishReason")
+                .or_else(|| m.get("finish_reason"))
+                .is_none()
+    }) && !blocked_prompt
+    {
         return Err(
             crate::proxy::mappers::error_classifier::report_stream_error(
                 "gemini-collector",
@@ -286,19 +295,52 @@ where
         );
     }
 
-    if !content_parts.is_empty() {
-        let anchor_str = anchor.unwrap_or("root");
-        crate::proxy::thinking_store::capture_gemini_parts_with_anchor(
-            session_id,
-            &content_parts,
-            anchor_str,
-        );
+    // Aggregation and history use the same candidate boundaries. A branch
+    // selection has no session-wide signature authority until it is replayed.
+    let singleton = grouped.len() == 1;
+    if grouped.len() > 1 {
+        SignatureCache::global().mark_multi_candidate_turn(session_id, message_count.max(1));
     }
-
-    // Construct final response
-    collected_response["candidates"][0]["content"]["parts"] = json!(content_parts);
-    if let Some(fr) = finish_reason {
-        collected_response["candidates"][0]["finishReason"] = json!(fr);
+    let mut candidates = Vec::with_capacity(grouped.len());
+    for (_, (mut candidate, parts)) in grouped {
+        if blocked_prompt
+            && parts.is_empty()
+            && candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"))
+                .is_none()
+        {
+            continue;
+        }
+        if !parts.is_empty() && super::has_candidate_finish(&candidate) {
+            if singleton {
+                for part in &parts {
+                    if let Some(sig) = part
+                        .get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .and_then(Value::as_str)
+                    {
+                        SignatureCache::global().cache_session_signature(
+                            session_id,
+                            sig.to_owned(),
+                            message_count.max(1),
+                        );
+                    }
+                }
+            }
+            crate::proxy::thinking_store::capture_gemini_parts_with_context(
+                session_id,
+                &parts,
+                anchor.unwrap_or("root"),
+                text_context_anchor.as_deref(),
+            );
+        }
+        candidate["content"]["parts"] = Value::Array(parts);
+        candidates.push(candidate);
+    }
+    collected_response["candidates"] = Value::Array(candidates);
+    if let Some(feedback) = prompt_feedback {
+        collected_response["promptFeedback"] = feedback;
     }
     if let Some(usage) = usage_metadata {
         collected_response["usageMetadata"] = usage;
@@ -307,11 +349,118 @@ where
     Ok(collected_response)
 }
 
+// Native signed parts must round-trip without moving their signature onto
+// concatenated text. Keep other provider metadata on its original part too.
+fn plain_text_mergeable(part: &Value) -> bool {
+    part.as_object()
+        .is_some_and(|object| object.keys().all(|key| key == "text" || key == "thought"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::stream;
     use std::io;
+
+    #[tokio::test]
+    async fn signed_plain_text_parts_keep_their_original_boundaries_at_eof() {
+        for signed in [
+            json!({"text":"second","thoughtSignature":"signed-fragment"}),
+            json!({"text":"second","thought_signature":"signed-fragment"}),
+            json!({"text":"","thoughtSignature":"signature-only"}),
+            json!({"text":"second","providerMetadata":{"anchor":7}}),
+        ] {
+            for newline in ["\n\n", ""] {
+                let first =
+                    json!({"candidates":[{"content":{"parts":[{"text":"first"},signed.clone()]}}]});
+                let last = json!({"candidates":[{"content":{"parts":[{"text":"third"}]},"finishReason":"STOP"}]});
+                let wire = format!("data: {first}\n\ndata: {last}{newline}");
+                let source = stream::iter(
+                    wire.as_bytes()
+                        .chunks(3)
+                        .map(|bytes| Ok::<_, io::Error>(Bytes::copy_from_slice(bytes)))
+                        .collect::<Vec<_>>(),
+                );
+                let response = collect_stream_to_json(source, "signed-parts")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response["candidates"][0]["content"]["parts"],
+                    json!([
+                        {"text":"first"},signed,{"text":"third"}
+                    ])
+                );
+                assert_eq!(response["candidates"][0]["finishReason"], "STOP");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_prompt_json_preserves_feedback_usage_and_has_no_fake_candidate() {
+        for newline in ["\n\n", ""] {
+            let blocked = json!({"response":{"promptFeedback":{"blockReason":"SAFETY","futureField":7},
+                "usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}});
+            let trailer = json!({"usageMetadata":{"candidatesTokenCount":0},"promptFeedback":{"blockReason":"BLOCK_REASON_UNSPECIFIED"}});
+            let wire = format!("data: {blocked}\n\ndata: {trailer}{newline}");
+            let response = collect_stream_to_json(
+                stream::iter(vec![Ok::<_, io::Error>(Bytes::from(wire))]),
+                "blocked-prompt",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response["promptFeedback"],
+                blocked["response"]["promptFeedback"]
+            );
+            assert_eq!(response["candidates"], json!([]));
+            assert_eq!(
+                response["usageMetadata"],
+                json!({"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":0})
+            );
+        }
+        let response = collect_stream_to_json(
+            stream::iter(vec![Ok::<_, io::Error>(Bytes::from(
+                "data: {\"promptFeedback\":{\"blockReason\":\"BLOCK_REASON_UNSPECIFIED\"}}\n\n",
+            ))]),
+            "default-feedback",
+        )
+        .await;
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn error_frames_keep_sparse_usage_zero_and_null_with_or_without_final_newline() {
+        for trailing_newline in [false, true] {
+            let initial = json!({"response": {
+                "candidates":[{"content":{"parts":[{"text":"partial"}]}}],
+                "usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":1,"futureUsageField":{"value":7}}
+            }});
+            let error = json!({"response": {
+                "error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"},
+                "usageMetadata":{"promptTokenCount":null,"cachedContentTokenCount":0,"candidatesTokenCount":5}
+            }});
+            let wire = format!(
+                "data: {initial}\n\ndata: {error}{}",
+                if trailing_newline { "\n\n" } else { "" }
+            );
+            let chunks = wire
+                .as_bytes()
+                .chunks(3)
+                .map(|chunk| Ok::<_, io::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let response = collect_stream_to_json(stream::iter(chunks), "error-usage-test")
+                .await
+                .unwrap();
+            assert_eq!(response["error"]["code"], 503);
+            assert!(response.get("candidates").is_none());
+            assert_eq!(
+                response["usageMetadata"],
+                json!({
+                    "promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":5,"futureUsageField":{"value":7}
+                })
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_collect_sparse_cumulative_usage_preserves_cache_and_honors_zero() {

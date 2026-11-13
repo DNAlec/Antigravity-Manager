@@ -316,7 +316,7 @@ pub fn wrap_request_v2(
                 *parts = new_parts;
             }
         }
-        crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+        crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
             contents,
             &final_model_name,
             should_inject,

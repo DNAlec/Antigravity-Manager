@@ -31,6 +31,9 @@ struct SessionNode {
     instructions: String,
     model: String,
     routing_session_id: String,
+    // Only an identity actually used for this turn's account/session scope.
+    // Never promote a generated response-chain cursor to an upstream affinity.
+    scope_identity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,9 @@ pub struct SessionParent(Arc<SessionNode>);
 impl SessionParent {
     pub fn routing_session_id(&self) -> &str {
         &self.0.routing_session_id
+    }
+    pub fn scope_identity(&self) -> Option<&str> {
+        self.0.scope_identity.as_deref()
     }
 }
 
@@ -95,6 +101,29 @@ impl HttpSessionStore {
         model: String,
         routing_session_id: Option<String>,
     ) {
+        self.insert_delta_with_identity(
+            response_id,
+            parent,
+            input_delta,
+            response_output,
+            instructions,
+            model,
+            routing_session_id,
+            None,
+        )
+    }
+
+    fn insert_delta_with_identity(
+        &mut self,
+        response_id: String,
+        parent: Option<SessionParent>,
+        input_delta: Vec<Value>,
+        response_output: Vec<Value>,
+        instructions: String,
+        model: String,
+        routing_session_id: Option<String>,
+        scope_identity: Option<String>,
+    ) {
         let routing_session_id = routing_session_id.unwrap_or_else(|| response_id.clone());
         self.sessions.insert(
             response_id,
@@ -106,6 +135,7 @@ impl HttpSessionStore {
                     instructions,
                     model,
                     routing_session_id,
+                    scope_identity,
                 }),
                 last_accessed: Instant::now(),
             },
@@ -177,7 +207,30 @@ pub async fn save_session_delta(
     model: String,
     routing_session_id: String,
 ) {
-    store().lock().await.insert_delta(
+    save_session_delta_with_identity(
+        response_id,
+        parent,
+        input_delta,
+        response_output,
+        instructions,
+        model,
+        routing_session_id,
+        None,
+    )
+    .await;
+}
+
+pub async fn save_session_delta_with_identity(
+    response_id: String,
+    parent: Option<SessionParent>,
+    input_delta: Vec<Value>,
+    response_output: Vec<Value>,
+    instructions: String,
+    model: String,
+    routing_session_id: String,
+    scope_identity: Option<String>,
+) {
+    store().lock().await.insert_delta_with_identity(
         response_id,
         parent,
         input_delta,
@@ -185,6 +238,7 @@ pub async fn save_session_delta(
         instructions,
         model,
         Some(routing_session_id),
+        scope_identity,
     );
 }
 
@@ -192,6 +246,63 @@ pub struct PreparedSessionInput {
     pub merged: Vec<Value>,
     pub delta: Vec<Value>,
     pub reset_parent: bool,
+}
+
+// Keep only a bounded identity for media omitted from server-side history. Hash the
+// complete part (including MIME, detail, URL, etc.) independently of JSON key order.
+pub(crate) fn media_placeholder(part: &serde_json::Map<String, Value>) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    let label = match part.get("type")?.as_str()? {
+        "input_image" | "image_url" => "[historical image omitted]",
+        "input_audio" | "audio" | "audio_url" => "[historical audio omitted]",
+        _ => return None,
+    };
+    fn hash_map(map: &serde_json::Map<String, Value>, h: &mut Sha256) {
+        h.update(b"{");
+        let mut keys: Vec<_> = map.keys().collect();
+        keys.sort_unstable();
+        for key in keys {
+            serde_json::to_writer(&mut *h, key).expect("hash writer");
+            hash_value(&map[key], h);
+        }
+        h.update(b"}");
+    }
+    fn hash_value(v: &Value, h: &mut Sha256) {
+        match v {
+            Value::Object(m) => hash_map(m, h),
+            Value::Array(a) => {
+                h.update(b"[");
+                for v in a {
+                    hash_value(v, h);
+                    h.update(b",");
+                }
+                h.update(b"]");
+            }
+            _ => serde_json::to_writer(h, v).expect("hash writer"),
+        }
+    }
+    let mut h = Sha256::new();
+    hash_map(part, &mut h);
+    Some(
+        serde_json::json!({"type":"input_text","text":label,"_am_media_digest":format!("{:x}",h.finalize())}),
+    )
+}
+
+// A fresh transcript may contain the original media instead of our bounded
+// placeholder. Never infer equality from the generic omission text.
+fn same_replay_content(old: &Value, new: &Value) -> bool {
+    if old == new {
+        return true;
+    }
+    match (old, new) {
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_replay_content(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) if a.contains_key("_am_media_digest") => {
+            media_placeholder(b).as_ref() == Some(old)
+        }
+        _ => false,
+    }
 }
 
 /// 合并请求历史，并在客户端回放完整历史时仅提取新增项。
@@ -205,7 +316,7 @@ pub fn prepare_session_input(
 
 /// Restore the complete model input while optionally retaining a delta for storage.
 pub fn prepare_session_input_with_storage(
-    history: Vec<Value>,
+    mut history: Vec<Value>,
     new_input: Vec<Value>,
     tool_call_cache: &HashMap<String, Value>,
     retain_delta: bool,
@@ -216,104 +327,118 @@ pub fn prepare_session_input_with_storage(
             Some("compaction") | Some("compaction_summary")
         )
     });
-    let exact_replay = !history.is_empty() && new_input.starts_with(&history);
-    let replayed_through = if reset_parent || exact_replay {
-        None
-    } else {
-        let history_ids: std::collections::HashSet<&str> = history
-            .iter()
-            .filter_map(|item| item.get("id").and_then(Value::as_str))
-            .filter(|id| !id.is_empty())
-            .collect();
-        new_input.iter().rposition(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| history_ids.contains(id))
-        })
+    // A previous_response_id supplies a parent, so inputs are deltas unless we
+    // can identify a replay of the parent's prefix or an overlapping suffix.
+    // The number of new messages alone says nothing about their provenance.
+    fn item_id(item: &Value) -> Option<&str> {
+        item.get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+    let same_item = |old: &Value, new: &Value| {
+        if old == new {
+            return true;
+        }
+        if let (Some(old_id), Some(new_id)) = (item_id(old), item_id(new)) {
+            return old_id == new_id;
+        }
+        // Only messages have role/content semantics. Tool outputs with different
+        // call_ids and arguments must not match just because neither has content.
+        let message = |v: &Value| {
+            v.get("role").is_some()
+                && v.get("type").is_none_or(|ty| ty == "message")
+                && v.get("content").is_some()
+        };
+        message(old)
+            && message(new)
+            && old["role"] == new["role"]
+            && same_replay_content(&old["content"], &new["content"])
     };
-
-    // Helper: check if two input items are semantically equivalent (ignoring volatile fields like id)
-    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
-        let role_a = a.get("role").and_then(Value::as_str);
-        let role_b = b.get("role").and_then(Value::as_str);
-        let type_a = a.get("type").and_then(Value::as_str);
-        let type_b = b.get("type").and_then(Value::as_str);
-        let content_a = a.get("content").or_else(|| a.get("text"));
-        let content_b = b.get("content").or_else(|| b.get("text"));
-        role_a == role_b && type_a == type_b && content_a == content_b
-    };
-
-    // Semantic prefix match: check if new_input starts with history semantically
-    let semantic_prefix_match = !history.is_empty()
-        && new_input.len() >= history.len()
-        && history
-            .iter()
-            .zip(new_input.iter())
-            .all(|(h, n)| items_semantically_equal(h, n));
-
-    // Semantic suffix find: find last item of history in new_input
-    let semantic_suffix_idx = if !history.is_empty()
-        && !reset_parent
-        && !exact_replay
-        && replayed_through.is_none()
-        && !semantic_prefix_match
-    {
-        let last_h = &history[history.len() - 1];
-        new_input
-            .iter()
-            .rposition(|n| items_semantically_equal(last_h, n))
-    } else {
-        None
-    };
-
-    let (delta_source, use_new_input_as_merged) = if reset_parent || history.is_empty() {
-        (new_input.clone(), false)
-    } else if exact_replay {
-        (new_input[history.len()..].to_vec(), false)
-    } else if semantic_prefix_match {
-        (new_input[history.len()..].to_vec(), false)
-    } else if let Some(index) = replayed_through {
-        (new_input[index + 1..].to_vec(), false)
-    } else if let Some(index) = semantic_suffix_idx {
-        (new_input[index + 1..].to_vec(), false)
-    } else if new_input.len() >= history.len() {
-        // [FIX #3382] Fallback protection:
-        // When the client sends full conversation history but formatting/IDs differed
-        // such that no boundary was identified, appending all of new_input to history
-        // would double the history (2x, 4x, ...). Instead, treat new_input as the authoritative
-        // current history, extracting the last element as delta.
-        tracing::warn!(
-            "[Session] Match failed but new_input (len: {}) >= history (len: {}). Preventing history duplication.",
-            new_input.len(),
-            history.len()
+    let mut replayed = 0;
+    if !reset_parent && !history.is_empty() {
+        // A real full replay is common and must not grow the chain exponentially.
+        if new_input.len() >= history.len()
+            && (history.len() > 1
+                || item_id(&history[0]).is_some_and(|id| item_id(&new_input[0]) == Some(id)))
+            && history.iter().zip(&new_input).all(|(a, b)| same_item(a, b))
+        {
+            replayed = history.len();
+        } else if let Some(first_id) = new_input.first().and_then(item_id) {
+            // Partial overlap is safe only when the incoming prefix starts at a
+            // known item ID. Repeated unlabelled text is a valid new turn. IDs in
+            // stored history are unique; if a malformed parent repeats this ID,
+            // treat the boundary as ambiguous rather than dropping input.
+            let mut matches = history
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item_id(item) == Some(first_id));
+            if let Some((start, _)) = matches.next() {
+                let suffix = &history[start..];
+                if matches.next().is_none()
+                    && suffix.len() <= new_input.len()
+                    && suffix.iter().zip(&new_input).all(|(a, b)| same_item(a, b))
+                {
+                    replayed = suffix.len();
+                }
+            }
+        }
+    }
+    let mut incoming = new_input.into_iter();
+    let start = history.len() - replayed;
+    for (old, mut new) in history[start..].iter_mut().zip(incoming.by_ref()) {
+        // Only upgrade verified, equivalent content; ID-based deduplication alone
+        // does not authorize replacing an existing message with edited content.
+        if old.get("content").is_some()
+            && old["content"] != new["content"]
+            && same_replay_content(&old["content"], &new["content"])
+        {
+            old["content"] = new["content"].take();
+        }
+    }
+    let new_items: Vec<Value> = incoming.collect();
+    if !retain_delta {
+        let merged = merge_history_with_new_input(
+            if reset_parent { Vec::new() } else { history },
+            &[],
+            new_items,
+            tool_call_cache,
         );
-        let delta_slice = if new_input.is_empty() {
+        return PreparedSessionInput {
+            merged,
+            delta: Vec::new(),
+            reset_parent,
+        };
+    }
+    if !reset_parent && new_items.is_empty() {
+        return PreparedSessionInput {
+            merged: history,
+            delta: Vec::new(),
+            reset_parent: false,
+        };
+    }
+    let parent_len = history.len();
+    let merged = merge_history_with_new_input(
+        if reset_parent {
             Vec::new()
         } else {
-            vec![new_input.last().unwrap().clone()]
-        };
-        (delta_slice, true)
+            history.clone()
+        },
+        &[],
+        new_items,
+        tool_call_cache,
+    );
+    // Tool repair/id deduplication may also replace an earlier item. In that
+    // case persist a new root rather than reconstructing a different history.
+    let reset_parent = reset_parent || !merged.starts_with(&history);
+    let delta = if reset_parent {
+        merged.clone()
     } else {
-        (new_input.clone(), false)
-    };
-
-    let delta = merge_history_with_new_input(Vec::new(), &[], delta_source, tool_call_cache);
-    let stored_delta = if retain_delta {
-        delta.clone()
-    } else {
-        Vec::new()
-    };
-    let merged = if reset_parent || history.is_empty() {
-        delta
-    } else if use_new_input_as_merged {
-        merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
-    } else {
-        merge_history_with_new_input(history, &[], delta, tool_call_cache)
+        merged[parent_len..].to_vec()
     };
 
     PreparedSessionInput {
         merged,
-        delta: stored_delta,
+        delta,
         reset_parent,
     }
 }
@@ -482,6 +607,45 @@ mod tests {
     }
 
     #[test]
+    fn bounded_media_matches_and_restores_only_the_verified_full_replay() {
+        let plain = |text: &str| json!({"type":"input_text","text":text});
+        let image =
+            json!({"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"high"});
+        let old = json!({"role":"user","content":[plain("look"),media_placeholder(image.as_object().unwrap()).unwrap()]});
+        let answer = json!({"role":"assistant","id":"a","content":"answer"});
+        let next = json!({"role":"user","content":"again"});
+        for keep in [true, false] {
+            let original = json!({"role":"user","content":[plain("look"),{"detail":"high","image_url":image["image_url"],"type":"input_image"}]});
+            let parent = vec![old.clone(), answer.clone()];
+            let restored = prepare_session_input_with_storage(
+                parent.clone(),
+                vec![original.clone(), answer.clone(), next.clone()],
+                &Default::default(),
+                keep,
+            );
+            assert_eq!(
+                restored.merged,
+                vec![original.clone(), answer.clone(), next.clone()]
+            );
+            assert!(!restored.reset_parent);
+            assert_eq!(
+                restored.delta,
+                if keep { vec![next.clone()] } else { vec![] }
+            );
+            let mut changed = original;
+            changed["content"][1]["image_url"] = json!("data:image/png;base64,Ag==");
+            let other = prepare_session_input_with_storage(
+                parent,
+                vec![changed.clone(), answer.clone(), next.clone()],
+                &Default::default(),
+                keep,
+            );
+            assert!(other.merged.contains(&old));
+            assert!(other.merged.contains(&changed));
+        }
+    }
+
+    #[test]
     fn responses_store_false_restores_full_input_without_retaining_delta() {
         let history = vec![
             json!({"id": "old", "role": "user", "content": "x".repeat(32768)}),
@@ -607,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_input_fallback_avoids_duplication_when_unmatched() {
+    fn prepare_session_input_preserves_unmatched_delta_even_when_long_as_parent() {
         let history = vec![
             json!({"role": "user", "type": "message", "content": "msg 1"}),
             json!({"role": "assistant", "type": "message", "content": "msg 2"}),
@@ -618,8 +782,162 @@ mod tests {
             json!({"role": "assistant", "type": "message", "content": "different 2"}),
         ];
 
-        let prepared = prepare_session_input(history, new_input, &HashMap::new());
-        // Should not duplicate to 4 items
-        assert_eq!(prepared.merged.len(), 2);
+        let prepared = prepare_session_input(history.clone(), new_input.clone(), &HashMap::new());
+        assert_eq!(prepared.delta, new_input);
+        assert_eq!(prepared.merged, [history, new_input].concat());
+        assert!(!prepared.reset_parent);
+    }
+}
+
+#[cfg(test)]
+mod continuation_delta_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn model_input_and_restored_child_agree_for_deltas_replays_and_compaction() {
+        let root = vec![
+            json!({"role":"user","type":"message","content":"Task","id":"u"}),
+            json!({"role":"assistant","type":"message","content":"Answer","id":"a"}),
+        ];
+        let extra = vec![
+            json!({"role":"developer","content":"New instruction"}),
+            json!({"role":"user","content":"Continue"}),
+        ];
+        let expected = [root.clone(), extra.clone()].concat();
+        let mut semantic = root.clone();
+        for item in &mut semantic {
+            item.as_object_mut().unwrap().remove("id");
+        }
+        semantic.extend(extra.clone());
+        let reset = vec![json!({"type":"compaction_summary"}), extra[1].clone()];
+        for (label, new, expected, detach) in [
+            ("equal length delta", extra.clone(), expected.clone(), false),
+            (
+                "longer delta",
+                [
+                    extra.clone(),
+                    vec![json!({"role":"user","content":"Extra"})],
+                ]
+                .concat(),
+                [
+                    expected.clone(),
+                    vec![json!({"role":"user","content":"Extra"})],
+                ]
+                .concat(),
+                false,
+            ),
+            ("exact replay", expected.clone(), expected.clone(), false),
+            (
+                "same content without IDs",
+                semantic,
+                expected.clone(),
+                false,
+            ),
+            (
+                "overlapping tail",
+                [vec![root[1].clone()], extra.clone()].concat(),
+                expected,
+                false,
+            ),
+            ("explicit compaction", reset, vec![extra[1].clone()], true),
+        ] {
+            for retain in [false, true] {
+                let mut store = HttpSessionStore::new();
+                store.insert_delta(
+                    "parent".into(),
+                    None,
+                    root.clone(),
+                    vec![],
+                    String::new(),
+                    "m".into(),
+                    None,
+                );
+                let (entry, parent) = store.get("parent").unwrap();
+                let prep = prepare_session_input_with_storage(
+                    entry.input_items,
+                    new.clone(),
+                    &Default::default(),
+                    retain,
+                );
+                assert_eq!(prep.merged, expected, "{label}");
+                assert_eq!(prep.reset_parent, detach, "{label}");
+                if retain {
+                    store.insert_delta(
+                        "child".into(),
+                        (!prep.reset_parent).then_some(parent),
+                        prep.delta,
+                        vec![],
+                        String::new(),
+                        "m".into(),
+                        None,
+                    );
+                    assert_eq!(
+                        store.get("child").unwrap().0.input_items,
+                        expected,
+                        "{label}"
+                    );
+                } else {
+                    assert!(prep.delta.is_empty())
+                }
+            }
+        }
+    }
+    #[test]
+    fn repeated_messages_only_overlap_at_a_known_boundary() {
+        let a = json!({"role":"user","content":"A"});
+        let b = json!({"role":"assistant","content":"B"});
+        let c = json!({"role":"user","content":"C"});
+        let with_id = |mut item: Value, id: &str| {
+            item["id"] = json!(id);
+            item
+        };
+        let b1 = with_id(b.clone(), "first-b");
+        let b2 = with_id(b.clone(), "second-b");
+        for (parent, new, delta) in [
+            (
+                vec![a.clone(), b1.clone()],
+                vec![b1.clone(), b2.clone(), c.clone()],
+                vec![b2.clone(), c.clone()],
+            ),
+            (
+                vec![a.clone(), b1.clone()],
+                vec![b2.clone(), c.clone()],
+                vec![b2.clone(), c.clone()],
+            ),
+            (vec![b1.clone()], vec![b2.clone()], vec![b2]),
+            (vec![b.clone()], vec![b.clone()], vec![b.clone()]),
+            (
+                vec![a, b.clone()],
+                vec![b.clone(), b.clone(), c.clone()],
+                vec![b.clone(), b, c],
+            ),
+        ] {
+            for retain in [true, false] {
+                let prepared = prepare_session_input_with_storage(
+                    parent.clone(),
+                    new.clone(),
+                    &HashMap::new(),
+                    retain,
+                );
+                assert_eq!(
+                    prepared.merged,
+                    [parent.as_slice(), delta.as_slice()].concat()
+                );
+                if retain {
+                    assert_eq!(prepared.delta, delta);
+                } else {
+                    assert!(prepared.delta.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn distinct_tool_items_are_not_semantic_replays() {
+        let first = json!({"type":"function_call_output","call_id":"one","output":"old value"});
+        let next = json!({"type":"function_call_output","call_id":"two","output":"new value"});
+        let prep =
+            prepare_session_input(vec![first.clone()], vec![next.clone()], &Default::default());
+        assert_eq!(prep.merged, vec![first, next.clone()]);
+        assert_eq!(prep.delta, vec![next]);
     }
 }

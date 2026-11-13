@@ -167,10 +167,14 @@ pub async fn handle_generate(
     let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
+    // Only the terminal consumed attempt contributes failure usage; retries
+    // must not inherit or sum counters from another upstream response.
+    let mut terminal_stream_usage: Option<Value> = None;
     let mut last_email: Option<String> = None;
     let mut force_rotate = false;
     let mut retry_state = RequestRetryState::default();
     let mut retry_credentials: Option<crate::proxy::token_manager::LeasedCredentials> = None;
+    let mut session_lease = None;
     let mut attempted_accounts: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut image_permit = None;
@@ -178,7 +182,6 @@ pub async fn handle_generate(
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
     let mut heal_flags = crate::proxy::pipeline::AutoHealFlags::default();
-    let mut degraded_wrapped_body: Option<Value> = None;
 
     let thinking_cfg = body
         .get("request")
@@ -269,7 +272,7 @@ pub async fn handle_generate(
         let client_session_id = session_scope.client_id.clone();
 
         // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
-        let (access_token, project_id, email, account_id, _wait_ms, mut session_lease) =
+        let (access_token, project_id, email, account_id, _wait_ms, selected_session_lease) =
             if let Some(credentials) = retry_credentials.take() {
                 credentials
             } else if config.request_type == "image_gen" {
@@ -296,12 +299,13 @@ pub async fn handle_generate(
                 }
             } else {
                 let mut token_result = token_manager
-                    .get_token_filtered_with_lease(
+                    .get_token_filtered_with_retry_lease(
                         &config.request_type,
                         force_rotate,
                         Some(&affinity_key),
                         &config.final_model,
                         &attempted_accounts,
+                        &mut session_lease,
                     )
                     .await;
 
@@ -313,7 +317,7 @@ pub async fn handle_generate(
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         token_result = token_manager
-                            .get_token_filtered_with_lease(
+                            .get_token_filtered_with_retry_lease(
                                 &config.request_type,
                                 crate::proxy::pipeline::rotation::token_retry_force_rotate(
                                     force_rotate,
@@ -322,6 +326,7 @@ pub async fn handle_generate(
                                 Some(&affinity_key),
                                 &config.final_model,
                                 &attempted_accounts,
+                                &mut session_lease,
                             )
                             .await;
                     }
@@ -331,7 +336,9 @@ pub async fn handle_generate(
                     Ok(t) => t,
                     Err(e) => {
                         retry_state.preserve_token_error(&e);
-                        if !failure_statuses.is_empty() {
+                        if !failure_statuses.is_empty()
+                            && !crate::proxy::session_bindings::is_session_binding_changed_error(&e)
+                        {
                             tracing::warn!(
                             "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
                             trace_id
@@ -339,16 +346,19 @@ pub async fn handle_generate(
                             break;
                         }
                         return Ok(retry_state.finish_error_response(
-                            crate::proxy::handlers::common::build_token_error_response(
+                            crate::proxy::handlers::common::build_token_error_response_with_usage(
                                 "gemini",
                                 mapped_model.as_str(),
                                 last_email.as_deref(),
                                 &e,
+                                terminal_stream_usage.as_ref(),
                             ),
                         ));
                     }
                 }
             };
+
+        session_lease = selected_session_lease;
 
         let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
 
@@ -364,28 +374,19 @@ pub async fn handle_generate(
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
         let tf_start = std::time::Instant::now();
-        let mut wrapped_body = if let Some(body) = degraded_wrapped_body.take() {
-            body
-        } else {
-            let mut wb = wrap_request_v2(
-                &body,
-                &project_id,
-                &mapped_model,
-                Some(account_id.as_str()),
-                Some(&session_id),
-                token_obj.as_ref(),
-                Some(&token_manager),
-                Some(&state.upstream),
-                Some(&affinity_key),
-                retried_without_thinking,
-            );
-            if heal_flags.retried_with_budget_degraded {
-                crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
-                    &mut wb,
-                );
-            }
-            wb
-        };
+        let mut wrapped_body = wrap_request_v2(
+            &body,
+            &project_id,
+            &mapped_model,
+            Some(account_id.as_str()),
+            Some(&session_id),
+            token_obj.as_ref(),
+            Some(&token_manager),
+            Some(&state.upstream),
+            Some(&affinity_key),
+            retried_without_thinking,
+        );
+        heal_flags.reapply(&mut wrapped_body);
         // [Signature-Retry] 400 签名错误后的重试：由流水线统一清除签名（包含客户端自带的 thoughtSignature）
         if retried_without_thinking {
             crate::proxy::pipeline::InboundThinkingPipeline::strip_signatures_for_retry(
@@ -410,6 +411,35 @@ pub async fn handle_generate(
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(
             &mut wrapped_body,
         );
+        // Resolve text history only after all request normalization, and use the
+        // same visible prefix when recording the response from this attempt.
+        let thinking_enabled =
+            crate::proxy::pipeline::qos::payload_enables_thinking(&wrapped_body, None);
+        let contents_path = if wrapped_body.get("request").is_some() {
+            "/request/contents"
+        } else {
+            "/contents"
+        };
+        let response_text_context = wrapped_body
+            .pointer_mut(contents_path)
+            .and_then(Value::as_array_mut)
+            .map(|contents| {
+                crate::proxy::thinking_store::finalize_request_text_context(
+                    &session_id,
+                    contents,
+                    &mapped_model,
+                    thinking_enabled,
+                    retried_without_thinking,
+                )
+            });
+        let expected_candidates = wrapped_body
+            .get("request")
+            .unwrap_or(&wrapped_body)
+            .pointer("/generationConfig/candidateCount")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(1)
+            .max(1);
         let estimated_input_tokens = crate::proxy::pipeline::estimate_tokens(&wrapped_body);
 
         if let Some(ref recorder) = upstream_recorder {
@@ -664,11 +694,14 @@ pub async fn handle_generate(
             }
 
             let track_image_success = config.request_type == "image_gen";
-            if !track_image_success {
-                token_manager.commit_session_lease(&mut session_lease);
-                // [智能限流] 请求成功，重置该账号的连续失败计数
+            let mut session_confirmation = if !track_image_success {
+                // HTTP acceptance still confirms account health in all scheduling
+                // modes; only cache warmth waits for body validation.
                 token_manager.mark_account_success(&account_id);
-            }
+                token_manager.accept_session_response(&mut session_lease)
+            } else {
+                None
+            };
             // 6. 响应处理
             if is_stream {
                 use axum::body::Body;
@@ -720,11 +753,20 @@ pub async fn handle_generate(
                 // Preserve structured upstream errors before protocol conversion.
                 let stream_errors =
                     crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
-                let response_stream =
-                    Box::pin(crate::proxy::pipeline::stream_error::observe_stream_errors(
+                let response_stream = Box::pin(
+                    crate::proxy::pipeline::stream_error::observe_response_errors(
                         response_stream,
                         stream_errors.clone(),
-                    ));
+                        !client_wants_stream,
+                    ),
+                );
+                let response_stream = Box::pin(
+                    crate::proxy::token_manager::confirm_session_response_stream(
+                        response_stream,
+                        stream_errors.clone(),
+                        session_confirmation.take(),
+                    ),
+                );
                 let s_id = session_id.clone(); // Clone for stream closure
 
                 // [对齐其他协议] 上游已返回 200：立即向客户端返回响应头，
@@ -755,17 +797,19 @@ pub async fn handle_generate(
                         mapped_model, session_id, message_count
                     ),
                 );
-                let handler = crate::proxy::mappers::gemini::streaming::GeminiStreamHandler::new(
-                    cloud_code_trace_id.clone(),
-                    s_id.clone(),
-                    mapped_model.clone(),
-                    message_count,
-                    causal_anchor.clone(),
-                    track_image_success,
-                    Some(token_manager.clone()),
-                    account_id.clone(),
-                    mapped_model.clone(),
-                );
+                let handler =
+                    crate::proxy::mappers::gemini::streaming::GeminiStreamHandler::new_with_context(
+                        cloud_code_trace_id.clone(),
+                        s_id.clone(),
+                        mapped_model.clone(),
+                        message_count,
+                        causal_anchor.clone(),
+                        track_image_success,
+                        Some(token_manager.clone()),
+                        account_id.clone(),
+                        mapped_model.clone(),
+                        response_text_context.clone(),
+                    ).with_candidate_request(expected_candidates,!client_wants_stream);
                 let upstream_stream = response_stream.map(|r| r.map_err(|e| e.to_string()));
                 let lifecycle_stream = crate::proxy::pipeline::run_stream_lifecycle(
                     Box::pin(upstream_stream),
@@ -842,21 +886,31 @@ pub async fn handle_generate(
                         .into_response());
                 } else {
                     // Collect to JSON
-                    use crate::proxy::mappers::gemini::collector::collect_stream_to_json_with_anchor_and_count;
-                    let collected_response = collect_stream_to_json_with_anchor_and_count(
+                    use crate::proxy::mappers::gemini::collector::collect_stream_to_json_with_context;
+                    let collected_response = collect_stream_to_json_with_context(
                         Box::pin(stream),
                         &s_id,
                         Some(&causal_anchor),
                         message_count,
+                        response_text_context.clone(),
                     )
                     .await;
-                    if let Some(failure) = stream_errors.failure() {
+                    if let Some(failure) = stream_errors.failure_or_incomplete(
+                        collected_response.as_ref().err().map(String::as_str),
+                    ) {
                         let failure_status =
                             StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
-                        if !failure.after_output {
+                        let failure_usage =
+                            failure.usage_with_response(collected_response.as_ref().ok());
+                        if !failure.after_output
+                            && !crate::proxy::pipeline::stream_error::has_measured_usage(
+                                failure_usage.as_ref(),
+                            )
+                        {
                             break 'upstream_response (failure_status, None, failure.body);
                         }
-                        // Output has already been consumed: classify the error, but do not replay.
+                        // Content or measured prefill has been consumed: classify
+                        // the error without replaying an already billable attempt.
                         retry_state.preserve_http_stop(
                             failure.status,
                             &failure.body,
@@ -864,6 +918,7 @@ pub async fn handle_generate(
                             config.request_type != "image_gen",
                         );
                         failure_statuses.record(failure_status);
+                        terminal_stream_usage = failure_usage;
                         last_error = failure.body;
                         break 'attempts;
                     }
@@ -1012,6 +1067,10 @@ pub async fn handle_generate(
                     }
                 };
 
+            if let Some(confirmation) = session_confirmation.as_mut() {
+                confirmation.observe_json(&gemini_resp);
+            }
+
             // [FIX #1522] Inject Tool ID into Non-streaming Response
             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
                 &mut gemini_resp,
@@ -1025,8 +1084,35 @@ pub async fn handle_generate(
                 Some(&gemini_resp)
             };
 
+            if let Some(candidates) = inner_val
+                .and_then(|v| v.get("candidates"))
+                .and_then(Value::as_array)
+            {
+                if crate::proxy::mappers::gemini::candidate_indices(candidates).is_none() {
+                    let mut failure = json!({"error":{"code":502,"status":"INTERNAL","message":"Invalid or duplicate Gemini candidate index"}});
+                    crate::proxy::pipeline::stream_error::attach_usage_metadata(
+                        &mut failure,
+                        inner_val.and_then(|v| v.get("usageMetadata")),
+                    );
+                    return Ok(retry_state.finish_error_response(
+                        (StatusCode::BAD_GATEWAY, Json(failure)).into_response(),
+                    ));
+                }
+            }
+            if inner_val
+                .and_then(|v| v.get("candidates"))
+                .and_then(Value::as_array)
+                .is_some_and(|c| c.len() > 1)
+            {
+                crate::proxy::SignatureCache::global()
+                    .mark_multi_candidate_turn(&session_id, message_count);
+            }
             if let Some(resp) = inner_val {
-                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
+                if let Some(candidates) = resp
+                    .get("candidates")
+                    .and_then(|c| c.as_array())
+                    .filter(|c| c.len() == 1)
+                {
                     for cand in candidates {
                         if let Some(parts) = cand
                             .get("content")
@@ -1051,10 +1137,11 @@ pub async fn handle_generate(
             }
 
             let preceding_turn = preceding_turn_anchor.as_ref();
-            crate::proxy::thinking_store::capture_gemini_response_with_preceding(
+            crate::proxy::thinking_store::capture_gemini_response_with_context(
                 &session_id,
                 &gemini_resp,
                 preceding_turn,
+                response_text_context.as_deref(),
             );
             let unwrapped = unwrap_response(&gemini_resp);
             return Ok(Response::builder()
@@ -1097,7 +1184,6 @@ pub async fn handle_generate(
             &error_text,
             retry_after.as_deref(),
             &mut wrapped_body,
-            &mut degraded_wrapped_body,
             &mut heal_flags,
             &mut retry_state,
             &account_id,
@@ -1451,16 +1537,24 @@ pub async fn handle_generate(
     if final_status == StatusCode::TOO_MANY_REQUESTS
         && crate::proxy::rate_limit::is_quota_depleted_signal(&last_error)
     {
-        if let Ok(raw_json) = serde_json::from_str::<Value>(&last_error) {
+        if let Ok(mut raw_json) = serde_json::from_str::<Value>(&last_error) {
+            crate::proxy::pipeline::stream_error::attach_usage_metadata(
+                &mut raw_json,
+                terminal_stream_usage.as_ref(),
+            );
             return Ok((final_status, headers, Json(raw_json)).into_response());
         }
     }
 
-    let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+    let mut dual_err = crate::proxy::handlers::common::build_dual_track_error(
         "gemini",
         final_status.as_u16(),
         initial_mapped_model.as_str(),
         &last_error,
+    );
+    crate::proxy::pipeline::stream_error::attach_usage_metadata(
+        &mut dual_err,
+        terminal_stream_usage.as_ref(),
     );
 
     Ok(retry_state.finish_error_response((final_status, headers, Json(dual_err)).into_response()))

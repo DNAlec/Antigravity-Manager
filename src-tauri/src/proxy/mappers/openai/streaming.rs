@@ -10,6 +10,9 @@ use uuid::Uuid;
 use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
+use crate::proxy::pipeline::stream_error::{
+    is_refusal_finish_reason, response_has_prompt_refusal, response_is_refusal,
+};
 use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::pipeline::{run_stream_lifecycle, ProtocolStreamHandler, StreamLifecycleConfig};
 
@@ -38,7 +41,8 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 /// Supports both legacy v1internal format and new Interactions API format.
 ///
 /// Key semantic difference:
-/// - Old format: candidatesTokenCount = all output tokens (text + thinking + tool)
+/// - Gemini candidatesTokenCount excludes separately reported thoughtsTokenCount;
+///   candidatesTokensDetails are a breakdown already included in the candidate total.
 /// - New format: total_output_tokens = text + tool output only; thought tokens are separate (total_thought_tokens)
 ///
 /// For Codex, we must sum them back together as `completion_tokens`.
@@ -51,6 +55,15 @@ fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
     Some(usage)
+}
+
+fn merge_openai_usage(
+    metadata: &mut Option<Value>,
+    final_usage: &mut Option<super::models::OpenAIUsage>,
+    update: &Value,
+) {
+    merge_cumulative_usage(metadata, update);
+    *final_usage = metadata.as_ref().and_then(extract_usage_metadata);
 }
 
 #[allow(dead_code)]
@@ -97,9 +110,16 @@ pub struct OpenAIChatStreamHandler {
     pub is_thinking_active: bool,
     pub has_emitted_finish_reason: bool,
     pub has_emitted_done: bool,
+    pub refused: bool,
+    pub whole_prompt_blocked: bool,
 }
 
 impl ProtocolStreamHandler for OpenAIChatStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
+        merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, usage);
+        Vec::new()
+    }
+
     fn process_line(&mut self, line: &str) -> Vec<Bytes> {
         if !line.starts_with("data: ") {
             return Vec::new();
@@ -117,13 +137,15 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 json
             };
             if let Some(u) = actual_data.get("usageMetadata") {
-                merge_cumulative_usage(&mut self.usage_metadata, u);
-                self.final_usage = self
-                    .usage_metadata
-                    .as_ref()
-                    .and_then(extract_usage_metadata);
+                merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
             }
 
+            // A refusal is terminal, but sparse usage trailers may still follow.
+            if self.whole_prompt_blocked {
+                return chunks;
+            }
+            self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
+            self.refused |= response_is_refusal(&actual_data);
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                 if !candidates.is_empty() {
                     tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
@@ -308,18 +330,18 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                     let gemini_finish_reason = raw_finish_reason.map(|f| match f {
                         "STOP" => "stop",
                         "MAX_TOKENS" => "length",
-                        "SAFETY" => "content_filter",
-                        "RECITATION" => "content_filter",
+                        reason if is_refusal_finish_reason(reason) => "content_filter",
                         "MALFORMED_FUNCTION_CALL" => "stop",
                         _ => "stop",
                     });
 
-                    let finish_reason =
-                        if !self.emitted_tool_calls.is_empty() && gemini_finish_reason.is_some() {
-                            Some("tool_calls")
-                        } else {
-                            gemini_finish_reason
-                        };
+                    let finish_reason = if !self.emitted_tool_calls.is_empty()
+                        && gemini_finish_reason == Some("stop")
+                    {
+                        Some("tool_calls")
+                    } else {
+                        gemini_finish_reason
+                    };
 
                     if !thought_out.is_empty() {
                         self.has_thinking = true;
@@ -380,6 +402,18 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                     }
                 }
             }
+            if self.whole_prompt_blocked && !self.has_emitted_finish_reason {
+                self.has_emitted_finish_reason = true;
+                self.is_thinking_active = false;
+                let mut chunk = json!({"id":self.stream_id,"object":"chat.completion.chunk","created":self.created_ts,
+                    "model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]});
+                if !self.include_usage {
+                    if let Some(usage) = self.final_usage.take() {
+                        chunk["usage"] = serde_json::to_value(usage).unwrap();
+                    }
+                }
+                chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
+            }
         } else {
             report_sse_json_parse(
                 "openai",
@@ -409,6 +443,15 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
 
     fn is_terminal(&self) -> bool {
         self.has_emitted_done
+    }
+
+    fn finalize_without_content(&self) -> bool {
+        self.refused
+    }
+
+    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
+        self.whole_prompt_blocked
+            .then(|| std::time::Duration::from_millis(250))
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
@@ -449,14 +492,17 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             )));
         }
 
-        if self.include_usage {
+        // include_usage=false puts known usage on the finish chunk. A later
+        // sparse trailer still needs one final snapshot, including zero corrections.
+        if self.include_usage || self.final_usage.is_some() {
             if let Some(usage) = self.final_usage.take() {
                 let usage_chunk = json!({
                     "id": &self.stream_id,
                     "object": "chat.completion.chunk",
                     "created": self.created_ts,
                     "model": &self.model,
-                    "choices": [],
+                    // Older clients index choices[0] unless include_usage was requested.
+                    "choices": if self.include_usage { json!([]) } else { json!([{"index":0,"delta":{},"finish_reason":null}]) },
                     "usage": usage
                 });
                 chunks.push(Bytes::from(format!(
@@ -540,6 +586,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 &self.model,
                 "chat.completion.chunk",
                 error_report,
+                self.final_usage.as_ref(),
             )),
             Bytes::from("data: [DONE]\n\n"),
         ]
@@ -564,15 +611,45 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_openai_sse_stream_with_context(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_ts = Utc::now().timestamp();
     let empty_set = std::collections::HashSet::new();
     let client_tool_names = client_tool_names.unwrap_or(empty_set);
-    let thinking_acc = if let Some(ref a) = causal_anchor {
+    let mut thinking_acc = if let Some(ref a) = causal_anchor {
         crate::proxy::thinking_store::TurnAccumulator::with_anchor(a)
     } else {
         crate::proxy::thinking_store::TurnAccumulator::new()
     };
+    if let Some(anchor) = text_context_anchor {
+        thinking_acc = thinking_acc.with_text_context_anchor(anchor);
+    }
 
     let trace_info = format!(
         "model={} session={} messages={}",
@@ -597,6 +674,8 @@ where
         is_thinking_active: false,
         has_emitted_finish_reason: false,
         has_emitted_done: false,
+        refused: false,
+        whole_prompt_blocked: false,
     };
 
     let config =
@@ -626,6 +705,11 @@ pub struct LegacyCompletionStreamHandler {
 }
 
 impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
+        merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, usage);
+        Vec::new()
+    }
+
     fn process_line(&mut self, line: &str) -> Vec<Bytes> {
         let mut frames = Vec::new();
         if !line.starts_with("data: ") {
@@ -658,11 +742,7 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
             json
         };
         if let Some(u) = actual_data.get("usageMetadata") {
-            merge_cumulative_usage(&mut self.usage_metadata, u);
-            self.final_usage = self
-                .usage_metadata
-                .as_ref()
-                .and_then(extract_usage_metadata);
+            merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
         }
 
         let mut content_out = String::new();
@@ -718,11 +798,11 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
             .and_then(|c| c.first())
             .and_then(|c| c.get("finishReason"))
             .and_then(|f| f.as_str())
+            .or_else(|| response_has_prompt_refusal(&actual_data).then_some("SAFETY"))
             .map(|f| match f {
                 "STOP" => "stop",
                 "MAX_TOKENS" => "length",
-                "SAFETY" => "content_filter",
-                "RECITATION" => "content_filter",
+                reason if is_refusal_finish_reason(reason) => "content_filter",
                 _ => "stop",
             });
 
@@ -775,6 +855,7 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
                 &self.model,
                 "text_completion",
                 error_report,
+                self.final_usage.as_ref(),
             )),
             Bytes::from("data: [DONE]\n\n"),
         ]
@@ -809,6 +890,21 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_legacy_sse_stream_with_context(gemini_stream, model, session_id, message_count, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_legacy_sse_stream_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     let random_str: String = (0..28)
@@ -822,6 +918,10 @@ where
         "model={} session={} messages={}",
         model, session_id, message_count
     );
+    let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
+    if let Some(anchor) = text_context_anchor {
+        thinking_acc = thinking_acc.with_text_context_anchor(anchor);
+    }
     let handler = LegacyCompletionStreamHandler {
         stream_id: format!("cmpl-{}", random_str),
         created_ts: Utc::now().timestamp(),
@@ -830,7 +930,7 @@ where
         message_count,
         final_usage: None,
         usage_metadata: None,
-        thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
+        thinking_acc,
         has_content: false,
         has_thinking: false,
         is_thinking_active: false,
@@ -879,14 +979,53 @@ fn split_namespace_tool_name(qualified_name: &str) -> (String, Option<String>) {
     (name.to_string(), None)
 }
 
+/// Responses custom calls carry raw text. Declarations decide the wire type;
+/// only declaration-free legacy calls fall back to known names and shapes.
+pub(crate) fn responses_tool_call_item(
+    name: &str,
+    args: Option<&Value>,
+    serialized: &str,
+    item_id: &str,
+    call_id: &str,
+    kinds: &super::request::ResponsesToolKinds,
+) -> Value {
+    let (name, namespace, custom) = kinds.wire_identity(name).unwrap_or_else(|| {
+        let (name, namespace) = split_namespace_tool_name(name);
+        let custom = matches!(name.as_str(), "apply_patch" | "apply_patch_v2" | "shell");
+        (name, namespace, custom)
+    });
+    let raw_input = if custom {
+        args.and_then(Value::as_object)
+            .filter(|o| o.len() == 1)
+            .and_then(|o| o.get("input"))
+            .and_then(Value::as_str)
+    } else {
+        None
+    };
+    // A malformed custom input cannot be represented as raw text without
+    // changing the next Gemini call. Retain it as complete function arguments.
+    let mut item = json!({"id":item_id,"type":if raw_input.is_some(){"custom_tool_call"}else{"function_call"},
+        "status":"completed","name":name,"call_id":call_id});
+    if let Some(text) = raw_input {
+        item["input"] = json!(text);
+    } else {
+        item["arguments"] = json!(serialized);
+    }
+    if let Some(ns) = namespace {
+        item["namespace"] = json!(ns);
+    }
+    item
+}
+
 fn openai_chat_error_frame(
     stream_id: &str,
     created_ts: i64,
     model: &str,
     object: &str,
     report: &StreamErrorReport,
+    usage: Option<&super::models::OpenAIUsage>,
 ) -> String {
-    let error_chunk = json!({
+    let mut error_chunk = json!({
         "id": stream_id,
         "object": object,
         "created": created_ts,
@@ -896,12 +1035,21 @@ fn openai_chat_error_frame(
             "type": report.classified.error_type,
             "message": report.client_message(),
             "code": "stream_error",
+            "upstream_status": report.upstream_status,
             "i18n_key": report.classified.i18n_key,
             "function": report.function,
             "call_site": report.call_site(),
             "params": report.params
         }
     });
+    if let Some(usage) = usage {
+        let mut snapshot = serde_json::to_value(usage).unwrap_or_default();
+        // Error usage is a full cumulative snapshot. Preserve explicit zero so
+        // outer gateways/monitoring can clear any earlier positive observation.
+        snapshot["prompt_tokens_details"] = json!({"cached_tokens": usage.prompt_tokens_details.as_ref().and_then(|details|details.cached_tokens).unwrap_or(0)});
+        snapshot["completion_tokens_details"] = json!({"reasoning_tokens": usage.completion_tokens_details.as_ref().and_then(|details|details.reasoning_tokens).unwrap_or(0)});
+        error_chunk["usage"] = snapshot;
+    }
     format!(
         "data: {}\n\n",
         serde_json::to_string(&error_chunk).unwrap_or_default()
@@ -942,6 +1090,7 @@ pub struct CodexResponsesStreamHandler {
     message_count: usize,
     response_id: String,
     cache_tool_calls: bool,
+    tool_kinds: super::request::ResponsesToolKinds,
     completion_tx:
         Option<tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>>,
     ack_rx: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -961,6 +1110,7 @@ pub struct CodexResponsesStreamHandler {
     has_thinking: bool,
     has_seen_tool_calls: bool,
     final_finish_reason: Option<String>,
+    whole_prompt_blocked: bool,
     final_outputs_map: std::collections::BTreeMap<u32, Value>,
     next_output_index: u32,
     message_output_index: u32,
@@ -993,6 +1143,7 @@ impl CodexResponsesStreamHandler {
             message_count,
             response_id,
             cache_tool_calls,
+            tool_kinds: Default::default(),
             completion_tx,
             ack_rx: None,
             ack_failed: false,
@@ -1011,6 +1162,7 @@ impl CodexResponsesStreamHandler {
             has_thinking: false,
             has_seen_tool_calls: false,
             final_finish_reason: None,
+            whole_prompt_blocked: false,
             final_outputs_map: std::collections::BTreeMap::new(),
             next_output_index: 0,
             message_output_index: 0,
@@ -1031,6 +1183,7 @@ impl CodexResponsesStreamHandler {
             "type": "error",
             "code": error_report.classified.error_type,
             "message": error_report.client_message(),
+            "upstream_status": error_report.upstream_status,
             "function": error_report.function,
             "call_site": error_report.call_site(),
             "params": error_report.params,
@@ -1273,29 +1426,19 @@ impl CodexResponsesStreamHandler {
         }
         self.thinking_acc.record_tool_id(name, &call_id);
 
-        let (actual_name, namespace) = split_namespace_tool_name(name);
         let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);
-        let is_custom_tool = actual_name == "apply_patch"
-            || actual_name == "apply_patch_v2"
-            || actual_name == "shell";
-
-        let final_args_str = args_str.clone();
-
-        let mut item_obj = json!({
-            "id": &tool_item_id,
-            "type": if is_custom_tool { "custom_tool_call" } else { "function_call" },
-            "status": "completed",
-            "name": actual_name,
-            "call_id": &call_id,
-        });
-        if is_custom_tool {
-            item_obj["input"] = json!(&final_args_str);
-        } else {
-            item_obj["arguments"] = json!(&final_args_str);
-        }
-        if let Some(ns) = namespace {
-            item_obj["namespace"] = json!(ns);
-        }
+        let item_obj = responses_tool_call_item(
+            name,
+            Some(&args),
+            &args_str,
+            &tool_item_id,
+            &call_id,
+            &self.tool_kinds,
+        );
+        let is_custom_tool = item_obj["type"] == "custom_tool_call";
+        let final_args_str = item_obj[if is_custom_tool { "input" } else { "arguments" }]
+            .as_str()
+            .expect("tool item text");
 
         let tool_output_index = self.next_output_index;
         self.next_output_index += 1;
@@ -1479,48 +1622,38 @@ impl CodexResponsesStreamHandler {
             .collect();
 
         let missing_actionable_output = !self.message_item_emitted && !self.has_seen_tool_calls;
-        let mut terminal_status = if missing_actionable_output {
+        let refused = self
+            .final_finish_reason
+            .as_deref()
+            .is_some_and(is_refusal_finish_reason);
+        let mut terminal_status = if missing_actionable_output
+            || refused
+            || matches!(
+                self.final_finish_reason.as_deref(),
+                Some("MAX_TOKENS") | None
+            ) {
             "incomplete"
         } else {
-            match self.final_finish_reason.as_deref() {
-                Some("MAX_TOKENS")
-                | Some("SAFETY")
-                | Some("RECITATION")
-                | Some("BLOCKLIST")
-                | Some("PROHIBITED_CONTENT")
-                | Some("SPII")
-                | Some("IMAGE_SAFETY")
-                | Some("IMAGE_PROHIBITED_CONTENT")
-                | None => "incomplete",
-                _ => "completed",
-            }
+            "completed"
         };
         let mut incomplete_details = if terminal_status == "incomplete" {
-            let reason = match self.final_finish_reason.as_deref() {
-                Some("MAX_TOKENS") => "max_output_tokens",
-                Some("SAFETY")
-                | Some("RECITATION")
-                | Some("BLOCKLIST")
-                | Some("PROHIBITED_CONTENT")
-                | Some("SPII")
-                | Some("IMAGE_SAFETY")
-                | Some("IMAGE_PROHIBITED_CONTENT") => "content_filter",
-                _ => "interrupted",
+            let reason = if refused {
+                "content_filter"
+            } else if self.final_finish_reason.as_deref() == Some("MAX_TOKENS") {
+                "max_output_tokens"
+            } else {
+                "interrupted"
             };
             json!({"reason": reason})
         } else {
             Value::Null
         };
-        let mut terminal_error = if missing_actionable_output {
-            json!({
-                "code": "empty_response",
-                "message": "Gemini stream ended without a final assistant message or tool call."
-            })
+        let mut terminal_error = if refused {
+            Value::Null
+        } else if missing_actionable_output {
+            json!({"code":"empty_response","message":"Gemini stream ended without a final assistant message or tool call."})
         } else if self.final_finish_reason.is_none() {
-            json!({
-                "code": "upstream_interrupted",
-                "message": "Gemini stream ended without finishReason."
-            })
+            json!({"code":"upstream_interrupted","message":"Gemini stream ended without finishReason."})
         } else {
             Value::Null
         };
@@ -1530,6 +1663,7 @@ impl CodexResponsesStreamHandler {
             terminal_error = json!({
                 "code": report.classified.error_type,
                 "message": report.client_message(),
+                "upstream_status": report.upstream_status,
                 "function": report.function,
                 "call_site": report.call_site(),
                 "params": report.params,
@@ -1541,7 +1675,14 @@ impl CodexResponsesStreamHandler {
             .unwrap_or_default()
             .as_secs();
 
-        if terminal_status == "completed" {
+        // A normal output-limit truncation still has resumable history. Keep the
+        // same persistence barrier as completed responses, but never save failed,
+        // refused, interrupted, or empty generations under a usable response id.
+        let resumable_truncation = terminal_status == "incomplete"
+            && self.final_finish_reason.as_deref() == Some("MAX_TOKENS")
+            && !missing_actionable_output
+            && terminal_error.is_null();
+        if terminal_status == "completed" || resumable_truncation {
             if let Some(tx) = self.completion_tx.take() {
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 if tx.send((final_outputs.clone(), ack_tx)).is_ok() {
@@ -1599,6 +1740,11 @@ impl CodexResponsesStreamHandler {
 }
 
 impl ProtocolStreamHandler for CodexResponsesStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
+        merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, usage);
+        Vec::new()
+    }
+
     fn initial_frames(&mut self) -> Vec<Bytes> {
         let mut frames = Vec::new();
 
@@ -1657,11 +1803,15 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
         };
 
         if let Some(u) = actual_data.get("usageMetadata") {
-            merge_cumulative_usage(&mut self.usage_metadata, u);
-            self.final_usage = self
-                .usage_metadata
-                .as_ref()
-                .and_then(extract_usage_metadata);
+            merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
+        }
+
+        if self.whole_prompt_blocked {
+            return frames;
+        }
+        self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
+        if self.whole_prompt_blocked {
+            self.final_finish_reason = Some("SAFETY".into());
         }
 
         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -1669,7 +1819,11 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
                 tracing::debug!("[Codex-Stream-Debug] Raw Candidate: {:?}", candidates[0]);
             }
             if let Some(candidate) = candidates.first() {
-                if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+                if let Some(reason) = candidate
+                    .get("finishReason")
+                    .or_else(|| candidate.get("finish_reason"))
+                    .and_then(Value::as_str)
+                {
                     self.final_finish_reason = Some(reason.to_string());
                 }
                 if let Some(parts) = candidate
@@ -1708,6 +1862,11 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
         // Responses 协议具备语义完整的 response.incomplete（含 empty_response 诊断），
         // 思考结束但无正文时仍应下发终态而非裸中断。
         true
+    }
+
+    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
+        self.whole_prompt_blocked
+            .then(|| std::time::Duration::from_millis(250))
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
@@ -1764,11 +1923,44 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_codex_sse_stream_with_context(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        _assistant_turn_index,
+        response_id,
+        completion_tx,
+        cache_tool_calls,
+        None,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_codex_sse_stream_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    _assistant_turn_index: usize,
+    response_id: String,
+    completion_tx: Option<
+        tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
+    >,
+    cache_tool_calls: bool,
+    text_context_anchor: Option<String>,
+    tool_kinds: super::request::ResponsesToolKinds,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let trace_info = format!(
         "model={} session={} response_id={} messages={}",
         model, session_id, response_id, message_count
     );
-    let handler = CodexResponsesStreamHandler::new(
+    let mut handler = CodexResponsesStreamHandler::new(
         model,
         session_id,
         message_count,
@@ -1776,6 +1968,10 @@ where
         completion_tx,
         cache_tool_calls,
     );
+    handler.tool_kinds = tool_kinds;
+    if let Some(anchor) = text_context_anchor {
+        handler.thinking_acc = handler.thinking_acc.with_text_context_anchor(anchor);
+    }
     let config = StreamLifecycleConfig::new("openai-codex", "create_codex_sse_stream", trace_info);
     run_stream_lifecycle(gemini_stream, handler, config)
 }
@@ -1891,6 +2087,48 @@ mod tests {
             }
         }
         assert_chat_usage(&final_usage.expect("late final usage"), false);
+    }
+
+    #[tokio::test]
+    async fn test_chat_internal_json_collection_keeps_late_usage_and_zero() {
+        for cached in [80, 0] {
+            let frames = vec![
+                json!({"candidates":[{"content":{"parts":[{"text":"hello"}]}}],
+                    "usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":40}}),
+                json!({"candidates":[{"finishReason":"STOP"}],
+                    "usageMetadata":{"candidatesTokenCount":5}}),
+                json!({"usageMetadata":{"cachedContentTokenCount":cached}}),
+            ];
+            let source = stream::iter(
+                frames
+                    .into_iter()
+                    .map(|frame| Ok::<_, String>(Bytes::from(format!("data: {frame}\n\n")))),
+            );
+            // The non-stream handler enables usage for its internal SSE collector
+            // even when the client omits stream_options or sets include_usage=false.
+            let mapped = create_openai_sse_stream(
+                Box::pin(source),
+                "gemini-test".into(),
+                "json-usage-test".into(),
+                1,
+                None,
+                true,
+            );
+            let response = super::super::collector::collect_stream_to_json(mapped)
+                .await
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["choices"][0]["message"]["content"], "hello");
+            assert_eq!(response["choices"][0]["finish_reason"], "stop");
+            assert_eq!(response["usage"]["prompt_tokens"], 100);
+            assert_eq!(response["usage"]["completion_tokens"], 5);
+            assert_eq!(
+                response["usage"]["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                cached as u64
+            );
+        }
     }
 
     #[tokio::test]
@@ -3196,6 +3434,36 @@ mod tests {
             finish_reasons,
             vec!["stop".to_string()],
             "Completed stream must not emit duplicate finish_reason"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_usage_snapshot_tests {
+    use super::*;
+    #[test]
+    fn error_usage_snapshot_serializes_zero_cache_and_reasoning() {
+        let usage = super::super::models::OpenAIUsage::from(
+            &crate::proxy::pipeline::CanonicalUsage::new(100, 0, 5, 0),
+        );
+        let report = report_stream_error("chat", "test", &"upstream stream failed", "test");
+        let rendered = openai_chat_error_frame(
+            "id",
+            0,
+            "model",
+            "chat.completion.chunk",
+            &report,
+            Some(&usage),
+        );
+        let event: Value =
+            serde_json::from_str(rendered.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            event["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            event["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64(),
+            Some(0)
         );
     }
 }

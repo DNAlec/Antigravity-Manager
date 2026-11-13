@@ -98,6 +98,8 @@ pub struct StreamingState {
     /// Merged cumulative usage, including fields omitted by later sparse frames.
     pub last_usage: Option<UsageMetadata>,
     pub(super) usage_metadata: Option<serde_json::Value>,
+    pub(super) defer_finish_for_usage: bool,
+    pub(super) pending_finish_reason: Option<String>,
 }
 
 impl StreamingState {
@@ -131,6 +133,8 @@ impl StreamingState {
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
             last_usage: None,
             usage_metadata: None,
+            defer_finish_for_usage: false,
+            pending_finish_reason: None,
         }
     }
 
@@ -396,7 +400,11 @@ impl StreamingState {
         }
 
         // 确定 stop_reason：若触发工具调用，必须严格优先保持 tool_use；若触发最大长度或截断异常收尾，标记 max_tokens
-        let stop_reason = if self.used_tool {
+        let stop_reason = if finish_reason
+            .is_some_and(crate::proxy::pipeline::stream_error::is_refusal_finish_reason)
+        {
+            "refusal"
+        } else if self.used_tool {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"

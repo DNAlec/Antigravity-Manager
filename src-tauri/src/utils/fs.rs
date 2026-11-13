@@ -88,7 +88,16 @@ fn atomic_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
 /// 3. Replace target file via atomic rename (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` on Windows, `fs::rename` on POSIX).
 /// 4. If any step fails, remove the temporary file.
 pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<(), String> {
-    let target = target_path.as_ref();
+    write_atomic_inner(target_path.as_ref(), content, false)
+}
+
+/// Use a private temporary file before publishing credentials by atomic rename.
+/// Replacing an existing 0600 account file must not expose it through the umask.
+pub fn write_private_atomic(target: impl AsRef<Path>, content: &[u8]) -> Result<(), String> {
+    write_atomic_inner(target.as_ref(), content, true)
+}
+
+fn write_atomic_inner(target: &Path, content: &[u8], private: bool) -> Result<(), String> {
     let parent_dir = target
         .parent()
         .ok_or_else(|| "Target path has no parent directory".to_string())?;
@@ -100,7 +109,17 @@ pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<()
     let temp_filename = format!("{}.tmp.{}", file_name, Uuid::new_v4());
     let temp_path: PathBuf = parent_dir.join(temp_filename);
 
-    let mut file = File::create(&temp_path)
+    let mut options = File::options();
+    options.create_new(true).write(true);
+    if private {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+    }
+    let mut file = options
+        .open(&temp_path)
         .map_err(|e| format!("Failed to create temporary file {:?}: {}", temp_path, e))?;
 
     if let Err(e) = file.write_all(content) {

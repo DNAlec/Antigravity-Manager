@@ -1,5 +1,6 @@
 use crate::proxy::mappers::claude::models::{ClaudeRequest, MessageContent};
 use crate::proxy::mappers::openai::models::{OpenAIContent, OpenAIRequest};
+use crate::proxy::mappers::prompt_sanitizer::PromptSanitizer;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -9,7 +10,7 @@ pub struct SessionManager;
 /// 清理用户消息中混入的系统提示词（如 Claude Code / Cursor / AtomCode 的 <system-reminder>、<environment>、[System...] 等）
 /// 提取真正的用户输入内容，保证同一对话无论经过多少轮、携带什么动态时间戳，会话指纹都绝对稳定。
 pub fn sanitize_user_text_for_fingerprint(raw: &str) -> String {
-    let mut s = raw.to_string();
+    let mut s = PromptSanitizer::strip_billing_header_lines(raw);
 
     // 1. 移除 <system-reminder>...</system-reminder> 标签及内部内容
     while let Some(start) = s.find("<system-reminder>") {
@@ -54,13 +55,16 @@ pub fn sanitize_user_text_for_fingerprint(raw: &str) -> String {
 /// 提取 Claude 消息内容的摘要表示（防止大尺寸 Base64 多模态数据全序列化哈希雪崩）
 fn extract_claude_content_summary(content: &MessageContent) -> String {
     match content {
-        MessageContent::String(s) => s.clone(),
+        MessageContent::String(s) => PromptSanitizer::strip_billing_header_lines(s),
         MessageContent::Array(blocks) => {
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
                     crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
-                        parts.push(text.clone());
+                        let text = PromptSanitizer::strip_billing_header_lines(text);
+                        if !text.trim().is_empty() {
+                            parts.push(text);
+                        }
                     }
                     crate::proxy::mappers::claude::models::ContentBlock::Image {
                         source, ..
@@ -99,13 +103,16 @@ fn extract_claude_content_summary(content: &MessageContent) -> String {
 /// 提取 OpenAI 消息内容的摘要表示（防止大尺寸 Base64 多模态数据全序列化哈希雪崩）
 fn extract_openai_content_summary(content: &OpenAIContent) -> String {
     match content {
-        OpenAIContent::String(s) => s.clone(),
+        OpenAIContent::String(s) => PromptSanitizer::strip_billing_header_lines(s),
         OpenAIContent::Array(blocks) => {
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
                     crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } => {
-                        parts.push(text.clone());
+                        let text = PromptSanitizer::strip_billing_header_lines(text);
+                        if !text.trim().is_empty() {
+                            parts.push(text);
+                        }
                     }
                     crate::proxy::mappers::openai::models::OpenAIContentBlock::ImageUrl {
                         image_url,
@@ -145,7 +152,10 @@ fn extract_gemini_parts_summary(parts: &[Value]) -> String {
     let mut text_parts = Vec::new();
     for part in parts {
         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            text_parts.push(text.to_string());
+            let text = PromptSanitizer::strip_billing_header_lines(text);
+            if !text.trim().is_empty() {
+                text_parts.push(text);
+            }
         } else if let Some(inline_data) = part.get("inlineData").or_else(|| part.get("inline_data"))
         {
             let mime = inline_data
@@ -243,7 +253,8 @@ impl SessionManager {
                 crate::proxy::mappers::claude::models::SystemPrompt::String(s) => s.clone(),
                 crate::proxy::mappers::claude::models::SystemPrompt::Array(blocks) => blocks
                     .iter()
-                    .map(|b| b.text.as_str())
+                    .map(|b| PromptSanitizer::strip_billing_header_lines(&b.text))
+                    .filter(|text| !text.trim().is_empty())
                     .collect::<Vec<_>>()
                     .join(" "),
             };
@@ -343,10 +354,11 @@ impl SessionManager {
                                 match block {
                                 crate::proxy::mappers::openai::models::OpenAIContentBlock::Text {
                                     text,
-                                } => Some(text.as_str()),
+                                } => Some(PromptSanitizer::strip_billing_header_lines(text)),
                                 _ => None,
                             }
                             })
+                            .filter(|text| !text.trim().is_empty())
                             .collect::<Vec<_>>()
                             .join(" "),
                     };
@@ -498,6 +510,149 @@ mod tests {
         assert_eq!(sanitize_user_text_for_fingerprint(text1), "你好啊");
         assert_eq!(sanitize_user_text_for_fingerprint(text2), "你好啊");
         assert_eq!(sanitize_user_text_for_fingerprint(text3), "你好啊");
+    }
+
+    #[test]
+    fn billing_lines_are_ignored_before_content_blocks_are_joined() {
+        let mut expected = None;
+        for seed in ["aaa", "bbb"] {
+            let header = format!("x-anthropic-billing-header: cc_version=2.1; cch={seed}");
+            let gemini = serde_json::json!({
+                "contents":[{"role":"user","parts":[{"text":header},{"text":"Continue."}]}],
+                "systemInstruction":{"parts":[{"text":header},{"text":"Project A"}]}
+            });
+            let openai: OpenAIRequest = serde_json::from_value(serde_json::json!({
+                "model":"gemini-3.8-flash","messages":[
+                    {"role":"system","content":[{"type":"text","text":header},{"type":"text","text":"Project A"}]},
+                    {"role":"user","content":[{"type":"text","text":header},{"type":"text","text":"Continue."}]}
+                ]
+            })).unwrap();
+            let claude: ClaudeRequest = serde_json::from_value(serde_json::json!({
+                "model":"claude-sonnet-4-6","max_tokens":1024,
+                "system":[{"type":"text","text":header},{"type":"text","text":"Project A"}],
+                "messages":[{"role":"user","content":[{"type":"text","text":header},{"type":"text","text":"Continue."}]}]
+            })).unwrap();
+            let anchors = [
+                SessionManager::gemini_content_anchor(&gemini),
+                SessionManager::openai_content_anchor(&openai),
+                SessionManager::extract_session_id(&claude),
+            ];
+            assert_eq!(anchors[0], anchors[1]);
+            assert_eq!(anchors[1], anchors[2]);
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-session-id", "stable-client".parse().unwrap());
+            let scope = crate::proxy::thinking_store::SessionScope::resolve(
+                &headers,
+                Some(&gemini),
+                None,
+                anchors[0].clone(),
+                Some("tenant"),
+            );
+            if let Some(ref key) = expected {
+                assert_eq!(&scope.store_key, key);
+            } else {
+                expected = Some(scope.store_key);
+            }
+        }
+        let plain = serde_json::json!({"contents":[{"role":"user","parts":[{"text":"Continue."}]}],"systemInstruction":{"parts":[{"text":"Project A"}]}});
+        let inline = serde_json::json!({"contents":[{"role":"user","parts":[{"text":"x-anthropic-billing-header: cch=ccc\nContinue."}]}],"systemInstruction":{"parts":[{"text":"x-client-billing-info: ddd\nProject A"}]}});
+        assert_eq!(
+            SessionManager::gemini_content_anchor(&plain),
+            SessionManager::gemini_content_anchor(&inline)
+        );
+    }
+
+    #[test]
+    fn trailing_billing_lines_in_a_nonfinal_block_keep_cross_protocol_anchors() {
+        fn anchors(user: &str, system: &str) -> [String; 3] {
+            use serde_json::json;
+            let text_blocks =
+                |first: &str| json!([{"type":"text","text":first},{"type":"text","text":"second"}]);
+            let gemini = json!({
+                "contents":[{"role":"user","parts":[{"text":user},{"text":"second"}]}],
+                "systemInstruction":{"parts":[{"text":system},{"text":"second"}]}
+            });
+            let claude: ClaudeRequest = serde_json::from_value(json!({"model":"claude-sonnet-4-6","max_tokens":256,
+                "system":text_blocks(system),"messages":[{"role":"user","content":text_blocks(user)}]})).unwrap();
+            let openai: OpenAIRequest = serde_json::from_value(json!({"model":"gemini-3.8-flash",
+                "messages":[{"role":"system","content":text_blocks(system)},{"role":"user","content":text_blocks(user)}]})).unwrap();
+            [
+                SessionManager::gemini_content_anchor(&gemini),
+                SessionManager::extract_session_id(&claude),
+                SessionManager::openai_content_anchor(&openai),
+            ]
+        }
+        let clean = anchors("first", "project");
+        assert_eq!(clean[0], clean[1]);
+        assert_eq!(clean[1], clean[2]);
+        for eol in ["\n", "\r\n"] {
+            let injected =
+                |first: &str| format!("{first}{eol}x-client-billing-info: abc{eol}X-Billing: def");
+            assert_eq!(
+                anchors(&injected("first"), "project"),
+                clean,
+                "user anchor {eol:?}"
+            );
+            assert_eq!(
+                anchors("first", &injected("project")),
+                clean,
+                "system anchor {eol:?}"
+            );
+            let real_ending = format!("first{eol}");
+            let real_anchor = anchors(&real_ending, "project");
+            assert_ne!(
+                real_anchor[0], clean[0],
+                "an intentional separator between user parts is meaningful"
+            );
+            assert_eq!(anchors(&injected(&real_ending), "project"), real_anchor);
+            assert_eq!(
+                anchors(&format!("{}{eol}", injected("first")), "project"),
+                real_anchor
+            );
+        }
+        for (raw, expected) in [
+            ("first\n\n\nx-billing: injected", "first\n\n"),
+            ("first\nx-billing: injected\n\n", "first\n\n"),
+            (
+                "first\n    x-billing: literal",
+                "first\n    x-billing: literal",
+            ),
+            (
+                "first\n~~~http\nx-billing: literal",
+                "first\n~~~http\nx-billing: literal",
+            ),
+            ("first\n`x-billing: literal`", "first\n`x-billing: literal`"),
+        ] {
+            assert_eq!(PromptSanitizer::strip_billing_header_lines(raw), expected);
+        }
+    }
+
+    #[test]
+    fn fingerprint_metadata_cleanup_preserves_business_text_and_code_examples() {
+        for text in [
+            "Please parse x-anthropic-billing-header: cch=business-data",
+            "> x-anthropic-billing-header: quoted example",
+            "```http\nx-anthropic-billing-header: cch=aaa\n```\nExplain this header",
+            "~~~http\nx-anthropic-billing-header: cch=aaa\n~~~\nExplain this header",
+            "~~~~http\nx-anthropic-billing-header: cch=aaa\n~~~~",
+            "~~~http\n    ~~~\nx-anthropic-billing-header: cch=aaa\n~~~",
+            "~~~http\nx-anthropic-billing-header: cch=aaa",
+            "Example:\n    x-anthropic-billing-header: cch=aaa",
+            "Use `x-anthropic-billing-header: cch=aaa` in the test",
+            "Billing requirements for Project A",
+        ] {
+            assert_eq!(sanitize_user_text_for_fingerprint(text), text);
+        }
+        let a = "```http\nx-anthropic-billing-header: cch=aaa\n```";
+        let b = "```http\nx-anthropic-billing-header: cch=bbb\n```";
+        assert_ne!(
+            sanitize_user_text_for_fingerprint(a),
+            sanitize_user_text_for_fingerprint(b)
+        );
+        assert_eq!(
+            sanitize_user_text_for_fingerprint("x-billing: metadata\nActual business instruction"),
+            "Actual business instruction"
+        );
     }
 
     #[test]

@@ -2035,6 +2035,12 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
 ///
 /// 返回被降级替换的图像数量。
 pub fn purge_corrupted_images_from_gemini_payload(body: &mut Value) -> usize {
+    omit_images_from_gemini_payload(body, true)
+}
+
+/// Prepare/replay omission without publishing a global blacklist change until
+/// the retry policy has approved it.
+pub fn omit_images_from_gemini_payload(body: &mut Value, record_blacklist: bool) -> usize {
     let root = if body.get("request").is_some() {
         body.get_mut("request").unwrap()
     } else {
@@ -2086,13 +2092,13 @@ pub fn purge_corrupted_images_from_gemini_payload(body: &mut Value) -> usize {
     }
 
     // 2. 根据单图 vs 多图策略判定是否写入全局持久黑名单 (Review 建议 #1)
-    if total_images == 1 {
+    if record_blacklist && total_images == 1 {
         // 单图场景：100% 确认该图片为上游解码失败源，记录全局黑名单安全可靠
         record_corrupted_image_hash(&image_data_list[0]);
         tracing::warn!(
             "[Image-Defense] Single-image request encountered 400. Purged to placeholder and recorded hash to blacklist."
         );
-    } else {
+    } else if record_blacklist {
         // 多图场景：上游 400 无法指明具体哪张图片损坏。
         // 为保障当前轮次自愈恢复，全部降级为占位符；但不将所有哈希写入全局黑名单，避免健康图片被误杀
         tracing::warn!(

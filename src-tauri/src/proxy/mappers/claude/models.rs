@@ -380,7 +380,7 @@ pub struct Candidate {
     pub grounding_metadata: Option<GroundingMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "promptTokenCount")]
@@ -394,6 +394,23 @@ pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "cachedContentTokenCount")]
     pub cached_content_token_count: Option<u32>,
+}
+
+// Normalize Gemini/Interactions counters before the typed Claude adapter can
+// discard aliases or separately reported thinking tokens. These fields contain
+// total input and combined output, as required by to_claude_usage.
+impl<'de> Deserialize<'de> for UsageMetadata {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let mut usage = crate::proxy::pipeline::usage::ObservedUsage::default();
+        usage.merge_usage(&raw);
+        Ok(Self {
+            prompt_token_count: usage.input_tokens(),
+            candidates_token_count: usage.output_tokens(),
+            total_token_count: usage.total_tokens(),
+            cached_content_token_count: usage.cached_tokens(),
+        })
+    }
 }
 
 // ========== Grounding Metadata (for googleSearch results) ==========

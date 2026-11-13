@@ -35,12 +35,28 @@ pub struct ClaudeStreamHandler {
 }
 
 impl ProtocolStreamHandler for ClaudeStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &serde_json::Value) -> Vec<Bytes> {
+        merge_claude_usage(&mut self.state, usage);
+        Vec::new()
+    }
+
     fn process_line(&mut self, line: &str) -> Vec<Bytes> {
         process_sse_line(line, &mut self.state, &self.trace_id, &self.email).unwrap_or_default()
     }
 
     fn is_terminal(&self) -> bool {
         self.state.message_stop_sent
+    }
+
+    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
+        self.state
+            .pending_finish_reason
+            .as_ref()
+            .map(|_| std::time::Duration::from_millis(250))
+    }
+
+    fn finalize_without_content(&self) -> bool {
+        self.state.pending_finish_reason.is_some()
     }
 
     fn has_content(&self) -> bool {
@@ -67,7 +83,7 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
         // 绝不可伪造文本、伪造响应ID或伪造 message_stop！
         // 伪造收尾会导致 Claude Code 等客户端状态机误判为"生成正常终结"，从而抑制原生重试循环并使会话中毒。
         // 此处严格静默，交由 stream_lifecycle 统一识别未完成状态并如实透传 Err，促使客户端触发原生重试。
-        if !self.state.has_content {
+        if !self.state.has_content && self.state.pending_finish_reason.is_none() {
             tracing::warn!(
                 "[{}] Stream finalized without content (has_thinking: {}). Suppressing fake completion to allow client retry.",
                 self.trace_id,
@@ -104,16 +120,25 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
         // Claude Code 2.1.293 的 PU(e) 只要检测到 overloaded_error 字符串，立即触发 30 分钟冷却并在未产生内容前进入 10 次指数退避重试风暴。
         // 首包未就绪时发生错误统一使用 Anthropic 标准的 api_error，促使客户端转入 retryWithoutStreaming 单次重试或直接暴露错误。
         let err_type = "api_error";
-        let error_json = serde_json::json!({
+        let mut error_json = serde_json::json!({
             "type": "error",
             "error": {
                 "type": err_type,
+                "upstream_status": error_report.upstream_status,
                 "message": error_report.client_message(),
                 "function": error_report.function,
                 "call_site": error_report.call_site(),
                 "params": error_report.params,
             }
         });
+        if let Some(usage) = self.state.last_usage.as_ref() {
+            error_json["usage"] = serde_json::to_value(utils::to_claude_usage(
+                usage,
+                self.state.scaling_enabled,
+                self.state.context_limit,
+            ))
+            .unwrap_or_default();
+        }
         vec![self.state.emit("error", error_json)]
     }
 
@@ -150,7 +175,44 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_claude_sse_stream_with_context(
+        gemini_stream,
+        trace_id,
+        email,
+        session_id,
+        scaling_enabled,
+        context_limit,
+        estimated_prompt_tokens,
+        message_count,
+        client_adapter,
+        registered_tool_names,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_claude_sse_stream_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    trace_id: String,
+    email: String,
+    session_id: Option<String>, // [NEW v3.3.17] Session ID for signature caching
+    scaling_enabled: bool,      // [NEW] Flag for context usage scaling
+    context_limit: u32,
+    estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
+    message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
+    client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
+    registered_tool_names: Vec<String>,   // [FIX #MCP] Tool names for fuzzy matching
+    text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let mut state = StreamingState::new();
+    if let Some(anchor) = text_context_anchor {
+        state.thinking_acc = state.thinking_acc.with_text_context_anchor(anchor);
+    }
+    state.defer_finish_for_usage = true;
     state.session_id = session_id;
     state.message_count = message_count;
     state.scaling_enabled = scaling_enabled;
@@ -174,6 +236,15 @@ where
     let config = StreamLifecycleConfig::new("claude", "create_claude_sse_stream", trace_info);
 
     run_stream_lifecycle(gemini_stream, handler, config)
+}
+
+fn merge_claude_usage(state: &mut StreamingState, usage: &serde_json::Value) {
+    merge_cumulative_usage(&mut state.usage_metadata, usage);
+    if let Some(merged) = &state.usage_metadata {
+        if let Ok(parsed) = serde_json::from_value::<UsageMetadata>(merged.clone()) {
+            state.last_usage = Some(parsed);
+        }
+    }
 }
 
 /// 处理单行 SSE 数据
@@ -224,12 +295,17 @@ fn process_sse_line(
 
     // Upstream usage is cumulative but may omit counters reported in earlier frames.
     if let Some(usage_val) = raw_json.get("usageMetadata") {
-        merge_cumulative_usage(&mut state.usage_metadata, usage_val);
-        if let Some(merged) = &state.usage_metadata {
-            if let Ok(parsed_usage) = serde_json::from_value::<UsageMetadata>(merged.clone()) {
-                state.last_usage = Some(parsed_usage);
-            }
-        }
+        merge_claude_usage(state, usage_val);
+    }
+
+    // Once the model has finished, only usage trailers are accepted. Content and
+    // additional finish frames must not reopen blocks or extend the drain window.
+    if state.pending_finish_reason.is_some() {
+        return if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks)
+        };
     }
 
     // 捕获 groundingMetadata (Web Search)
@@ -306,10 +382,17 @@ fn process_sse_line(
                 .get("finishReason")
                 .or_else(|| raw_json.get("finish_reason"))
                 .and_then(|f| f.as_str())
+        })
+        .or_else(|| {
+            crate::proxy::pipeline::stream_error::response_has_prompt_refusal(raw_json)
+                .then_some("SAFETY")
         });
 
     if let Some(finish_reason) = finish_reason {
-        if state.has_thinking && !state.has_content {
+        if state.has_thinking
+            && !state.has_content
+            && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
+        {
             tracing::warn!(
                 "[{}] Upstream emitted finishReason '{}' after thinking without content. Suppressing message_stop to allow native client retry.",
                 trace_id,
@@ -338,7 +421,11 @@ fn process_sse_line(
                 );
             }
 
-            chunks.extend(state.emit_finish(Some(finish_reason), usage.as_ref()));
+            if state.defer_finish_for_usage {
+                state.pending_finish_reason = Some(finish_reason.to_string());
+            } else {
+                chunks.extend(state.emit_finish(Some(finish_reason), usage.as_ref()));
+            }
         }
     }
 
@@ -349,11 +436,235 @@ fn process_sse_line(
     }
 }
 
+#[cfg(test)]
+mod usage_tail_tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+
+    async fn events(
+        source: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,
+    ) -> Vec<Value> {
+        let mut stream = create_claude_sse_stream(
+            source,
+            "usage_tail".into(),
+            "test@example.test".into(),
+            None,
+            false,
+            1_000_000,
+            None,
+            1,
+            None,
+            vec![],
+        );
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("completed stream");
+            for line in String::from_utf8_lossy(&chunk).lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str(data) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1
+        );
+        events
+    }
+
+    fn frame(value: Value) -> Result<Bytes, String> {
+        Ok(Bytes::from(format!("data: {value}\n\n")))
+    }
+
+    #[tokio::test]
+    async fn claude_usage_tail_merges_same_and_separate_chunks_before_stop() {
+        for same_chunk in [false, true] {
+            let frames = vec![
+                frame(
+                    json!({"candidates":[{"content":{"parts":[{"text":"answer"}]}}],"usageMetadata":{"promptTokenCount":100}}),
+                ),
+                frame(
+                    json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":5}}),
+                ),
+                frame(json!({"response":{"usageMetadata":{"cachedContentTokenCount":80}}})),
+                frame(json!({"candidates":[{"content":{"parts":[{"text":"must not appear"}]}}]})),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ];
+            let frames = if same_chunk {
+                vec![Ok(Bytes::from(
+                    frames
+                        .into_iter()
+                        .flat_map(|frame| frame.unwrap().to_vec())
+                        .collect::<Vec<_>>(),
+                ))]
+            } else {
+                frames
+            };
+            let out = events(Box::pin(futures::stream::iter(frames))).await;
+            let final_usage = &out
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap()["usage"];
+            assert_eq!(final_usage["input_tokens"], 20);
+            assert_eq!(final_usage["cache_read_input_tokens"], 80);
+            assert_eq!(final_usage["output_tokens"], 5);
+            assert!(!serde_json::to_string(&out)
+                .unwrap()
+                .contains("must not appear"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claude_usage_tail_has_a_fixed_deadline_despite_live_upstream() {
+        let start = tokio::time::Instant::now();
+        let source = async_stream::stream! {
+            yield frame(json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100}}));
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                yield frame(json!({"usageMetadata":{"cachedContentTokenCount":80}}));
+            }
+        };
+        let out = events(Box::pin(source)).await;
+        assert!(start.elapsed() <= std::time::Duration::from_millis(300));
+        assert_eq!(
+            out.iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap()["usage"]["cache_read_input_tokens"],
+            80
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_usage_tail_zero_and_null_survive_mapper_and_json_collector() {
+        for (same_chunk, cache_update, expected_cache, expected_input) in [
+            (false, json!(0), 0u32, 100u32),
+            (true, json!(0), 0, 100),
+            (false, Value::Null, 80, 20),
+            (true, Value::Null, 80, 20),
+        ] {
+            let frames = vec![
+                frame(
+                    json!({"candidates":[{"content":{"parts":[{"text":"answer"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}),
+                ),
+                frame(
+                    json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":5}}),
+                ),
+                frame(json!({"usageMetadata":{"cachedContentTokenCount":cache_update}})),
+            ];
+            let frames = if same_chunk {
+                vec![Ok(Bytes::from(
+                    frames
+                        .into_iter()
+                        .flat_map(|frame| frame.unwrap().to_vec())
+                        .collect::<Vec<_>>(),
+                ))]
+            } else {
+                frames
+            };
+            let mut stream = create_claude_sse_stream(
+                Box::pin(futures::stream::iter(frames)),
+                "zero_cache".into(),
+                "test@example.test".into(),
+                None,
+                false,
+                1_000_000,
+                None,
+                1,
+                None,
+                vec![],
+            );
+            let mut rendered = Vec::new();
+            let mut parsed: Vec<Value> = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                for line in String::from_utf8_lossy(&chunk).lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if let Ok(event) = serde_json::from_str(data) {
+                            parsed.push(event);
+                        }
+                    }
+                }
+                rendered.push(Ok::<Bytes, std::io::Error>(chunk));
+            }
+            let initial = parsed
+                .iter()
+                .find(|event| event["type"] == "message_start")
+                .unwrap();
+            assert_eq!(
+                initial["message"]["usage"]["cache_read_input_tokens"].as_u64(),
+                Some(80)
+            );
+            let final_event = parsed
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(
+                final_event["usage"]
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64),
+                Some(expected_cache as u64)
+            );
+            assert_eq!(final_event["usage"]["input_tokens"], expected_input);
+
+            let collected = collector::collect_stream_to_json(futures::stream::iter(rendered))
+                .await
+                .unwrap();
+            assert_eq!(
+                collected.usage.cache_read_input_tokens,
+                Some(expected_cache)
+            );
+            assert_eq!(collected.usage.input_tokens, expected_input);
+            assert_eq!(collected.usage.output_tokens, 5);
+            let response = serde_json::to_value(collected).unwrap();
+            assert_eq!(
+                response["usage"]
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64),
+                Some(expected_cache as u64)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_usage_tail_transport_close_preserves_only_an_observed_finish() {
+        for (has_finish, has_content) in [(true, true), (true, false), (false, true)] {
+            let mut candidate = json!({});
+            if has_content {
+                candidate["content"] = json!({"parts":[{"text":"answer"}]});
+            }
+            if has_finish {
+                candidate["finishReason"] = json!("STOP");
+            }
+            let frames = vec![
+                frame(json!({"candidates":[candidate]})),
+                Err("connection reset".to_string()),
+            ];
+            let out = events(Box::pin(futures::stream::iter(frames))).await;
+            let delta = out
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(
+                delta["delta"]["stop_reason"],
+                if has_finish { "end_turn" } else { "max_tokens" }
+            );
+        }
+    }
+}
+
 /// 发送强制结束事件
 pub fn emit_force_stop(state: &mut StreamingState) -> Vec<Bytes> {
     if !state.message_stop_sent {
         let usage = state.last_usage.clone();
-        let mut chunks = state.emit_finish(None, usage.as_ref());
+        let reason = state.pending_finish_reason.take();
+        let mut chunks = state.emit_finish(reason.as_deref(), usage.as_ref());
         if chunks.is_empty() {
             chunks.push(Bytes::from(
                 "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -575,10 +886,8 @@ mod tests {
                 if explicit_zero { 100 } else { 20 }
             );
             assert_eq!(
-                delta["usage"]["cache_read_input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0),
-                if explicit_zero { 0 } else { 80 }
+                delta["usage"]["cache_read_input_tokens"].as_u64(),
+                Some(if explicit_zero { 0 } else { 80 })
             );
             assert_eq!(delta["usage"]["output_tokens"], 5);
             assert_eq!(events.last().unwrap()["type"], "message_stop");
@@ -1437,5 +1746,53 @@ mod tests {
             "Heartbeat frame data must contain type: ping, got: {}",
             chunk_str
         );
+    }
+}
+
+#[cfg(test)]
+mod normalized_usage_regressions {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+    #[tokio::test]
+    async fn native_thoughts_and_interactions_usage_survive_mapper_and_collector() {
+        for (usage, expected_input, expected_cache, expected_output) in [
+            (
+                json!({"promptTokenCount":7339,"candidatesTokenCount":3,"thoughtsTokenCount":5,"totalTokenCount":7347}),
+                7339,
+                0,
+                8,
+            ),
+            (
+                json!({"total_input_tokens":100,"total_cached_tokens":80,"total_output_tokens":3,"total_thought_tokens":5}),
+                20,
+                80,
+                8,
+            ),
+        ] {
+            let frame = json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}],"usageMetadata":usage});
+            let upstream = futures::stream::iter(vec![Ok::<_, String>(Bytes::from(format!(
+                "data: {frame}\n\n"
+            )))]);
+            let mapped = create_claude_sse_stream(
+                Box::pin(upstream),
+                "usage".into(),
+                "test@example.test".into(),
+                None,
+                false,
+                1_000_000,
+                None,
+                1,
+                None,
+                vec![],
+            );
+            let response = collect_stream_to_json(mapped.map(|r| r.map_err(std::io::Error::other)))
+                .await
+                .unwrap();
+            let response: Value = serde_json::to_value(response).unwrap();
+            assert_eq!(response["usage"]["input_tokens"], expected_input);
+            assert_eq!(response["usage"]["cache_read_input_tokens"], expected_cache);
+            assert_eq!(response["usage"]["output_tokens"], expected_output);
+        }
     }
 }

@@ -96,6 +96,8 @@ pub struct StreamErrorReport {
     pub line: u32,
     pub params: String,
     pub raw: String,
+    /// HTTP-equivalent status from a structured upstream error, if present.
+    pub upstream_status: Option<u16>,
 }
 
 impl StreamErrorReport {
@@ -134,6 +136,7 @@ pub fn report_stream_error(
         line: loc.line(),
         params: params.to_string(),
         raw: sanitize_raw(&error.to_string()),
+        upstream_status: None,
     };
     tracing::error!(
         adapter = report.adapter,
