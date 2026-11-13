@@ -1329,7 +1329,6 @@ pub async fn monitor_middleware(
         return response;
     }
 
-
     // 过滤噪音请求，避免客户端探针刷屏淹没真实业务日志 (Issue #3498 + `/v1/models` 轮询刷屏 + 三方网关探活)
     // 胶囊开关关闭时（默认）：所有 GET 成功请求与 POST 探针成功请求不记录、不落库；失败请求与非探针业务请求始终记录。
     // 详见 `should_skip_request_log` 的行为边界说明。

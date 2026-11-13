@@ -225,8 +225,10 @@ where
     };
 
     let final_finish_reason = if final_tool_calls.is_some()
-        && matches!(finish_reason.as_deref(), None | Some("stop" | "function_call"))
-    {
+        && matches!(
+            finish_reason.as_deref(),
+            None | Some("stop" | "function_call")
+        ) {
         Some("tool_calls".to_string())
     } else {
         finish_reason.or(Some("stop".to_string()))
