@@ -26,13 +26,16 @@ AM 修复失败重试签名、累计媒体去重、文件输出、工具身份�
 将两仓并列检出到 `Antigravity-Manager/`、`sub2api/`。Go/Rust 版本以 manifest 为准，本次使用 Go 1.27.4、Rust 1.96.0，Linux 已具备 GTK/WebKitGTK 等 Tauri 依赖。AM 根目录可执行：
 
 ```sh
+am_r19_profile=$(mktemp -d)
+export ABV_DATA_DIR="$am_r19_profile/profile"
+export ABV_DATA_DIR_POINTER_FILE="$am_r19_profile/profile-pointer"
 cd src-tauri
 cargo test --locked --no-default-features -j2 --lib stream_completion_tests:: -- --test-threads=1
 cargo test --locked --no-default-features -j2 --lib r19_ -- --test-threads=1
 cargo test --locked --no-default-features -j2 --lib proxy::http_session_store:: -- --test-threads=1
 ```
 
-测试使用独立临时 profile；如需自行指定，可设置 `ABV_DATA_DIR` 与 `ABV_DATA_DIR_POINTER_FILE` 到专用临时路径，避免混用个人资料目录。
+上面命令为每次复跑显式设置独立临时 profile。不要省略 `ABV_DATA_DIR` 与 `ABV_DATA_DIR_POINTER_FILE`，以免测试写入个人资料目录。确认日志后可清理该临时目录。
 
 两仓联验入口在 [sub2api 工具 README](https://github.com/DNAlec/sub2api/blob/codex/cache-continuity-fixes/tools/cache-continuity/r19/README.md)。`stream` 运行本仓永久回归后把当次 collector JSON 交给 Go 计费断言；默认 `billing` 使用旧 fixture，累计帧保留修前的 4 张结果，不能用于证明当前修复有效。
 
