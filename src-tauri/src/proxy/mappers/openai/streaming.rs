@@ -594,7 +594,9 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     }
 
     fn on_finish(&mut self) {
-        if !self.upstream_finished {
+        // Reasoning-only Chat responses fail the lifecycle's content guard,
+        // even when the provider already emitted a successful finish reason.
+        if !self.upstream_finished || !self.has_content {
             return;
         }
         let acc = std::mem::take(&mut self.thinking_acc);

@@ -43,6 +43,7 @@ struct CandidateState {
     thinking: Option<TurnAccumulator>,
     finish: bool,
     active_thought: bool,
+    has_content: bool,
 }
 
 impl GeminiStreamHandler {
@@ -220,6 +221,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                     thinking: (!self.buffered).then(|| self.capture_template.clone()),
                     finish: false,
                     active_thought: false,
+                    has_content: false,
                 });
             if super::has_candidate_finish(cand) {
                 self.saw_finish_reason = true;
@@ -241,11 +243,11 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                     }
                     if part.get("functionCall").is_some() {
                         self.saw_function_call = true;
-                        self.has_content = true;
                         // 工具调用是明确的行动输出，必然意味着思考阶段已结束。
                         self.is_thinking_active = false;
-                    } else if (!is_thought && part.get("text").is_some()) || super::has_media(part)
-                    {
+                    }
+                    if super::has_visible_content(part) {
+                        state.has_content = true;
                         self.has_content = true;
                     }
                     if let Some(thinking) = &mut state.thinking {
@@ -256,7 +258,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             // Publish before yielding the terminal event: the client can start the
             // next request immediately, without reading a usage trailer or EOF.
             // Taking the accumulator also makes a repeated terminal idempotent.
-            if state.finish && super::has_successful_candidate_finish(cand) {
+            if state.finish && state.has_content && super::has_successful_candidate_finish(cand) {
                 if let Some(thinking) = state.thinking.take() {
                     if multiple && !self.marked_multi_candidate {
                         crate::proxy::SignatureCache::global()

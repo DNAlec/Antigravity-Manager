@@ -513,3 +513,214 @@ async fn buffered_error_terminal_never_publishes_reasoning_history() {
         .get_session_signature(&session)
         .is_none());
 }
+
+async fn check_thinking_only_completion(proto: &str) {
+    crate::modules::proxy_db::init_db().unwrap();
+    for reason in ["STOP", "MAX_TOKENS"] {
+        for split in [false, true] {
+            let session = format!("r19-thinking-only-{proto}-{}", uuid::Uuid::new_v4());
+            let thought = json!({"thought":true,"text":"Signed reasoning without an answer.","thoughtSignature":sig(b'A')});
+            let mut frames = vec![json!({"candidates":[{"content":{"parts":[thought]}}]})];
+            if split {
+                frames.push(json!({"candidates":[{"finishReason":reason}]}));
+            } else {
+                frames[0]["candidates"][0]["finishReason"] = json!(reason);
+            }
+            let anchor = Some(compute_response_text_anchor(&[user()]));
+            let stream = match proto {
+                "claude" => create_claude_sse_stream_with_context(
+                    raw(frames),
+                    "trace".into(),
+                    "test".into(),
+                    Some(session.clone()),
+                    false,
+                    1000,
+                    None,
+                    1,
+                    None,
+                    vec![],
+                    anchor,
+                ),
+                "chat" => create_openai_sse_stream_with_context(
+                    raw(frames),
+                    "gemini-2.5-flash".into(),
+                    session.clone(),
+                    1,
+                    None,
+                    false,
+                    Some(compute_causal_anchor(Some(&user()))),
+                    anchor,
+                ),
+                "legacy" => create_legacy_sse_stream_with_context(
+                    raw(frames),
+                    "gemini-2.5-flash".into(),
+                    session.clone(),
+                    1,
+                    anchor,
+                ),
+                "responses" => create_codex_sse_stream_with_context(
+                    raw(frames),
+                    "gemini-2.5-flash".into(),
+                    session.clone(),
+                    1,
+                    1,
+                    format!("response-{session}"),
+                    None,
+                    false,
+                    anchor,
+                    Default::default(),
+                ),
+                "gemini" => run_stream_lifecycle(
+                    raw(frames),
+                    native(&session, "gemini-2.5-flash", false, 1),
+                    StreamLifecycleConfig::new("gemini", "r19", "test".into()),
+                ),
+                _ => unreachable!(),
+            };
+            let chunks = stream.collect::<Vec<_>>().await;
+            let wire = chunks
+                .iter()
+                .filter_map(|chunk| chunk.as_ref().ok())
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<String>();
+            if matches!(proto, "claude" | "chat" | "gemini") {
+                assert!(
+                    chunks.iter().any(Result::is_err),
+                    "{proto} {reason} split={split}: expected incomplete stream: {wire}"
+                );
+                assert!(!wire.contains("message_stop") && !wire.contains("data: [DONE]"));
+            } else if proto == "responses" {
+                assert!(wire.contains("response.incomplete"), "{reason}: {wire}");
+            } else {
+                // Legacy renders reasoning as ordinary completion text, so this
+                // is a deliverable answer and must retain its successful history.
+                assert!(chunks.iter().all(Result::is_ok));
+                assert!(
+                    wire.contains("Signed reasoning without an answer.")
+                        && wire.contains("data: [DONE]")
+                );
+            }
+            let rows = crate::modules::proxy_db::load_thinking_records(&session).unwrap();
+            let signature = crate::proxy::SignatureCache::global().get_session_signature(&session);
+            if proto == "legacy" {
+                assert_eq!(rows.len(), 1, "{proto} {reason} split={split}");
+                assert!(signature.is_some());
+            } else {
+                assert!(
+                    rows.is_empty(),
+                    "{proto} {reason} split={split}: incomplete output stored"
+                );
+                assert!(
+                    signature.is_none(),
+                    "{proto} {reason} split={split}: incomplete signature published"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn thinking_only_claude_failure_does_not_publish_history() {
+    check_thinking_only_completion("claude").await;
+}
+
+#[tokio::test]
+async fn thinking_only_chat_failure_does_not_publish_history() {
+    check_thinking_only_completion("chat").await;
+}
+
+#[tokio::test]
+async fn thinking_only_responses_incomplete_does_not_publish_history() {
+    check_thinking_only_completion("responses").await;
+}
+
+#[tokio::test]
+async fn thinking_only_legacy_success_retains_visible_reasoning_history() {
+    check_thinking_only_completion("legacy").await;
+}
+
+#[tokio::test]
+async fn thinking_only_gemini_failure_does_not_publish_history() {
+    check_thinking_only_completion("gemini").await;
+}
+
+#[tokio::test]
+async fn thinking_only_gemini_candidate_cannot_borrow_sibling_content() {
+    crate::modules::proxy_db::init_db().unwrap();
+    for buffered in [false, true] {
+        let session = format!("r19-thinking-only-sibling-{}", uuid::Uuid::new_v4());
+        let frames = vec![json!({"candidates":[
+            {"index":0,"content":{"parts":[{"thought":true,"text":"Undeliverable thought.","thoughtSignature":sig(b'A')}]},"finishReason":"STOP"},
+            {"index":1,"content":{"parts":[{"thought":true,"text":"Successful thought.","thoughtSignature":sig(b'B')},{"text":"Done."}]},"finishReason":"STOP"}
+        ]})];
+        let stream = run_stream_lifecycle(
+            raw(frames),
+            native(&session, "gemini-2.5-flash", buffered, 2),
+            StreamLifecycleConfig::new("gemini", "r19", "test".into()),
+        );
+        let chunks = stream.collect::<Vec<_>>().await;
+        assert!(chunks.iter().all(Result::is_ok));
+        if buffered {
+            collector::collect_stream_to_json(futures::stream::iter(chunks), &session)
+                .await
+                .unwrap();
+        }
+        let rows = crate::modules::proxy_db::load_thinking_records(&session).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "buffered={buffered}: undeliverable candidate stored"
+        );
+        assert_eq!(rows[0].signature.as_deref(), Some(sig(b'B').as_str()));
+        assert!(crate::proxy::SignatureCache::global()
+            .get_session_signature(&session)
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn signed_gemini_text_tool_and_media_outputs_retain_history() {
+    crate::modules::proxy_db::init_db().unwrap();
+    for visible in [
+        json!({"text":"Done."}),
+        json!({"functionCall":{"name":"inspect","id":"call_visible","args":{}}}),
+        json!({"inlineData":{"mimeType":"image/png","data":"cG5n"}}),
+        json!({"fileData":{"mimeType":"image/png","fileUri":"https://files.example/output.png"}}),
+    ] {
+        for buffered in [false, true] {
+            for split in [false, true] {
+                let session = format!("r19-visible-history-{}", uuid::Uuid::new_v4());
+                let thought = json!({"thought":true,"text":"Successful signed reasoning.","thoughtSignature":sig(b'B')});
+                let mut frames =
+                    vec![json!({"candidates":[{"content":{"parts":[thought,visible]}}]})];
+                if split {
+                    frames.push(json!({"candidates":[{"finishReason":"STOP"}]}));
+                } else {
+                    frames[0]["candidates"][0]["finishReason"] = json!("STOP");
+                }
+                let stream = run_stream_lifecycle(
+                    raw(frames),
+                    native(&session, "gemini-2.5-flash", buffered, 1),
+                    StreamLifecycleConfig::new("gemini", "r19", "test".into()),
+                );
+                let chunks = stream.collect::<Vec<_>>().await;
+                assert!(chunks.iter().all(Result::is_ok), "{visible}");
+                if buffered {
+                    collector::collect_stream_to_json(futures::stream::iter(chunks), &session)
+                        .await
+                        .unwrap();
+                }
+                let rows = crate::modules::proxy_db::load_thinking_records(&session).unwrap();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "buffered={buffered} split={split}: {visible}"
+                );
+                assert_eq!(rows[0].signature.as_deref(), Some(sig(b'B').as_str()));
+                assert!(crate::proxy::SignatureCache::global()
+                    .get_session_signature(&session)
+                    .is_some());
+            }
+        }
+    }
+}

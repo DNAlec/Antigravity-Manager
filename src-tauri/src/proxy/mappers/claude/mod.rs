@@ -407,10 +407,6 @@ fn process_sse_line(
         });
 
     if let Some(finish_reason) = finish_reason {
-        state.upstream_finished |= raw_json
-            .get("candidates")
-            .and_then(|c| c.get(0))
-            .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
         if state.has_thinking
             && !state.has_content
             && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
@@ -421,6 +417,12 @@ fn process_sse_line(
                 finish_reason
             );
         } else {
+            // A thinking-only candidate is rejected by the lifecycle below.
+            // Its upstream STOP must not authorize publishing retry history.
+            state.upstream_finished |= raw_json
+                .get("candidates")
+                .and_then(|c| c.get(0))
+                .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
             let usage = state.last_usage.clone();
 
             if let Some(ref u) = usage {

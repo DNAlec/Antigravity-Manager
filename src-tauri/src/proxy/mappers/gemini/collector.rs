@@ -345,7 +345,9 @@ where
         {
             continue;
         }
-        if !parts.is_empty() && super::has_successful_candidate_finish(&candidate) {
+        if parts.iter().any(super::has_visible_content)
+            && super::has_successful_candidate_finish(&candidate)
+        {
             if singleton {
                 for part in &parts {
                     if let Some(sig) = part

@@ -49,6 +49,15 @@ pub(crate) fn has_media(part: &serde_json::Value) -> bool {
         .any(|key| part.get(*key).is_some())
 }
 
+/// The content required for a deliverable Gemini candidate. Thoughts alone
+/// cannot pass the stream lifecycle's no-content guard.
+pub(crate) fn has_visible_content(part: &serde_json::Value) -> bool {
+    (part.get("thought").and_then(serde_json::Value::as_bool) != Some(true)
+        && part.get("text").is_some())
+        || part.get("functionCall").is_some()
+        || has_media(part)
+}
+
 /// Error/refusal terminals finish transport, but cannot authorize replaying
 /// partial reasoning. A model output limit is a valid resumable truncation.
 pub(crate) fn has_successful_candidate_finish(candidate: &serde_json::Value) -> bool {
