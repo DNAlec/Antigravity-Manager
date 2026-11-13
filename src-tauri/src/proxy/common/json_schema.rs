@@ -144,6 +144,9 @@ pub fn validate_tool_schema(schema: &Value) -> Result<(), String> {
                     }
                 }
             }
+            // The accepted fragments must remain representable once combined;
+            // for example allOf must not hide a type-array/anyOf intersection.
+            return walk(&Value::Object(combined), depth);
         }
         if let Some(one_of) = map.get("oneOf") {
             if map.contains_key("anyOf")
@@ -528,18 +531,59 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
     match value {
         Value::Object(map) => {
-            if let Some(Value::Array(types)) = map.get("type") {
+            // Resolve compositions before inferring a type from properties/items.
+            // allOf can introduce a type array, while oneOf must already be a
+            // union when the structural normalization below runs.
+            merge_all_of(map);
+            if !map.contains_key("anyOf")
+                && map
+                    .get("oneOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|branches| disjoint_schema_union(branches))
+            {
+                if let Some(branches) = map.remove("oneOf") {
+                    map.insert("anyOf".to_string(), branches);
+                }
+            }
+            if let Some(Value::Array(types)) = map.get("type").cloned() {
                 if !map.contains_key("anyOf") && !map.contains_key("oneOf") {
+                    // JSON Schema applies these keywords only to their own
+                    // types. Move them into the matching alternatives before
+                    // array defaults or object healing can change their meaning.
+                    let constraints: Vec<_> = [
+                        ("items", "array"),
+                        ("minItems", "array"),
+                        ("maxItems", "array"),
+                        ("properties", "object"),
+                        ("required", "object"),
+                        ("minProperties", "object"),
+                        ("maxProperties", "object"),
+                        ("minLength", "string"),
+                        ("maxLength", "string"),
+                        ("pattern", "string"),
+                        ("minimum", "number"),
+                        ("maximum", "number"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, kind)| map.remove(key).map(|value| (key, kind, value)))
+                    .collect();
                     let branches = types
                         .iter()
-                        .map(|kind| json!({"type":kind}))
+                        .map(|kind| {
+                            let mut branch = json!({"type":kind});
+                            let kind = kind.as_str().unwrap_or_default().to_ascii_lowercase();
+                            for (key, target, constraint) in &constraints {
+                                if kind == *target || (kind == "integer" && *target == "number") {
+                                    branch[*key] = constraint.clone();
+                                }
+                            }
+                            branch
+                        })
                         .collect::<Vec<_>>();
                     map.remove("type");
                     map.insert("anyOf".into(), json!(branches));
                 }
             }
-            // 0. [NEW] 合并 allOf
-            merge_all_of(map);
 
             // 0.1 [NEW #3327] 规范化 const 关键字 (转换为 enum 与对应 type)
             // Gemini/Vertex 的 Schema proto 不支持 const，直接传入会导致 400 INVALID_ARGUMENT
@@ -587,8 +631,9 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
             if is_explicit_array {
                 map.remove("properties");
-            } else if map.get("type").and_then(|t| t.as_str()) == Some("object")
-                || map.contains_key("properties")
+            } else if !map.contains_key("anyOf")
+                && (map.get("type").and_then(|t| t.as_str()) == Some("object")
+                    || map.contains_key("properties"))
             {
                 if let Some(items) = map.remove("items") {
                     tracing::warn!("[Schema-Normalization] Found 'items' in an Object-like node. Moving content to 'properties'.");
@@ -630,23 +675,16 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     props.remove(k);
                 }
 
-                let mut nullable_keys = std::collections::HashSet::new();
-                for (k, v) in props.iter_mut() {
+                for v in props.values_mut() {
                     // properties 的每一个值都必须是一个独立的 Schema 节点
-                    if clean_json_schema_recursive(v, true, depth + 1) {
-                        nullable_keys.insert(k.clone());
-                    }
+                    clean_json_schema_recursive(v, true, depth + 1);
                 }
                 let valid_keys: std::collections::HashSet<String> = props.keys().cloned().collect();
 
                 if let Some(Value::Array(req_arr)) = map.get_mut("required") {
                     req_arr.retain(|r| {
                         r.as_str()
-                            .map(|s| {
-                                valid_keys.contains(s)
-                                    && !nullable_keys.contains(s)
-                                    && !dropped_keys.iter().any(|d| d == s)
-                            })
+                            .map(|s| valid_keys.contains(s) && !dropped_keys.iter().any(|d| d == s))
                             .unwrap_or(false)
                     });
                     if req_arr.is_empty() {
@@ -704,16 +742,6 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
             }
 
-            if !map.contains_key("anyOf")
-                && map
-                    .get("oneOf")
-                    .and_then(Value::as_array)
-                    .is_some_and(|branches| disjoint_schema_union(branches))
-            {
-                if let Some(branches) = map.remove("oneOf") {
-                    map.insert("anyOf".to_string(), branches);
-                }
-            }
             // Gemini Schema supports anyOf. Selecting a single branch silently
             // changes the tool contract (for example, integer|string -> string).
             let can_inline_union = map.keys().all(|key| {
@@ -722,6 +750,7 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     "anyOf" | "title" | "description" | "default" | "$schema"
                 )
             });
+            let parent_items = map.get("items").cloned();
             if let Some(Value::Array(branches)) = map.get_mut("anyOf") {
                 let is_null = |v: &Value| {
                     v.get("type")
@@ -746,6 +775,28 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     });
                 }
                 for branch in branches {
+                    if let (Some(items), Some(branch_map)) =
+                        (parent_items.as_ref(), branch.as_object_mut())
+                    {
+                        merge_all_of(branch_map);
+                        let accepts_array = match branch_map.get("type") {
+                            Some(Value::String(kind)) => kind.eq_ignore_ascii_case("array"),
+                            Some(Value::Array(types)) => types.iter().any(|kind| {
+                                kind.as_str()
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("array"))
+                            }),
+                            _ => {
+                                branch_map.contains_key("anyOf") || branch_map.contains_key("oneOf")
+                            }
+                        };
+                        if accepts_array {
+                            // Parent and explicit branch constraints remain a
+                            // conjunction. Inherit only a missing item schema,
+                            // preventing the default string items from adding
+                            // an unrelated restriction to this alternative.
+                            branch_map.entry("items").or_insert_with(|| items.clone());
+                        }
+                    }
                     clean_json_schema_recursive(branch, true, depth + 1);
                 }
                 if had_null {
@@ -1233,6 +1284,108 @@ mod tests {
         let req = schema["required"].as_array().unwrap();
         assert_eq!(req.len(), 2);
         assert!(req.contains(&serde_json::json!("a")) && req.contains(&serde_json::json!("b")));
+    }
+
+    #[test]
+    fn r19_type_union_keeps_constraints_on_their_applicable_branch() {
+        for (mut schema, expected) in [
+            (
+                json!({"type":["array","null"],"items":{"type":"integer"},"minItems":1}),
+                json!({"type":"array","items":{"type":"integer"},"minItems":1,"nullable":true}),
+            ),
+            (
+                json!({"type":["array","object"],"items":{"type":"integer"},"minItems":1,"properties":{"x":{"type":"integer"}},"required":["x"],"maxProperties":2}),
+                json!({"anyOf":[{"type":"array","items":{"type":"integer"},"minItems":1},{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"maxProperties":2}]}),
+            ),
+            (
+                json!({"type":["string","integer","boolean"],"minLength":2,"pattern":"^a","minimum":3}),
+                json!({"anyOf":[{"type":"string","minLength":2,"pattern":"^a"},{"type":"integer","minimum":3},{"type":"boolean"}]}),
+            ),
+        ] {
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(schema, expected);
+        }
+    }
+
+    #[test]
+    fn r19_compositions_normalize_before_structural_type_inference() {
+        for (mut schema, expected) in [
+            (
+                json!({"allOf":[{"type":["string","integer"]}]}),
+                json!({"anyOf":[{"type":"string"},{"type":"integer"}]}),
+            ),
+            (
+                json!({"allOf":[{"type":["array","null"]},{"items":{"type":"integer"}}]}),
+                json!({"type":"array","items":{"type":"integer"},"nullable":true}),
+            ),
+            (
+                json!({"oneOf":[{"type":"string"},{"type":"integer"}],"properties":{"x":{"type":"boolean"}}}),
+                json!({"anyOf":[{"type":"string"},{"type":"integer"}],"properties":{"x":{"type":"boolean"}}}),
+            ),
+        ] {
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(schema, expected);
+        }
+    }
+
+    #[test]
+    fn r19_composed_union_constraints_fail_before_lossy_fallbacks() {
+        for schema in [
+            json!({"allOf":[{"type":["string","integer"]}],"anyOf":[{"type":"integer"}]}),
+            json!({"allOf":[{"type":["string","integer"]},{"oneOf":[{"type":"integer"}]}]}),
+        ] {
+            assert!(super::validate_tool_schema(&schema).is_err(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn r19_union_parent_items_prevent_incompatible_array_defaults() {
+        for keyword in ["anyOf", "oneOf"] {
+            let mut schema =
+                json!({keyword:[{"type":"array"},{"type":"null"}],"items":{"type":"integer"}});
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(
+                schema,
+                json!({"anyOf":[{"type":"array","items":{"type":"integer"}},{"type":"null"}],"items":{"type":"integer"}})
+            );
+        }
+        let mut schema = json!({"allOf":[{"anyOf":[{"type":"array"},{"type":"object","properties":{"y":{"type":"boolean"}}}]},{"items":{"type":"integer"},"properties":{"x":{"type":"string"}},"required":["x"]}]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            json!({"anyOf":[{"type":"array","items":{"type":"integer"}},{"type":"object","properties":{"y":{"type":"boolean"}}}],"items":{"type":"integer"},"properties":{"x":{"type":"string"}},"required":["x"]})
+        );
+    }
+
+    #[test]
+    fn r19_union_parent_and_explicit_branch_items_remain_conjoined() {
+        let mut schema = json!({"anyOf":[{"type":"array","items":{"type":"integer","minimum":2}},{"anyOf":[{"type":"array"},{"type":"null"}]}],"items":{"type":"integer","maximum":5}});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema["items"], json!({"type":"integer","maximum":5}));
+        assert_eq!(
+            schema["anyOf"][0]["items"],
+            json!({"type":"integer","minimum":2})
+        );
+        assert_eq!(
+            schema["anyOf"][1]["anyOf"][0]["items"],
+            json!({"type":"integer","maximum":5})
+        );
+    }
+
+    #[test]
+    fn r19_nullable_union_properties_remain_required() {
+        let mut schema = json!({"type":"object","properties":{"a":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["a"]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            json!({"type":"object","properties":{"a":{"type":"string","nullable":true}},"required":["a"]})
+        );
     }
 
     #[test]

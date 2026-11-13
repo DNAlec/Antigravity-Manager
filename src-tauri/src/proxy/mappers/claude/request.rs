@@ -1858,6 +1858,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn r19_tool_type_unions_preserve_final_array_and_object_constraints() {
+        let req: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-6",
+            "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
+                "ids":{"type":["array","null"],"items":{"type":"integer"},"minItems":1},
+                "inherited":{"anyOf":[{"type":"array"},{"type":"null"}],"items":{"type":"integer"}},
+                "value":{"type":["array","object"],"items":{"type":"integer"},"properties":{"x":{"type":"integer"}},"required":["x"]},
+                "choice":{"allOf":[{"type":["string","integer"]}]}
+            },"required":["ids","value"]}}],
+            "messages":[{"role":"user","content":"Inspect [1]"}]
+        })).unwrap();
+        let body = transform_claude_request_in(&req, "p", false, None, "r19-union", None).unwrap();
+        let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(
+            schema["properties"]["ids"],
+            json!({"type":"ARRAY","items":{"type":"INTEGER"},"minItems":1,"nullable":true})
+        );
+        assert_eq!(
+            schema["properties"]["inherited"],
+            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"NULL"}],"items":{"type":"INTEGER"}})
+        );
+        assert_eq!(
+            schema["properties"]["value"],
+            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"OBJECT","properties":{"x":{"type":"INTEGER"}},"required":["x"]}]})
+        );
+        assert_eq!(
+            schema["properties"]["choice"],
+            json!({"anyOf":[{"type":"STRING"},{"type":"INTEGER"}]})
+        );
+        assert_eq!(schema["required"], json!(["ids", "value"]));
+    }
+
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::ThinkingBudgetConfig;
