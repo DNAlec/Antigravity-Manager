@@ -1,6 +1,35 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Merge cumulative upstream usage by field presence, never by addition or maximum.
+/// Sparse frames leave earlier counters intact; explicit values (including zero)
+/// replace them. Keep unknown fields so native Gemini responses remain lossless.
+pub fn merge_cumulative_usage(current: &mut Option<Value>, update: &Value) {
+    if !update.is_object() {
+        return;
+    }
+
+    fn merge_value(current: &mut Value, update: &Value) {
+        if let (Some(current), Some(update)) = (current.as_object_mut(), update.as_object()) {
+            for (key, value) in update {
+                match current.get_mut(key) {
+                    Some(existing) => merge_value(existing, value),
+                    None => {
+                        current.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        } else {
+            *current = update.clone();
+        }
+    }
+
+    match current {
+        Some(current) => merge_value(current, update),
+        None => *current = Some(update.clone()),
+    }
+}
+
 /// 统一用量与缓存计算引擎（CanonicalUsage）
 /// 权威收拢 Google Gemini 原生 usageMetadata，并提供向四大协议专属格式的标准散开方法
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +257,54 @@ impl CanonicalUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_usage_preserves_sparse_fields_and_replaces_explicit_values() {
+        let mut usage = None;
+        merge_cumulative_usage(
+            &mut usage,
+            &json!({
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 80,
+                "candidatesTokenCount": 3,
+                "futureDetails": {"cached": 80, "other": 2},
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 100}]
+            }),
+        );
+        let sparse = json!({"candidatesTokenCount": 5, "futureDetails": {"other": 1}});
+        merge_cumulative_usage(&mut usage, &sparse);
+        merge_cumulative_usage(&mut usage, &sparse);
+        let merged = usage.as_ref().unwrap();
+        assert_eq!(merged["promptTokenCount"], 100);
+        assert_eq!(merged["cachedContentTokenCount"], 80);
+        assert_eq!(merged["candidatesTokenCount"], 5);
+        assert_eq!(merged["futureDetails"], json!({"cached": 80, "other": 1}));
+        assert_eq!(merged["promptTokensDetails"][0]["tokenCount"], 100);
+
+        merge_cumulative_usage(
+            &mut usage,
+            &json!({
+                "cachedContentTokenCount": 0,
+                "candidatesTokenCount": 2,
+                "futureDetails": {"cached": 0},
+                "promptTokensDetails": []
+            }),
+        );
+        let merged = usage.unwrap();
+        assert_eq!(merged["cachedContentTokenCount"], 0);
+        assert_eq!(merged["candidatesTokenCount"], 2);
+        assert_eq!(merged["futureDetails"], json!({"cached": 0, "other": 1}));
+        assert_eq!(merged["promptTokensDetails"], json!([]));
+    }
+
+    #[test]
+    fn cumulative_usage_ignores_non_object_metadata() {
+        let mut usage = Some(json!({"cachedContentTokenCount": 80}));
+        for update in [Value::Null, json!(0), json!([])] {
+            merge_cumulative_usage(&mut usage, &update);
+        }
+        assert_eq!(usage, Some(json!({"cachedContentTokenCount": 80})));
+    }
 
     #[test]
     fn test_canonical_usage_from_gemini_and_diffusion() {

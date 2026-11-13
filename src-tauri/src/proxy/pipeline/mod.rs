@@ -18,6 +18,7 @@ mod official_alignment_tests;
 pub mod policy;
 pub mod qos;
 pub mod rotation;
+pub mod stream_error;
 pub mod stream_lifecycle;
 pub mod stream_peek;
 pub mod terminal;

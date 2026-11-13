@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
+use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::pipeline::{run_stream_lifecycle, ProtocolStreamHandler, StreamLifecycleConfig};
 
 /// 保存 thoughtSignature 到会话缓存
@@ -87,6 +88,8 @@ pub struct OpenAIChatStreamHandler {
     pub include_usage: bool,
     pub emitted_tool_calls: std::collections::HashSet<String>,
     pub final_usage: Option<super::models::OpenAIUsage>,
+    // Retain raw cumulative fields even after a translated usage frame is emitted.
+    pub usage_metadata: Option<Value>,
     pub tool_call_index: usize,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
     pub has_content: bool,
@@ -114,7 +117,11 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 json
             };
             if let Some(u) = actual_data.get("usageMetadata") {
-                self.final_usage = extract_usage_metadata(u);
+                merge_cumulative_usage(&mut self.usage_metadata, u);
+                self.final_usage = self
+                    .usage_metadata
+                    .as_ref()
+                    .and_then(extract_usage_metadata);
             }
 
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -582,6 +589,7 @@ where
         include_usage,
         emitted_tool_calls: std::collections::HashSet::new(),
         final_usage: None,
+        usage_metadata: None,
         tool_call_index: 0,
         thinking_acc,
         has_content: false,
@@ -609,6 +617,7 @@ pub struct LegacyCompletionStreamHandler {
     session_id: String,
     message_count: usize,
     final_usage: Option<super::models::OpenAIUsage>,
+    usage_metadata: Option<Value>,
     thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
     has_content: bool,
     has_thinking: bool,
@@ -649,7 +658,11 @@ impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
             json
         };
         if let Some(u) = actual_data.get("usageMetadata") {
-            self.final_usage = extract_usage_metadata(u);
+            merge_cumulative_usage(&mut self.usage_metadata, u);
+            self.final_usage = self
+                .usage_metadata
+                .as_ref()
+                .and_then(extract_usage_metadata);
         }
 
         let mut content_out = String::new();
@@ -816,6 +829,7 @@ where
         session_id,
         message_count,
         final_usage: None,
+        usage_metadata: None,
         thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
         has_content: false,
         has_thinking: false,
@@ -952,6 +966,7 @@ pub struct CodexResponsesStreamHandler {
     message_output_index: u32,
     reasoning_output_index: u32,
     final_usage: Option<super::models::OpenAIUsage>,
+    usage_metadata: Option<Value>,
     thinking_committed: bool,
 }
 
@@ -1001,6 +1016,7 @@ impl CodexResponsesStreamHandler {
             message_output_index: 0,
             reasoning_output_index: 0,
             final_usage: None,
+            usage_metadata: None,
             thinking_committed: false,
         }
     }
@@ -1641,7 +1657,11 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
         };
 
         if let Some(u) = actual_data.get("usageMetadata") {
-            self.final_usage = extract_usage_metadata(u);
+            merge_cumulative_usage(&mut self.usage_metadata, u);
+            self.final_usage = self
+                .usage_metadata
+                .as_ref()
+                .and_then(extract_usage_metadata);
         }
 
         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -1765,6 +1785,167 @@ mod tests {
     use super::*;
     use futures::stream;
     use serde_json::json;
+
+    fn sparse_usage_chunks(explicit_zero: bool) -> Vec<Value> {
+        let mut final_usage = json!({"candidatesTokenCount": 5, "totalTokenCount": 105});
+        if explicit_zero {
+            final_usage["cachedContentTokenCount"] = json!(0);
+        }
+        vec![
+            json!({"response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "cachedContentTokenCount": 80,
+                    "candidatesTokenCount": 3
+                }
+            }}),
+            json!({"response": {
+                "candidates": [{"finishReason": "STOP"}],
+                "usageMetadata": final_usage
+            }}),
+        ]
+    }
+
+    fn assert_chat_usage(usage: &Value, explicit_zero: bool) {
+        assert_eq!(usage["prompt_tokens"], 100);
+        assert_eq!(usage["completion_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 105);
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            if explicit_zero { 0 } else { 80 }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_sparse_cumulative_usage_preserves_cache_and_honors_zero() {
+        for include_usage in [false, true] {
+            for explicit_zero in [false, true] {
+                let items: Vec<Result<Bytes, String>> = sparse_usage_chunks(explicit_zero)
+                    .into_iter()
+                    .map(|chunk| Ok(Bytes::from(format!("data: {chunk}\n\n"))))
+                    .collect();
+                let mut output = create_openai_sse_stream(
+                    Box::pin(stream::iter(items)),
+                    "gemini-pro-agent".to_string(),
+                    "sparse-usage-test".to_string(),
+                    0,
+                    None,
+                    include_usage,
+                );
+                let mut final_usage = None;
+                while let Some(chunk) = output.next().await {
+                    for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                if let Some(usage) = event.get("usage") {
+                                    final_usage = Some(usage.clone());
+                                    if include_usage {
+                                        assert_eq!(event["choices"], json!([]));
+                                    } else {
+                                        assert_eq!(event["choices"][0]["finish_reason"], "stop");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_chat_usage(&final_usage.expect("final usage"), explicit_zero);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_late_sparse_cumulative_usage_keeps_cache_with_include_usage() {
+        let mut chunks = sparse_usage_chunks(false);
+        let late_usage = chunks[1]["response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("usageMetadata")
+            .unwrap();
+        chunks.push(json!({"usageMetadata": late_usage}));
+        let items: Vec<Result<Bytes, String>> = chunks
+            .into_iter()
+            .map(|chunk| Ok(Bytes::from(format!("data: {chunk}\n\n"))))
+            .collect();
+        let mut output = create_openai_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-pro-agent".to_string(),
+            "late-sparse-usage-test".to_string(),
+            0,
+            None,
+            true,
+        );
+        let mut final_usage = None;
+        while let Some(chunk) = output.next().await {
+            for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        if let Some(usage) = event.get("usage") {
+                            final_usage = Some(usage.clone());
+                        }
+                    }
+                }
+            }
+        }
+        assert_chat_usage(&final_usage.expect("late final usage"), false);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_sparse_cumulative_usage_preserves_cache_and_honors_zero() {
+        for late_usage in [false, true] {
+            for explicit_zero in [false, true] {
+                let mut chunks = sparse_usage_chunks(explicit_zero);
+                if late_usage {
+                    let usage = chunks[1]["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usageMetadata")
+                        .unwrap();
+                    chunks.push(json!({"usageMetadata": usage}));
+                }
+                let items = chunks
+                    .into_iter()
+                    .map(|chunk| Ok(Bytes::from(format!("data: {chunk}\n\n"))))
+                    .collect();
+                let (_, events) = collect_legacy_stream(items).await;
+                let final_event = events.last().expect("completion usage");
+                assert_chat_usage(&final_event["usage"], explicit_zero);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_sparse_cumulative_usage_preserves_cache_and_honors_zero() {
+        for late_usage in [false, true] {
+            for explicit_zero in [false, true] {
+                let mut chunks = sparse_usage_chunks(explicit_zero);
+                if late_usage {
+                    let usage = chunks[1]["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usageMetadata")
+                        .unwrap();
+                    chunks.push(json!({"usageMetadata": usage}));
+                }
+                let (_, events) = collect_codex_stream_with_cache(chunks, false).await;
+                let completed = events
+                    .iter()
+                    .find(|event| event["type"] == "response.completed")
+                    .expect("completed response");
+                let usage = &completed["response"]["usage"];
+                assert_eq!(usage["input_tokens"], 100);
+                assert_eq!(usage["output_tokens"], 5);
+                assert_eq!(usage["total_tokens"], 105);
+                assert_eq!(
+                    usage["input_tokens_details"]["cached_tokens"],
+                    if explicit_zero { 0 } else { 80 }
+                );
+            }
+        }
+    }
 
     async fn collect_codex_stream(chunks: Vec<Value>) -> (String, Vec<Value>) {
         collect_codex_stream_with_cache(chunks, true).await

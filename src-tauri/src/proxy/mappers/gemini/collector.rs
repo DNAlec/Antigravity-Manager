@@ -6,6 +6,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::SignatureCache; // Assuming this is available at crate root or re-exported
 
 /// Collects a Gemini SSE stream into a complete Gemini Response Value
@@ -104,7 +105,7 @@ where
 
                     // 1. Capture Usage
                     if let Some(usage) = actual_data.get("usageMetadata") {
-                        usage_metadata = Some(usage.clone());
+                        merge_cumulative_usage(&mut usage_metadata, usage);
                     }
 
                     // 2. Capture Content & Signature
@@ -311,6 +312,47 @@ mod tests {
     use super::*;
     use futures::stream;
     use std::io;
+
+    #[tokio::test]
+    async fn test_collect_sparse_cumulative_usage_preserves_cache_and_honors_zero() {
+        for explicit_zero in [false, true] {
+            let mut final_usage = json!({"candidatesTokenCount": 5, "totalTokenCount": 105});
+            if explicit_zero {
+                final_usage["cachedContentTokenCount"] = json!(0);
+            }
+            let frames = vec![
+                json!({"response": {
+                    "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 100,
+                        "cachedContentTokenCount": 80,
+                        "candidatesTokenCount": 3,
+                        "futureUsageField": {"value": 7}
+                    }
+                }}),
+                json!({"response": {
+                    "candidates": [{"finishReason": "STOP"}],
+                    "usageMetadata": final_usage
+                }}),
+            ];
+            let byte_stream =
+                stream::iter(frames.into_iter().map(|frame| {
+                    Ok::<Bytes, io::Error>(Bytes::from(format!("data: {frame}\n\n")))
+                }));
+            let response = collect_stream_to_json(byte_stream, "sparse-usage-test")
+                .await
+                .unwrap();
+            let usage = &response["usageMetadata"];
+            assert_eq!(usage["promptTokenCount"], 100);
+            assert_eq!(
+                usage["cachedContentTokenCount"],
+                if explicit_zero { 0 } else { 80 }
+            );
+            assert_eq!(usage["candidatesTokenCount"], 5);
+            assert_eq!(usage["totalTokenCount"], 105);
+            assert_eq!(usage["futureUsageField"]["value"], 7);
+        }
+    }
 
     #[tokio::test]
     async fn test_collect_simple_text_response() {

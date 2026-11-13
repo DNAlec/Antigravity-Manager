@@ -95,8 +95,9 @@ pub struct StreamingState {
     // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
     pub text_delta_emitted_this_turn: bool,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
-    /// 缓存流式过程中接收到的最近一次使用量元数据，防止单独下发 finishReason 或无元数据收尾时 Token 统计归零
+    /// Merged cumulative usage, including fields omitted by later sparse frames.
     pub last_usage: Option<UsageMetadata>,
+    pub(super) usage_metadata: Option<serde_json::Value>,
 }
 
 impl StreamingState {
@@ -129,6 +130,7 @@ impl StreamingState {
             text_delta_emitted_this_turn: false,
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
             last_usage: None,
+            usage_metadata: None,
         }
     }
 

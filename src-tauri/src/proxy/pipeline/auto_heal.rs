@@ -163,6 +163,58 @@ pub struct AutoHealOutcome {
     pub delay_ms: u64,
 }
 
+/// Prepare a repair without changing the live request until its replay is allowed.
+/// This runs before ordinary CacheFirst failure handling and before account penalties.
+#[allow(clippy::too_many_arguments)]
+pub fn try_auto_heal_with_retry_policy(
+    classification: &crate::proxy::pipeline::UpstreamClassification,
+    status_code: u16,
+    error_text: &str,
+    retry_after: Option<&str>,
+    body: &mut Value,
+    degraded: &mut Option<Value>,
+    flags: &mut AutoHealFlags,
+    retry_state: &mut crate::proxy::pipeline::rotation::RequestRetryState,
+    account_id: &str,
+    scheduling: &crate::proxy::sticky_config::StickySessionConfig,
+    cache_bound: bool,
+) -> Option<AutoHealOutcome> {
+    if crate::proxy::upstream::request_policy::request_policy().single_attempt
+        || classification.is_model_not_found()
+        || classification.is_internal_gateway_message()
+    {
+        return None;
+    }
+    let mut repaired_body = body.clone();
+    let mut repaired_degraded = None;
+    let mut repaired_flags = *flags;
+    let mut heal = try_auto_heal(
+        classification,
+        status_code,
+        error_text,
+        &mut repaired_body,
+        &mut repaired_degraded,
+        &mut repaired_flags,
+    )?;
+    heal.delay_ms = retry_state.authorize_payload_repair(
+        account_id,
+        heal.delay_ms,
+        crate::proxy::upstream::retry::parse_retry_delay(error_text, retry_after),
+        scheduling,
+        crate::proxy::pipeline::rotation::cache_first_preserves_failure(
+            status_code,
+            error_text,
+            retry_after,
+            scheduling,
+            cache_bound,
+        ),
+    )?;
+    *body = repaired_body;
+    *degraded = repaired_degraded;
+    *flags = repaired_flags;
+    Some(heal)
+}
+
 /// 通用原地自愈执行器（协议无关，操作的是已转换的 Gemini Canonical IR）
 ///
 /// 四个适配器过去各写一份同样的判断与改写：
@@ -194,7 +246,7 @@ pub fn try_auto_heal(
             flags.retried_with_capacity_promoted = true;
             *degraded = Some(body.clone());
             tracing::warn!(
-                "[AutoHeal] Upstream 503 MODEL_CAPACITY_EXHAUSTED: promoted tier to HIGH and retrying on same account"
+                "[AutoHeal] Prepared HIGH tier repair for upstream MODEL_CAPACITY_EXHAUSTED"
             );
             return Some(AutoHealOutcome {
                 kind: "promote_tier_to_high_capacity",
@@ -211,7 +263,7 @@ pub fn try_auto_heal(
         flags.retried_with_budget_degraded = true;
         *degraded = Some(body.clone());
         tracing::warn!(
-            "[AutoHeal] upstream {}/overloaded: degraded thinking budget to 4000 (preserving prefix cache) err={}",
+            "[AutoHeal] Prepared thinking budget reduction for upstream {}/overloaded (preserving prefix cache) err={}",
             status_code,
             crate::proxy::upstream::client::strip_internal_markers(error_text)
         );
@@ -242,7 +294,7 @@ pub fn try_auto_heal(
         }
         *degraded = Some(body.clone());
         tracing::warn!(
-            "[AutoHeal] upstream 400 tool_choice/thinking conflict: stripped thinkingConfig and retrying on same account"
+            "[AutoHeal] Prepared thinkingConfig removal for upstream tool_choice/thinking conflict"
         );
         return Some(AutoHealOutcome {
             kind: "strip_thinking_on_tool_choice_conflict",
@@ -263,7 +315,7 @@ pub fn try_auto_heal(
         flags.retried_with_image_omitted = true;
         *degraded = Some(body.clone());
         tracing::warn!(
-            "[AutoHeal] upstream 400 unable to process image: purged {} image(s) to text placeholders, retrying on same account",
+            "[AutoHeal] Prepared replacement of {} corrupted image(s) with text placeholders",
             purged
         );
         return Some(AutoHealOutcome {
@@ -273,6 +325,259 @@ pub fn try_auto_heal(
     }
 
     None
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+    use crate::proxy::pipeline::rotation::{RequestRetryState, RetryStrategy};
+    use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+
+    fn body() -> Value {
+        json!({"model": "gemini-pro-agent-medium", "request": {
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "MEDIUM", "thinkingBudget": 10000}},
+            "contents": [{"role": "user", "parts": [{"text": "Keep this prefix"}]}]
+        }})
+    }
+
+    fn repair(
+        error: &str,
+        retry_after: Option<&str>,
+        body: &mut Value,
+        degraded: &mut Option<Value>,
+        flags: &mut AutoHealFlags,
+        state: &mut RequestRetryState,
+        scheduling: &StickySessionConfig,
+    ) -> Option<AutoHealOutcome> {
+        let classification =
+            crate::proxy::pipeline::UpstreamClassification::classify(503, error, retry_after);
+        try_auto_heal_with_retry_policy(
+            &classification,
+            503,
+            error,
+            retry_after,
+            body,
+            degraded,
+            flags,
+            state,
+            "warm",
+            scheduling,
+            true,
+        )
+    }
+
+    #[test]
+    fn payload_repair_runs_before_cache_first_stop_and_preserves_prefix() {
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        for (error, kind) in [
+            ("MODEL_CAPACITY_EXHAUSTED", "promote_tier_to_high_capacity"),
+            ("model overloaded", "degrade_thinking_budget"),
+        ] {
+            let mut body = body();
+            let prefix = body["request"]["contents"].clone();
+            let mut degraded = None;
+            let mut flags = AutoHealFlags::default();
+            let mut state = RequestRetryState::default();
+            let heal = repair(
+                error,
+                None,
+                &mut body,
+                &mut degraded,
+                &mut flags,
+                &mut state,
+                &scheduling,
+            )
+            .unwrap();
+            assert_eq!(heal.kind, kind);
+            assert_eq!(body["request"]["contents"], prefix);
+            assert_eq!(degraded.as_ref(), Some(&body));
+            if kind == "promote_tier_to_high_capacity" {
+                assert_eq!(
+                    body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                    "HIGH"
+                );
+            } else {
+                assert_eq!(
+                    body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    4000
+                );
+            }
+            assert_eq!(
+                state.cache_first_failure("warm", 503, error, None, &scheduling, true),
+                Some(RetryStrategy::NoRetry)
+            );
+        }
+    }
+
+    #[test]
+    fn payload_repair_denied_by_replay_or_delay_does_not_change_request() {
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            max_wait_seconds: 1,
+            ..Default::default()
+        };
+        for already_retried in [false, true] {
+            let mut state = RequestRetryState::default();
+            if already_retried {
+                assert_eq!(
+                    state.authorize_payload_repair("warm", 50, None, &scheduling, true),
+                    Some(50)
+                );
+            }
+            let mut body = body();
+            let original = body.clone();
+            let mut degraded = None;
+            let mut flags = AutoHealFlags::default();
+            let retry_after = if already_retried { None } else { Some("2") };
+            assert!(repair(
+                "MODEL_CAPACITY_EXHAUSTED",
+                retry_after,
+                &mut body,
+                &mut degraded,
+                &mut flags,
+                &mut state,
+                &scheduling
+            )
+            .is_none());
+            assert_eq!(body, original);
+            assert!(degraded.is_none());
+            assert!(!flags.retried_with_capacity_promoted);
+        }
+    }
+
+    #[test]
+    fn payload_repair_request_fix_does_not_consume_transient_replay() {
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let mut body = body();
+        let mut degraded = None;
+        let mut flags = AutoHealFlags::default();
+        let mut state = RequestRetryState::default();
+        let error = "Thinking may not be enabled when tool_choice forces tool use";
+        let classification =
+            crate::proxy::pipeline::UpstreamClassification::classify(400, error, None);
+        assert!(try_auto_heal_with_retry_policy(
+            &classification,
+            400,
+            error,
+            None,
+            &mut body,
+            &mut degraded,
+            &mut flags,
+            &mut state,
+            "warm",
+            &scheduling,
+            true
+        )
+        .is_some());
+        assert!(repair(
+            "MODEL_CAPACITY_EXHAUSTED",
+            None,
+            &mut body,
+            &mut degraded,
+            &mut flags,
+            &mut state,
+            &scheduling
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn payload_repair_does_not_intercept_model_or_quota_recovery() {
+        for (status, error) in [
+            (503, "model not found"),
+            (503, "no quota accounts"),
+            (
+                429,
+                r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure"}]}}"#,
+            ),
+        ] {
+            let mut body = body();
+            let original = body.clone();
+            let mut degraded = None;
+            let mut flags = AutoHealFlags::default();
+            let mut state = RequestRetryState::default();
+            let classification =
+                crate::proxy::pipeline::UpstreamClassification::classify(status, error, None);
+            assert!(try_auto_heal_with_retry_policy(
+                &classification,
+                status,
+                error,
+                None,
+                &mut body,
+                &mut degraded,
+                &mut flags,
+                &mut state,
+                "warm",
+                &Default::default(),
+                true
+            )
+            .is_none());
+            assert_eq!(body, original);
+            assert!(degraded.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_repair_exhausted_budget_does_not_change_request() {
+        use crate::proxy::pipeline::budget;
+        budget::scope(
+            budget::RequestContext::new(std::time::Instant::now()),
+            async {
+                let mut body = body();
+                let original = body.clone();
+                let mut degraded = None;
+                let mut flags = AutoHealFlags::default();
+                let mut state = RequestRetryState::default();
+                assert!(repair(
+                    "MODEL_CAPACITY_EXHAUSTED",
+                    None,
+                    &mut body,
+                    &mut degraded,
+                    &mut flags,
+                    &mut state,
+                    &Default::default()
+                )
+                .is_none());
+                assert_eq!(body, original);
+                assert!(degraded.is_none());
+                assert!(!flags.retried_with_capacity_promoted);
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn payload_repair_single_attempt_process_guard() {
+        // Also run this test alone in a fresh process with
+        // ANTIGRAVITY_UPSTREAM_SINGLE_ATTEMPT=1 (the setting is cached per process).
+        if !crate::proxy::upstream::request_policy::request_policy().single_attempt {
+            return;
+        }
+        let mut body = body();
+        let original = body.clone();
+        let mut degraded = None;
+        let mut flags = AutoHealFlags::default();
+        let mut state = RequestRetryState::default();
+        assert!(repair(
+            "MODEL_CAPACITY_EXHAUSTED",
+            None,
+            &mut body,
+            &mut degraded,
+            &mut flags,
+            &mut state,
+            &Default::default()
+        )
+        .is_none());
+        assert_eq!(body, original);
+        assert!(degraded.is_none());
+        assert!(!flags.retried_with_capacity_promoted);
+    }
 }
 
 /// 检查 Gemini candidate 中的部件类型分布

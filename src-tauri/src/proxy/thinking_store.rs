@@ -2380,7 +2380,7 @@ pub fn explicit_session_id_with_query(
 
 /// 稳定会话号的唯一优先级：
 /// 产品会话头（`x-claude-code-session-id` 最先）→ 其它通配会话头 →
-/// 通用 `x-session-id` → 别名头 → query → body 稳定字段。
+/// 通用 `x-session-id` → `x-session-affinity` → 别名头 → query → body 稳定字段。
 /// `previous_response_id` 是每轮游标，不在名单里。
 pub fn stable_session_winner(
     headers: &HeaderMap,
@@ -2419,6 +2419,7 @@ const GENERIC_SESSION_HEADER: &str = "x-session-id";
 
 /// Non-session-named aliases. Lowest header priority after `x-session-id`.
 const ALIAS_SESSION_HEADERS: &[&str] = &[
+    "x-session-affinity",
     "x-conversation-id",
     "conversation-id",
     "x-chat-id",
@@ -3922,6 +3923,44 @@ mod tests {
         ignored.insert("x-request-id", "req-should-not-win".parse().unwrap());
         ignored.insert("x-api-key", "secret".parse().unwrap());
         assert_eq!(explicit_session_id_with_query(&ignored, None, None), None);
+    }
+
+    #[test]
+    fn affinity_header_is_a_fallback_without_collapsing_branch_sessions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-affinity", "flow-root".parse().unwrap());
+        headers.insert("x-conversation-id", "legacy-alias".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root")
+        );
+
+        headers.insert("x-session-id", "flow-root:step:1".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root:step:1")
+        );
+        headers.insert("x-opencode-session-id", "flow-root:step:2".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root:step:2")
+        );
+        headers.insert(
+            "x-claude-code-session-id",
+            "product-session".parse().unwrap(),
+        );
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("product-session")
+        );
+
+        let mut blank = HeaderMap::new();
+        blank.insert("x-session-affinity", "  ".parse().unwrap());
+        blank.insert("x-conversation-id", "legacy-alias".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&blank, None, None).as_deref(),
+            Some("legacy-alias")
+        );
     }
 
     #[test]

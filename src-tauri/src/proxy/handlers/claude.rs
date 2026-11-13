@@ -1751,7 +1751,7 @@ pub async fn handle_messages(
     let image_scheduler = state.image_scheduler.clone();
     let mut image_permit = None;
 
-    while let Some(attempt) = super::common::next_rotation_attempt(
+    'attempts: while let Some(attempt) = super::common::next_rotation_attempt(
         &mut used_attempts,
         max_attempts,
         retry_credentials.is_some(),
@@ -1774,6 +1774,7 @@ pub async fn handle_messages(
             );
             break;
         }
+        retry_state.begin_attempt();
 
         // 2. 模型路由解析
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
@@ -1852,14 +1853,17 @@ pub async fn handle_messages(
             if let Err(ref e) = res {
                 if crate::proxy::handlers::common::is_transient_token_error(e) {
                     tracing::warn!(
-                        "Token acquisition transient error ({}), retrying once with force_rotate...",
+                            "Token acquisition transient error ({}), retrying once under scheduling policy...",
                         e
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     res = token_manager
                         .get_token_filtered_with_lease(
                             &config.request_type,
-                            true,
+                            crate::proxy::pipeline::rotation::token_retry_force_rotate(
+                                force_rotate,
+                                token_manager.get_scheduling_mode().await,
+                            ),
                             session_id,
                             &config.final_model,
                             &attempted_accounts,
@@ -1874,6 +1878,7 @@ pub async fn handle_messages(
             match token_result {
                 Ok(t) => t,
                 Err(e) => {
+                    retry_state.preserve_token_error(&e);
                     if !failure_statuses.is_empty() {
                         tracing::warn!(
                         "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
@@ -1896,11 +1901,13 @@ pub async fn handle_messages(
                             safe_message
                         ),
                     );
-                    return crate::proxy::handlers::common::build_token_error_response(
-                        "claude",
-                        mapped_model.as_str(),
-                        None,
-                        &safe_message,
+                    return retry_state.finish_error_response(
+                        crate::proxy::handlers::common::build_token_error_response(
+                            "claude",
+                            mapped_model.as_str(),
+                            None,
+                            &safe_message,
+                        ),
                     );
                 }
             };
@@ -2226,6 +2233,27 @@ pub async fn handle_messages(
                 // 非终态（连接失败 / 调度错误）：按既有策略冷却并换账号。
                 // 状态码与其余三条链路对齐为 502，不再把所有错误都当 504。
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
+                if let Some(strategy) = retry_state.cache_first_failure(
+                    &account_id,
+                    502,
+                    &e,
+                    None,
+                    &token_manager.get_sticky_config().await,
+                    config.request_type != "image_gen",
+                ) {
+                    if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id).await {
+                        retry_credentials = Some((
+                            access_token.clone(),
+                            project_id.clone(),
+                            email.clone(),
+                            account_id.clone(),
+                            0,
+                            session_lease.clone(),
+                        ));
+                        continue;
+                    }
+                    break;
+                }
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
                 crate::proxy::pipeline::rotation::record_attempted_account(
                     &mut attempted_accounts,
@@ -2296,7 +2324,21 @@ pub async fn handle_messages(
         let status = response.status();
 
         // 成功
-        if status.is_success() {
+        // HTTP failures and pre-output SSE errors share the same recovery policy.
+        let (status, retry_after, error_text) = 'upstream_response: {
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|header| header.to_str().ok())
+                    .map(str::to_string);
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                break 'upstream_response (status, retry_after, error_text);
+            }
+
             crate::proxy::stage_trace::StageTrace::mark_current(
                 "upstream_ok",
                 format!(
@@ -2362,6 +2404,14 @@ pub async fn handle_messages(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                // Preserve structured upstream errors before protocol conversion.
+                let stream_errors =
+                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
+                let gemini_stream =
+                    Box::pin(crate::proxy::pipeline::stream_error::observe_stream_errors(
+                        gemini_stream,
+                        stream_errors.clone(),
+                    ));
 
                 let current_message_count = request_with_mapped.messages.len();
 
@@ -2566,7 +2616,11 @@ pub async fn handle_messages(
                             budget_secs,
                             &mut failure_statuses,
                         );
-                        break;
+                        retry_state.preserve_on_stop(
+                            token_manager.get_scheduling_mode().await,
+                            config.request_type != "image_gen",
+                        );
+                        break 'attempts;
                     }
                     crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
                         last_error = "Error event during peek".to_string();
@@ -2585,8 +2639,49 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    if let Some(failure) = stream_errors.failure() {
+                        let failure_status =
+                            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        if !failure.after_output {
+                            break 'upstream_response (failure_status, None, failure.body);
+                        }
+                        // Output has already been consumed: classify the error, but do not replay.
+                        retry_state.preserve_http_stop(
+                            failure.status,
+                            &failure.body,
+                            &token_manager.get_sticky_config().await,
+                            config.request_type != "image_gen",
+                        );
+                        failure_statuses.record(failure_status);
+                        last_error = failure.body;
+                        break 'attempts;
+                    }
+                    failure_statuses.record(StatusCode::BAD_GATEWAY);
+                    if let Some(strategy) = retry_state.cache_first_failure(
+                        &account_id,
+                        502,
+                        &last_error,
+                        None,
+                        &token_manager.get_sticky_config().await,
+                        config.request_type != "image_gen",
+                    ) {
+                        if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id)
+                            .await
+                        {
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                                session_lease.clone(),
+                            ));
+                            continue 'attempts;
+                        }
+                        break 'attempts;
+                    }
                     force_rotate = true;
-                    continue;
+                    continue 'attempts;
                 }
 
                 match first_data_chunk {
@@ -2607,7 +2702,26 @@ pub async fn handle_messages(
                         // 客户端要非 Stream，需要收集完整响应并转换为 JSON
                         use crate::proxy::mappers::claude::collect_stream_to_json;
 
-                        match collect_stream_to_json(Box::pin(combined_stream)).await {
+                        let collected_response =
+                            collect_stream_to_json(Box::pin(combined_stream)).await;
+                        if let Some(failure) = stream_errors.failure() {
+                            let failure_status = StatusCode::from_u16(failure.status)
+                                .unwrap_or(StatusCode::BAD_GATEWAY);
+                            if !failure.after_output {
+                                break 'upstream_response (failure_status, None, failure.body);
+                            }
+                            // Output has already been consumed: classify the error, but do not replay.
+                            retry_state.preserve_http_stop(
+                                failure.status,
+                                &failure.body,
+                                &token_manager.get_sticky_config().await,
+                                config.request_type != "image_gen",
+                            );
+                            failure_statuses.record(failure_status);
+                            last_error = failure.body;
+                            break 'attempts;
+                        }
+                        match collected_response {
                             Ok(full_response) => {
                                 info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                                 let attempts_b64 =
@@ -2639,6 +2753,14 @@ pub async fn handle_messages(
                                     .unwrap();
                             }
                             Err(e) => {
+                                if retry_state.preserve_on_stop(
+                                    token_manager.get_scheduling_mode().await,
+                                    config.request_type != "image_gen",
+                                ) {
+                                    last_error = format!("Stream collection error: {}", e);
+                                    failure_statuses.record(StatusCode::BAD_GATEWAY);
+                                    break 'attempts;
+                                }
                                 tracing::warn!(
                                         "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
                                         trace_id,
@@ -2646,7 +2768,7 @@ pub async fn handle_messages(
                                     );
                                 last_error = format!("Stream collection error: {}", e);
                                 force_rotate = true;
-                                continue;
+                                continue 'attempts;
                             }
                         }
                     }
@@ -2657,7 +2779,7 @@ pub async fn handle_messages(
                             trace_id
                         );
                         last_error = "Empty response stream (None)".to_string();
-                        continue;
+                        continue 'attempts;
                     }
                 }
             } else {
@@ -2675,11 +2797,17 @@ pub async fn handle_messages(
                         if let Some(attempt) = usage_attempt {
                             attempt.finish_error();
                         }
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            format!("Failed to read body: {}", e),
-                        )
-                            .into_response();
+                        retry_state.preserve_on_stop(
+                            token_manager.get_scheduling_mode().await,
+                            config.request_type != "image_gen",
+                        );
+                        return retry_state.finish_error_response(
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Failed to read body: {}", e),
+                            )
+                                .into_response(),
+                        );
                     }
                 };
 
@@ -2694,8 +2822,14 @@ pub async fn handle_messages(
                         if let Some(attempt) = usage_attempt {
                             attempt.finish_error();
                         }
-                        return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
-                            .into_response();
+                        retry_state.preserve_on_stop(
+                            token_manager.get_scheduling_mode().await,
+                            config.request_type != "image_gen",
+                        );
+                        return retry_state.finish_error_response(
+                            (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
+                                .into_response(),
+                        );
                     }
                 };
 
@@ -2814,23 +2948,87 @@ pub async fn handle_messages(
                     ))
                     .unwrap();
             }
+        };
+
+        failure_statuses.record(status);
+        let status_code = status.as_u16();
+        last_error = format!("HTTP {}: {}", status_code, error_text);
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+        let scheduling = token_manager.get_sticky_config().await;
+
+        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
+        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
+        if let Some(heal) = crate::proxy::pipeline::auto_heal::try_auto_heal_with_retry_policy(
+            &classification,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            &mut gemini_body,
+            &mut degraded_gemini_body,
+            &mut heal_flags,
+            &mut retry_state,
+            &account_id,
+            &scheduling,
+            config.request_type != "image_gen",
+        ) {
+            force_rotate = false;
+            crate::proxy::stage_trace::StageTrace::alert_current(
+                "self_heal",
+                format!(
+                    "protocol=claude kind={} status={} account={}",
+                    heal.kind, status_code, email
+                ),
+            );
+            if !apply_retry_strategy(
+                RetryStrategy::GraceRetry(std::time::Duration::from_millis(heal.delay_ms)),
+                attempt,
+                max_attempts,
+                status_code,
+                &trace_id,
+            )
+            .await
+            {
+                break;
+            }
+            if config.request_type != "image_gen" {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+            }
+            continue;
         }
 
-        // 1. 立即提取状态码和 headers（防止 response 被 move）
-        let status_code = status.as_u16();
-        failure_statuses.record(status);
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        // 2. 获取错误文本并转移 Response 所有权
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", status));
-        last_error = format!("HTTP {}: {}", status_code, error_text);
+        // CacheFirst policy is shared across protocols and runs before account penalties.
+        if let Some(strategy) = retry_state.cache_first_failure(
+            &account_id,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            &token_manager.get_sticky_config().await,
+            config.request_type != "image_gen",
+        ) {
+            if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                continue;
+            }
+            break;
+        }
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -2856,11 +3054,6 @@ pub async fn handle_messages(
         }
 
         // 3. 统一流水线决策判定（协议无关的唯一真理）
-        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-        );
 
         if classification.is_model_not_found() {
             // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策统一由 policy 承担
@@ -2935,28 +3128,6 @@ pub async fn handle_messages(
                 "[{}] Unbound session {} from account {} due to status {}",
                 trace_id, affinity_key, email, status_code
             );
-        }
-
-        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
-        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
-        if let Some(heal) = crate::proxy::pipeline::try_auto_heal(
-            &classification,
-            status_code,
-            &error_text,
-            &mut gemini_body,
-            &mut degraded_gemini_body,
-            &mut heal_flags,
-        ) {
-            force_rotate = false;
-            crate::proxy::stage_trace::StageTrace::alert_current(
-                "self_heal",
-                format!(
-                    "protocol=claude kind={} status={} account={}",
-                    heal.kind, status_code, email
-                ),
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(heal.delay_ms)).await;
-            continue;
         }
 
         // 4. 处理 400 错误（Thinking 签名失效 / 块顺序错误）
@@ -3158,7 +3329,7 @@ pub async fn handle_messages(
         &last_error,
     );
 
-    (response_status, headers, Json(dual_err)).into_response()
+    retry_state.finish_error_response((response_status, headers, Json(dual_err)).into_response())
 }
 
 /// 列出可用模型

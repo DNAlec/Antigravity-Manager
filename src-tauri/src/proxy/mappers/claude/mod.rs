@@ -21,6 +21,7 @@ pub use streaming::{BlockType, PartProcessor, StreamingState};
 pub use thinking_utils::filter_invalid_thinking_blocks_with_family; // [NEW]
 
 use crate::proxy::mappers::error_classifier::StreamErrorReport;
+use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::pipeline::{run_stream_lifecycle, ProtocolStreamHandler, StreamLifecycleConfig};
 use bytes::Bytes;
 use futures::Stream;
@@ -221,10 +222,13 @@ fn process_sse_line(
         chunks.push(state.emit_message_start(raw_json));
     }
 
-    // 捕获 usageMetadata（无论是否携带 finishReason，均持续缓存在 state.last_usage 中）
+    // Upstream usage is cumulative but may omit counters reported in earlier frames.
     if let Some(usage_val) = raw_json.get("usageMetadata") {
-        if let Ok(parsed_usage) = serde_json::from_value::<UsageMetadata>(usage_val.clone()) {
-            state.last_usage = Some(parsed_usage);
+        merge_cumulative_usage(&mut state.usage_metadata, usage_val);
+        if let Some(merged) = &state.usage_metadata {
+            if let Ok(parsed_usage) = serde_json::from_value::<UsageMetadata>(merged.clone()) {
+                state.last_usage = Some(parsed_usage);
+            }
         }
     }
 
@@ -312,10 +316,7 @@ fn process_sse_line(
                 finish_reason
             );
         } else {
-            let usage = raw_json
-                .get("usageMetadata")
-                .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok())
-                .or_else(|| state.last_usage.clone());
+            let usage = state.last_usage.clone();
 
             if let Some(ref u) = usage {
                 let cached_tokens = u.cached_content_token_count.unwrap_or(0);
@@ -518,6 +519,71 @@ fn process_grounding_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sparse_cumulative_usage_emits_preserved_cache_and_honors_zero() {
+        use serde_json::{json, Value};
+
+        for explicit_zero in [false, true] {
+            let mut state = StreamingState::new();
+            let first = json!({"response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "cachedContentTokenCount": 80,
+                    "candidatesTokenCount": 3
+                }
+            }});
+            process_sse_line(
+                &format!("data: {first}"),
+                &mut state,
+                "test",
+                "test@example.com",
+            );
+
+            let mut final_usage = json!({"candidatesTokenCount": 5, "totalTokenCount": 105});
+            if explicit_zero {
+                final_usage["cachedContentTokenCount"] = json!(0);
+            }
+            let last = json!({"response": {
+                "candidates": [{"finishReason": "STOP"}],
+                "usageMetadata": final_usage
+            }});
+            let chunks = process_sse_line(
+                &format!("data: {last}"),
+                &mut state,
+                "test",
+                "test@example.com",
+            )
+            .unwrap();
+            let events: Vec<Value> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    String::from_utf8_lossy(chunk)
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let delta = events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(
+                delta["usage"]["input_tokens"],
+                if explicit_zero { 100 } else { 20 }
+            );
+            assert_eq!(
+                delta["usage"]["cache_read_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                if explicit_zero { 0 } else { 80 }
+            );
+            assert_eq!(delta["usage"]["output_tokens"], 5);
+            assert_eq!(events.last().unwrap()["type"], "message_stop");
+        }
+    }
 
     #[test]
     fn test_process_sse_line_done() {
