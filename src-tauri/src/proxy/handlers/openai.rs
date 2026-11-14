@@ -11,8 +11,8 @@ use tracing::{debug, error, info}; // Import Engine trait for encode method
 
 use crate::proxy::mappers::gemini::SUMMARY_REQUEST_TIMEOUT_SECS;
 use crate::proxy::mappers::openai::{
-    transform_openai_request, transform_openai_request_with_session, transform_openai_response,
-    OpenAIContent, OpenAIContentBlock, OpenAIMessage, OpenAIRequest, OpenAIResponse,
+    transform_openai_request, transform_openai_request_with_session, OpenAIContent,
+    OpenAIContentBlock, OpenAIMessage, OpenAIRequest, OpenAIResponse,
 };
 use crate::proxy::pipeline::timing::{TimingBuilderExt, TimingHeaders};
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
@@ -40,6 +40,24 @@ use std::collections::VecDeque;
 use std::io;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
+
+/// A peek timeout stops this attempt even when the mapper has buffered only
+/// usage. Preserve those raw counters before dropping the unfinished stream.
+fn record_nonstream_peek_timeout(
+    protocol: &str,
+    budget_secs: u64,
+    observer: &crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver,
+    failures: &mut FailureStatusTracker,
+    retry_state: &mut RequestRetryState,
+    mode: crate::proxy::sticky_config::SchedulingMode,
+    cache_bound: bool,
+) -> Option<Value> {
+    crate::proxy::pipeline::terminal::record_first_byte_timeout(protocol, budget_secs, failures);
+    retry_state.preserve_on_stop(mode, cache_bound);
+    observer
+        .failure_or_incomplete(Some("Timeout waiting for first data"))
+        .and_then(|failure| failure.usage)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NormalizedInputImage {
@@ -283,8 +301,20 @@ fn responses_input_item_type(item: &Value) -> &str {
         .unwrap_or("")
 }
 
-fn responses_item_tool_name(item: &Value) -> Option<&str> {
-    item.get("name")
+fn take_responses_input_items(body: &mut Value) -> Vec<Value> {
+    match body.as_object_mut().and_then(|obj| obj.remove("input")) {
+        Some(Value::Array(items)) => items,
+        // Responses accepts a string as shorthand for a user message. Normalize
+        // it before merging history so both the current request and stored delta
+        // retain the same input, including on previous_response_id continuations.
+        Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
+        _ => Vec::new(),
+    }
+}
+
+fn responses_item_tool_name(item: &Value) -> Option<String> {
+    let name = item
+        .get("name")
         .and_then(Value::as_str)
         .or_else(|| {
             item.get("function")
@@ -296,7 +326,11 @@ fn responses_item_tool_name(item: &Value) -> Option<&str> {
             item.get("tool")
                 .and_then(|t| t.get("name"))
                 .and_then(Value::as_str)
-        })
+        })?;
+    Some(match item.get("namespace").and_then(Value::as_str) {
+        Some(ns) => crate::proxy::mappers::openai::request::qualify_namespace_tool_name(ns, name),
+        None => name.to_owned(),
+    })
 }
 
 fn push_responses_content_part(
@@ -324,6 +358,12 @@ fn push_responses_content_part(
         } else {
             Err(part)
         }
+    } else if part_type == "input_file" {
+        if let Some(obj) = part.as_object_mut() {
+            obj.remove("type");
+        }
+        media_parts.push(json!({"type":"file","file":part}));
+        Ok(())
     } else if part_type == "image_url" {
         if let Some(image_url) = part.as_object_mut().and_then(|obj| obj.remove("image_url")) {
             media_parts.push(json!({
@@ -391,10 +431,57 @@ fn responses_content_parts(content: Option<Value>) -> (Vec<String>, Vec<Value>, 
     (text_parts, media_parts, unhandled_parts)
 }
 
-fn responses_message_parts(item: &mut Value) -> (Vec<String>, Vec<Value>) {
-    let content = item.as_object_mut().and_then(|obj| obj.remove("content"));
-    let (text, media, _) = responses_content_parts(content);
-    (text, media)
+// Keep one ordered sequence for assistant refusals, text, images and audio.
+// A plain-text-only message retains the legacy string representation.
+fn responses_message_content(item: &mut Value, marker: Option<String>) -> (Value, String, bool) {
+    let raw = item.as_object_mut().and_then(|obj| obj.remove("content"));
+    let parts = match raw {
+        Some(Value::Array(parts)) => parts,
+        Some(part) => vec![part],
+        None => Vec::new(),
+    };
+    let mut ordered = Vec::new();
+    let mut text = Vec::new();
+    let mut run_start = 0;
+    let mut has_media = false;
+    let flush = |run: &[String], out: &mut Vec<Value>| {
+        if !run.is_empty() {
+            let text = prefix_with_step_marker(None, run.join("\n"));
+            if !text.is_empty() {
+                out.push(json!({"type":"text","text":text}));
+            }
+        }
+    };
+    for part in parts {
+        match part {
+            Value::String(s) => text.push(s),
+            mut part if part["type"] == "refusal" => {
+                if let Some(Value::String(s)) =
+                    part.as_object_mut().and_then(|m| m.remove("refusal"))
+                {
+                    text.push(s);
+                }
+            }
+            part => {
+                let mut media = Vec::new();
+                let _ = push_responses_content_part(part, &mut text, &mut media);
+                if !media.is_empty() {
+                    has_media = true;
+                    flush(&text[run_start..], &mut ordered);
+                    run_start = text.len();
+                    ordered.append(&mut media);
+                }
+            }
+        }
+    }
+    let joined = text.join("\n");
+    let content = if has_media {
+        flush(&text[run_start..], &mut ordered);
+        Value::Array(ordered)
+    } else {
+        Value::String(prefix_with_step_marker(marker, joined.clone()))
+    };
+    (content, joined, has_media)
 }
 
 fn responses_tool_output_parts(item: &mut Value) -> (String, Vec<Value>) {
@@ -447,6 +534,42 @@ fn decoded_base64_len(encoded: &str) -> Result<usize, String> {
             .map_err(|_| "Input image contains invalid base64 data".to_string())?,
     )
     .map_err(|_| "Input image is too large".to_string())
+}
+
+fn validate_openai_file(
+    file: &crate::proxy::mappers::openai::models::OpenAIInputFile,
+) -> Result<(), String> {
+    let mapped = file.to_gemini_part().ok_or_else(|| {
+        "File input requires one valid inline document or public file URL".to_owned()
+    })?;
+    if let Some(data) = mapped["inlineData"]["data"].as_str() {
+        if data.len() > MAX_INPUT_IMAGE_BYTES.div_ceil(3).saturating_mul(4) {
+            return Err("Input document exceeds the media size limit".to_owned());
+        }
+        let decoded = decoded_base64_len(data)
+            .map_err(|_| "Input document contains invalid base64 data".to_owned())?;
+        if decoded > MAX_INPUT_IMAGE_BYTES {
+            return Err("Input document exceeds the media size limit".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_file_inputs(request: &OpenAIRequest) -> Result<(), String> {
+    for message in &request.messages {
+        if let Some(crate::proxy::mappers::openai::models::OpenAIContent::Array(parts)) =
+            &message.content
+        {
+            for part in parts {
+                if let crate::proxy::mappers::openai::models::OpenAIContentBlock::File { file } =
+                    part
+                {
+                    validate_openai_file(file)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_responses_image_data_url(
@@ -539,76 +662,42 @@ fn validate_responses_input_image_limits_with_mode(
 }
 
 fn historical_media_placeholder(value: &serde_json::Map<String, Value>) -> Option<Value> {
-    match value.get("type").and_then(Value::as_str) {
-        Some("input_image") | Some("image_url") => Some(json!({
-            "type": "input_text",
-            "text": "[historical image omitted]"
-        })),
-        Some("input_audio") | Some("audio") | Some("audio_url") => Some(json!({
-            "type": "input_text",
-            "text": "[historical audio omitted]"
-        })),
-        _ => None,
-    }
+    crate::proxy::http_session_store::media_placeholder(value)
 }
 
 fn history_without_inline_media(value: &Value) -> Value {
-    fn clone_bounded(value: &Value) -> Option<Value> {
-        match value {
-            Value::String(text)
-                if text.starts_with("data:image/") || text.starts_with("data:audio/") =>
-            {
-                None
-            }
-            Value::Array(values) => Some(Value::Array(
-                values.iter().filter_map(clone_bounded).collect(),
-            )),
-            Value::Object(values) => historical_media_placeholder(values).or_else(|| {
-                Some(Value::Object(
-                    values
-                        .iter()
-                        .filter_map(|(key, value)| {
-                            clone_bounded(value).map(|value| (key.clone(), value))
-                        })
-                        .collect(),
-                ))
-            }),
-            _ => Some(value.clone()),
-        }
+    match value {
+        Value::Array(v) => Value::Array(v.iter().map(history_without_inline_media).collect()),
+        Value::Object(m) => historical_media_placeholder(m).unwrap_or_else(|| {
+            Value::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), history_without_inline_media(v)))
+                    .collect(),
+            )
+        }),
+        _ => value.clone(),
     }
-
-    clone_bounded(value).unwrap_or(Value::Null)
 }
 
-fn into_history_without_inline_media(value: Value) -> Option<Value> {
-    match value {
-        Value::String(text)
-            if text.starts_with("data:image/") || text.starts_with("data:audio/") =>
-        {
-            None
-        }
-        Value::Array(values) => Some(Value::Array(
-            values
-                .into_iter()
-                .filter_map(into_history_without_inline_media)
-                .collect(),
-        )),
-        Value::Object(values) => {
-            if let Some(placeholder) = historical_media_placeholder(&values) {
-                Some(placeholder)
-            } else {
-                Some(Value::Object(
-                    values
-                        .into_iter()
-                        .filter_map(|(key, value)| {
-                            into_history_without_inline_media(value).map(|value| (key, value))
-                        })
-                        .collect(),
-                ))
+fn into_history_without_inline_media(value: Value) -> Value {
+    // For the owned path, drop actual media without cloning the payload. A
+    // data URL in a text field (notably custom_tool_call.input) remains text.
+    fn bound(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(bound),
+            Value::Object(values) => {
+                if let Some(placeholder) = historical_media_placeholder(values) {
+                    *value = placeholder;
+                } else {
+                    values.values_mut().for_each(bound);
+                }
             }
+            _ => {}
         }
-        other => Some(other),
     }
+    let mut value = value;
+    bound(&mut value);
+    value
 }
 
 async fn save_session_unless_response_cancelled<F>(
@@ -815,9 +904,22 @@ pub(crate) fn is_request_structured_output(req: &OpenAIRequest) -> bool {
         || req.text.as_ref().and_then(|t| t.get("format")).is_some()
 }
 
+#[cfg(test)]
 fn convert_chat_response_to_responses(
     chat_response: &OpenAIResponse,
     is_structured_output: bool,
+) -> Value {
+    convert_chat_response_to_responses_with_tools(
+        chat_response,
+        is_structured_output,
+        &Default::default(),
+    )
+}
+
+fn convert_chat_response_to_responses_with_tools(
+    chat_response: &OpenAIResponse,
+    is_structured_output: bool,
+    tool_kinds: &crate::proxy::mappers::openai::request::ResponsesToolKinds,
 ) -> Value {
     let mut output = Vec::new();
 
@@ -882,28 +984,321 @@ fn convert_chat_response_to_responses(
                 continue;
             };
             let call_id = tool_call.call_id.as_deref().unwrap_or(&tool_call.id);
-            output.push(json!({
-                "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-                "type": "function_call",
-                "status": "completed",
-                "call_id": call_id,
-                "name": function.name,
-                "arguments": function.arguments
-            }));
+            let args = serde_json::from_str::<Value>(&function.arguments).ok();
+            output.push(
+                crate::proxy::mappers::openai::streaming::responses_tool_call_item(
+                    &function.name,
+                    args.as_ref(),
+                    &function.arguments,
+                    &format!("fc_{}", uuid::Uuid::new_v4().simple()),
+                    call_id,
+                    tool_kinds,
+                ),
+            );
         }
     }
+
+    // The internal Chat stream already carries the upstream terminal reason.
+    // Preserve it when returning Responses JSON, just as the Responses stream
+    // does, rather than turning a truncated/refused answer into a completion.
+    let refused = chat_response
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.as_deref() == Some("content_filter"));
+    let length_limited = chat_response
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.as_deref() == Some("length"));
+    let missing_finish = chat_response.choices.iter().any(|choice| {
+        choice
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+            .is_none()
+    });
+    let missing_actionable_output = !output.iter().any(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("message" | "function_call" | "custom_tool_call")
+        )
+    });
+    let incomplete = refused || length_limited || missing_finish || missing_actionable_output;
+    let incomplete_details = if incomplete {
+        json!({"reason": if refused {
+            "content_filter"
+        } else if length_limited {
+            "max_output_tokens"
+        } else {
+            "interrupted"
+        }})
+    } else {
+        Value::Null
+    };
+    let error = if refused {
+        Value::Null
+    } else if missing_actionable_output {
+        json!({"code":"empty_response","message":"Gemini stream ended without a final assistant message or tool call."})
+    } else if missing_finish {
+        json!({"code":"upstream_interrupted","message":"Gemini stream ended without finishReason."})
+    } else {
+        Value::Null
+    };
 
     json!({
         "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
         "object": "response",
         "type": "response",
         "created_at": chrono::Utc::now().timestamp(),
-        "status": "completed",
-        "error": null,
+        "status": if incomplete { "incomplete" } else { "completed" },
+        "incomplete_details": incomplete_details,
+        "error": error,
         "output": output,
         "model": chat_response.model,
         "usage": responses_usage_value(chat_response)
     })
+}
+
+#[cfg(test)]
+mod responses_conversion_terminal_tests {
+    use super::convert_chat_response_to_responses;
+    use crate::proxy::mappers::openai::{models::OpenAIResponse, streaming};
+    use bytes::Bytes;
+    use futures::{Stream, StreamExt};
+    use serde_json::{json, Value};
+    use std::pin::Pin;
+
+    fn chat_response(finish_reason: Value, message: Value) -> OpenAIResponse {
+        serde_json::from_value(json!({
+            "id":"chat_test", "object":"chat.completion", "created":1, "model":"gemini-pro",
+            "choices":[{"index":0,"message":message,"finish_reason":finish_reason}],
+            "usage":{"prompt_tokens":100,"completion_tokens":7,"total_tokens":107,
+                "prompt_tokens_details":{"cached_tokens":80},
+                "completion_tokens_details":{"reasoning_tokens":2}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn responses_json_terminal_reasons_preserve_output_and_usage() {
+        for (finish, expected_status, expected_reason) in [
+            ("stop", "completed", Value::Null),
+            ("tool_calls", "completed", Value::Null),
+            ("length", "incomplete", json!("max_output_tokens")),
+            ("content_filter", "incomplete", json!("content_filter")),
+        ] {
+            for with_tool in [false, true] {
+                let mut message =
+                    json!({"role":"assistant","content":"answer","reasoning_content":"thought"});
+                if with_tool {
+                    message["tool_calls"] = json!([{"id":"call_test","type":"function",
+                        "function":{"name":"lookup","arguments":"{\"key\":1}"}}]);
+                }
+                let response = convert_chat_response_to_responses(
+                    &chat_response(json!(finish), message),
+                    false,
+                );
+                assert_eq!(response["status"], expected_status, "{finish}/{with_tool}");
+                assert_eq!(response["incomplete_details"]["reason"], expected_reason);
+                assert!(response["error"].is_null());
+                assert_eq!(response["output"][0]["summary"][0]["text"], "thought");
+                assert_eq!(response["output"][1]["content"][0]["text"], "answer");
+                if with_tool {
+                    assert_eq!(response["output"][2]["call_id"], "call_test");
+                    assert_eq!(response["output"][2]["arguments"], "{\"key\":1}");
+                }
+                assert_eq!(
+                    response["usage"],
+                    json!({"input_tokens":100,
+                    "input_tokens_details":{"cached_tokens":80},"output_tokens":7,
+                    "output_tokens_details":{"reasoning_tokens":2},"total_tokens":107})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn responses_json_retains_refusal_without_inventing_content() {
+        for refusal in [None, Some("provider refusal")] {
+            let mut message = json!({"role":"assistant","content":null});
+            if let Some(refusal) = refusal {
+                message["refusal"] = json!(refusal);
+            }
+            let response = convert_chat_response_to_responses(
+                &chat_response(json!("content_filter"), message),
+                false,
+            );
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], "content_filter");
+            assert!(response["error"].is_null());
+            if let Some(refusal) = refusal {
+                assert_eq!(
+                    response["output"][0]["content"],
+                    json!([{"type":"refusal","refusal":refusal}])
+                );
+            } else {
+                assert_eq!(response["output"], json!([]));
+            }
+        }
+    }
+
+    #[test]
+    fn responses_json_missing_finish_or_answer_is_incomplete() {
+        let cases = [
+            (
+                Value::Null,
+                json!({"role":"assistant","content":"partial"}),
+                "upstream_interrupted",
+            ),
+            (
+                json!(""),
+                json!({"role":"assistant","content":"partial"}),
+                "upstream_interrupted",
+            ),
+            (
+                json!("stop"),
+                json!({"role":"assistant","content":null,"reasoning_content":"thought"}),
+                "empty_response",
+            ),
+        ];
+        for (finish, message, error) in cases {
+            let response =
+                convert_chat_response_to_responses(&chat_response(finish, message), false);
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], "interrupted");
+            assert_eq!(response["error"]["code"], error);
+        }
+    }
+
+    type Source = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
+    fn source(frames: Vec<Value>) -> Source {
+        Box::pin(futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|value| Ok(Bytes::from(format!("data: {value}\n\n")))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn responses_json_matches_stream_for_text_tool_refusal_and_usage_tail() {
+        let tool = json!({"functionCall":{"name":"lookup","args":{"key":1},"id":"call_test"}});
+        let cases = [
+            (
+                "stop",
+                json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}]}),
+            ),
+            (
+                "tool_calls",
+                json!({"candidates":[{"content":{"parts":[tool.clone()]},"finishReason":"STOP"}]}),
+            ),
+            (
+                "length",
+                json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+            ),
+            (
+                "length",
+                json!({"candidates":[{"content":{"parts":[tool.clone()]},"finishReason":"MAX_TOKENS"}]}),
+            ),
+            (
+                "content_filter",
+                json!({"candidates":[{"finishReason":"SAFETY"}]}),
+            ),
+            (
+                "content_filter",
+                json!({"candidates":[{"content":{"parts":[tool]},"finishReason":"SAFETY"}]}),
+            ),
+            (
+                "content_filter",
+                json!({"candidates":[{"content":{"parts":[{"text":"thought","thought":true}]},"finishReason":"RECITATION"}]}),
+            ),
+            (
+                "content_filter",
+                json!({"candidates":[{"finishReason":"MODEL_ARMOR"}]}),
+            ),
+            (
+                "content_filter",
+                json!({"promptFeedback":{"blockReason":"OTHER"}}),
+            ),
+        ];
+        for (finish, candidate) in cases {
+            for cache in [80, 0] {
+                let mut candidate = candidate.clone();
+                candidate["usageMetadata"] = json!({"promptTokenCount":100,"cachedContentTokenCount":80,
+                    "candidatesTokenCount":5,"thoughtsTokenCount":2});
+                let frames = vec![
+                    candidate,
+                    json!({"usageMetadata":{"cachedContentTokenCount":cache}}),
+                ];
+                let chat_stream = streaming::create_openai_sse_stream(
+                    source(frames.clone()),
+                    "gemini-pro".into(),
+                    "terminal-json".into(),
+                    1,
+                    None,
+                    true,
+                );
+                let chat =
+                    crate::proxy::mappers::openai::collector::collect_stream_to_json(chat_stream)
+                        .await
+                        .unwrap();
+                assert_eq!(chat.choices[0].finish_reason.as_deref(), Some(finish));
+                let converted = convert_chat_response_to_responses(&chat, false);
+                let mut responses = streaming::create_codex_sse_stream(
+                    source(frames),
+                    "gemini-pro".into(),
+                    "terminal-stream".into(),
+                    1,
+                    1,
+                    "resp_terminal".into(),
+                    None,
+                    false,
+                );
+                let mut terminal = None;
+                while let Some(chunk) = responses.next().await {
+                    for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                if matches!(
+                                    event["type"].as_str(),
+                                    Some(
+                                        "response.completed"
+                                            | "response.incomplete"
+                                            | "response.failed"
+                                    )
+                                ) {
+                                    terminal = Some(event["response"].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                let terminal = terminal.expect("Responses terminal frame");
+                for key in ["status", "incomplete_details", "error", "usage"] {
+                    assert_eq!(
+                        converted[key], terminal[key],
+                        "{finish}/cache={cache}/{key}"
+                    );
+                }
+                assert_eq!(
+                    converted["usage"]["input_tokens_details"]["cached_tokens"],
+                    cache
+                );
+                assert_eq!(converted["usage"]["output_tokens"], 7);
+                let json_types: Vec<_> = converted["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["type"].clone())
+                    .collect();
+                let stream_types: Vec<_> = terminal["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["type"].clone())
+                    .collect();
+                assert_eq!(json_types, stream_types);
+            }
+        }
+    }
 }
 
 /// 仅识别客户端本地私有展示项（如本地渲染的思考块），绝不误杀伴随工具调用的真实过程进度说明。
@@ -941,7 +1336,7 @@ mod stream_peek_tests {
     use super::parse_generation_input_images;
     use super::response_has_inline_image_data;
     use super::responses_input_item_type;
-    use super::responses_message_parts;
+    use super::responses_message_content;
     use super::responses_routing_session_id;
     use super::rewrite_terminal_assistant_prefill;
     use super::save_session_unless_response_cancelled;
@@ -1136,12 +1531,12 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
 
         assert_eq!(responses_input_item_type(&string_message), "message");
         assert_eq!(
-            responses_message_parts(&mut string_message.clone()).0,
-            vec!["Follow the system instructions."]
+            responses_message_content(&mut string_message.clone(), None).0,
+            "Follow the system instructions."
         );
         assert_eq!(
-            responses_message_parts(&mut array_message.clone()).0,
-            vec!["Continue planning."]
+            responses_message_content(&mut array_message.clone(), None).0,
+            "Continue planning."
         );
 
         let converted = convert_codex_to_openai_request(json!({
@@ -1266,10 +1661,13 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             .iter()
             .find(|part| part.get("functionResponse").is_some())
             .expect("function response");
-        let inline_data = parts
+        let inline_data = function_response["functionResponse"]["parts"]
+            .as_array()
+            .expect("tool-owned media")
             .iter()
             .find(|part| part.get("inlineData").is_some())
             .expect("inline image data");
+        assert_eq!(function_response["functionResponse"]["id"], "call_image");
 
         assert_eq!(
             function_response["functionResponse"]["response"]["output"],
@@ -1300,9 +1698,16 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
         });
 
         let borrowed = history_without_inline_media(&history);
-        let moved = into_history_without_inline_media(history).expect("bounded history");
-        assert_eq!(borrowed, expected);
-        assert_eq!(moved, expected);
+        let moved = into_history_without_inline_media(history);
+        assert_eq!(borrowed, moved);
+        let mut visible = moved;
+        let digest = visible["output"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("_am_media_digest")
+            .unwrap();
+        assert_eq!(digest.as_str().unwrap().len(), 64);
+        assert_eq!(visible, expected);
         assert!(!borrowed.to_string().contains("base64"));
     }
 
@@ -2085,6 +2490,8 @@ pub async fn handle_chat_completions(
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let clean_start = std::time::Instant::now();
+    validate_openai_tool_schemas(body["tools"].as_array().map(Vec::as_slice))
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     // [NEW] Check for Image Model Redirection
     let model_name = body
         .get("model")
@@ -2143,6 +2550,8 @@ pub async fn handle_chat_completions(
         && (body.get("instructions").is_some() || body.get("input").is_some());
 
     if is_responses_format {
+        validate_responses_continuation(&body)
+            .map_err(|(_, _, message)| (StatusCode::BAD_REQUEST, message.to_owned()))?;
         debug!("Detected Responses API format, converting with structured role preservation");
         body = convert_codex_to_openai_request(body);
     }
@@ -2159,6 +2568,9 @@ pub async fn handle_chat_completions(
     });
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+
+    validate_openai_file_inputs(&openai_req)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
@@ -2373,9 +2785,11 @@ pub async fn handle_chat_completions(
     let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
+    let mut terminal_stream_usage: Option<serde_json::Value> = None;
     let mut last_email: Option<String> = None;
     let mut retry_state = RequestRetryState::default();
     let mut retry_credentials: Option<crate::proxy::token_manager::LeasedCredentials> = None;
+    let mut session_lease = None;
     let mut attempted_accounts: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut image_permit = None;
@@ -2383,7 +2797,6 @@ pub async fn handle_chat_completions(
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
     let mut heal_flags = crate::proxy::pipeline::AutoHealFlags::default();
-    let mut degraded_gemini_body: Option<Value> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     // [2026-10-29] 四协议统一抽象：显式关闭思考（thinking.type=disabled / budget=0 / effort=none）
@@ -2410,7 +2823,7 @@ pub async fn handle_chat_completions(
     openai_req.session_id = Some(store_key.clone());
     let client_session_id = session_scope.client_id.clone();
 
-    while let Some(attempt) = next_rotation_attempt(
+    'attempts: while let Some(attempt) = next_rotation_attempt(
         &mut used_attempts,
         max_attempts,
         retry_credentials.is_some(),
@@ -2424,6 +2837,7 @@ pub async fn handle_chat_completions(
         ) {
             break;
         }
+        retry_state.begin_attempt();
 
         let norm_start = std::time::Instant::now();
         // 将 OpenAI 工具转为 Value 数组以便探测联网
@@ -2443,7 +2857,7 @@ pub async fn handle_chat_completions(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
-        let (access_token, project_id, email, account_id, _wait_ms, mut session_lease) =
+        let (access_token, project_id, email, account_id, _wait_ms, selected_session_lease) =
             if let Some(credentials) = retry_credentials.take() {
                 credentials
             } else if config.request_type == "image_gen" {
@@ -2470,29 +2884,34 @@ pub async fn handle_chat_completions(
                 }
             } else {
                 let mut token_result = token_manager
-                    .get_token_filtered_with_lease(
+                    .get_token_filtered_with_retry_lease(
                         &config.request_type,
                         force_rotate,
                         Some(&affinity_key),
                         &mapped_model,
                         &attempted_accounts,
+                        &mut session_lease,
                     )
                     .await;
 
                 if let Err(ref e) = token_result {
                     if crate::proxy::handlers::common::is_transient_token_error(e) {
                         tracing::warn!(
-                            "Token acquisition transient error ({}), retrying once with force_rotate...",
+                            "Token acquisition transient error ({}), retrying once under scheduling policy...",
                             e
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         token_result = token_manager
-                            .get_token_filtered_with_lease(
+                            .get_token_filtered_with_retry_lease(
                                 &config.request_type,
-                                true,
+                                crate::proxy::pipeline::rotation::token_retry_force_rotate(
+                                    force_rotate,
+                                    token_manager.get_scheduling_mode().await,
+                                ),
                                 Some(&affinity_key),
                                 &mapped_model,
                                 &attempted_accounts,
+                                &mut session_lease,
                             )
                             .await;
                     }
@@ -2501,22 +2920,30 @@ pub async fn handle_chat_completions(
                 match token_result {
                     Ok(t) => t,
                     Err(e) => {
-                        if !failure_statuses.is_empty() {
+                        retry_state.preserve_token_error(&e);
+                        if !failure_statuses.is_empty()
+                            && !crate::proxy::session_bindings::is_session_binding_changed_error(&e)
+                        {
                             tracing::warn!(
                             "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
                             trace_id
                         );
                             break;
                         }
-                        return Ok(crate::proxy::handlers::common::build_token_error_response(
-                            "openai",
-                            mapped_model.as_str(),
-                            None,
-                            &e,
+                        return Ok(retry_state.finish_error_response(
+                            crate::proxy::handlers::common::build_token_error_response_with_usage(
+                                "openai",
+                                mapped_model.as_str(),
+                                None,
+                                &e,
+                                terminal_stream_usage.as_ref(),
+                            ),
                         ));
                     }
                 }
             };
+
+        session_lease = selected_session_lease;
 
         let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
 
@@ -2532,26 +2959,17 @@ pub async fn handle_chat_completions(
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
         let tf_start = std::time::Instant::now();
         let (mut gemini_body, _routed_session, message_count, _prefix_hash) =
-            if let Some(body) = degraded_gemini_body.take() {
-                (body, String::new(), 0, String::new())
-            } else {
-                let (mut b, s, c, p) = transform_openai_request_with_session(
-                    &openai_req,
-                    &project_id,
-                    &mapped_model,
-                    proxy_token.as_ref(),
-                    &affinity_key,
-                    None,
-                    false,
-                    retried_without_thinking,
-                );
-                if heal_flags.retried_with_budget_degraded {
-                    crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
-                        &mut b,
-                    );
-                }
-                (b, s, c, p)
-            };
+            transform_openai_request_with_session(
+                &openai_req,
+                &project_id,
+                &mapped_model,
+                proxy_token.as_ref(),
+                &affinity_key,
+                None,
+                false,
+                retried_without_thinking,
+            );
+        heal_flags.reapply(&mut gemini_body);
         let session_id = store_key.clone();
         // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
         if retried_without_thinking {
@@ -2574,6 +2992,27 @@ pub async fn handle_chat_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        // Resolve text history only after all request normalization, and use the
+        // same visible prefix when recording the response from this attempt.
+        let thinking_enabled =
+            crate::proxy::pipeline::qos::payload_enables_thinking(&gemini_body, None);
+        let contents_path = if gemini_body.get("request").is_some() {
+            "/request/contents"
+        } else {
+            "/contents"
+        };
+        let response_text_context = gemini_body
+            .pointer_mut(contents_path)
+            .and_then(Value::as_array_mut)
+            .map(|contents| {
+                crate::proxy::thinking_store::finalize_request_text_context(
+                    &session_id,
+                    contents,
+                    &mapped_model,
+                    thinking_enabled,
+                    retried_without_thinking,
+                )
+            });
         let estimated_input_tokens = crate::proxy::pipeline::estimate_tokens(&gemini_body);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
@@ -2751,6 +3190,27 @@ pub async fn handle_chat_completions(
 
                 // 非终态（连接失败 / 调度异常）：冷却该账号并继续轮换
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
+                if let Some(strategy) = retry_state.cache_first_failure(
+                    &account_id,
+                    502,
+                    &e,
+                    None,
+                    &token_manager.get_sticky_config().await,
+                    config.request_type != "image_gen",
+                ) {
+                    if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id).await {
+                        retry_credentials = Some((
+                            access_token.clone(),
+                            project_id.clone(),
+                            email.clone(),
+                            account_id.clone(),
+                            0,
+                            session_lease.clone(),
+                        ));
+                        continue;
+                    }
+                    break;
+                }
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
                 crate::proxy::pipeline::rotation::record_attempted_account(
                     &mut attempted_accounts,
@@ -2810,13 +3270,30 @@ pub async fn handle_chat_completions(
         // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
-        if status.is_success() {
-            let track_image_success = config.request_type == "image_gen";
-            if !track_image_success {
-                token_manager.commit_session_lease(&mut session_lease);
-                // [智能限流] 请求成功，重置该账号的连续失败计数
-                token_manager.mark_account_success(&account_id);
+        // HTTP failures and pre-output SSE errors share the same recovery policy.
+        let (status, retry_after, error_text) = 'upstream_response: {
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|header| header.to_str().ok())
+                    .map(str::to_string);
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                break 'upstream_response (status, retry_after, error_text);
             }
+
+            let track_image_success = config.request_type == "image_gen";
+            let mut session_confirmation = if !track_image_success {
+                // HTTP acceptance still confirms account health in all scheduling
+                // modes; only cache warmth waits for body validation.
+                token_manager.mark_account_success(&account_id);
+                token_manager.accept_session_response(&mut session_lease)
+            } else {
+                None
+            };
             // 5. 处理流式 vs 非流式
             if actual_stream {
                 use axum::body::Body;
@@ -2865,16 +3342,36 @@ pub async fn handle_chat_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                // Preserve structured upstream errors before protocol conversion.
+                let stream_errors =
+                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
+                let gemini_stream = Box::pin(
+                    crate::proxy::pipeline::stream_error::observe_response_errors(
+                        gemini_stream,
+                        stream_errors.clone(),
+                        !client_wants_stream,
+                    ),
+                );
+                let gemini_stream = Box::pin(
+                    crate::proxy::token_manager::confirm_session_response_stream(
+                        gemini_stream,
+                        stream_errors.clone(),
+                        session_confirmation.take(),
+                    ),
+                );
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
-                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_anchor;
-                let include_usage = openai_req
-                    .stream_options
-                    .as_ref()
-                    .map(|o| o.include_usage)
-                    .unwrap_or(false);
-                let mut openai_stream = create_openai_sse_stream_with_anchor(
+                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_context;
+                // Internal streaming is an implementation detail of JSON responses;
+                // the collector needs the usage trailer even without stream_options.
+                let include_usage = !client_wants_stream
+                    || openai_req
+                        .stream_options
+                        .as_ref()
+                        .map(|o| o.include_usage)
+                        .unwrap_or(false);
+                let mut openai_stream = create_openai_sse_stream_with_context(
                     gemini_stream,
                     openai_req.model.clone(),
                     session_id.clone(),
@@ -2882,9 +3379,11 @@ pub async fn handle_chat_completions(
                     Some(client_tool_names.clone()),
                     include_usage,
                     Some(causal_anchor),
+                    response_text_context.clone(),
                 );
 
                 let mut first_data_chunk = None;
+                let mut peek_failed = false;
 
                 // [Pipeline StreamPeek] 流式请求不再阻塞等待首包：直接返回响应头，
                 // 由 run_stream_lifecycle 的 InitialTtft 负责首字宽限与心跳保活
@@ -2950,38 +3449,83 @@ pub async fn handle_chat_completions(
                         } => {
                             // 首包预算耗尽不是账号故障：不跨账号重放，直接 504
                             last_error = format!("First chunk timeout after {}s", budget_secs);
-                            crate::proxy::pipeline::terminal::record_first_byte_timeout(
+                            terminal_stream_usage = record_nonstream_peek_timeout(
                                 "openai",
                                 budget_secs,
+                                &stream_errors,
                                 &mut failure_statuses,
+                                &mut retry_state,
+                                token_manager.get_scheduling_mode().await,
+                                config.request_type != "image_gen",
                             );
-                            break;
+                            break 'attempts;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
                             last_error = "Error event during peek".to_string();
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::StreamError {
                             error,
                             ..
                         } => {
                             last_error = format!("Stream error during peek: {}", error);
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::Eof { .. } => {
                             last_error = "Empty response stream during peek".to_string();
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
                     }
                 } else {
                     // 流式：发头时 TTFT 未知（-1）；真实值由首块探针上报 QoS。
                     ttft_ms = crate::proxy::pipeline::stream_peek::TTFT_UNKNOWN_MS;
+                }
+
+                if peek_failed {
+                    if let Some(failure) = stream_errors.failure_or_incomplete(Some(&last_error)) {
+                        let failure_status =
+                            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        if failure.replay_safe() {
+                            break 'upstream_response (failure_status, None, failure.body);
+                        }
+                        // Output has already been consumed: classify the error, but do not replay.
+                        retry_state.preserve_http_stop(
+                            failure.status,
+                            &failure.body,
+                            &token_manager.get_sticky_config().await,
+                            config.request_type != "image_gen",
+                        );
+                        failure_statuses.record(failure_status);
+                        terminal_stream_usage = failure.usage.clone();
+                        last_error = failure.body;
+                        break 'attempts;
+                    }
+                    failure_statuses.record(StatusCode::BAD_GATEWAY);
+                    if let Some(strategy) = retry_state.cache_first_failure(
+                        &account_id,
+                        502,
+                        &last_error,
+                        None,
+                        &token_manager.get_sticky_config().await,
+                        config.request_type != "image_gen",
+                    ) {
+                        if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id)
+                            .await
+                        {
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                                session_lease.clone(),
+                            ));
+                            continue 'attempts;
+                        }
+                        break 'attempts;
+                    }
+                    force_rotate = true;
+                    continue 'attempts;
                 }
 
                 // Combine first chunk with remaining stream (only when peek ran)
@@ -3171,7 +3715,28 @@ pub async fn handle_chat_completions(
                     // 收集流数据并聚合为 JSON
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
 
-                    match collect_stream_to_json(combined_stream).await {
+                    let collected_response = collect_stream_to_json(combined_stream).await;
+                    if let Some(failure) = stream_errors.failure_or_incomplete(
+                        collected_response.as_ref().err().map(String::as_str),
+                    ) {
+                        let failure_status =
+                            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        if failure.replay_safe() {
+                            break 'upstream_response (failure_status, None, failure.body);
+                        }
+                        // Output has already been consumed: classify the error, but do not replay.
+                        retry_state.preserve_http_stop(
+                            failure.status,
+                            &failure.body,
+                            &token_manager.get_sticky_config().await,
+                            config.request_type != "image_gen",
+                        );
+                        failure_statuses.record(failure_status);
+                        terminal_stream_usage = failure.usage.clone();
+                        last_error = failure.body;
+                        break 'attempts;
+                    }
+                    match collected_response {
                         Ok(full_response) => {
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                             if debug_logger::is_enabled(&debug_cfg) {
@@ -3221,11 +3786,17 @@ pub async fn handle_chat_completions(
                         }
                         Err(e) => {
                             error!("[{}] Stream collection error: {}", trace_id, e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            retry_state.preserve_on_stop(
+                                token_manager.get_scheduling_mode().await,
+                                config.request_type != "image_gen",
+                            );
+                            return Ok(retry_state.finish_error_response(
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Stream collection error: {}", e),
+                                )
+                                    .into_response(),
+                            ));
                         }
                     }
                 }
@@ -3238,18 +3809,40 @@ pub async fn handle_chat_completions(
             let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
                 holder.set_attempts(fallback_attempts.clone());
             });
-            let gemini_resp: Value = crate::proxy::pipeline::usage_diagnostics::read_json_response(
-                response,
-                crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
-                    &config.final_model,
-                    &account_id,
-                    "openai_chat_json",
-                ),
-            )
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            let gemini_resp: Value =
+                match crate::proxy::pipeline::usage_diagnostics::read_json_response(
+                    response,
+                    crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
+                        &config.final_model,
+                        &account_id,
+                        "openai_chat_json",
+                    ),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        retry_state.preserve_on_stop(
+                            token_manager.get_scheduling_mode().await,
+                            config.request_type != "image_gen",
+                        );
+                        return Ok(retry_state.finish_error_response(
+                            (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
+                                .into_response(),
+                        ));
+                    }
+                };
 
-            crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
+            if let Some(confirmation) = session_confirmation.as_mut() {
+                confirmation.observe_json(&gemini_resp);
+            }
+
+            crate::proxy::thinking_store::capture_gemini_response_with_context(
+                &session_id,
+                &gemini_resp,
+                None,
+                response_text_context.as_deref(),
+            );
 
             // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
             // 兼容两种格式: cachedContentTokenCount (旧), total_cached_tokens (新)
@@ -3275,12 +3868,14 @@ pub async fn handle_chat_completions(
                 }
             }
 
-            let openai_response = transform_openai_response(
-                &gemini_resp,
-                Some(&session_id),
-                message_count,
-                Some(&client_tool_names),
-            );
+            let openai_response =
+                crate::proxy::mappers::openai::response::transform_openai_response_with_context(
+                    &gemini_resp,
+                    Some(&session_id),
+                    message_count,
+                    Some(&client_tool_names),
+                    response_text_context.clone(),
+                );
             if debug_logger::is_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
                     .unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }));
@@ -3323,21 +3918,86 @@ pub async fn handle_chat_completions(
                 ))
                 .unwrap()
                 .into_response());
-        }
+        };
 
-        // 处理特定错误并重试
         failure_statuses.record(status);
         let status_code = status.as_u16();
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+        let scheduling = token_manager.get_sticky_config().await;
+
+        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
+        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
+        if let Some(heal) = crate::proxy::pipeline::auto_heal::try_auto_heal_with_retry_policy(
+            &classification,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            &mut gemini_body,
+            &mut heal_flags,
+            &mut retry_state,
+            &account_id,
+            &scheduling,
+            config.request_type != "image_gen",
+        ) {
+            force_rotate = false;
+            crate::proxy::stage_trace::StageTrace::alert_current(
+                "self_heal",
+                format!(
+                    "protocol=openai kind={} status={} account={}",
+                    heal.kind, status_code, email
+                ),
+            );
+            if !apply_retry_strategy(
+                RetryStrategy::GraceRetry(std::time::Duration::from_millis(heal.delay_ms)),
+                attempt,
+                max_attempts,
+                status_code,
+                &trace_id,
+            )
+            .await
+            {
+                break;
+            }
+            if config.request_type != "image_gen" {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+            }
+            continue;
+        }
+
+        // CacheFirst policy is shared across protocols and runs before account penalties.
+        if let Some(strategy) = retry_state.cache_first_failure(
+            &account_id,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            &token_manager.get_sticky_config().await,
+            config.request_type != "image_gen",
+        ) {
+            if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                continue;
+            }
+            break;
+        }
 
         // [New] 打印错误报文日志
         tracing::error!(
@@ -3383,33 +4043,6 @@ pub async fn handle_chat_completions(
             pool_size,
         );
         // 统一流水线决策判定：协议无关的限流与错误判定
-        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-        );
-
-        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
-        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
-        if let Some(heal) = crate::proxy::pipeline::try_auto_heal(
-            &classification,
-            status_code,
-            &error_text,
-            &mut gemini_body,
-            &mut degraded_gemini_body,
-            &mut heal_flags,
-        ) {
-            force_rotate = false;
-            crate::proxy::stage_trace::StageTrace::alert_current(
-                "self_heal",
-                format!(
-                    "protocol=openai kind={} status={} account={}",
-                    heal.kind, status_code, email
-                ),
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(heal.delay_ms)).await;
-            continue;
-        }
 
         if classification.is_model_not_found() {
             // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策已下沉
@@ -3645,14 +4278,181 @@ pub async fn handle_chat_completions(
         &last_error,
     );
 
-    let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+    let mut dual_err = crate::proxy::handlers::common::build_dual_track_error(
         "openai",
         final_status.as_u16(),
         &mapped_model,
         &last_error,
     );
 
-    Ok((final_status, headers, Json(dual_err)).into_response())
+    crate::proxy::pipeline::stream_error::attach_error_usage(
+        &mut dual_err,
+        "openai",
+        terminal_stream_usage.as_ref(),
+    );
+    Ok(retry_state.finish_error_response((final_status, headers, Json(dual_err)).into_response()))
+}
+
+/// Only requests without a cursor start a new Responses conversation.
+async fn load_responses_parent(
+    id: Option<&str>,
+    strict: bool,
+) -> Result<
+    Option<(
+        crate::proxy::http_session_store::HttpSessionEntry,
+        crate::proxy::http_session_store::SessionParent,
+    )>,
+    Value,
+> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let parent = crate::proxy::http_session_store::get_session_with_parent(id).await;
+    if strict && parent.is_none() {
+        return Err(
+            json!({"error":{"type":"invalid_request_error","code":"previous_response_not_found",
+            "param":"previous_response_id","message":format!("Previous response '{}' was not found",id)}}),
+        );
+    }
+    Ok(parent)
+}
+
+fn validate_openai_tool_schemas(tools: Option<&[Value]>) -> Result<(), String> {
+    for tool in tools.unwrap_or_default() {
+        if tool["type"] == "namespace" {
+            validate_openai_tool_schemas(tool["tools"].as_array().map(Vec::as_slice))?;
+        } else if let Some(schema) = tool
+            .get("parameters")
+            .or_else(|| tool["function"].get("parameters"))
+        {
+            crate::proxy::common::json_schema::validate_tool_schema(schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_responses_continuation(
+    body: &Value,
+) -> Result<(), (&'static str, &'static str, &'static str)> {
+    if body
+        .get("previous_response_id")
+        .is_some_and(|v| !v.is_null() && !v.is_string())
+    {
+        return Err((
+            "invalid_type",
+            "previous_response_id",
+            "previous_response_id must be a string or null",
+        ));
+    }
+    if body["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "compaction"
+                || (item["type"] == "compaction_summary"
+                    && item
+                        .as_object()
+                        .is_some_and(|m| m.keys().any(|key| key != "type" && key != "id")))
+        })
+    }) {
+        return Err(("unsupported_compaction", "input", "Cannot restore a Responses compaction payload; send the compacted plaintext transcript instead"));
+    }
+    // Validate only Responses protocol containers. Business tool arguments may
+    // legitimately contain fields named type, encrypted_content or file_id.
+    fn unsupported_content(value: &Value) -> bool {
+        match value {
+            Value::Array(parts) => parts.iter().any(unsupported_content),
+            Value::Object(part) => {
+                if part.get("type").is_some_and(|t| t == "input_file") {
+                    if part.get("file_id").is_some_and(|id| !id.is_null()) {
+                        return true;
+                    }
+                    let Ok(file) = serde_json::from_value::<
+                        crate::proxy::mappers::openai::models::OpenAIInputFile,
+                    >(value.clone()) else {
+                        return true;
+                    };
+                    validate_openai_file(&file).is_err()
+                } else {
+                    part.get("type").is_some_and(|t| t == "input_image")
+                        && part.get("file_id").is_some_and(|id| !id.is_null())
+                }
+            }
+            _ => false,
+        }
+    }
+    if let Some(items) = body["input"].as_array() {
+        for item in items {
+            if item["type"] == "reasoning"
+                && item
+                    .get("encrypted_content")
+                    .is_some_and(|v| !v.is_null() && v != "")
+            {
+                return Err((
+                    "unsupported_reasoning",
+                    "input",
+                    "Cannot restore external encrypted reasoning; send plaintext reasoning instead",
+                ));
+            }
+            let content = match item["type"].as_str() {
+                Some("function_call_output" | "custom_tool_call_output") => {
+                    item["output"].get("content").unwrap_or(&item["output"])
+                }
+                None | Some("message") => &item["content"],
+                _ => item,
+            };
+            if unsupported_content(content) {
+                return Err(("unsupported_file_input", "input", "File input cannot be represented: supply one valid inline base64 document or public file URL; external file IDs are not supported"));
+            }
+        }
+    }
+    fn unique_tools(
+        tools: &[Value],
+        namespaces: &mut Vec<String>,
+        names: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        for tool in tools {
+            if tool["type"] == "namespace" {
+                if let (Some(ns), Some(children)) =
+                    (tool["name"].as_str(), tool["tools"].as_array())
+                {
+                    namespaces.push(ns.to_owned());
+                    let unique = unique_tools(children, namespaces, names);
+                    namespaces.pop();
+                    if !unique {
+                        return false;
+                    }
+                }
+            } else if let Some(name) = tool["function"]["name"]
+                .as_str()
+                .or_else(|| tool["name"].as_str())
+            {
+                let qualified = namespaces.iter().rev().fold(name.to_owned(), |child, ns| {
+                    crate::proxy::mappers::openai::request::qualify_namespace_tool_name(ns, &child)
+                });
+                if !names.insert(qualified) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    if body["tools"]
+        .as_array()
+        .is_some_and(|tools| !unique_tools(tools, &mut Vec::new(), &mut Default::default()))
+    {
+        return Err((
+            "ambiguous_tool_name",
+            "tools",
+            "Tool names must remain unique after namespace qualification",
+        ));
+    }
+    if validate_openai_tool_schemas(body["tools"].as_array().map(Vec::as_slice)).is_err() {
+        return Err((
+            "unsupported_tool_schema",
+            "tools",
+            "Tool schema contains a union that cannot be represented without changing its contract",
+        ));
+    }
+    Ok(())
 }
 
 fn responses_store_enabled(body: &Value) -> bool {
@@ -3688,7 +4488,14 @@ pub async fn handle_completions(
         crate::proxy::payload_audit::reorder_payload_fields(&debug_value_without_inline_data(&body))
     });
     let is_responses_api = is_responses_api_path(uri.path());
-    let is_codex_style = body.get("input").is_some() || body.get("instructions").is_some();
+    let is_codex_style = body.get("input").is_some()
+        || body.get("instructions").is_some()
+        || (is_responses_api && body.get("previous_response_id").is_some());
+    if is_responses_api {
+        if let Err((code, param, message)) = validate_responses_continuation(&body) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","code":code,"param":param,"message":message}}))).into_response();
+        }
+    }
     let store_response = responses_store_enabled(&body);
 
     // [MODEL GATE] /v1/completions 与 /responses 系列同样必须在选号前完成模型校验：
@@ -3719,19 +4526,8 @@ pub async fn handle_completions(
         .get("previous_response_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let explicit_session_id = headers
-        .get("x-session-id")
-        .or_else(|| headers.get("session-id"))
-        .or_else(|| headers.get("x-claude-code-session-id"))
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .or_else(|| {
-            body.get("session_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        });
+    let mut explicit_session_id =
+        crate::proxy::thinking_store::stable_session_winner(&headers, Some(&body), None);
     let response_id_for_save = format!("resp-{}", uuid::Uuid::new_v4());
     let http_tool_call_cache: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
@@ -3739,50 +4535,48 @@ pub async fn handle_completions(
     let mut stored_routing_session_id = None;
     let mut session_delta_input = Vec::new();
     if is_codex_style {
-        let existing_input = body
-            .as_object_mut()
-            .and_then(|obj| obj.remove("input"))
-            .and_then(|value| match value {
-                Value::Array(items) => Some(items),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        let merged = if let Some(ref prev_id) = previous_response_id {
-            if let Some((session, parent)) =
-                crate::proxy::http_session_store::get_session_with_parent(prev_id).await
-            {
-                stored_routing_session_id = Some(parent.routing_session_id().to_string());
-                let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
-                    session.input_items,
-                    existing_input,
-                    &http_tool_call_cache,
-                    store_response,
-                );
-                session_delta_input = prepared.delta;
-                if store_response && !prepared.reset_parent {
-                    session_parent = Some(parent);
-                }
-                if let Some(obj) = body.as_object_mut() {
-                    if !obj.contains_key("instructions") && !session.instructions.is_empty() {
-                        obj.insert("instructions".to_string(), json!(session.instructions));
-                    }
-                    if !obj.contains_key("model") && !session.model.is_empty() {
-                        obj.insert("model".to_string(), json!(session.model));
-                    }
-                }
-                tracing::debug!(
-                    "[MultiTurn] Restored session from prev_id={}, {} items in history",
-                    prev_id,
-                    prepared.merged.len()
-                );
-                prepared.merged
-            } else {
-                if store_response {
-                    session_delta_input = existing_input.clone();
-                }
-                existing_input
+        let existing_input = take_responses_input_items(&mut body);
+        let selected =
+            match load_responses_parent(previous_response_id.as_deref(), is_responses_api).await {
+                Ok(selected) => selected,
+                Err(error) => return (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+            };
+        let existing_input = match crate::proxy::http_session_store::resolve_input_references(
+            selected.as_ref().map(|(session, _)| session.input_items.as_slice()).unwrap_or_default(),
+            existing_input,
+        ) {
+            Ok(input) => input,
+            Err(message) => return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","code":"item_reference_not_found","param":"input","message":message}}))).into_response(),
+        };
+        let merged = if let Some((session, parent)) = selected {
+            if explicit_session_id.is_none() {
+                explicit_session_id = parent.scope_identity().map(str::to_owned);
             }
+            stored_routing_session_id = Some(parent.routing_session_id().to_string());
+            let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
+                session.input_items,
+                existing_input,
+                &http_tool_call_cache,
+                store_response,
+            );
+            session_delta_input = prepared.delta;
+            if store_response && !prepared.reset_parent {
+                session_parent = Some(parent);
+            }
+            if let Some(obj) = body.as_object_mut() {
+                if !obj.contains_key("instructions") && !session.instructions.is_empty() {
+                    obj.insert("instructions".to_string(), json!(session.instructions));
+                }
+                if !obj.contains_key("model") && !session.model.is_empty() {
+                    obj.insert("model".to_string(), json!(session.model));
+                }
+            }
+            tracing::debug!(
+                "[MultiTurn] Restored session from prev_id={:?}, {} items in history",
+                previous_response_id,
+                prepared.merged.len()
+            );
+            prepared.merged
         } else {
             if store_response {
                 session_delta_input = existing_input.clone();
@@ -3826,7 +4620,7 @@ pub async fn handle_completions(
         bounded_session_input = store_response.then(|| {
             session_delta_input
                 .drain(..)
-                .filter_map(into_history_without_inline_media)
+                .map(into_history_without_inline_media)
                 .filter(|item| !item.is_null())
                 .collect()
         });
@@ -3867,11 +4661,11 @@ pub async fn handle_completions(
                             .unwrap_or("unknown");
 
                         let name = if item_type == "local_shell_call" {
-                            "shell"
+                            "shell".to_string()
                         } else if item_type == "web_search_call" {
-                            "google_search"
+                            "google_search".to_string()
                         } else {
-                            responses_item_tool_name(item).unwrap_or("unknown")
+                            responses_item_tool_name(item).unwrap_or_else(|| "unknown".to_string())
                         };
 
                         call_id_to_name.insert(call_id.to_string(), name.to_string());
@@ -3901,8 +4695,8 @@ pub async fn handle_completions(
                             .and_then(Value::as_str)
                             .unwrap_or("user")
                             .to_string();
-                        let (text_parts, image_parts) = responses_message_parts(&mut item);
-                        let joined_text = text_parts.join("\n");
+                        let (content, joined_text, has_media) =
+                            responses_message_content(&mut item, step_marker);
                         if is_codex_transcript_only_assistant_message(&item, &joined_text) {
                             continue;
                         }
@@ -3922,35 +4716,14 @@ pub async fn handle_completions(
                         // 若为 assistant 角色且没有任何实际正文、图像或思考元数据，属于纯空占位消息，予以过滤
                         if role == "assistant"
                             && joined_text.trim().is_empty()
-                            && image_parts.is_empty()
+                            && !has_media
                             && reasoning_content.is_none()
                             && signature.is_none()
                         {
                             continue;
                         }
 
-                        // 构造消息内容：如果有图像则使用数组格式
-                        let mut message = if image_parts.is_empty() {
-                            let content = prefix_with_step_marker(step_marker, joined_text);
-                            json!({
-                                "role": role,
-                                "content": content
-                            })
-                        } else {
-                            let mut content_blocks: Vec<Value> = Vec::new();
-                            let marker_text = prefix_with_step_marker(step_marker, joined_text);
-                            if !marker_text.is_empty() {
-                                content_blocks.push(json!({
-                                    "type": "text",
-                                    "text": marker_text
-                                }));
-                            }
-                            content_blocks.extend(image_parts);
-                            json!({
-                                "role": role,
-                                "content": content_blocks
-                            })
-                        };
+                        let mut message = json!({"role":role,"content":content});
 
                         if let Some(rc) = reasoning_content {
                             if let Some(obj) = message.as_object_mut() {
@@ -4002,7 +4775,8 @@ pub async fn handle_completions(
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call"
                     | "web_search_call" => {
-                        let mut name = responses_item_tool_name(&item).unwrap_or("unknown");
+                        let mut name = responses_item_tool_name(&item)
+                            .unwrap_or_else(|| "unknown".to_string());
                         let mut args_str = item
                             .get("arguments")
                             .and_then(|v| v.as_str())
@@ -4021,7 +4795,7 @@ pub async fn handle_completions(
                                     .unwrap_or_else(|_| "{}".to_string());
                             }
                         } else if item_type == "local_shell_call" {
-                            name = "shell";
+                            name = "shell".to_string();
                             if let Some(action) = item.get("action") {
                                 if let Some(exec) = action.get("exec") {
                                     let mut args_obj = serde_json::Map::new();
@@ -4043,7 +4817,7 @@ pub async fn handle_completions(
                                 }
                             }
                         } else if item_type == "web_search_call" {
-                            name = "google_search";
+                            name = "google_search".to_string();
                             if let Some(action) = item.get("action") {
                                 let mut args_obj = serde_json::Map::new();
                                 if let Some(q) = action.get("query") {
@@ -4376,6 +5150,10 @@ pub async fn handle_completions(
         }
     };
 
+    if let Err(message) = validate_openai_file_inputs(&openai_req) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
         openai_req
@@ -4420,6 +5198,13 @@ pub async fn handle_completions(
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
+    let responses_tool_kinds = if is_codex_style {
+        crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(
+            openai_req.tools.as_deref(),
+        )
+    } else {
+        Default::default()
+    };
 
     // Server-authoritative thinking: do NOT prefill messages.reasoning_content from
     // SignatureCache. OpenAI mapping ignores client/cached reasoning text and fills
@@ -4501,9 +5286,11 @@ pub async fn handle_completions(
     let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
+    let mut terminal_stream_usage: Option<serde_json::Value> = None;
     let mut last_email: Option<String> = None;
     let mut retry_state = RequestRetryState::default();
     let mut retry_credentials: Option<crate::proxy::token_manager::LeasedCredentials> = None;
+    let mut session_lease = None;
     let mut attempted_accounts: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut failure_statuses = FailureStatusTracker::default();
@@ -4535,9 +5322,8 @@ pub async fn handle_completions(
     let mut force_rotate = false;
     let mut retried_without_thinking = false;
     let mut heal_flags = crate::proxy::pipeline::AutoHealFlags::default();
-    let mut degraded_gemini_body: Option<Value> = None;
 
-    while let Some(attempt) = next_rotation_attempt(
+    'attempts: while let Some(attempt) = next_rotation_attempt(
         &mut used_attempts,
         max_attempts,
         retry_credentials.is_some(),
@@ -4551,6 +5337,7 @@ pub async fn handle_completions(
         ) {
             break;
         }
+        retry_state.begin_attempt();
 
         let norm_start = std::time::Instant::now();
         // 3. 模型配置解析
@@ -4571,34 +5358,39 @@ pub async fn handle_completions(
 
         let session_id = Some(affinity_key.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms, mut session_lease) =
+        let (access_token, project_id, email, account_id, _wait_ms, selected_session_lease) =
             if let Some(credentials) = retry_credentials.take() {
                 credentials
             } else {
                 let mut token_result = token_manager
-                    .get_token_filtered_with_lease(
+                    .get_token_filtered_with_retry_lease(
                         &config.request_type,
                         force_rotate,
                         session_id,
                         &mapped_model,
                         &attempted_accounts,
+                        &mut session_lease,
                     )
                     .await;
 
                 if let Err(ref e) = token_result {
                     if crate::proxy::handlers::common::is_transient_token_error(e) {
                         tracing::warn!(
-                            "Token acquisition transient error ({}), retrying once with force_rotate...",
+                            "Token acquisition transient error ({}), retrying once under scheduling policy...",
                             e
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         token_result = token_manager
-                            .get_token_filtered_with_lease(
+                            .get_token_filtered_with_retry_lease(
                                 &config.request_type,
-                                true,
+                                crate::proxy::pipeline::rotation::token_retry_force_rotate(
+                                    force_rotate,
+                                    token_manager.get_scheduling_mode().await,
+                                ),
                                 session_id,
                                 &mapped_model,
                                 &attempted_accounts,
+                                &mut session_lease,
                             )
                             .await;
                     }
@@ -4607,7 +5399,10 @@ pub async fn handle_completions(
                 match token_result {
                     Ok(t) => t,
                     Err(e) => {
-                        if !failure_statuses.is_empty() {
+                        retry_state.preserve_token_error(&e);
+                        if !failure_statuses.is_empty()
+                            && !crate::proxy::session_bindings::is_session_binding_changed_error(&e)
+                        {
                             tracing::warn!(
                             "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
                             trace_id
@@ -4619,15 +5414,20 @@ pub async fn handle_completions(
                         } else {
                             "openai"
                         };
-                        return crate::proxy::handlers::common::build_token_error_response(
-                            protocol,
-                            mapped_model.as_str(),
-                            None,
-                            &e,
+                        return retry_state.finish_error_response(
+                            crate::proxy::handlers::common::build_token_error_response_with_usage(
+                                protocol,
+                                mapped_model.as_str(),
+                                None,
+                                &e,
+                                terminal_stream_usage.as_ref(),
+                            ),
                         );
                     }
                 }
             };
+
+        session_lease = selected_session_lease;
 
         let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
 
@@ -4641,40 +5441,30 @@ pub async fn handle_completions(
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
         let tf_start = std::time::Instant::now();
-        let (mut gemini_body, _routed_session, message_count, _prefix_hash) =
-            if let Some(body) = degraded_gemini_body.take() {
-                (body, String::new(), 0, String::new())
-            } else {
-                let (mut b, r, m, p) = if is_responses_api {
-                    transform_openai_request_with_session(
-                        &openai_req,
-                        &project_id,
-                        &mapped_model,
-                        proxy_token.as_ref(),
-                        &affinity_key,
-                        signature_read_key.as_deref(),
-                        true, // is_responses_api
-                        retried_without_thinking,
-                    )
-                } else {
-                    transform_openai_request_with_session(
-                        &openai_req,
-                        &project_id,
-                        &mapped_model,
-                        proxy_token.as_ref(),
-                        &affinity_key,
-                        None,
-                        false,
-                        retried_without_thinking,
-                    )
-                };
-                if heal_flags.retried_with_budget_degraded {
-                    crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
-                        &mut b,
-                    );
-                }
-                (b, r, m, p)
-            };
+        let (mut gemini_body, _routed_session, message_count, _prefix_hash) = if is_responses_api {
+            transform_openai_request_with_session(
+                &openai_req,
+                &project_id,
+                &mapped_model,
+                proxy_token.as_ref(),
+                &affinity_key,
+                signature_read_key.as_deref(),
+                true, // is_responses_api
+                retried_without_thinking,
+            )
+        } else {
+            transform_openai_request_with_session(
+                &openai_req,
+                &project_id,
+                &mapped_model,
+                proxy_token.as_ref(),
+                &affinity_key,
+                None,
+                false,
+                retried_without_thinking,
+            )
+        };
+        heal_flags.reapply(&mut gemini_body);
         let session_id = session_id_str.clone();
         // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
         if retried_without_thinking {
@@ -4697,6 +5487,27 @@ pub async fn handle_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        // Resolve text history only after all request normalization, and use the
+        // same visible prefix when recording the response from this attempt.
+        let thinking_enabled =
+            crate::proxy::pipeline::qos::payload_enables_thinking(&gemini_body, None);
+        let contents_path = if gemini_body.get("request").is_some() {
+            "/request/contents"
+        } else {
+            "/contents"
+        };
+        let response_text_context = gemini_body
+            .pointer_mut(contents_path)
+            .and_then(Value::as_array_mut)
+            .map(|contents| {
+                crate::proxy::thinking_store::finalize_request_text_context(
+                    &session_id,
+                    contents,
+                    &mapped_model,
+                    thinking_enabled,
+                    retried_without_thinking,
+                )
+            });
         let estimated_input_tokens = crate::proxy::pipeline::estimate_tokens(&gemini_body);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
@@ -4878,6 +5689,27 @@ pub async fn handle_completions(
 
                 // 非终态（连接失败 / 调度异常）：冷却该账号并继续轮换
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
+                if let Some(strategy) = retry_state.cache_first_failure(
+                    &account_id,
+                    502,
+                    &e,
+                    None,
+                    &token_manager.get_sticky_config().await,
+                    config.request_type != "image_gen",
+                ) {
+                    if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id).await {
+                        retry_credentials = Some((
+                            access_token.clone(),
+                            project_id.clone(),
+                            email.clone(),
+                            account_id.clone(),
+                            0,
+                            session_lease.clone(),
+                        ));
+                        continue;
+                    }
+                    break;
+                }
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
                 crate::proxy::pipeline::rotation::record_attempted_account(
                     &mut attempted_accounts,
@@ -4904,13 +5736,30 @@ pub async fn handle_completions(
         let response = call_result.response;
         let upstream_url = response.url().to_string();
         let status = response.status();
-        if status.is_success() {
-            let track_image_success = config.request_type == "image_gen";
-            if !track_image_success {
-                token_manager.commit_session_lease(&mut session_lease);
-                // [智能限流] 请求成功，重置该账号的连续失败计数
-                token_manager.mark_account_success(&account_id);
+        // HTTP failures and pre-output SSE errors share the same recovery policy.
+        let (status, retry_after, error_text) = 'upstream_response: {
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|header| header.to_str().ok())
+                    .map(str::to_string);
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                break 'upstream_response (status, retry_after, error_text);
             }
+
+            let track_image_success = config.request_type == "image_gen";
+            let mut session_confirmation = if !track_image_success {
+                // HTTP acceptance still confirms account health in all scheduling
+                // modes; only cache warmth waits for body validation.
+                token_manager.mark_account_success(&account_id);
+                token_manager.accept_session_response(&mut session_lease)
+            } else {
+                None
+            };
 
             if list_response {
                 use axum::body::Body;
@@ -4960,6 +5809,23 @@ pub async fn handle_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                // Preserve structured upstream errors before protocol conversion.
+                let stream_errors =
+                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
+                let gemini_stream = Box::pin(
+                    crate::proxy::pipeline::stream_error::observe_response_errors(
+                        gemini_stream,
+                        stream_errors.clone(),
+                        !client_wants_stream,
+                    ),
+                );
+                let gemini_stream = Box::pin(
+                    crate::proxy::token_manager::confirm_session_response_stream(
+                        gemini_stream,
+                        stream_errors.clone(),
+                        session_confirmation.take(),
+                    ),
+                );
 
                 // DECISION: Which stream to create?
                 // If client wants stream: give them what they asked (Legacy/Codex SSE).
@@ -4969,7 +5835,7 @@ pub async fn handle_completions(
                 if client_wants_stream {
                     let mut session_completion_rx = None;
                     let mut openai_stream = if is_codex_style {
-                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
+                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_context;
                         let completion_tx = if store_response {
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             session_completion_rx = Some(rx);
@@ -4977,7 +5843,7 @@ pub async fn handle_completions(
                         } else {
                             None
                         };
-                        create_codex_sse_stream(
+                        create_codex_sse_stream_with_context(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id_str.clone(),
@@ -4986,14 +5852,17 @@ pub async fn handle_completions(
                             response_id_for_save.clone(),
                             completion_tx,
                             store_response,
+                            response_text_context.clone(),
+                            responses_tool_kinds.clone(),
                         )
                     } else {
-                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
-                        create_legacy_sse_stream(
+                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_context;
+                        create_legacy_sse_stream_with_context(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id,
                             message_count,
+                            response_text_context.clone(),
                         )
                     };
 
@@ -5059,22 +5928,24 @@ pub async fn handle_completions(
                         converted_meta,
                     );
 
-                    // 仅当转换器产生 response.completed 时保存本轮增量及必要输出。
+                    // Save completed output and recoverable max-token truncations;
+                    // the converter excludes transport failures and empty output.
                     if let Some(completion_rx) = session_completion_rx {
                         let save_parent = session_parent;
                         let save_input = session_save_input;
                         let save_instructions = session_save_instructions;
                         let save_model = openai_req.model.clone();
                         let rid = response_id_for_save.clone();
+                        let scope_identity = explicit_session_id.clone();
                         tokio::spawn(async move {
                             if let Ok((outputs, ack_tx)) = completion_rx.await {
                                 let outputs = outputs
                                     .into_iter()
-                                    .filter_map(into_history_without_inline_media)
+                                    .map(into_history_without_inline_media)
                                     .collect();
                                 save_session_unless_response_cancelled(
                                     ack_tx,
-                                    crate::proxy::http_session_store::save_session_delta(
+                                    crate::proxy::http_session_store::save_session_delta_with_identity(
                                         rid,
                                         save_parent,
                                         save_input,
@@ -5082,6 +5953,7 @@ pub async fn handle_completions(
                                         save_instructions,
                                         save_model,
                                         routing_session_id,
+                                        scope_identity,
                                     ),
                                 )
                                 .await;
@@ -5120,27 +5992,25 @@ pub async fn handle_completions(
                 } else {
                     // Forced Stream Internal -> Convert to Legacy JSON
                     // Use CHAT SSE Stream (so Collector can parse it)
-                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_anchor;
+                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_context;
                     // Note: We use create_openai_sse_stream regardless of is_codex_style here,
                     // because we just want the content aggregation which chat stream does well.
-                    let mut openai_stream = create_openai_sse_stream_with_anchor(
+                    let mut openai_stream = create_openai_sse_stream_with_context(
                         gemini_stream,
                         openai_req.model.clone(),
-                        if is_responses_api {
-                            response_id_for_save.clone()
-                        } else {
-                            session_id
-                        },
+                        session_id_str.clone(),
                         message_count,
                         Some(client_tool_names.clone()),
                         true,
                         Some(causal_anchor),
+                        response_text_context.clone(),
                     );
 
                     // [Pipeline StreamPeek] 内部强制流（非流式客户端）：返回前仍需首包，
                     // 统一走 pipeline::stream_peek；超时属于时间问题（不跨账号重放），其余错误仍可换号。
                     headers_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
                     let mut first_data_chunk = None;
+                    let mut peek_failed = false;
                     let is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
                         &gemini_body,
                         Some(&mapped_model),
@@ -5199,34 +6069,81 @@ pub async fn handle_completions(
                             ..
                         } => {
                             last_error = format!("Timeout peek internal ({}s)", budget_secs);
-                            crate::proxy::pipeline::terminal::record_first_byte_timeout(
+                            terminal_stream_usage = record_nonstream_peek_timeout(
                                 "openai_responses",
                                 budget_secs,
+                                &stream_errors,
                                 &mut failure_statuses,
+                                &mut retry_state,
+                                token_manager.get_scheduling_mode().await,
+                                config.request_type != "image_gen",
                             );
-                            break;
+                            break 'attempts;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
                             last_error = "Error event in internal stream".to_string();
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::StreamError {
                             error,
                             ..
                         } => {
                             last_error = format!("Internal stream error: {}", error);
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
                         crate::proxy::pipeline::stream_peek::PeekOutcome::Eof { .. } => {
                             last_error = "Empty internal stream".to_string();
-                            force_rotate = true;
-                            failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            continue;
+                            peek_failed = true;
                         }
+                    }
+
+                    if peek_failed {
+                        if let Some(failure) =
+                            stream_errors.failure_or_incomplete(Some(&last_error))
+                        {
+                            let failure_status = StatusCode::from_u16(failure.status)
+                                .unwrap_or(StatusCode::BAD_GATEWAY);
+                            if failure.replay_safe() {
+                                break 'upstream_response (failure_status, None, failure.body);
+                            }
+                            // Output has already been consumed: classify the error, but do not replay.
+                            retry_state.preserve_http_stop(
+                                failure.status,
+                                &failure.body,
+                                &token_manager.get_sticky_config().await,
+                                config.request_type != "image_gen",
+                            );
+                            failure_statuses.record(failure_status);
+                            terminal_stream_usage = failure.usage.clone();
+                            last_error = failure.body;
+                            break 'attempts;
+                        }
+                        failure_statuses.record(StatusCode::BAD_GATEWAY);
+                        if let Some(strategy) = retry_state.cache_first_failure(
+                            &account_id,
+                            502,
+                            &last_error,
+                            None,
+                            &token_manager.get_sticky_config().await,
+                            config.request_type != "image_gen",
+                        ) {
+                            if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id)
+                                .await
+                            {
+                                retry_credentials = Some((
+                                    access_token.clone(),
+                                    project_id.clone(),
+                                    email.clone(),
+                                    account_id.clone(),
+                                    0,
+                                    session_lease.clone(),
+                                ));
+                                continue 'attempts;
+                            }
+                            break 'attempts;
+                        }
+                        force_rotate = true;
+                        continue 'attempts;
                     }
 
                     let combined_stream = futures::stream::once(async move {
@@ -5255,14 +6172,38 @@ pub async fn handle_completions(
 
                     // Collect
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
-                    match collect_stream_to_json(combined_stream).await {
+                    let collected_response = collect_stream_to_json(combined_stream).await;
+                    if let Some(failure) = stream_errors.failure_or_incomplete(
+                        collected_response.as_ref().err().map(String::as_str),
+                    ) {
+                        let failure_status =
+                            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        if failure.replay_safe() {
+                            break 'upstream_response (failure_status, None, failure.body);
+                        }
+                        // Output has already been consumed: classify the error, but do not replay.
+                        retry_state.preserve_http_stop(
+                            failure.status,
+                            &failure.body,
+                            &token_manager.get_sticky_config().await,
+                            config.request_type != "image_gen",
+                        );
+                        failure_statuses.record(failure_status);
+                        terminal_stream_usage = failure.usage.clone();
+                        last_error = failure.body;
+                        break 'attempts;
+                    }
+                    match collected_response {
                         Ok(chat_resp) => {
                             let is_responses_api = is_responses_api_path(uri.path());
 
                             if is_responses_api {
                                 let is_structured = is_request_structured_output(&openai_req);
-                                let mut resp =
-                                    convert_chat_response_to_responses(&chat_resp, is_structured);
+                                let mut resp = convert_chat_response_to_responses_with_tools(
+                                    &chat_resp,
+                                    is_structured,
+                                    &responses_tool_kinds,
+                                );
                                 resp["id"] = json!(response_id_for_save.clone());
                                 let outputs = resp
                                     .get("output")
@@ -5270,10 +6211,10 @@ pub async fn handle_completions(
                                     .cloned()
                                     .unwrap_or_default()
                                     .into_iter()
-                                    .filter_map(into_history_without_inline_media)
+                                    .map(into_history_without_inline_media)
                                     .collect();
                                 if store_response {
-                                    crate::proxy::http_session_store::save_session_delta(
+                                    crate::proxy::http_session_store::save_session_delta_with_identity(
                                         response_id_for_save.clone(),
                                         session_parent,
                                         session_save_input,
@@ -5281,6 +6222,7 @@ pub async fn handle_completions(
                                         session_save_instructions,
                                         openai_req.model.clone(),
                                         routing_session_id.clone(),
+                                        explicit_session_id.clone(),
                                     )
                                     .await;
                                 }
@@ -5411,11 +6353,17 @@ pub async fn handle_completions(
                                 .into_response();
                         }
                         Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response();
+                            retry_state.preserve_on_stop(
+                                token_manager.get_scheduling_mode().await,
+                                config.request_type != "image_gen",
+                            );
+                            return retry_state.finish_error_response(
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Stream collection error: {}", e),
+                                )
+                                    .into_response(),
+                            );
                         }
                     }
                 }
@@ -5446,29 +6394,50 @@ pub async fn handle_completions(
                 {
                     Ok(json) => json,
                     Err(e) => {
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            [("X-Mapped-Model", mapped_model.as_str())],
-                            format!("Parse error: {}", e),
-                        )
-                            .into_response();
+                        retry_state.preserve_on_stop(
+                            token_manager.get_scheduling_mode().await,
+                            config.request_type != "image_gen",
+                        );
+                        return retry_state.finish_error_response(
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                [("X-Mapped-Model", mapped_model.as_str())],
+                                format!("Parse error: {}", e),
+                            )
+                                .into_response(),
+                        );
                     }
                 };
 
-            crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
+            if let Some(confirmation) = session_confirmation.as_mut() {
+                confirmation.observe_json(&gemini_resp);
+            }
 
-            let chat_resp = transform_openai_response(
+            crate::proxy::thinking_store::capture_gemini_response_with_context(
+                &session_id_str,
                 &gemini_resp,
-                Some(&signature_session_id_str),
-                1,
-                Some(&client_tool_names),
+                None,
+                response_text_context.as_deref(),
             );
+
+            let chat_resp =
+                crate::proxy::mappers::openai::response::transform_openai_response_with_context(
+                    &gemini_resp,
+                    Some(&signature_session_id_str),
+                    1,
+                    Some(&client_tool_names),
+                    response_text_context.clone(),
+                );
 
             let is_responses_api = is_responses_api_path(uri.path());
 
             if is_responses_api {
                 let is_structured = is_request_structured_output(&openai_req);
-                let resp = convert_chat_response_to_responses(&chat_resp, is_structured);
+                let resp = convert_chat_response_to_responses_with_tools(
+                    &chat_resp,
+                    is_structured,
+                    &responses_tool_kinds,
+                );
                 if debug_logger::is_enabled(&debug_cfg) {
                     let payload = json!({
                         "kind": "exchange_summary",
@@ -5574,43 +6543,30 @@ pub async fn handle_completions(
                 ))
                 .unwrap()
                 .into_response();
-        }
+        };
 
-        // Handle errors and retry
         failure_statuses.record(status);
         let status_code = status.as_u16();
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
-
-        tracing::error!(
-            "[Codex-Upstream] Error Response {}: {}",
-            status_code,
-            error_text
-        );
-
-        // 3. 统一流水线判定与标记限流状态(用于 UI 显示)
         let classification = crate::proxy::pipeline::UpstreamClassification::classify(
             status_code,
             &error_text,
             retry_after.as_deref(),
         );
+        let scheduling = token_manager.get_sticky_config().await;
 
         // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：统一在同一账号原地修复重试
-        if let Some(heal) = crate::proxy::pipeline::try_auto_heal(
+        if let Some(heal) = crate::proxy::pipeline::auto_heal::try_auto_heal_with_retry_policy(
             &classification,
             status_code,
             &error_text,
+            retry_after.as_deref(),
             &mut gemini_body,
-            &mut degraded_gemini_body,
             &mut heal_flags,
+            &mut retry_state,
+            &account_id,
+            &scheduling,
+            config.request_type != "image_gen",
         ) {
             force_rotate = false;
             crate::proxy::stage_trace::StageTrace::alert_current(
@@ -5620,9 +6576,60 @@ pub async fn handle_completions(
                     heal.kind, status_code, email
                 ),
             );
-            tokio::time::sleep(std::time::Duration::from_millis(heal.delay_ms)).await;
+            if !apply_retry_strategy(
+                RetryStrategy::GraceRetry(std::time::Duration::from_millis(heal.delay_ms)),
+                attempt,
+                max_attempts,
+                status_code,
+                &trace_id,
+            )
+            .await
+            {
+                break;
+            }
+            if config.request_type != "image_gen" {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+            }
             continue;
         }
+
+        // CacheFirst policy is shared across protocols and runs before account penalties.
+        if let Some(strategy) = retry_state.cache_first_failure(
+            &account_id,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            &token_manager.get_sticky_config().await,
+            config.request_type != "image_gen",
+        ) {
+            if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+                retry_credentials = Some((
+                    access_token.clone(),
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                continue;
+            }
+            break;
+        }
+
+        tracing::error!(
+            "[Codex-Upstream] Error Response {}: {}",
+            status_code,
+            error_text
+        );
+
+        // 3. 统一流水线判定与标记限流状态(用于 UI 显示)
 
         // [FIX Signature] 400 思考签名无效：清库 + 流水线去签名，同账号原地重试
         if classification.is_thought_signature_error() {
@@ -5800,13 +6807,18 @@ pub async fn handle_completions(
     } else {
         "openai"
     };
-    let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+    let mut dual_err = crate::proxy::handlers::common::build_dual_track_error(
         protocol,
         final_status.as_u16(),
         &mapped_model,
         &last_error,
     );
-    (final_status, headers, axum::Json(dual_err)).into_response()
+    crate::proxy::pipeline::stream_error::attach_error_usage(
+        &mut dual_err,
+        protocol,
+        terminal_stream_usage.as_ref(),
+    );
+    retry_state.finish_error_response((final_status, headers, axum::Json(dual_err)).into_response())
 }
 
 /// Helper to resolve token limits (context length and max output tokens) for any model ID.
@@ -7382,7 +8394,7 @@ pub async fn handle_images_edits(
 // ==========================================
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use uuid::Uuid;
 
 // ==========================================
@@ -7427,7 +8439,6 @@ struct WebsocketSessionState {
     last_request: Option<Value>,
     last_response_output: Value,
     last_response_id: String,
-    last_response_pending_tool_call_ids: Vec<String>,
     tool_call_cache: std::collections::HashMap<String, Value>,
 }
 
@@ -7435,20 +8446,30 @@ pub async fn handle_responses_websocket(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     State(state): State<AppState>,
+    user_identity: Option<
+        axum::extract::Extension<crate::proxy::middleware::auth::UserTokenIdentity>,
+    >,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_websocket_session(socket, headers, state))
+    ws.on_upgrade(move |socket| handle_websocket_session(socket, headers, state, user_identity))
 }
 
-async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, state: AppState) {
+async fn handle_websocket_session(
+    mut socket: WebSocket,
+    headers: HeaderMap,
+    state: AppState,
+    user_identity: Option<
+        axum::extract::Extension<crate::proxy::middleware::auth::UserTokenIdentity>,
+    >,
+) {
     tracing::info!("Codex responses websocket: client connected");
     let mut session_state = WebsocketSessionState {
         last_request: None,
         last_response_output: json!([]),
         last_response_id: String::new(),
-        last_response_pending_tool_call_ids: Vec::new(),
         tool_call_cache: std::collections::HashMap::new(),
     };
 
+    let connection_id = format!("ws-{}", Uuid::new_v4());
     while let Some(msg_result) = socket.recv().await {
         let msg = match msg_result {
             Ok(m) => m,
@@ -7505,9 +8526,36 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         }
 
         if should_handle_prewarm_locally(&payload, &session_state) {
-            let (created, completed) = handle_prewarm_locally(&payload, &mut session_state);
-            let _ = socket.send(Message::Text(created.to_string())).await;
-            let _ = socket.send(Message::Text(completed.to_string())).await;
+            let mut pending = session_state.clone();
+            let (created, completed) = match prepare_websocket_prewarm(
+                &payload,
+                &mut pending,
+                &headers,
+                &connection_id,
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(message) => {
+                    let event = json!({"type":"error","error":{"type":"invalid_request_error","message":message}});
+                    if socket.send(Message::Text(event.to_string())).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            if socket
+                .send(Message::Text(created.to_string()))
+                .await
+                .is_err()
+                || socket
+                    .send(Message::Text(completed.to_string()))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            session_state = pending;
             if debug_logger::is_enabled(&debug_cfg) {
                 let payload_log = json!({
                     "kind": "codex_websocket_local_response",
@@ -7526,174 +8574,222 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
             continue;
         }
 
-        let normalized = match normalize_responses_websocket_request(payload, &mut session_state) {
-            Ok(n) => n,
-            Err(e) => {
-                let error_ev = json!({
-                    "type": "error",
-                    "error": {
-                        "message": e,
-                        "type": "invalid_request_error"
-                    }
-                });
-                let _ = socket.send(Message::Text(error_ev.to_string())).await;
+        // Stage the merge: an invalid request, failed generation, or disconnected
+        // writer must not consume the last successfully delivered turn.
+        let mut pending = session_state.clone();
+        let mut normalized = match normalize_responses_websocket_request(payload, &mut pending) {
+            Ok(body) => body,
+            Err(message) => {
+                let event = json!({"type":"error","error":{"type":"invalid_request_error","message":message}});
+                if socket.send(Message::Text(event.to_string())).await.is_err() {
+                    return;
+                }
                 continue;
             }
         };
-
-        let openai_body = convert_codex_to_openai_request(normalized);
-        let response_result = handle_chat_completions(
+        if let Err(message) =
+            prepare_websocket_generation(&mut normalized, &mut pending, &headers, &connection_id)
+                .await
+        {
+            let event = json!({"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found","message":message}});
+            if socket.send(Message::Text(event.to_string())).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let mut usage = crate::proxy::middleware::monitor::WebsocketTurnUsage::begin(
+            &headers,
+            &normalized,
+            user_identity.as_ref().map(|i| &i.0),
+        );
+        let response = handle_completions(
+            axum::extract::OriginalUri(axum::http::Uri::from_static("/v1/responses")),
             State(state.clone()),
             headers.clone(),
             None,
-            None,
-            Json(openai_body),
+            user_identity.clone(),
+            Json(normalized),
         )
         .await;
-
-        let response = match response_result {
-            Ok(res) => res.into_response(),
-            Err((status, err_msg)) => {
-                let error_ev = json!({
-                    "type": "error",
-                    "error": {
-                        "message": err_msg,
-                        "type": "server_error",
-                        "code": status.as_u16().to_string()
-                    }
-                });
-                let _ = socket.send(Message::Text(error_ev.to_string())).await;
-                continue;
-            }
-        };
-
+        usage.response(response.status().as_u16(), response.headers());
         if !response.status().is_success() {
-            let error_ev = json!({
-                "type": "error",
-                "error": {
-                    "message": format!("Upstream returned status {}", response.status()),
-                    "type": "server_error"
-                }
-            });
-            let _ = socket.send(Message::Text(error_ev.to_string())).await;
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap_or_default();
+            let event = websocket_http_error_event(status, &body);
+            usage.observe(&event);
+            usage.record(
+                state.monitor.clone(),
+                user_identity.as_ref().map(|i| i.0.clone()),
+            );
+            if socket.send(Message::Text(event.to_string())).await.is_err() {
+                return;
+            }
             continue;
         }
-
-        let body = response.into_body();
-        let mut stream = body.into_data_stream();
-
-        let mut translation_state = TranslationState {
-            response_id: format!("resp-{}", &Uuid::new_v4().to_string()[..24]),
-            item_id: format!("item-{}", &Uuid::new_v4().to_string()[..16]),
-            message_output_index: None,
-            next_output_index: 0,
-            tool_output_indices: std::collections::HashMap::new(),
-            message_item_added: false,
-            content_part_added: false,
-            accumulated_text: String::new(),
-            tool_calls: std::collections::HashMap::new(),
-            tool_calls_added: std::collections::HashSet::new(),
-        };
-
-        let created_ev = json!({
-            "type": "response.created",
-            "response": {
-                "id": &translation_state.response_id,
-                "object": "response",
-                "status": "in_progress",
-                "output": []
+        let events = websocket_response_events(response.into_body().into_data_stream());
+        futures::pin_mut!(events);
+        let mut logged_events = debug_logger::is_enabled(&debug_cfg).then(Vec::new);
+        let mut disconnected = false;
+        while let Some(event) = events.next().await {
+            // Account for actual upstream observations even if the client leaves
+            // while sending the terminal. Only delivered output is resumable.
+            usage.observe(&event);
+            if socket.send(Message::Text(event.to_string())).await.is_err() {
+                disconnected = true;
+                break;
             }
-        });
-        let mut outgoing_ws_events = Vec::new();
-        send_ws_event(&mut socket, &mut outgoing_ws_events, &created_ev).await;
-
-        let mut buffer = bytes::BytesMut::new();
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Stream chunk error: {:?}", e);
-                    break;
-                }
-            };
-            buffer.extend_from_slice(&chunk);
-            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                let line_raw = buffer.split_to(pos + 1);
-                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                    let line = line_str.trim();
-                    if line.is_empty() || !line.starts_with("data: ") {
-                        continue;
-                    }
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part == "[DONE]" {
-                        break;
-                    }
-                    if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
-                        translate_openai_chunk_to_ws(
-                            &chunk_json,
-                            &mut translation_state,
-                            &mut socket,
-                            &mut outgoing_ws_events,
-                        )
-                        .await;
-                    }
-                }
+            if let Some(log) = logged_events.as_mut() {
+                log.push(debug_value_without_inline_data(&event));
+            }
+            if commit_websocket_response(&mut pending, &event) {
+                session_state = pending;
+                break;
             }
         }
-
-        if !buffer.is_empty() {
-            if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                let line = line_str.trim();
-                if line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
-                        if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
-                            translate_openai_chunk_to_ws(
-                                &chunk_json,
-                                &mut translation_state,
-                                &mut socket,
-                                &mut outgoing_ws_events,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
+        usage.record(
+            state.monitor.clone(),
+            user_identity.as_ref().map(|i| i.0.clone()),
+        );
+        if disconnected {
+            return;
         }
-
-        let completed_output = finalize_ws_events(
-            &mut translation_state,
-            &mut socket,
-            &mut session_state,
-            &mut outgoing_ws_events,
-        )
-        .await;
-        if debug_logger::is_enabled(&debug_cfg) {
-            let payload_log = json!({
-                "kind": "codex_websocket_converted_response",
-                "protocol": "codex_websocket",
-                "trace_id": ws_trace_id,
-                "events": debug_value_without_inline_data(&Value::Array(outgoing_ws_events)),
-                "completed_output": debug_value_without_inline_data(&completed_output),
-            });
+        if let Some(events) = logged_events {
             debug_logger::write_exchange_payload(
                 &debug_cfg,
                 Some(&ws_trace_id),
                 "codex_websocket_converted_response",
-                &payload_log,
+                &json!({"kind":"codex_websocket_converted_response","events":events}),
             )
             .await;
         }
-
-        session_state.last_response_output =
-            into_history_without_inline_media(completed_output).unwrap_or_else(|| json!([]));
-        session_state.last_response_id = translation_state.response_id.clone();
-        session_state.last_response_pending_tool_call_ids = translation_state
-            .tool_calls
-            .values()
-            .map(|(_, call_id, _, _)| call_id.clone())
-            .collect();
     }
+}
+
+// Resolve a first or historical branch cursor before dispatch. Current socket
+// turns have already merged their own local snapshot, including store=false.
+async fn prepare_websocket_generation(
+    body: &mut Value,
+    pending: &mut WebsocketSessionState,
+    headers: &HeaderMap,
+    connection_id: &str,
+) -> Result<(), String> {
+    let previous = body["previous_response_id"]
+        .as_str()
+        .filter(|id| !id.is_empty());
+    let new_root = previous.is_none() && pending.last_response_id.is_empty();
+    let mut explicit =
+        crate::proxy::thinking_store::stable_session_winner(headers, Some(body), None);
+    if let Some(id) = previous {
+        // An explicit cursor not represented by the current socket snapshot must
+        // resolve independently. Do not splice a sibling, failed or expired turn
+        // onto the last successful turn. Keep the cursor for native HTTP storage.
+        let (parent, stored) = crate::proxy::http_session_store::get_session_with_parent(id)
+            .await
+            .ok_or_else(|| format!("Previous response '{}' was not found", id))?;
+        if explicit.is_none() {
+            explicit = stored.scope_identity().map(str::to_owned);
+        }
+        let history = pending.last_request.as_mut().expect("normalized request");
+        let delta = take_responses_input_items(history);
+        let delta =
+            crate::proxy::http_session_store::resolve_input_references(&parent.input_items, delta)?;
+        let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
+            parent.input_items,
+            delta,
+            &pending.tool_call_cache,
+            false,
+        );
+        history["input"] = if body.get("generate").and_then(Value::as_bool) == Some(false) {
+            // The saved parent was already bounded; newly supplied input hasn't
+            // been dispatched yet and must reach the model before abbreviation.
+            Value::Array(prepared.merged)
+        } else {
+            history_without_inline_media(&Value::Array(prepared.merged))
+        };
+        if history.get("instructions").is_none() && !parent.instructions.is_empty() {
+            history["instructions"] = json!(parent.instructions);
+        }
+        if history.get("model").is_none() && !parent.model.is_empty() {
+            history["model"] = json!(parent.model);
+            body["model"] = history["model"].clone();
+        }
+        // An imported anonymous parent uses its restored content anchor, as it
+        // does over HTTP; never invent a new socket identity for it.
+    }
+    let new_identity = if new_root {
+        explicit.or_else(|| Some(connection_id.to_owned()))
+    } else {
+        explicit
+    };
+    if let Some(id) = new_identity {
+        body["session_id"] = json!(id);
+        if let Some(history) = pending.last_request.as_mut() {
+            history["session_id"] = json!(id);
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_websocket_prewarm(
+    payload: &Value,
+    pending: &mut WebsocketSessionState,
+    headers: &HeaderMap,
+    connection_id: &str,
+) -> Result<(Value, Value), String> {
+    validate_responses_continuation(payload).map_err(|(_, _, msg)| msg.to_owned())?;
+    // The pending request lives on an idle socket until its first generation.
+    // Bound the entire retained JSON (including audio and tools), allowing for
+    // base64 expansion. A sizing writer does not allocate a second huge buffer.
+    let max_bytes = crate::proxy::config::get_multimodal_config()
+        .max_total_image_mb
+        .max(1)
+        .saturating_mul(1024 * 1024);
+    if serialized_json_len(payload)
+        > max_bytes
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(64 * 1024)
+    {
+        return Err(
+            "WebSocket prewarm payload exceeds the configured media retention limit".to_owned(),
+        );
+    }
+    validate_responses_input_image_limits_with_mode(payload.get("input"), false)?;
+    let mut validated = payload.clone();
+    if payload["previous_response_id"]
+        .as_str()
+        .is_none_or(str::is_empty)
+    {
+        let input = take_responses_input_items(&mut validated);
+        validated["input"] = json!(crate::proxy::http_session_store::resolve_input_references(
+            &[],
+            input
+        )?);
+    }
+    let events = handle_prewarm_locally(&validated, pending);
+    // Only metadata is needed for parent lookup/session resolution here;
+    // the original, validated input is already owned by pending.last_request.
+    let mut body = json!({"generate":false});
+    if let Some(id) = payload.get("previous_response_id") {
+        body["previous_response_id"] = id.clone();
+    }
+    if let Some(id) =
+        crate::proxy::thinking_store::stable_session_winner(headers, Some(payload), None)
+    {
+        body["session_id"] = json!(id);
+    }
+    if body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        && crate::proxy::thinking_store::stable_session_winner(headers, Some(&body), None).is_none()
+    {
+        body["session_id"] = json!(connection_id);
+    }
+    prepare_websocket_generation(&mut body, pending, headers, connection_id).await?;
+    Ok(events)
 }
 
 fn should_handle_prewarm_locally(payload: &Value, state: &WebsocketSessionState) -> bool {
@@ -7761,7 +8857,9 @@ fn handle_prewarm_locally(payload: &Value, state: &mut WebsocketSessionState) ->
         }
     });
 
-    let mut normalized = history_without_inline_media(payload);
+    // There is no model call on prewarm. Keep newly supplied media until the
+    // first real generation; normal commit retains only bounded history.
+    let mut normalized = payload.clone();
     if let Some(obj) = normalized.as_object_mut() {
         obj.remove("type");
         obj.remove("generate");
@@ -7769,7 +8867,6 @@ fn handle_prewarm_locally(payload: &Value, state: &mut WebsocketSessionState) ->
     state.last_request = Some(normalized);
     state.last_response_output = json!([]);
     state.last_response_id = response_id;
-    state.last_response_pending_tool_call_ids = Vec::new();
 
     (created_ev, completed_ev)
 }
@@ -7778,6 +8875,7 @@ fn normalize_responses_websocket_request(
     mut payload: Value,
     state: &mut WebsocketSessionState,
 ) -> Result<Value, String> {
+    validate_responses_continuation(&payload).map_err(|(_, _, msg)| msg.to_owned())?;
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -7794,10 +8892,23 @@ fn normalize_responses_websocket_request(
                     }
                 }
                 let model_name = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                if model_name.is_empty() {
+                if model_name.is_empty()
+                    && payload["previous_response_id"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+                {
                     return Err("missing model in response.create request".to_string());
                 }
                 validate_responses_input_image_limits(payload.get("input"))?;
+                if payload["previous_response_id"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                {
+                    let input = take_responses_input_items(&mut payload);
+                    payload["input"] = json!(
+                        crate::proxy::http_session_store::resolve_input_references(&[], input)?
+                    );
+                }
                 state.last_request = Some(history_without_inline_media(&payload));
                 Ok(payload)
             } else {
@@ -7821,88 +8932,149 @@ fn normalize_response_subsequent_request(
     }
     validate_responses_input_image_limits(payload.get("input"))?;
 
-    // [FIX] 拦截 compaction 和完整历史替换事件
-    if should_replace_websocket_transcript(&payload) {
+    let previous = payload["previous_response_id"]
+        .as_str()
+        .filter(|id| !id.is_empty());
+    let external_parent = previous.is_some_and(|id| id != state.last_response_id);
+    let has_identity =
+        crate::proxy::thinking_store::extract_body_session_id(Some(&payload)).is_some();
+    if !external_parent {
+        let resets_parent = should_replace_websocket_transcript(&payload)
+            || payload["input"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    matches!(
+                        item["type"].as_str(),
+                        Some("compaction" | "compaction_summary")
+                    )
+                })
+            });
+        let mut history = if resets_parent {
+            Vec::new()
+        } else {
+            state
+                .last_request
+                .as_ref()
+                .and_then(|v| v["input"].as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        if !resets_parent {
+            if let Some(output) = state.last_response_output.as_array() {
+                history.extend(output.iter().cloned());
+            }
+        }
+        let incoming = take_responses_input_items(&mut payload);
+        payload["input"] = json!(crate::proxy::http_session_store::resolve_input_references(
+            &history, incoming
+        )?);
+    }
+    let last = state.last_request.as_mut().expect("checked above");
+    if let Some(obj) = payload.as_object_mut() {
+        // The initial generate:false event prepared these options for this
+        // specific generation. After it completes, ordinary turns inherit only
+        // the existing connection defaults, never a sibling's settings.
+        let from_prewarm = state.last_response_id.starts_with("resp_prewarm_");
+        let token_fields = [
+            "max_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "maxTokens",
+            "max_output_tokens",
+            "maxOutputTokens",
+        ];
+        let overrides_tokens = token_fields.iter().any(|field| obj.contains_key(*field));
+        let prewarm_options = [
+            "max_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "maxTokens",
+            "maxOutputTokens",
+            "store",
+            "reasoning",
+            "text",
+            "max_output_tokens",
+            "max_tool_calls",
+            "parallel_tool_calls",
+            "temperature",
+            "top_p",
+            "top_logprobs",
+            "truncation",
+            "include",
+            "stream_options",
+            "service_tier",
+            "background",
+            "metadata",
+            "safety_identifier",
+            "user",
+            "prompt",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+        ];
+        for field in [
+            "model",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "session_id",
+        ]
+        .into_iter()
+        .chain(prewarm_options.into_iter().filter(|_| from_prewarm))
+        {
+            // A historical branch gets configuration from its own parent,
+            // not from the unrelated latest turn on this connection.
+            if !external_parent
+                && !obj.contains_key(field)
+                && (field != "session_id" || !has_identity)
+                && (!overrides_tokens || !token_fields.contains(&field))
+            {
+                if let Some(value) = last.get_mut(field).map(Value::take) {
+                    obj.insert(field.to_owned(), value);
+                }
+            }
+        }
+    }
+    if external_parent {
+        state.tool_call_cache.clear();
+        state.last_response_output = json!([]);
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("type");
-            obj.remove("previous_response_id");
-            obj.insert("stream".to_string(), Value::Bool(true));
+            obj.insert("stream".into(), Value::Bool(true));
         }
         state.last_request = Some(history_without_inline_media(&payload));
         return Ok(payload);
     }
-
-    // [FIX] 始终走完整的 merge 逻辑，废弃 transcript replacement 分支
-    // 旧逻辑在检测到 function_call/assistant 时直接替换整个历史，导致多轮对话历史丢失
-    // 正确做法：last_request.input + last_response_output + new payload.input 全部合并
-    let mut last_request = state.last_request.take().expect("checked above");
-    let mut merged_input = last_request
-        .as_object_mut()
-        .and_then(|obj| obj.remove("input"))
-        .and_then(|value| match value {
-            Value::Array(items) => Some(items),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    // 上一轮请求的 input 已按所有权移入 merged_input。
-    // 2. 上一轮 response 的 output items（assistant 回复、工具调用等）
-    if let Value::Array(items) = std::mem::take(&mut state.last_response_output) {
-        merged_input.extend(items);
+    let replace = should_replace_websocket_transcript(&payload);
+    let incoming = take_responses_input_items(&mut payload);
+    let compacted = incoming.iter().any(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("compaction" | "compaction_summary")
+        )
+    });
+    if replace || compacted {
+        state.tool_call_cache.clear();
     }
-
-    // 3. 本轮新的 input items（用户消息、工具调用结果等）
-    let current_input = payload
-        .as_object_mut()
-        .and_then(|obj| obj.remove("input"))
-        .and_then(|value| match value {
-            Value::Array(items) => Some(items),
-            _ => None,
-        })
-        .unwrap_or_default();
-    for item in current_input {
-        let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if t == "compaction" || t == "compaction_summary" {
-            continue;
+    let parent = if replace {
+        Vec::new()
+    } else {
+        let mut last_request = state.last_request.take().expect("checked above");
+        let mut history = take_responses_input_items(&mut last_request);
+        if let Value::Array(output) = std::mem::take(&mut state.last_response_output) {
+            history.extend(output);
         }
-        if t == "function_call_output" || t == "custom_tool_call_output" {
-            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                state
-                    .last_response_pending_tool_call_ids
-                    .retain(|x| x != call_id);
-            }
-        }
-        merged_input.push(item);
-    }
-
-    repair_tool_calls(&mut merged_input, &state.tool_call_cache);
-
-    let deduped = dedupe_function_calls_by_call_id(dedupe_input_items_by_id(merged_input));
-
+        history
+    };
+    let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
+        parent,
+        incoming,
+        &state.tool_call_cache,
+        false,
+    );
+    let deduped = dedupe_function_calls_by_call_id(prepared.merged);
     if let Some(obj) = payload.as_object_mut() {
         obj.remove("type");
         obj.remove("previous_response_id");
         obj.insert("input".to_string(), Value::Array(deduped));
-        if !obj.contains_key("model") {
-            if let Some(model) = last_request.get_mut("model").map(Value::take) {
-                obj.insert("model".to_string(), model);
-            }
-        }
-        if !obj.contains_key("instructions") {
-            if let Some(instructions) = last_request.get_mut("instructions").map(Value::take) {
-                obj.insert("instructions".to_string(), instructions);
-            }
-        }
-        if !obj.contains_key("tools") {
-            if let Some(tools) = last_request.get_mut("tools").map(Value::take) {
-                obj.insert("tools".to_string(), tools);
-            }
-        }
-        if !obj.contains_key("tool_choice") {
-            if let Some(tool_choice) = last_request.get_mut("tool_choice").map(Value::take) {
-                obj.insert("tool_choice".to_string(), tool_choice);
-            }
-        }
         obj.insert("stream".to_string(), Value::Bool(true));
     }
     state.last_request = Some(history_without_inline_media(&payload));
@@ -7910,6 +9082,12 @@ fn normalize_response_subsequent_request(
 }
 
 fn should_replace_websocket_transcript(payload: &Value) -> bool {
+    // An explicit append can legally contain new assistant/tool history.
+    // Shared replay detection handles a true full prefix and compaction.
+    if payload["type"] == "response.append" {
+        return false;
+    }
+
     let previous_response_id = payload
         .get("previous_response_id")
         .and_then(|v| v.as_str())
@@ -7934,55 +9112,6 @@ fn should_replace_websocket_transcript(payload: &Value) -> bool {
     false
 }
 
-fn dedupe_input_items_by_id(items: Vec<Value>) -> Vec<Value> {
-    use std::collections::{HashMap, HashSet};
-    let mut referenced_call_ids = HashSet::new();
-    for item in &items {
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if item_type == "function_call_output" || item_type == "custom_tool_call_output" {
-            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                if !call_id.is_empty() {
-                    referenced_call_ids.insert(call_id.to_string());
-                }
-            }
-        }
-    }
-
-    let mut keep_map: HashMap<String, (usize, bool)> = HashMap::new();
-    for (idx, item) in items.iter().enumerate() {
-        let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if item_id.is_empty() {
-            continue;
-        }
-        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-        let is_referenced = !call_id.is_empty() && referenced_call_ids.contains(call_id);
-        if let Some(&(_existing_idx, existing_referenced)) = keep_map.get(item_id) {
-            if is_referenced || !existing_referenced {
-                keep_map.insert(item_id.to_string(), (idx, is_referenced));
-            }
-        } else {
-            keep_map.insert(item_id.to_string(), (idx, is_referenced));
-        }
-    }
-
-    let mut keep_indices = HashSet::new();
-    for (_, (idx, _)) in keep_map {
-        keep_indices.insert(idx);
-    }
-
-    let mut filtered = Vec::new();
-    for (idx, item) in items.into_iter().enumerate() {
-        let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !item_id.is_empty() {
-            if !keep_indices.contains(&idx) {
-                continue;
-            }
-        }
-        filtered.push(item);
-    }
-    filtered
-}
-
 fn dedupe_function_calls_by_call_id(items: Vec<Value>) -> Vec<Value> {
     use std::collections::HashSet;
     let mut seen_call_ids = HashSet::new();
@@ -8002,42 +9131,6 @@ fn dedupe_function_calls_by_call_id(items: Vec<Value>) -> Vec<Value> {
         filtered.push(item);
     }
     filtered
-}
-
-fn repair_tool_calls(
-    input_items: &mut Vec<Value>,
-    tool_call_cache: &std::collections::HashMap<String, Value>,
-) {
-    let mut call_present = std::collections::HashSet::new();
-    for item in input_items.iter() {
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if item_type == "function_call" || item_type == "custom_tool_call" {
-            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                call_present.insert(call_id.to_string());
-            }
-        }
-    }
-
-    let mut new_items = Vec::new();
-    let mut inserted = std::collections::HashSet::new();
-    for item in input_items.drain(..) {
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if item_type == "function_call_output" || item_type == "custom_tool_call_output" {
-            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                if !call_id.is_empty()
-                    && !call_present.contains(call_id)
-                    && !inserted.contains(call_id)
-                {
-                    if let Some(cached_call) = tool_call_cache.get(call_id) {
-                        new_items.push(cached_call.clone());
-                        inserted.insert(call_id.to_string());
-                    }
-                }
-            }
-        }
-        new_items.push(item);
-    }
-    *input_items = new_items;
 }
 
 fn convert_codex_to_openai_request(mut body: Value) -> Value {
@@ -8100,9 +9193,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     } else if item_type == "web_search_call" {
                         "web_search_call".to_string()
                     } else {
-                        responses_item_tool_name(&item)
-                            .unwrap_or("unknown")
-                            .to_string()
+                        responses_item_tool_name(&item).unwrap_or_else(|| "unknown".to_string())
                     };
                     call_id_to_name.insert(call_id.to_string(), name);
                 }
@@ -8127,34 +9218,21 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         .and_then(Value::as_str)
                         .unwrap_or("user")
                         .to_string();
-                    let (text_parts, image_parts) = responses_message_parts(&mut item);
-                    let joined_text = text_parts.join("\n");
+                    let (content, joined_text, has_media) =
+                        responses_message_content(&mut item, step_marker);
                     if is_codex_transcript_only_assistant_message(&item, &joined_text) {
                         continue;
                     }
 
-                    if role == "assistant"
-                        && joined_text.trim().is_empty()
-                        && image_parts.is_empty()
-                    {
+                    if role == "assistant" && joined_text.trim().is_empty() && !has_media {
                         continue;
                     }
 
-                    if image_parts.is_empty() {
-                        let content = prefix_with_step_marker(step_marker, joined_text);
-                        messages.push(json!({ "role": role, "content": content }));
-                    } else {
-                        let mut content_blocks = Vec::new();
-                        let marker_text = prefix_with_step_marker(step_marker, joined_text);
-                        if !marker_text.is_empty() {
-                            content_blocks.push(json!({ "type": "text", "text": marker_text }));
-                        }
-                        content_blocks.extend(image_parts);
-                        messages.push(json!({ "role": role, "content": content_blocks }));
-                    }
+                    messages.push(json!({"role":role,"content":content}));
                 }
                 "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
-                    let mut name = responses_item_tool_name(&item).unwrap_or("unknown");
+                    let mut name =
+                        responses_item_tool_name(&item).unwrap_or_else(|| "unknown".to_string());
                     let mut args_str = item
                         .get("arguments")
                         .and_then(|v| v.as_str())
@@ -8172,7 +9250,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                                 .unwrap_or_else(|_| "{}".to_string());
                         }
                     } else if item_type == "local_shell_call" || name == "local_shell_call" {
-                        name = "shell";
+                        name = "shell".to_string();
                         if let Some(action) = item.get("action") {
                             if let Some(exec) = action.get("exec") {
                                 let mut args_obj = serde_json::Map::new();
@@ -8194,7 +9272,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                             }
                         }
                     } else if item_type == "web_search_call" || name == "web_search_call" {
-                        name = "google_search";
+                        name = "google_search".to_string();
                         if let Some(action) = item.get("action") {
                             let mut args_obj = serde_json::Map::new();
                             if let Some(q) = action.get("query") {
@@ -8233,11 +9311,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     let (mut output_str, output_media) = responses_tool_output_parts(&mut item);
 
                     let name = match call_id_to_name.get(&call_id).cloned().or_else(|| {
-                        get_cached_tool_call(&call_id).and_then(|v| {
-                            v.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
+                        get_cached_tool_call(&call_id).and_then(|v| responses_item_tool_name(&v))
                     }) {
                         Some(name) => name,
                         None if item_type == "custom_tool_call_output" => {
@@ -8290,379 +9364,112 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
     body
 }
 
-struct TranslationState {
-    response_id: String,
-    item_id: String,
-    message_output_index: Option<u32>,
-    next_output_index: u32,
-    tool_output_indices: std::collections::HashMap<u32, u32>,
-    message_item_added: bool,
-    content_part_added: bool,
-    accumulated_text: String,
-    tool_calls: std::collections::HashMap<u32, (String, String, String, String)>,
-    tool_calls_added: std::collections::HashSet<u32>,
+fn websocket_http_error_event(status: u16, body: &[u8]) -> Value {
+    let envelope = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    let error = envelope
+        .get("error")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(
+            || json!({"type":"server_error","code":status,"message":String::from_utf8_lossy(body)}),
+        );
+    let mut event = json!({"type":"error","status":status,"error":error});
+    for field in ["usage", "usageMetadata"] {
+        if let Some(value) = envelope.get(field) {
+            event[field] = value.clone();
+        }
+    }
+    event
 }
 
-async fn send_ws_event(socket: &mut WebSocket, ws_events: &mut Vec<Value>, event: &Value) {
-    ws_events.push(event.clone());
-    let _ = socket.send(Message::Text(event.to_string())).await;
-}
-
-async fn translate_openai_chunk_to_ws(
-    chunk: &Value,
-    state: &mut TranslationState,
-    socket: &mut WebSocket,
-    ws_events: &mut Vec<Value>,
-) {
-    if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
-        for choice in choices {
-            if let Some(delta) = choice.get("delta") {
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                    if !reasoning.is_empty() {
-                        let message_output_index = match state.message_output_index {
-                            Some(idx) => idx,
-                            None => {
-                                let idx = state.next_output_index;
-                                state.next_output_index += 1;
-                                state.message_output_index = Some(idx);
-                                idx
-                            }
-                        };
-                        let reasoning_ev = json!({
-                            "type": "response.reasoning_summary_text.delta",
-                            "sequence_number": 0,
-                            "item_id": &state.item_id,
-                            "output_index": message_output_index,
-                            "summary_index": 0,
-                            "delta": reasoning
-                        });
-                        send_ws_event(socket, ws_events, &reasoning_ev).await;
-
-                        if !state.message_item_added {
-                            let item_added = json!({
-                                "type": "response.output_item.added",
-                                "output_index": message_output_index,
-                                "item": {
-                                    "id": &state.item_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "phase": "commentary",
-                                    "status": "in_progress",
-                                    "content": []
-                                }
-                            });
-                            send_ws_event(socket, ws_events, &item_added).await;
-
-                            let part_added = json!({
-                                "type": "response.content_part.added",
-                                "item_id": &state.item_id,
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": ""
-                                }
-                            });
-                            send_ws_event(socket, ws_events, &part_added).await;
-                            state.message_item_added = true;
-                            state.content_part_added = true;
-                        }
-
-                        let delta_ev = json!({
-                            "type": "response.output_text.delta",
-                            "item_id": &state.item_id,
-                            "output_index": message_output_index,
-                            "content_index": 0,
-                            "delta": reasoning
-                        });
-                        send_ws_event(socket, ws_events, &delta_ev).await;
-                        state.accumulated_text.push_str(reasoning);
-                    }
-                }
-
-                if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-                    if !content.is_empty() {
-                        let message_output_index = match state.message_output_index {
-                            Some(idx) => idx,
-                            None => {
-                                let idx = state.next_output_index;
-                                state.next_output_index += 1;
-                                state.message_output_index = Some(idx);
-                                idx
-                            }
-                        };
-                        if !state.message_item_added {
-                            let item_added = json!({
-                                "type": "response.output_item.added",
-                                "output_index": message_output_index,
-                                "item": {
-                                    "id": &state.item_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "phase": "commentary",
-                                    "status": "in_progress",
-                                    "content": []
-                                }
-                            });
-                            send_ws_event(socket, ws_events, &item_added).await;
-
-                            let part_added = json!({
-                                "type": "response.content_part.added",
-                                "item_id": &state.item_id,
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": ""
-                                }
-                            });
-                            send_ws_event(socket, ws_events, &part_added).await;
-                            state.message_item_added = true;
-                            state.content_part_added = true;
-                        }
-
-                        let delta_ev = json!({
-                            "type": "response.output_text.delta",
-                            "item_id": &state.item_id,
-                            "output_index": message_output_index,
-                            "content_index": 0,
-                            "delta": content
-                        });
-                        send_ws_event(socket, ws_events, &delta_ev).await;
-                        state.accumulated_text.push_str(content);
-                    }
-                }
-
-                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                    for tc in tool_calls {
-                        let tc_idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let tc_name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let tc_args = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        if !tc_id.is_empty() || !tc_name.is_empty() {
-                            let tool_item_id =
-                                format!("item-{}", &Uuid::new_v4().to_string()[..16]);
-                            let call_id = if tc_id.is_empty() {
-                                format!("call_{}", &Uuid::new_v4().to_string()[..16])
-                            } else {
-                                tc_id.to_string()
-                            };
-                            state.tool_calls.insert(
-                                tc_idx,
-                                (
-                                    tool_item_id,
-                                    call_id.clone(),
-                                    tc_name.to_string(),
-                                    String::new(),
-                                ),
-                            );
-                            if !tc_name.is_empty() {
-                                // 临时插入一个包含 name 的 Value，最终会被 finalize_ws_events 里的完整 Value 覆盖
-                                insert_cached_tool_call(call_id, json!({ "name": tc_name }));
-                            }
-                        }
-
-                        if let Some((tool_item_id, call_id, name, args)) =
-                            state.tool_calls.get_mut(&tc_idx)
-                        {
-                            args.push_str(tc_args);
-                            let tool_output_index = match state.tool_output_indices.get(&tc_idx) {
-                                Some(idx) => *idx,
-                                None => {
-                                    let idx = state.next_output_index;
-                                    state.next_output_index += 1;
-                                    state.tool_output_indices.insert(tc_idx, idx);
-                                    idx
-                                }
-                            };
-
-                            if !state.tool_calls_added.contains(&tc_idx) {
-                                let (actual_name, namespace) = split_namespace_tool_name(name);
-                                let mut item_obj = serde_json::json!({
-                                    "id": tool_item_id,
-                                    "type": "function_call",
-                                    "status": "in_progress",
-                                    "name": actual_name,
-                                    "call_id": call_id,
-                                    "arguments": ""
-                                });
-                                if let Some(ns) = namespace {
-                                    item_obj["namespace"] = json!(ns);
-                                }
-                                let tool_added = json!({
-                                    "type": "response.output_item.added",
-                                    "output_index": tool_output_index,
-                                    "item": item_obj
-                                });
-                                send_ws_event(socket, ws_events, &tool_added).await;
-                                state.tool_calls_added.insert(tc_idx);
-                            }
-
-                            if !tc_args.is_empty() {
-                                let args_delta = json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": tool_item_id,
-                                    "output_index": tool_output_index,
-                                    "delta": tc_args
-                                });
-                                send_ws_event(socket, ws_events, &args_delta).await;
-                            }
-                        }
-                    }
-                }
+// Forward native Responses events unchanged. The same mapper now owns HTTP and
+// WebSocket terminal semantics, reasoning items, tool output and sparse usage.
+fn websocket_response_events<S, E>(source: S) -> impl futures::Stream<Item = Value>
+where
+    S: futures::Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    async_stream::stream! {
+        futures::pin_mut!(source);
+        let mut buffer = bytes::BytesMut::new();
+        let mut response_id = Value::Null;
+        let mut model = Value::Null;
+        let mut next_sequence = 0;
+        let mut failure = "Responses stream ended before a terminal event".to_string();
+        'read: while let Some(chunk) = source.next().await {
+            match chunk {
+                Ok(chunk) => buffer.extend_from_slice(&chunk),
+                Err(err) => { failure = format!("Responses body read failed: {err}"); break; }
+            }
+            while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+                let line = buffer.split_to(end + 1);
+                let Some(data) = line.strip_prefix(b"data:") else { continue };
+                let event: Value = match serde_json::from_slice(data) {
+                    Ok(event) => event,
+                    Err(_) => { failure = "Invalid event from Responses stream".into(); break 'read; }
+                };
+                if let Some(id) = event.pointer("/response/id") { response_id = id.clone(); }
+                if let Some(value) = event.pointer("/response/model") { model = value.clone(); }
+                if let Some(seq) = event["sequence_number"].as_u64() { next_sequence = seq.saturating_add(1); }
+                let terminal = matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.failed"));
+                yield event;
+                if terminal { return; }
             }
         }
+        // A body error/EOF can occur after response.created and visible deltas.
+        // An error envelope is terminal here; never fabricate response.completed.
+        let error = json!({"code":"stream_error","message":failure});
+        yield json!({"type":"response.failed","sequence_number":next_sequence,"response":{"id":response_id,"model":model,"object":"response","status":"failed","error":error,"output":[]}});
     }
 }
 
-async fn finalize_ws_events(
-    state: &mut TranslationState,
-    socket: &mut WebSocket,
-    session_state: &mut WebsocketSessionState,
-    ws_events: &mut Vec<Value>,
-) -> Value {
-    let mut output_items = Vec::new();
-    let mut tool_keys: Vec<u32> = state.tool_calls.keys().cloned().collect();
-    tool_keys.sort();
-
-    for tc_idx in tool_keys {
-        if let Some((tool_item_id, call_id, name, args)) = state.tool_calls.get(&tc_idx) {
-            let tool_output_index = match state.tool_output_indices.get(&tc_idx) {
-                Some(idx) => *idx,
-                None => {
-                    let idx = state.next_output_index;
-                    state.next_output_index += 1;
-                    state.tool_output_indices.insert(tc_idx, idx);
-                    idx
-                }
-            };
-            let args_done = json!({
-                "type": "response.function_call_arguments.done",
-                "item_id": tool_item_id,
-                "output_index": tool_output_index,
-                "arguments": args
-            });
-            send_ws_event(socket, ws_events, &args_done).await;
-
-            let (actual_name, namespace) = split_namespace_tool_name(name);
-            let mut item_obj = serde_json::json!({
-                "id": tool_item_id,
-                "type": "function_call",
-                "status": "completed",
-                "name": actual_name,
-                "call_id": call_id,
-                "arguments": args
-            });
-            if let Some(ns) = namespace {
-                item_obj["namespace"] = json!(ns);
+fn commit_websocket_response(state: &mut WebsocketSessionState, event: &Value) -> bool {
+    let response = &event["response"];
+    let resumable = match event["type"].as_str() {
+        Some("response.completed") => response["status"] == "completed",
+        Some("response.incomplete") => {
+            response["incomplete_details"]["reason"] == "max_output_tokens"
+                && response["error"].is_null()
+        }
+        _ => false,
+    };
+    let Some(id) = response["id"].as_str().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let Some(output) = response["output"].as_array() else {
+        return false;
+    };
+    if !resumable
+        || !output.iter().any(|item| match item["type"].as_str() {
+            Some("message") => item["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["type"] == "output_text"
+                        && part["text"].as_str().is_some_and(|text| !text.is_empty())
+                })
+            }),
+            Some("function_call" | "custom_tool_call") => {
+                item["call_id"].as_str().is_some_and(|id| !id.is_empty())
             }
-
-            let tool_done = json!({
-                "type": "response.output_item.done",
-                "output_index": tool_output_index,
-                "item": item_obj
-            });
-            send_ws_event(socket, ws_events, &tool_done).await;
-
-            let tc_val = item_obj.clone();
-
-            session_state
+            _ => false,
+        })
+    {
+        return false;
+    }
+    state.last_response_output = history_without_inline_media(&response["output"]);
+    state.last_response_id = id.to_owned();
+    for call in output.iter().filter(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("function_call" | "custom_tool_call")
+        )
+    }) {
+        if let Some(call_id) = call["call_id"].as_str() {
+            state
                 .tool_call_cache
-                .insert(call_id.clone(), tc_val.clone());
-            insert_cached_tool_call(call_id.clone(), tc_val.clone());
-            output_items.push(tc_val);
+                .insert(call_id.to_string(), call.clone());
         }
     }
-
-    if state.message_item_added {
-        let message_output_index = state.message_output_index.unwrap_or(0);
-        let text_done = json!({
-            "type": "response.output_text.done",
-            "item_id": &state.item_id,
-            "output_index": message_output_index,
-            "content_index": 0,
-            "text": &state.accumulated_text
-        });
-        send_ws_event(socket, ws_events, &text_done).await;
-
-        let part_done = json!({
-            "type": "response.content_part.done",
-            "item_id": &state.item_id,
-            "output_index": message_output_index,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": &state.accumulated_text
-            }
-        });
-        send_ws_event(socket, ws_events, &part_done).await;
-
-        let message_done = json!({
-            "type": "response.output_item.done",
-            "output_index": message_output_index,
-            "item": {
-                "id": &state.item_id,
-                "type": "message",
-                "role": "assistant",
-                "phase": "final_answer",
-                "status": "completed",
-                "content": [{
-                    "type": "output_text",
-                    "text": &state.accumulated_text
-                }]
-            }
-        });
-        send_ws_event(socket, ws_events, &message_done).await;
-
-        output_items.push(json!({
-            "id": &state.item_id,
-            "type": "message",
-            "role": "assistant",
-            "phase": "final_answer",
-            "status": "completed",
-            "content": [{
-                "type": "output_text",
-                "text": &state.accumulated_text
-            }]
-        }));
-    }
-
-    let completed_ev = json!({
-        "type": "response.completed",
-        "response": {
-            "id": &state.response_id,
-            "object": "response",
-            "status": "completed",
-            "output": output_items
-        }
-    });
-    send_ws_event(socket, ws_events, &completed_ev).await;
-
-    json!(output_items)
-}
-
-fn split_namespace_tool_name(qualified_name: &str) -> (String, Option<String>) {
-    let name = qualified_name.trim();
-    if name.starts_with("mcp__") {
-        return (name.to_string(), None);
-    }
-    if let Some(pos) = name.find("__") {
-        if pos > 0 {
-            let namespace = name[..pos].to_string();
-            let actual_name = name[pos + 2..].to_string();
-            return (actual_name, Some(namespace));
-        }
-    }
-    (name.to_string(), None)
+    true
 }
 
 const CONTEXT_SUMMARY_PROMPT: &str = r#"You are a context compression specialist. Your task is to create a structured XML snapshot of the conversation history.
@@ -8905,4 +9712,1513 @@ async fn try_compress_openai_with_summary(
     let mut forked_request = original_request.clone();
     forked_request.messages = forked_messages;
     Ok(forked_request)
+}
+
+#[cfg(test)]
+mod nonstream_peek_timeout_tests {
+    use super::*;
+    use crate::proxy::pipeline::stream_error::{
+        attach_error_usage, observe_response_errors, UpstreamStreamErrorObserver,
+    };
+    use crate::proxy::pipeline::stream_peek::{
+        is_heartbeat, peek_first_data, PeekOutcome, StreamDialect,
+    };
+    use crate::proxy::sticky_config::SchedulingMode;
+    use futures::StreamExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_keeps_buffered_prefill_usage_and_cache_affinity() {
+        for protocol in ["openai", "openai_responses"] {
+            for mode in [SchedulingMode::CacheFirst, SchedulingMode::Balance] {
+                for measured in [true, false] {
+                    let observer = UpstreamStreamErrorObserver::default();
+                    let count = if measured { 4096 } else { 0 };
+                    let raw = json!({"usageMetadata":{"promptTokenCount":count,"cachedContentTokenCount":count}});
+                    let source = futures::stream::iter(vec![Ok::<_, String>(Bytes::from(
+                        format!("data: {raw}\n\n"),
+                    ))])
+                    .chain(futures::stream::pending());
+                    let upstream = observe_response_errors(source, observer.clone(), true);
+                    let mut mapped = crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_context(Box::pin(upstream), "gemini-flash".into(), "timeout-regression".into(), 1, None, true, None, None);
+                    let outcome = peek_first_data(
+                        &mut mapped,
+                        1,
+                        |b| is_heartbeat(b, StreamDialect::OpenAi),
+                        |_| false,
+                    )
+                    .await;
+                    let PeekOutcome::Timeout { budget_secs, .. } = outcome else {
+                        panic!("expected a timeout, got {outcome:?}");
+                    };
+                    let mut failures = FailureStatusTracker::default();
+                    let mut retry_state = RequestRetryState::default();
+                    let usage = record_nonstream_peek_timeout(
+                        protocol,
+                        budget_secs,
+                        &observer,
+                        &mut failures,
+                        &mut retry_state,
+                        mode,
+                        true,
+                    );
+                    assert_eq!(failures.final_status(), StatusCode::GATEWAY_TIMEOUT);
+                    assert_eq!(usage.is_some(), measured);
+                    let mut error = json!({"error":{"code":504,"message":"first data timeout"}});
+                    attach_error_usage(
+                        &mut error,
+                        if protocol == "openai_responses" {
+                            "responses"
+                        } else {
+                            "openai"
+                        },
+                        usage.as_ref(),
+                    );
+                    if measured {
+                        assert_eq!(error["usageMetadata"]["promptTokenCount"], 4096);
+                        let field = if protocol == "openai_responses" {
+                            "input_tokens_details"
+                        } else {
+                            "prompt_tokens_details"
+                        };
+                        assert_eq!(error["usage"][field]["cached_tokens"], 4096);
+                    } else {
+                        assert!(error.get("usage").is_none());
+                    }
+                    let response = retry_state.finish_error_response(
+                        (failures.final_status(), Json(error)).into_response(),
+                    );
+                    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+                    assert_eq!(
+                        response.headers().get("x-am-cache-affinity").is_some(),
+                        mode == SchedulingMode::CacheFirst
+                    );
+                    drop(mapped); // The timeout returns this terminal error; no replay path is entered.
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod responses_http_history_tests {
+    use super::{save_session_unless_response_cancelled, take_responses_input_items};
+    use crate::proxy::http_session_store::{
+        get_session, get_session_with_parent, prepare_session_input_with_storage,
+        save_session_delta,
+    };
+    use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
+    use bytes::Bytes;
+    use futures::{stream, StreamExt};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn http_string_input_preserves_first_turn_and_previous_response_delta() {
+        let first = "First question: 中文\n\"quoted\"";
+        let followup = "Continue from the previous answer.";
+        for store in [true, false] {
+            let mut string_body = json!({"model":"gemini-pro", "input":first});
+            let initial = take_responses_input_items(&mut string_body);
+            assert_eq!(initial, vec![json!({"role":"user","content":first})]);
+            assert!(string_body.get("input").is_none());
+            assert_eq!(string_body["model"], "gemini-pro");
+            let parent_id = format!("resp-string-{}", uuid::Uuid::new_v4());
+            save_session_delta(
+                parent_id.clone(), None, initial.clone(),
+                vec![json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"First answer"}]})],
+                "Keep context".into(), "gemini-pro".into(), "routing-string".into(),
+            ).await;
+            let (session, parent) = get_session_with_parent(&parent_id).await.unwrap();
+            let mut body = json!({"previous_response_id":parent_id,"input":followup});
+            let next = take_responses_input_items(&mut body);
+            let prepared = prepare_session_input_with_storage(
+                session.input_items.clone(),
+                next,
+                &HashMap::new(),
+                store,
+            );
+            assert_eq!(prepared.merged.len(), 3);
+            assert_eq!(prepared.merged[0], initial[0]);
+            assert_eq!(
+                prepared.merged[2],
+                json!({"role":"user","content":followup})
+            );
+            assert_eq!(parent.routing_session_id(), "routing-string");
+            assert!(!prepared.reset_parent);
+            assert_eq!(prepared.delta.len(), usize::from(store));
+            let mut array_body = json!({"input":[{"role":"user","content":followup}]});
+            let array = prepare_session_input_with_storage(
+                session.input_items,
+                take_responses_input_items(&mut array_body),
+                &HashMap::new(),
+                store,
+            );
+            assert_eq!(array.merged, prepared.merged);
+            assert_eq!(array.delta, prepared.delta);
+            if store {
+                let child_id = format!("resp-string-child-{}", uuid::Uuid::new_v4());
+                save_session_delta(
+                    child_id.clone(),
+                    Some(parent),
+                    prepared.delta,
+                    Vec::new(),
+                    session.instructions,
+                    session.model,
+                    "routing-string".into(),
+                )
+                .await;
+                assert_eq!(
+                    get_session(&child_id).await.unwrap().input_items,
+                    prepared.merged
+                );
+            }
+        }
+    }
+
+    fn sse(frame: Value) -> Result<Bytes, String> {
+        Ok(Bytes::from(format!("data: {frame}\n\n")))
+    }
+
+    async fn stream_with_history(
+        frames: Vec<Result<Bytes, String>>,
+        store: bool,
+    ) -> (String, Value) {
+        let id = format!("resp-history-{}", uuid::Uuid::new_v4());
+        let parent_id = format!("{id}-parent");
+        save_session_delta(parent_id.clone(), None,
+            vec![json!({"role":"user","content":"First question"})],
+            vec![json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"First answer"}]})],
+            String::new(), "gemini-pro".into(), "routing-history".into()).await;
+        let (_, parent) = get_session_with_parent(&parent_id).await.unwrap();
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>();
+        let save_id = id.clone();
+        let save_task = tokio::spawn(async move {
+            if let Ok((outputs, ack_tx)) = rx.await {
+                save_session_unless_response_cancelled(
+                    ack_tx,
+                    save_session_delta(
+                        save_id,
+                        Some(parent),
+                        vec![json!({"role":"user","content":"Next question"})],
+                        outputs,
+                        String::new(),
+                        "gemini-pro".into(),
+                        "routing-history".into(),
+                    ),
+                )
+                .await;
+            }
+        });
+        let callback = if store {
+            Some(tx)
+        } else {
+            drop(tx);
+            None
+        };
+        let mut mapped = create_codex_sse_stream(
+            Box::pin(stream::iter(frames)),
+            "gemini-pro".into(),
+            id.clone(),
+            3,
+            1,
+            id.clone(),
+            callback,
+            store,
+        );
+        let mut terminal = Value::Null;
+        while let Some(chunk) = mapped.next().await {
+            for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        if matches!(
+                            event["type"].as_str(),
+                            Some("response.completed" | "response.incomplete" | "response.failed")
+                        ) {
+                            terminal = event["response"].clone();
+                            if store && matches!(terminal["status"].as_str(), Some("completed")) {
+                                assert!(
+                                    get_session(&id).await.is_some(),
+                                    "save barrier precedes terminal event"
+                                );
+                            }
+                            if store
+                                && terminal["incomplete_details"]["reason"] == "max_output_tokens"
+                                && terminal["error"].is_null()
+                            {
+                                assert!(
+                                    get_session(&id).await.is_some(),
+                                    "truncated history precedes terminal event"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        drop(mapped);
+        save_task.await.unwrap();
+        (id, terminal)
+    }
+
+    #[tokio::test]
+    async fn max_tokens_stream_persists_text_and_tool_continuations() {
+        for (part, continuation) in [
+            (
+                json!({"text":"Partial answer"}),
+                json!({"role":"user","content":"Continue"}),
+            ),
+            (
+                json!({"functionCall":{"id":"tool-limit","name":"lookup","args":{"city":"Paris"}}}),
+                json!({"type":"function_call_output","call_id":"tool-limit","output":"sunny"}),
+            ),
+        ] {
+            for store in [true, false] {
+                let frames = vec![
+                    sse(
+                        json!({"candidates":[{"content":{"parts":[part]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}),
+                    ),
+                    sse(
+                        json!({"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"candidatesTokenCount":5}}),
+                    ),
+                    sse(json!({"usageMetadata":{"cachedContentTokenCount":0}})),
+                ];
+                let (id, response) = stream_with_history(frames, store).await;
+                assert_eq!(response["status"], "incomplete");
+                assert_eq!(
+                    response["incomplete_details"]["reason"],
+                    "max_output_tokens"
+                );
+                assert!(response["error"].is_null());
+                assert_eq!(response["usage"]["input_tokens"], 100);
+                assert_eq!(
+                    response["usage"]["input_tokens_details"]["cached_tokens"],
+                    0
+                );
+                assert_eq!(response["usage"]["output_tokens"], 5);
+                let restored = get_session_with_parent(&id).await;
+                assert_eq!(restored.is_some(), store);
+                if let Some((saved, parent)) = restored {
+                    assert_eq!(parent.routing_session_id(), "routing-history");
+                    assert_eq!(
+                        &saved.input_items[3..],
+                        response["output"].as_array().unwrap()
+                    );
+                    let mut next = continuation.clone();
+                    if next["type"] == "function_call_output" {
+                        next["call_id"] = response["output"][0]["call_id"].clone();
+                    }
+                    let prepared = prepare_session_input_with_storage(
+                        saved.input_items.clone(),
+                        vec![next.clone()],
+                        &HashMap::new(),
+                        true,
+                    );
+                    assert!(prepared.merged.starts_with(&saved.input_items));
+                    assert_eq!(prepared.merged.last(), Some(&next));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_empty_and_refused_streams_do_not_save_history() {
+        let partial = json!({"content":{"parts":[{"text":"partial"}]}});
+        for frames in [
+            vec![sse(json!({"candidates":[partial.clone()]}))],
+            vec![sse(json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}))],
+            vec![sse(
+                json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking"}]},"finishReason":"MAX_TOKENS"}]}),
+            )],
+            vec![sse(
+                json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"SAFETY"}]}),
+            )],
+            vec![
+                sse(
+                    json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+                ),
+                Err("connection reset before stream EOF".into()),
+            ],
+        ] {
+            let (id, response) = stream_with_history(frames, true).await;
+            assert_ne!(response["status"], "completed");
+            assert!(
+                get_session(&id).await.is_none(),
+                "non-resumable response: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_truncated_response_drops_pending_history_save() {
+        let id = format!("resp-truncated-cancel-{}", uuid::Uuid::new_v4());
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let save_id = id.clone();
+        let save_task = tokio::spawn(async move {
+            let (outputs, ack_tx) = rx.await.unwrap();
+            save_session_unless_response_cancelled(ack_tx, async move {
+                entered_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                save_session_delta(
+                    save_id,
+                    None,
+                    Vec::new(),
+                    outputs,
+                    String::new(),
+                    "gemini-pro".into(),
+                    "routing-cancel".into(),
+                )
+                .await;
+            })
+            .await;
+        });
+        let mapped = create_codex_sse_stream(
+            Box::pin(stream::iter(vec![sse(
+                json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+            )])),
+            "gemini-pro".into(),
+            id.clone(),
+            1,
+            0,
+            id.clone(),
+            Some(tx),
+            true,
+        );
+        let reader = tokio::spawn(async move {
+            let _ = mapped.collect::<Vec<_>>().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        reader.abort();
+        let _ = reader.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), save_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(get_session(&id).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod responses_websocket_history_tests {
+    use super::*;
+
+    fn state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+
+    fn input(text: &str, shorthand: bool) -> Value {
+        if shorthand {
+            json!(text)
+        } else {
+            json!([{"role":"user","content":text}])
+        }
+    }
+
+    #[test]
+    fn websocket_create_and_append_preserve_string_turns_and_assistant_output() {
+        for event in ["response.create", "response.append"] {
+            for first_shorthand in [true, false] {
+                for next_shorthand in [true, false] {
+                    for store in [true, false] {
+                        let mut state = state();
+                        let first=normalize_responses_websocket_request(json!({"type":"response.create","model":"gemini-pro","instructions":"Keep context","store":store,"input": input("Question one", first_shorthand)}), &mut state).unwrap();
+                        assert_eq!(
+                            convert_codex_to_openai_request(first)["messages"],
+                            json!([{"role":"system","content":"Keep context"},{"role":"user","content":"Question one"}])
+                        );
+                        state.last_response_id = "resp-first".into();
+                        state.last_response_output = json!([{"id":"assistant-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer one"}]}]);
+                        let next=normalize_responses_websocket_request(json!({"type":event,"previous_response_id":"resp-first","store":store,"input":input("Question two", next_shorthand)}),&mut state).unwrap();
+                        assert_eq!(next["model"], "gemini-pro");
+                        assert_eq!(next["store"], store);
+                        assert_eq!(
+                            convert_codex_to_openai_request(next)["messages"],
+                            json!([{"role":"system","content":"Keep context"},{"role":"user","content":"Question one"},{"role":"assistant","content":"Answer one"},{"role":"user","content":"Question two"}])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_prewarm_preserves_string_input_for_first_generation() {
+        for shorthand in [true, false] {
+            let mut state = state();
+            let prewarm = json!({"type":"response.create","model":"gemini-pro","generate":false,"input":input("Warm context",shorthand)});
+            assert!(should_handle_prewarm_locally(&prewarm, &state));
+            let (_, completed) = handle_prewarm_locally(&prewarm, &mut state);
+            assert_eq!(completed["response"]["usage"]["total_tokens"], 0);
+            let next = json!({"type":"response.create","previous_response_id":completed["response"]["id"],"input":"First question"});
+            assert!(!should_handle_prewarm_locally(&next, &state));
+            let normalized = normalize_responses_websocket_request(next, &mut state).unwrap();
+            assert_eq!(
+                convert_codex_to_openai_request(normalized)["messages"],
+                json!([{"role":"user","content":"Warm context"},{"role":"user","content":"First question"}])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod websocket_native_responses_tests {
+    use super::*;
+    use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
+    use futures::{stream, StreamExt};
+    fn state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+    fn frame(value: Value) -> Result<Bytes, String> {
+        Ok(Bytes::from(format!("data: {value}\n\n")))
+    }
+    #[tokio::test]
+    async fn native_terminal_usage_and_history_are_preserved_on_the_socket() {
+        for (name, reason, terminal, detail, save) in [
+            ("complete", "STOP", "response.completed", None, true),
+            (
+                "truncated",
+                "MAX_TOKENS",
+                "response.incomplete",
+                Some("max_output_tokens"),
+                true,
+            ),
+            (
+                "filtered",
+                "SAFETY",
+                "response.incomplete",
+                Some("content_filter"),
+                false,
+            ),
+            ("503", "", "response.failed", None, false),
+            ("transport", "", "response.failed", None, false),
+        ] {
+            let response_id = format!("resp-ws-test-{}", Uuid::new_v4());
+            let mut committed = state();
+            let mut pending = committed.clone();
+            let mut body = normalize_responses_websocket_request(
+                json!({"type":"response.create","model":"gemini-pro","input":"Task","store":false}),
+                &mut pending,
+            )
+            .unwrap();
+            prepare_websocket_generation(&mut body, &mut pending, &HeaderMap::new(), "ws-stable")
+                .await
+                .unwrap();
+            assert_eq!(body["session_id"], "ws-stable");
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["store"], false);
+            let mut frames = vec![frame(
+                json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"Thinking only","thoughtSignature":"c2lnbmF0dXJl"},{"text":"Visible answer"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}),
+            )];
+            if name == "503" {
+                frames.push(frame(
+                    json!({"error":{"code":503,"message":"generation failed"}}),
+                ));
+            } else if name == "transport" {
+                frames.push(Err("connection closed before message completed".into()));
+            } else {
+                frames.push(frame(json!({"candidates":[{"finishReason":reason}],"usageMetadata":{"candidatesTokenCount":5}})));
+            }
+            let source = create_codex_sse_stream(
+                Box::pin(stream::iter(frames)),
+                "gemini-pro".into(),
+                response_id.clone(),
+                1,
+                0,
+                response_id.clone(),
+                None,
+                false,
+            );
+            let events: Vec<_> = websocket_response_events(source).collect().await;
+            let last = events.last().unwrap();
+            assert_eq!(last["type"], terminal, "{name}");
+            assert_eq!(
+                last["response"]["incomplete_details"]["reason"].as_str(),
+                detail,
+                "{name}"
+            );
+            assert_eq!(
+                last["response"]["usage"]["input_tokens_details"]["cached_tokens"], 80,
+                "{name}"
+            );
+            if name == "503" {
+                assert_eq!(last["response"]["error"]["upstream_status"], 503);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(
+                        e["type"].as_str(),
+                        Some("response.completed" | "response.incomplete" | "response.failed")
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(commit_websocket_response(&mut pending, last), save);
+            if save {
+                committed = pending;
+                assert_eq!(committed.last_response_id, response_id);
+                let output = committed.last_response_output.as_array().unwrap();
+                assert!(output.iter().any(|i| i["type"] == "reasoning"));
+                let message = output.iter().find(|i| i["type"] == "message").unwrap();
+                assert_eq!(message["content"][0]["text"], "Visible answer");
+                let mut next=normalize_responses_websocket_request(json!({"type":"response.append","previous_response_id":response_id,"input":"Continue","store":false}),&mut committed).unwrap();
+                prepare_websocket_generation(
+                    &mut next,
+                    &mut committed,
+                    &HeaderMap::new(),
+                    "ws-stable",
+                )
+                .await
+                .unwrap();
+                assert!(next.get("previous_response_id").is_none());
+                assert_eq!(next["session_id"], "ws-stable");
+                let visible: Vec<_> = next["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i["role"] == "assistant" && i["type"] == "message")
+                    .collect();
+                assert_eq!(visible.len(), 1);
+                assert_eq!(visible[0]["content"][0]["text"], "Visible answer");
+            } else {
+                assert!(committed.last_request.is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn relay_preserves_tools_and_sparse_zero_without_global_storage() {
+        let id = Uuid::new_v4().to_string();
+        let frames = vec![
+            frame(
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":id,"name":"scope__scopeLookup","args":{"city":"Paris"}}}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}),
+            ),
+            frame(
+                json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":5}}),
+            ),
+            frame(json!({"usageMetadata":{"cachedContentTokenCount":0}})),
+        ];
+        let source = create_codex_sse_stream(
+            Box::pin(stream::iter(frames)),
+            "gemini-pro".into(),
+            id.clone(),
+            1,
+            0,
+            id.clone(),
+            None,
+            false,
+        );
+        let events: Vec<_> = websocket_response_events(source).collect().await;
+        let term = events.last().unwrap();
+        assert_eq!(term["type"], "response.completed");
+        assert_eq!(term["response"]["usage"]["input_tokens"], 100);
+        assert_eq!(
+            term["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            0
+        );
+        let mut st = state();
+        assert!(commit_websocket_response(&mut st, term));
+        let call = &st.tool_call_cache[&id];
+        assert_eq!(call["name"], "scopeLookup");
+        assert_eq!(call["namespace"], "scope");
+        let qualified = "scope__scopeLookup";
+        assert_eq!(responses_item_tool_name(call).as_deref(), Some(qualified));
+        let tools = Some(vec![
+            json!({"type":"namespace","name":"scope","tools":[{"type":"function","name":"scopeLookup"}]}),
+        ]);
+        assert!(
+            crate::proxy::mappers::openai::request::extract_client_tool_names(&tools)
+                .contains(qualified)
+        );
+        let req = convert_codex_to_openai_request(
+            json!({"model":"gemini-pro","input":[{"role":"user","content":"Look it up"},call,{"type":"function_call_output","call_id":id,"output":"Paris"}]}),
+        );
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], qualified);
+        assert_eq!(messages[2]["name"], qualified);
+        assert_eq!(
+            serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+            json!({"city":"Paris"})
+        );
+        assert!(get_cached_tool_call(&id).is_none());
+    }
+    #[tokio::test]
+    async fn full_transcript_replacement_and_explicit_aliases_keep_the_expected_identity() {
+        for (field, expected) in [
+            (None, "ws-connection"),
+            (Some("conversation_id"), "new-session"),
+        ] {
+            let mut st = state();
+            let mut root = normalize_responses_websocket_request(json!({"type":"response.create","model":"gemini-pro","tools":[],"instructions":"Continue","input":"First"}), &mut st).unwrap();
+            prepare_websocket_generation(&mut root, &mut st, &HeaderMap::new(), "ws-connection")
+                .await
+                .unwrap();
+            assert_eq!(root["session_id"], "ws-connection");
+            let event = json!({"type":"response.completed","response":{"id":"response-first","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}]}});
+            assert!(commit_websocket_response(&mut st, &event));
+            let mut followup = json!({"type":"response.create","input":[{"role":"user","content":"First"},{"role":"assistant","content":"Answer"},{"role":"user","content":"Next"}]});
+            if let Some(field) = field {
+                followup[field] = json!(expected);
+            }
+            let mut normalized = normalize_responses_websocket_request(followup, &mut st).unwrap();
+            prepare_websocket_generation(
+                &mut normalized,
+                &mut st,
+                &HeaderMap::new(),
+                "ws-connection",
+            )
+            .await
+            .unwrap();
+            assert_eq!(normalized["session_id"], expected);
+            assert_eq!(normalized["input"].as_array().unwrap().len(), 3);
+            assert_eq!(normalized["model"], "gemini-pro");
+            assert_eq!(normalized["tools"], json!([]));
+            assert_eq!(normalized["instructions"], "Continue");
+        }
+    }
+    #[test]
+    fn upfront_http_errors_keep_observed_cache_usage_and_status() {
+        let original = json!({"error":{"code":"unavailable","message":"retry"},"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":0}},"usageMetadata":{"promptTokenCount":100}});
+        let event = websocket_http_error_event(503, original.to_string().as_bytes());
+        assert_eq!(event["status"], 503);
+        assert_eq!(event["error"], original["error"]);
+        assert_eq!(event["usage"], original["usage"]);
+        assert_eq!(event["usageMetadata"], original["usageMetadata"]);
+        assert!(websocket_http_error_event(400, b"invalid body")
+            .get("usage")
+            .is_none());
+    }
+    #[tokio::test]
+    async fn broken_responses_body_never_emits_success_or_commits() {
+        let created = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r\",\"model\":\"model\"}}\n\n";
+        for broken in [
+            None,
+            Some(Ok(Bytes::from_static(b"data: {bad}\n\n"))),
+            Some(Err("body transport error".to_string())),
+        ] {
+            let mut frames: Vec<Result<Bytes, String>> = created
+                .as_bytes()
+                .chunks(7)
+                .map(|s| Ok(Bytes::copy_from_slice(s)))
+                .collect();
+            frames.extend(broken);
+            let events: Vec<_> = websocket_response_events(stream::iter(frames))
+                .collect()
+                .await;
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1]["type"], "response.failed");
+            assert_eq!(events[1]["response"]["id"], "r");
+            assert!(!commit_websocket_response(&mut state(), &events[1]));
+        }
+    }
+    #[tokio::test]
+    async fn first_websocket_cursor_restores_parent_once_and_keeps_local_history() {
+        use crate::proxy::http_session_store::save_session_delta;
+        let id = Uuid::new_v4().to_string();
+        save_session_delta(
+            id.clone(),
+            None,
+            vec![json!({"role":"user","content":"old"})],
+            vec![json!({"role":"assistant","type":"message","content":"prior answer"})],
+            "Keep context".into(),
+            "gemini-pro".into(),
+            "routing-root".into(),
+        )
+        .await;
+        let mut st = state();
+        let mut body=normalize_responses_websocket_request(json!({"type":"response.create","model":"gemini-pro","previous_response_id":id,"input":"new","store":false}),&mut st).unwrap();
+        prepare_websocket_generation(&mut body, &mut st, &HeaderMap::new(), "connection")
+            .await
+            .unwrap();
+        assert_eq!(body["input"], "new");
+        assert_eq!(body["previous_response_id"], id);
+        assert!(body.get("session_id").is_none());
+        assert_eq!(
+            st.last_request.as_ref().unwrap()["input"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            st.last_request.as_ref().unwrap()["instructions"],
+            "Keep context"
+        );
+    }
+}
+
+#[cfg(test)]
+mod websocket_cursor_regressions {
+    use super::*;
+
+    fn state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+    fn output(id: &str, answer: &str) -> Value {
+        json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[{"id":format!("message-{id}"),"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}]}})
+    }
+    async fn wire(
+        s: &WebsocketSessionState,
+        mut req: Value,
+    ) -> Result<(Value, WebsocketSessionState), String> {
+        req["store"] = json!(false);
+        let mut pending = s.clone();
+        let mut body = normalize_responses_websocket_request(req, &mut pending)?;
+        prepare_websocket_generation(&mut body, &mut pending, &HeaderMap::new(), "ws-consistent")
+            .await?;
+        Ok((body, pending))
+    }
+
+    #[tokio::test]
+    async fn returning_to_a_stored_parent_restores_its_real_identity_only() {
+        use crate::proxy::http_session_store::save_session_delta_with_identity;
+        for owner in [
+            Some("ws-consistent"),
+            Some("resp-looking-but-explicit"),
+            None,
+        ] {
+            let root_id = format!("resp-{}", Uuid::new_v4());
+            let mut first = json!({"type":"response.create","model":"g","input":"first"});
+            if let Some(explicit) = owner {
+                first["session_id"] = json!(explicit);
+            }
+            let (_, mut s) = wire(&state(), first).await.unwrap();
+            let root = output(&root_id, "first answer");
+            assert!(commit_websocket_response(&mut s, &root));
+            // HTTP's anonymous case deliberately has a resp-* chain identifier
+            // but no scope identity. A genuine client ID may itself start resp-.
+            save_session_delta_with_identity(
+                root_id.clone(),
+                None,
+                vec![json!({"role":"user","content":"first"})],
+                root["response"]["output"].as_array().unwrap().clone(),
+                String::new(),
+                "g".into(),
+                owner.unwrap_or(&root_id).to_owned(),
+                owner.map(str::to_owned),
+            )
+            .await;
+            let (second,mut child) = wire(&s,json!({"type":"response.create","previous_response_id":root_id,"session_id":"another-session","input":"second"})).await.unwrap();
+            assert_eq!(second["session_id"], "another-session");
+            assert!(commit_websocket_response(
+                &mut child,
+                &output("latest", "second answer")
+            ));
+            let request =
+                json!({"type":"response.create","previous_response_id":root_id,"input":"branch"});
+            let (branch, _) = wire(&child, request.clone()).await.unwrap();
+            assert_eq!(
+                branch["session_id"].as_str(),
+                owner,
+                "select the identity actually used for the named parent"
+            );
+            let mut overriding = request;
+            overriding["conversation_id"] = json!("requested-alias");
+            let (branch, _) = wire(&child, overriding).await.unwrap();
+            assert_eq!(branch["session_id"], "requested-alias");
+        }
+    }
+    #[tokio::test]
+    async fn explicit_old_or_failed_cursor_is_not_silently_replaced_by_latest() {
+        use crate::proxy::http_session_store::{get_session_with_parent, save_session_delta};
+        let root_id = Uuid::new_v4().to_string();
+        let second_id = Uuid::new_v4().to_string();
+        let failed_id = Uuid::new_v4().to_string();
+        let (_, mut s) = wire(
+            &state(),
+            json!({"type":"response.create","model":"g","input":"root turn"}),
+        )
+        .await
+        .unwrap();
+        let root = output(&root_id, "root answer");
+        assert!(commit_websocket_response(&mut s, &root));
+        save_session_delta(
+            root_id.clone(),
+            None,
+            vec![json!({"role":"user","content":"root turn"})],
+            root["response"]["output"].as_array().unwrap().clone(),
+            String::new(),
+            "g".into(),
+            "routing".into(),
+        )
+        .await;
+        let (_,mut s2)=wire(&s,json!({"type":"response.append","previous_response_id":root_id,"input":"separate child"})).await.unwrap();
+        assert!(commit_websocket_response(
+            &mut s2,
+            &output(&second_id, "child answer")
+        ));
+        let (_,mut failed)=wire(&s2,json!({"type":"response.append","previous_response_id":second_id,"input":"failed generation"})).await.unwrap();
+        assert!(!commit_websocket_response(
+            &mut failed,
+            &json!({"type":"response.failed","response":{"id":failed_id,"status":"failed","output":[]}})
+        ));
+        assert!(get_session_with_parent(&failed_id).await.is_none());
+        let delta = |id: &str| json!({"type":"response.append","previous_response_id":id,"input":"correct branch"});
+        let (control, _) = wire(&s2, delta(&second_id)).await.unwrap();
+        assert!(control["input"].to_string().contains("child answer"));
+        let (branch, _) = wire(&s2, delta(&root_id)).await.unwrap();
+        assert_eq!(branch["previous_response_id"], root_id);
+        let (_, branch_state) = wire(&s2, delta(&root_id)).await.unwrap();
+        let history = &branch_state.last_request.as_ref().unwrap()["input"];
+        assert!(history.to_string().contains("root answer"));
+        assert!(!history.to_string().contains("child answer"));
+        let bad = wire(&s2, delta(&failed_id)).await;
+        assert!(
+            bad.is_err(),
+            "a failed cursor must be rejected or resolved separately"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_compaction_replaces_parent_on_both_transports() {
+        use crate::proxy::http_session_store::prepare_session_input_with_storage;
+        let (_, mut st) = wire(
+            &state(),
+            json!({"type":"response.create","model":"g","input":"superseded-old-transcript"}),
+        )
+        .await
+        .unwrap();
+        let first = output("done", "superseded-old-answer");
+        assert!(commit_websocket_response(&mut st, &first));
+        let new = vec![
+            json!({"type":"compaction_summary"}),
+            json!({"role":"user","content":"condensed-continuation"}),
+        ];
+        let req = json!({"type":"response.create","previous_response_id":"done","input":new});
+        let (out, _) = wire(&st, req).await.unwrap();
+        let mut parent = vec![json!({"role":"user","content":"superseded-old-transcript"})];
+        parent.extend(
+            first["response"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        let http = prepare_session_input_with_storage(parent, new, &Default::default(), false);
+        assert_eq!(
+            out["input"],
+            json!(http.merged),
+            "same explicit compaction must not resend superseded parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_replay_with_correct_cursor_does_not_duplicate_unlabelled_user_turn() {
+        use crate::proxy::http_session_store::prepare_session_input_with_storage;
+        let (_, mut st) = wire(
+            &state(),
+            json!({"type":"response.create","model":"g","input":"opening"}),
+        )
+        .await
+        .unwrap();
+        let first = output("done", "answer");
+        assert!(commit_websocket_response(&mut st, &first));
+        let mut parent = vec![json!({"role":"user","content":"opening"})];
+        parent.extend(
+            first["response"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        let mut replay = parent.clone();
+        replay.push(json!({"role":"user","content":"followup"}));
+        let req = json!({"type":"response.create","previous_response_id":"done","input":replay});
+        let (out, _) = wire(&st, req).await.unwrap();
+        let http = prepare_session_input_with_storage(parent, replay, &Default::default(), false);
+        assert_eq!(
+            out["input"],
+            json!(http.merged),
+            "same complete replay with a correct cursor must not repeat the first user turn"
+        );
+    }
+    #[tokio::test]
+    async fn prewarming_from_an_http_parent_does_not_forget_the_parent() {
+        use crate::proxy::http_session_store::save_session_delta;
+        let root_id = Uuid::new_v4().to_string();
+        save_session_delta(
+            root_id.clone(),
+            None,
+            vec![json!({"role":"user","content":"persisted-root-question"})],
+            vec![json!({"role":"assistant","content":"persisted-root-answer"})],
+            "Previous instructions".to_string(),
+            "g".into(),
+            "saved-root".into(),
+        )
+        .await;
+        let empty = || WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        };
+        let mut s1 = empty();
+        let mut first=normalize_responses_websocket_request(json!({"type":"response.create","model":"g","previous_response_id":root_id,"input":"onward","store":false}),&mut s1).unwrap();
+        prepare_websocket_generation(&mut first, &mut s1, &HeaderMap::new(), "ws-one")
+            .await
+            .unwrap();
+        assert!(s1.last_request.as_ref().unwrap()["input"]
+            .to_string()
+            .contains("persisted-root-answer"));
+        let mut s2 = empty();
+        let prewarm = json!({"type":"response.create","generate":false,"model":"g","previous_response_id":root_id,"input":[],"store":false});
+        assert!(should_handle_prewarm_locally(&prewarm, &s2));
+        let (_, prewarmed) =
+            prepare_websocket_prewarm(&prewarm, &mut s2, &HeaderMap::new(), "ws-one")
+                .await
+                .unwrap();
+        let mut next=normalize_responses_websocket_request(json!({"type":"response.create","model":"g","previous_response_id":prewarmed["response"]["id"],"input":"onward","store":false}),&mut s2).unwrap();
+        prepare_websocket_generation(&mut next, &mut s2, &HeaderMap::new(), "ws-one")
+            .await
+            .unwrap();
+        assert!(
+            next["input"].to_string().contains("persisted-root-answer")
+                || next["previous_response_id"] == root_id,
+            "first generated turn after prewarm lacks the actual parent"
+        );
+    }
+}
+#[cfg(test)]
+mod responses_continuity_tests {
+    use super::*;
+    use crate::proxy::http_session_store::save_session_delta;
+    const PNG:&str="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    fn new_state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+    fn terminal(id: &str, answer: &str) -> Value {
+        json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[{"id":format!("msg_{id}"),"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}]}})
+    }
+
+    #[tokio::test]
+    async fn strict_parent_selection_distinguishes_missing_stored_and_new_conversations() {
+        let id = Uuid::new_v4().to_string();
+        assert!(load_responses_parent(None, true).await.unwrap().is_none());
+        let err = load_responses_parent(Some(&id), true).await.unwrap_err();
+        assert_eq!(err["error"]["code"], "previous_response_not_found");
+        assert_eq!(err["error"]["param"], "previous_response_id");
+        assert!(load_responses_parent(Some(&id), false)
+            .await
+            .unwrap()
+            .is_none());
+        save_session_delta(
+            id.clone(),
+            None,
+            vec![json!({"role":"user","content":"root"})],
+            vec![],
+            String::new(),
+            "g".into(),
+            "a".into(),
+        )
+        .await;
+        assert_eq!(
+            load_responses_parent(Some(&id), true)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .input_items[0]["content"],
+            "root"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_append_without_a_cursor_keeps_new_assistant_and_tool_deltas_and_deduplicates_replay(
+    ) {
+        let mut st = new_state();
+        normalize_responses_websocket_request(
+            json!({"type":"response.create","model":"g","input":"first"}),
+            &mut st,
+        )
+        .unwrap();
+        let output = terminal("first", "answer");
+        assert!(commit_websocket_response(&mut st, &output));
+        let parent = vec![
+            json!({"role":"user","content":"first"}),
+            output["response"]["output"][0].clone(),
+        ];
+        let deltas = vec![
+            json!([{"role":"assistant","content":"inserted"},{"role":"user","content":"next"}]),
+            json!([{"type":"function_call","id":"tool","call_id":"c","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":"found"}]),
+        ];
+        for delta in deltas {
+            let expected = [parent.clone(), delta.as_array().unwrap().clone()].concat();
+            for supplied in [delta, json!(expected)] {
+                for id in [None, Some("first")] {
+                    let mut req = json!({"type":"response.append","input":supplied});
+                    if let Some(id) = id {
+                        req["previous_response_id"] = json!(id);
+                    }
+                    let merged =
+                        normalize_responses_websocket_request(req, &mut st.clone()).unwrap();
+                    assert_eq!(merged["input"], json!(expected));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prewarm_pending_media_reaches_first_generation_then_only_bounded_history_is_kept() {
+        let id = Uuid::new_v4().to_string();
+        save_session_delta(
+            id.clone(),
+            None,
+            vec![json!({"role":"user","content":"old"})],
+            vec![],
+            String::new(),
+            "g".into(),
+            "a".into(),
+        )
+        .await;
+        for parent in [None, Some(id.as_str())] {
+            let mut st = new_state();
+            let mut pre = json!({"type":"response.create","generate":false,"model":"g","input":[{"role":"user","content":[{"type":"input_image","image_url":PNG}]}]});
+            if let Some(parent) = parent {
+                pre["previous_response_id"] = json!(parent);
+            }
+            let (_, done) = prepare_websocket_prewarm(&pre, &mut st, &HeaderMap::new(), "ws")
+                .await
+                .unwrap();
+            assert_eq!(done["response"]["usage"]["total_tokens"], 0);
+            let mut req=normalize_responses_websocket_request(json!({"type":"response.create","previous_response_id":done["response"]["id"],"input":"Describe it"}),&mut st).unwrap();
+            prepare_websocket_generation(&mut req, &mut st, &HeaderMap::new(), "ws")
+                .await
+                .unwrap();
+            let incoming = req["input"].as_array().unwrap();
+            assert_eq!(incoming.len(), if parent.is_some() { 3 } else { 2 });
+            assert_eq!(incoming[incoming.len() - 2]["content"][0]["image_url"], PNG);
+            assert!(!st.last_request.as_ref().unwrap().to_string().contains(PNG));
+            assert!(commit_websocket_response(
+                &mut st,
+                &terminal("generated", "red")
+            ));
+            let next=normalize_responses_websocket_request(json!({"type":"response.append","previous_response_id":"generated","input":"again"}),&mut st).unwrap();
+            assert!(!next["input"].to_string().contains(PNG));
+            assert!(next["input"]
+                .to_string()
+                .contains("[historical image omitted]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn prewarm_inherits_first_generation_options_and_allows_overrides() {
+        let pre = json!({"type":"response.create","model":"g","generate":false,"store":false,
+            "max_output_tokens":51,"reasoning":{"effort":"low"},"text":{"format":{"type":"json_object"}}});
+        for override_store in [false, true] {
+            let mut st = new_state();
+            let (_, done) = prepare_websocket_prewarm(&pre, &mut st, &HeaderMap::new(), "ws")
+                .await
+                .unwrap();
+            let mut dispatch = json!({"type":"response.append","input":"hello","previous_response_id":done["response"]["id"]});
+            if override_store {
+                dispatch["store"] = json!(true);
+                dispatch["max_output_tokens"] = json!(13);
+            }
+            let body = normalize_responses_websocket_request(dispatch, &mut st).unwrap();
+            assert_eq!(responses_store_enabled(&body), override_store);
+            assert_eq!(
+                body["max_output_tokens"],
+                if override_store { 13 } else { 51 }
+            );
+            assert_eq!(body["reasoning"], pre["reasoning"]);
+            assert_eq!(body["text"], pre["text"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_cursor_and_unsupported_compaction_do_not_consume_socket_history() {
+        let prior = json!({"type":"response.create","model":"g","input":"important"});
+        let mut st = new_state();
+        normalize_responses_websocket_request(prior, &mut st).unwrap();
+        assert!(commit_websocket_response(
+            &mut st,
+            &terminal("parent", "answer")
+        ));
+        for (key, bad) in [
+            ("previous_response_id", json!(5)),
+            (
+                "input",
+                json!([{"type":"compaction","encrypted_content":"opaque"},{"role":"user","content":"continue"}]),
+            ),
+        ] {
+            let mut payload =
+                json!({"type":"response.append","input":"next","previous_response_id":"parent"});
+            payload[key] = bad;
+            assert!(validate_responses_continuation(&payload).is_err());
+            assert!(normalize_responses_websocket_request(payload, &mut st).is_err());
+            assert_eq!(st.last_response_id, "parent");
+            assert!(st.last_request.as_ref().unwrap()["input"]
+                .to_string()
+                .contains("important"));
+        }
+    }
+
+    #[test]
+    fn refusal_and_interleaved_media_keep_their_order_on_replay() {
+        let request = json!({"input":[{"role":"user","content":[{"type":"input_text","text":"before"},
+            {"type":"input_image","image_url":PNG},{"type":"input_text","text":"after"}]},
+            {"role":"assistant","content":[{"type":"refusal","refusal":"declined"}]},{"role":"user","content":"next"}]});
+        let result = convert_codex_to_openai_request(request);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "before");
+        assert_eq!(blocks[1]["image_url"]["url"], PNG);
+        assert_eq!(blocks[2]["text"], "after");
+        assert_eq!(msgs[1]["content"], "declined");
+    }
+
+    #[test]
+    fn custom_data_url_argument_survives_borrowed_and_owned_storage() {
+        let call = json!({"type":"custom_tool_call","name":"inspect","call_id":"a","input":PNG});
+        assert_eq!(history_without_inline_media(&call), call);
+        assert_eq!(into_history_without_inline_media(call.clone()), call);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_and_json_take_wire_types_from_qualified_declarations() {
+        use crate::proxy::mappers::openai::{
+            models::OpenAIResponse, request::ResponsesToolKinds,
+            streaming::create_codex_sse_stream_with_context,
+        };
+        let raw = "{\"still\":\"raw text\"}";
+        let tools = json!([{"type":"custom","name":"mytool"},{"type":"custom","name":"flat__lookup"},{"type":"function","name":"shell","parameters":{"type":"object","properties":{"input":{"type":"string"}}}},{"type":"namespace","name":"scope","tools":[{"type":"custom","name":"custom"},{"type":"function","name":"apply_patch","parameters":{"type":"object","properties":{"input":{"type":"string"}}}}]}]);
+        let kinds = ResponsesToolKinds::from_tools(tools.as_array().map(|v| v.as_slice()));
+        for (name, args, is_custom) in [
+            ("mytool", json!({"input":raw}), true),
+            ("flat__lookup", json!({"input":raw}), true),
+            ("shell", json!({"input":raw}), false),
+            ("scope__custom", json!({"input":raw}), true),
+            ("scope__apply_patch", json!({"input":raw}), false),
+            ("mytool", json!({"input":raw,"another":[1,2]}), false),
+            ("scope__custom", json!({"input":7}), false),
+            ("mytool", json!({"other":"untouched"}), false),
+        ] {
+            let id = Uuid::new_v4().to_string();
+            let frame = json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":id,"name":name,"args":args}}]},"finishReason":"STOP"}]});
+            let source = create_codex_sse_stream_with_context(
+                Box::pin(futures::stream::iter(vec![Ok::<Bytes, String>(
+                    Bytes::from(format!("data: {frame}\n\n")),
+                )])),
+                "g".into(),
+                id.clone(),
+                1,
+                0,
+                id.clone(),
+                None,
+                false,
+                None,
+                kinds.clone(),
+            );
+            let events: Vec<_> = websocket_response_events(source).collect().await;
+            let terminal = &events.last().unwrap()["response"];
+            assert_eq!(terminal["status"], "completed");
+            let stream_item = &terminal["output"][0];
+            let chat:OpenAIResponse=serde_json::from_value(json!({"id":"chat","object":"chat.completion","created":1,"model":"g","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]})).unwrap();
+            let nonstream = convert_chat_response_to_responses_with_tools(&chat, false, &kinds);
+            let item = &nonstream["output"][0];
+            assert_eq!(nonstream["status"], "completed");
+            for k in ["type", "name", "namespace", "call_id", "input", "arguments"] {
+                assert_eq!(stream_item[k], item[k], "{name}/{k}");
+            }
+            assert_eq!(responses_item_tool_name(item).as_deref(), Some(name));
+            if name == "flat__lookup" {
+                assert!(item.get("namespace").is_none());
+                assert_eq!(item["name"], "flat__lookup");
+            }
+            if is_custom {
+                assert_eq!(item["type"], "custom_tool_call");
+                assert_eq!(item["input"], raw);
+                assert_eq!(
+                    events
+                        .iter()
+                        .find(|e| e["type"] == "response.custom_tool_call_input.delta")
+                        .unwrap()["delta"],
+                    raw
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .find(|e| e["type"] == "response.custom_tool_call_input.done")
+                        .unwrap()["input"],
+                    raw
+                );
+            } else {
+                assert_eq!(item["type"], "function_call");
+                assert_eq!(item["arguments"], args.to_string());
+            }
+            let result = if is_custom {
+                "custom_tool_call_output"
+            } else {
+                "function_call_output"
+            };
+            let replay = convert_codex_to_openai_request(
+                json!({"input":[{"role":"user","content":"use tool"},item,{"type":result,"call_id":id,"output":"done"}]}),
+            );
+            let f = &replay["messages"][1]["tool_calls"][0]["function"];
+            assert_eq!(f["name"], name);
+            assert_eq!(
+                serde_json::from_str::<Value>(f["arguments"].as_str().unwrap()).unwrap(),
+                args
+            );
+        }
+    }
+    #[tokio::test]
+    async fn responses_custom_tool_json_and_stream_use_the_same_raw_input() {
+        use crate::proxy::mappers::openai::{
+            models::OpenAIResponse, streaming::create_codex_sse_stream,
+        };
+        let raw = "{\"nested\":true}\nDo not reparse freeform input.";
+        for (name, args, custom) in [
+            ("scope__apply_patch", json!({"input":raw}), true),
+            ("apply_patch_v2", json!({"input":""}), true),
+            ("shell", json!({"input":raw}), true),
+            ("shell", json!({"command":["pwd"]}), false),
+            ("apply_patch", json!({"input":raw,"option":true}), false),
+            ("lookup", json!({"input":raw}), false),
+        ] {
+            let id = Uuid::new_v4().to_string();
+            let f = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":name,"id":id,"args":args}}]},"finishReason":"STOP"}]});
+            let source = create_codex_sse_stream(
+                Box::pin(futures::stream::iter(vec![Ok::<Bytes, String>(
+                    Bytes::from(format!("data: {f}\n\n")),
+                )])),
+                "g".into(),
+                id.clone(),
+                1,
+                0,
+                id.clone(),
+                None,
+                false,
+            );
+            let events: Vec<_> = websocket_response_events(source).collect().await;
+            let item = &events.last().unwrap()["response"]["output"][0];
+            let resp:OpenAIResponse=serde_json::from_value(json!({"id":"chat","object":"chat.completion","created":1,"model":"g","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]})).unwrap();
+            let json_resp = convert_chat_response_to_responses(&resp, false);
+            assert_eq!(json_resp["status"], "completed");
+            let json_item = &json_resp["output"][0];
+            for key in ["type", "call_id", "name", "namespace", "arguments", "input"] {
+                assert_eq!(item[key], json_item[key], "{name}/{key}");
+            }
+            let restored = if custom {
+                let text = args["input"].as_str().unwrap();
+                assert_eq!(item["type"], "custom_tool_call");
+                assert_eq!(item["input"], text);
+                assert_eq!(
+                    events
+                        .iter()
+                        .find(|e| e["type"] == "response.custom_tool_call_input.delta")
+                        .unwrap()["delta"],
+                    text
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .find(|e| e["type"] == "response.custom_tool_call_input.done")
+                        .unwrap()["input"],
+                    text
+                );
+                json!({"input":item["input"]})
+            } else {
+                assert_eq!(item["type"], "function_call");
+                serde_json::from_str::<Value>(item["arguments"].as_str().unwrap()).unwrap()
+            };
+            assert_eq!(restored, args);
+        }
+    }
+}
+
+#[cfg(test)]
+mod r19_responses_regressions {
+    use super::*;
+
+    fn state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ambiguous_tool_schema_fails_for_chat_and_responses_namespaces() {
+        let schema = json!({"oneOf":[{"type":"string"},{"type":"string","minLength":2}]});
+        for tools in [
+            json!([{"type":"function","function":{"name":"check","parameters":schema}}]),
+            json!([{"type":"namespace","name":"repo","tools":[{"type":"function","name":"check","parameters":schema}]}]),
+        ] {
+            assert!(validate_openai_tool_schemas(tools.as_array().map(Vec::as_slice)).is_err());
+            let body = json!({"type":"response.create","model":"g","input":"hi","tools":tools});
+            assert_eq!(
+                validate_responses_continuation(&body).unwrap_err().0,
+                "unsupported_tool_schema"
+            );
+            assert!(normalize_responses_websocket_request(body, &mut state()).is_err());
+        }
+    }
+
+    #[test]
+    fn ambiguous_namespace_tools_are_rejected_in_both_declaration_orders() {
+        let flat = json!({"type":"function","name":"repo__lookup","parameters":{"type":"object"}});
+        let ns =
+            json!({"type":"namespace","name":"repo","tools":[{"type":"custom","name":"lookup"}]});
+        for tools in [json!([flat, ns]), json!([ns, flat])] {
+            let body = json!({"type":"response.create","model":"g","input":"hi","tools":tools});
+            assert_eq!(
+                validate_responses_continuation(&body).unwrap_err().0,
+                "ambiguous_tool_name"
+            );
+            assert!(normalize_responses_websocket_request(body, &mut state()).is_err());
+        }
+        assert!(validate_responses_continuation(&json!({"tools":[{"type":"function","name":"plain"},{"type":"namespace","name":"repo","tools":[{"type":"custom","name":"lookup"}]}]})).is_ok());
+    }
+
+    #[test]
+    fn files_and_external_encrypted_reasoning_fail_before_history_is_consumed() {
+        for part in [
+            json!({"type":"input_file","file_data":"data:application/pdf;base64,not-base64"}),
+            json!({"type":"input_file","file_id":"file-one"}),
+            json!({"type":"input_file","file_url":"file:///private/file.pdf"}),
+            json!({"type":"input_image","file_id":"image-one"}),
+        ] {
+            for item in [
+                json!({"role":"user","content":[part,{"type":"input_text","text":"what?"}]}),
+                json!({"type":"function_call_output","call_id":"call-one","output":[part]}),
+            ] {
+                let body = json!({"type":"response.create","model":"g","input":[item]});
+                assert_eq!(
+                    validate_responses_continuation(&body).unwrap_err().0,
+                    "unsupported_file_input"
+                );
+                assert!(normalize_responses_websocket_request(body, &mut state()).is_err());
+            }
+        }
+        for encrypted in ["opaque-A", "opaque-B"] {
+            assert_eq!(
+                validate_responses_continuation(
+                    &json!({"input":[{"type":"reasoning","encrypted_content":encrypted}]})
+                )
+                .unwrap_err()
+                .0,
+                "unsupported_reasoning"
+            );
+        }
+        assert!(validate_responses_continuation(&json!({"input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"plain"}]},{"type":"function_call","name":"business","arguments":{"type":"input_file","encrypted_content":"business data"}}]})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_alias_overrides_prewarmed_limit_without_duplicate_fields() {
+        let aliases = [
+            "max_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "maxTokens",
+            "max_output_tokens",
+            "maxOutputTokens",
+        ];
+        for previous in aliases {
+            for next in aliases {
+                let mut s = state();
+                let mut pre = json!({"type":"response.create","model":"g","generate":false});
+                pre[previous] = json!(100);
+                let (_, done) =
+                    prepare_websocket_prewarm(&pre, &mut s, &HeaderMap::new(), "socket")
+                        .await
+                        .unwrap();
+                let mut event = json!({"type":"response.create","previous_response_id":done["response"]["id"],"input":"hi"});
+                event[next] = json!(5);
+                let normalized = normalize_responses_websocket_request(event, &mut s).unwrap();
+                let typed: crate::proxy::mappers::openai::models::OpenAIRequest =
+                    serde_json::from_value(normalized).unwrap();
+                assert_eq!(typed.max_tokens, Some(5), "{previous} -> {next}");
+            }
+        }
+    }
+
+    #[test]
+    fn representable_documents_reach_gemini_with_their_source_and_mime() {
+        for file in [
+            json!({"type":"input_file","file_data":"data:application/pdf;base64,JVBERi0xLjQKJSVFT0Y="}),
+            json!({"type":"input_file","filename":"report.pdf","file_data":"JVBERi0xLjQKJSVFT0Y="}),
+            json!({"type":"input_file","file_url":"https://example.invalid/report.pdf"}),
+        ] {
+            let body = json!({"model":"gemini-3.7-flash-high","input":[{"role":"user","content":[file,{"type":"input_text","text":"summarize"}]}]});
+            assert!(validate_responses_continuation(&body).is_ok());
+            let converted = convert_codex_to_openai_request(body);
+            let typed: OpenAIRequest = serde_json::from_value(converted).unwrap();
+            validate_openai_file_inputs(&typed).unwrap();
+            let (mapped, _, _, _) =
+                crate::proxy::mappers::openai::request::transform_openai_request_with_session(
+                    &typed,
+                    "project",
+                    "gemini-3.7-flash-high",
+                    None,
+                    "session",
+                    Some("session"),
+                    true,
+                    false,
+                );
+            let part = &mapped["request"]["contents"][0]["parts"][0];
+            if let Some(uri) = file["file_url"].as_str() {
+                assert_eq!(
+                    *part,
+                    json!({"fileData":{"fileUri":uri,"mimeType":"application/pdf"}})
+                );
+            } else {
+                assert_eq!(part["inlineData"]["mimeType"], "application/pdf");
+                assert_eq!(part["inlineData"]["data"], "JVBERi0xLjQKJSVFT0Y=");
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_item_references_preserve_parent_answers() {
+        let answer = json!({"type":"message","id":"answer","role":"assistant","content":"seven"});
+        let mut s = state();
+        s.last_request = Some(
+            json!({"model":"g","input":[{"role":"user","content":"first"},answer,{"role":"user","content":"second"}]}),
+        );
+        s.last_response_output =
+            json!([{"type":"message","id":"last","role":"assistant","content":"done"}]);
+        s.last_response_id = "parent".into();
+        let normalized=normalize_responses_websocket_request(json!({"type":"response.append","previous_response_id":"parent","input":[{"type":"item_reference","id":"answer"},{"role":"user","content":"explain"}]}),&mut s).unwrap();
+        assert!(normalized["input"].as_array().unwrap().contains(&answer));
+        assert!(!normalized["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "item_reference"));
+        let before = s.last_request.clone();
+        assert!(normalize_responses_websocket_request(
+            json!({"type":"response.append","input":[{"type":"item_reference","id":"missing"}]}),
+            &mut s
+        )
+        .is_err());
+        assert_eq!(s.last_request, before);
+    }
 }

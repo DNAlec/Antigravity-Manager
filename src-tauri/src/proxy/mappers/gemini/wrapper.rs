@@ -316,7 +316,7 @@ pub fn wrap_request_v2(
                 *parts = new_parts;
             }
         }
-        crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+        crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
             contents,
             &final_model_name,
             should_inject,
@@ -817,35 +817,63 @@ pub fn unwrap_response(response: &Value) -> Value {
 /// 目点是为了让客户端（如 OpenCode/Vercel AI SDK）能感知到 ID，
 /// 并在下一轮对话中原样带回，从而满足 Google v1internal 对 Claude 模型的校验。
 pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
-    if !model_name.to_lowercase().contains("claude") {
-        return;
-    }
+    ResponseToolIds::default().inject(response, model_name);
+}
 
-    if let Some(candidates) = response
-        .get_mut("candidates")
-        .and_then(|c| c.as_array_mut())
-    {
+/// Keep generated identities for the lifetime of a response, including wrapped
+/// frames and cumulative retransmissions. Explicit upstream IDs remain intact.
+#[derive(Default)]
+pub(crate) struct ResponseToolIds {
+    calls: std::collections::HashMap<(u64, String), Vec<String>>,
+}
+
+impl ResponseToolIds {
+    pub(crate) fn inject(&mut self, response: &mut Value, model_name: &str) {
+        if !model_name.to_ascii_lowercase().contains("claude") {
+            return;
+        }
+        let response = if response.get("response").is_some() {
+            &mut response["response"]
+        } else {
+            response
+        };
+        let Some(candidates) = response.get_mut("candidates").and_then(Value::as_array_mut) else {
+            return;
+        };
         for candidate in candidates {
-            if let Some(parts) = candidate
+            let index = candidate.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let Some(parts) = candidate
                 .get_mut("content")
                 .and_then(|c| c.get_mut("parts"))
-                .and_then(|p| p.as_array_mut())
-            {
-                let mut name_counters: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                for part in parts {
-                    if let Some(fc) = part.get_mut("functionCall").and_then(|f| f.as_object_mut()) {
-                        if fc.get("id").is_none() {
-                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                            let count = name_counters.entry(name.to_string()).or_insert(0);
-                            let call_id = format!("call_{}_{}", name, count);
-                            *count += 1;
-
-                            fc.insert("id".to_string(), json!(call_id));
-                            tracing::debug!("[Gemini-Wrap] Response stage: Injected synthetic call_id '{}' for client", call_id);
-                        }
-                    }
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut occurrences = std::collections::HashMap::new();
+            for part in parts {
+                let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                {
+                    continue;
                 }
+                let mut identity_fields = call.clone();
+                // Missing, null, and empty IDs all mean the same absent ID.
+                identity_fields.remove("id");
+                let mut identity = Value::Object(identity_fields);
+                identity.sort_all_objects();
+                let key = identity.to_string();
+                let count = occurrences.entry(key.clone()).or_insert(0usize);
+                let ids = self.calls.entry((index, key)).or_default();
+                if ids.len() <= *count {
+                    ids.push(format!("call_{}", uuid::Uuid::new_v4().simple()));
+                }
+                call.insert("id".into(), json!(ids[*count]));
+                *count += 1;
             }
         }
     }
@@ -1641,7 +1669,14 @@ mod tests {
             }
         });
 
-        let wrapped = wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None);
+        let mut wrapped = wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None);
+        crate::proxy::thinking_store::finalize_request_text_context(
+            "",
+            wrapped["request"]["contents"].as_array_mut().unwrap(),
+            "gemini-3-pro",
+            true,
+            false,
+        );
         let contents = wrapped["request"]["contents"].as_array().unwrap();
         let model_msg = &contents[0];
         let parts = model_msg["parts"].as_array().unwrap();
@@ -1651,7 +1686,14 @@ mod tests {
             parts.iter().all(|p| p.get("thought") != Some(&json!(true))),
             "无签名思考块必须被丢弃"
         );
-        assert_eq!(parts[0]["text"], "Regular model response");
+        assert!(parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none()));
+        assert_eq!(
+            parts[0]["text"],
+            "second thought block that should be downgraded"
+        );
+        assert_eq!(parts[1]["text"], "Regular model response");
     }
 
     #[test]

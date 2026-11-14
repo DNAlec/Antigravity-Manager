@@ -95,8 +95,13 @@ pub struct StreamingState {
     // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
     pub text_delta_emitted_this_turn: bool,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
-    /// 缓存流式过程中接收到的最近一次使用量元数据，防止单独下发 finishReason 或无元数据收尾时 Token 统计归零
+    pub(super) upstream_finished: bool,
+    pub(super) pending_tool_signatures: Vec<(String, String)>,
+    /// Merged cumulative usage, including fields omitted by later sparse frames.
     pub last_usage: Option<UsageMetadata>,
+    pub(super) usage_metadata: Option<serde_json::Value>,
+    pub(super) defer_finish_for_usage: bool,
+    pub(super) pending_finish_reason: Option<String>,
 }
 
 impl StreamingState {
@@ -128,7 +133,12 @@ impl StreamingState {
             registered_tool_names: Vec::new(),
             text_delta_emitted_this_turn: false,
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
+            upstream_finished: false,
+            pending_tool_signatures: Vec::new(),
             last_usage: None,
+            usage_metadata: None,
+            defer_finish_for_usage: false,
+            pending_finish_reason: None,
         }
     }
 
@@ -394,7 +404,11 @@ impl StreamingState {
         }
 
         // 确定 stop_reason：若触发工具调用，必须严格优先保持 tool_use；若触发最大长度或截断异常收尾，标记 max_tokens
-        let stop_reason = if self.used_tool {
+        let stop_reason = if finish_reason
+            .is_some_and(crate::proxy::pipeline::stream_error::is_refusal_finish_reason)
+        {
+            "refusal"
+        } else if self.used_tool {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"
@@ -672,26 +686,6 @@ impl<'a> PartProcessor<'a> {
             // 1. Cache family if we know the model
             if let Some(model) = &self.state.model_name {
                 SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
-            }
-
-            // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
-            if let Some(session_id) = &self.state.session_id {
-                // If FIFO strategy is enabled, use a unique index for each signature (e.g. timestamp or counter)
-                // However, our cache implementation currently keys by session_id.
-                // For FIFO, we might just rely on the fact that we are processing in order.
-                // But specifically for opencode, it might be calling tools in parallel or sequence.
-
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-                tracing::debug!(
-                    "[Claude-SSE] Cached signature to session {} (length: {}) [FIFO: {}]",
-                    session_id,
-                    sig.len(),
-                    use_fifo
-                );
             }
 
             tracing::debug!(
@@ -1084,19 +1078,9 @@ impl<'a> PartProcessor<'a> {
         if let Some(ref sig) = signature {
             tool_use["signature"] = json!(sig);
 
-            // 2. Cache tool signature (Layer 1 recovery)
-            if let Some(sid) = self.state.session_id.as_deref() {
-                SignatureCache::global().cache_tool_signature(sid, &tool_id, sig.clone());
-            }
-
-            // 3. [NEW v3.3.17] Cache to session-based storage
-            if let Some(session_id) = &self.state.session_id {
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-            }
+            self.state
+                .pending_tool_signatures
+                .push((tool_id.clone(), sig.clone()));
 
             tracing::debug!(
                 "[Claude-SSE] Captured thought_signature for function call (length: {})",

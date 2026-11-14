@@ -518,45 +518,262 @@ fn record_user_token_usage(
 }
 
 fn extract_cached_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.cached_tokens > 0 {
-        Some(c.cached_tokens)
-    } else {
-        None
-    }
+    let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+    observed.merge_usage(usage);
+    observed.cached_tokens()
 }
 
 fn extract_input_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("prompt_tokens").is_some()
-        || usage.get("input_tokens").is_some()
-        || usage.get("total_input_tokens").is_some()
-        || usage.get("promptTokenCount").is_some();
-    if !has_field {
-        return None;
-    }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.total_input_tokens)
+    let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+    observed.merge_usage(usage);
+    observed.input_tokens()
 }
 
 fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.reasoning_tokens > 0 {
-        Some(c.reasoning_tokens)
-    } else {
-        None
-    }
+    let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+    observed.merge_usage(usage);
+    observed.reasoning_tokens()
 }
 
 fn extract_output_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("completion_tokens").is_some()
-        || usage.get("output_tokens").is_some()
-        || usage.get("total_output_tokens").is_some()
-        || usage.get("candidatesTokenCount").is_some();
-    if !has_field {
-        return None;
+    let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+    observed.merge_usage(usage);
+    observed.output_tokens()
+}
+
+fn observe_stream_usage(
+    event: &Value,
+    observed: &mut crate::proxy::pipeline::usage::ObservedUsage,
+    log: &mut ProxyRequestLog,
+) {
+    if let Some(error) = crate::proxy::pipeline::stream_error::error_envelope(event) {
+        log.status = error
+            .get("upstream_status")
+            .and_then(Value::as_u64)
+            .or_else(|| error.get("code").and_then(Value::as_u64))
+            .filter(|code| (400..=599).contains(code))
+            .unwrap_or(502) as u16;
+        log.error = Some(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Upstream stream failed")
+                .to_owned(),
+        );
     }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.output_tokens)
+    observed.merge_event(event);
+    log.input_tokens = observed.input_tokens().or(log.input_tokens);
+    log.output_tokens = observed.output_tokens().or(log.output_tokens);
+    log.cached_tokens = observed.cached_tokens().or(log.cached_tokens);
+    log.reasoning_tokens = observed.reasoning_tokens().or(log.reasoning_tokens);
+}
+
+// An upgrade request has no generated tokens. The socket owns one independent
+// recorder per dispatched generation, even for store:false and failed turns.
+fn is_responses_socket_upgrade(method: &str, uri: &str, status: axum::http::StatusCode) -> bool {
+    method == "GET"
+        && uri.split('?').next() == Some("/v1/responses")
+        && status == axum::http::StatusCode::SWITCHING_PROTOCOLS
+}
+
+pub(crate) struct WebsocketTurnUsage {
+    log: ProxyRequestLog,
+    observed: crate::proxy::pipeline::usage::ObservedUsage,
+    start: Instant,
+    terminal: bool,
+    user_agent: Option<String>,
+}
+
+impl WebsocketTurnUsage {
+    pub(crate) fn begin(
+        headers: &axum::http::HeaderMap,
+        request: &Value,
+        identity: Option<&UserTokenIdentity>,
+    ) -> Self {
+        let get = |key: &str| {
+            headers
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let client_ip = get("x-forwarded-for")
+            .and_then(|v| v.split(',').next().map(|s| s.trim().to_owned()))
+            .or_else(|| get("x-real-ip"));
+        Self {
+            log: ProxyRequestLog {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                method: "WS".into(),
+                url: "/v1/responses".into(),
+                status: 200,
+                duration: 0,
+                model: request["model"].as_str().map(str::to_owned),
+                mapped_model: None,
+                upstream_model: None,
+                account_email: None,
+                client_ip,
+                error: None,
+                request_body: None,
+                upstream_request_body: None,
+                response_body: None,
+                request_headers: None,
+                upstream_request_headers: None,
+                response_headers: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_tokens: None,
+                reasoning_tokens: None,
+                protocol: Some("openai".into()),
+                username: identity.map(|i| i.username.clone()),
+                session_id: request["session_id"].as_str().map(str::to_owned),
+            },
+            observed: Default::default(),
+            start: Instant::now(),
+            terminal: false,
+            user_agent: get("user-agent"),
+        }
+    }
+
+    pub(crate) fn response(&mut self, status: u16, headers: &axum::http::HeaderMap) {
+        self.log.status = status;
+        let get = |key: &str| {
+            headers
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        self.log.mapped_model = get("x-mapped-model");
+        self.log.upstream_model = get("x-upstream-model");
+        self.log.account_email = get("x-account-email");
+        if let Some(id) = get("x-session-id") {
+            self.log.session_id = Some(id);
+        }
+    }
+
+    pub(crate) fn observe(&mut self, event: &Value) {
+        if self.terminal {
+            return;
+        }
+        let response_status = self.log.status;
+        observe_stream_usage(event, &mut self.observed, &mut self.log);
+        // A structured HTTP error often uses a string code. Retain the real HTTP status.
+        if response_status >= 400 {
+            self.log.status = response_status;
+        }
+        self.terminal = matches!(
+            event["type"].as_str(),
+            Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+        );
+    }
+
+    fn finish(mut self) -> (ProxyRequestLog, Option<String>) {
+        self.log.duration = self.start.elapsed().as_millis() as u64;
+        if !self.terminal && self.log.error.is_none() && self.log.status < 400 {
+            self.log.status = 499;
+            self.log.error = Some("WebSocket closed before the generation finished".into());
+        }
+        (self.log, self.user_agent)
+    }
+
+    pub(crate) fn record(
+        self,
+        monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+        identity: Option<UserTokenIdentity>,
+    ) {
+        let (log, agent) = self.finish();
+        // Metadata only: a busy database must not delay generation or socket cleanup.
+        tokio::spawn(async move {
+            if identity.is_some() {
+                let usage_log = log.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    record_user_token_usage(&identity, &usage_log, agent)
+                })
+                .await;
+                if let Err(err) = result {
+                    tracing::warn!("WebSocket user usage writer failed: {err}");
+                }
+            }
+            monitor.log_request(log).await;
+        });
+    }
+}
+
+fn observe_tail_usage(
+    bytes: &[u8],
+    observed: &mut crate::proxy::pipeline::usage::ObservedUsage,
+    log: &mut ProxyRequestLog,
+) {
+    // The capture can be truncated. Re-read its tail chronologically so sparse
+    // trailers complete earlier counters and final explicit zero wins.
+    for line in String::from_utf8_lossy(bytes).lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
+                observe_stream_usage(&event, observed, log);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_observation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn monitor_merges_message_start_and_tail_counters_chronologically() {
+        let mut log: ProxyRequestLog = serde_json::from_value(json!({
+            "id":"usage", "timestamp":0, "method":"POST", "url":"/v1/messages", "status":200, "duration":0
+        })).unwrap();
+        let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+        observe_stream_usage(
+            &json!({"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":80,"output_tokens":0}}}),
+            &mut observed,
+            &mut log,
+        );
+        observe_tail_usage(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\ndata: {\"usage\":{\"cache_read_input_tokens\":0}}\n\ndata: [DONE]\n", &mut observed, &mut log);
+        assert_eq!(
+            (log.input_tokens, log.output_tokens, log.cached_tokens),
+            (Some(20), Some(5), Some(0))
+        );
+    }
+
+    #[test]
+    fn monitor_records_structured_protocol_failure_and_preserves_usage() {
+        for event in [
+            json!({"type":"error","error":{"type":"api_error","upstream_status":429,"message":"quota"},"usage":{"input_tokens":20,"cache_read_input_tokens":80,"output_tokens":8}}),
+            json!({"error":{"code":"stream_error","upstream_status":429,"message":"quota"},"usage":{"prompt_tokens":100,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":80}}}),
+            json!({"type":"response.failed","response":{"error":{"upstream_status":429,"message":"quota"},"usage":{"input_tokens":100,"output_tokens":8,"input_tokens_details":{"cached_tokens":80}}}}),
+            json!({"error":{"code":429,"message":"quota"}}),
+        ] {
+            let mut log: ProxyRequestLog = serde_json::from_value(json!({"id":"error","timestamp":0,"method":"POST","url":"/v1/messages","status":200,"duration":0})).unwrap();
+            let mut observed = crate::proxy::pipeline::usage::ObservedUsage::default();
+            observe_stream_usage(
+                &json!({"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":3,"thoughtsTokenCount":5}}),
+                &mut observed,
+                &mut log,
+            );
+            observe_stream_usage(&event, &mut observed, &mut log);
+            assert_eq!(
+                (log.status, log.cached_tokens, log.output_tokens),
+                (429, Some(80), Some(8))
+            );
+            assert_eq!(log.error.as_deref(), Some("quota"));
+        }
+    }
+
+    #[test]
+    fn monitor_extracts_explicit_zero_but_not_absence() {
+        assert_eq!(
+            extract_cached_tokens(&json!({"cache_read_input_tokens":0})),
+            Some(0)
+        );
+        assert_eq!(
+            extract_reasoning_tokens(&json!({"thoughtsTokenCount":0})),
+            Some(0)
+        );
+        assert_eq!(extract_cached_tokens(&json!({})), None);
+        assert_eq!(extract_reasoning_tokens(&json!({})), None);
+    }
 }
 
 fn build_canonical_consolidated_response(
@@ -1108,6 +1325,9 @@ pub async fn monitor_middleware(
 
     let duration = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
+    if is_responses_socket_upgrade(&method, &uri, response.status()) {
+        return response;
+    }
 
     // 过滤噪音请求，避免客户端探针刷屏淹没真实业务日志 (Issue #3498 + `/v1/models` 轮询刷屏 + 三方网关探活)
     // 胶囊开关关闭时（默认）：所有 GET 成功请求与 POST 探针成功请求不记录、不落库；失败请求与非探针业务请求始终记录。
@@ -1343,14 +1563,13 @@ pub async fn monitor_middleware(
             );
             log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
+            let mut observed_usage = crate::proxy::pipeline::usage::ObservedUsage::default();
             // Parse and consolidate stream data into readable format
             if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
                 let mut thinking_content = String::new();
                 let mut response_content = String::new();
                 let mut thinking_signature = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
-                let mut cached_tokens: Option<u32> = None;
-                let mut reasoning_tokens: Option<u32> = None;
 
                 for line in full_response.lines() {
                     if !line.starts_with("data: ") {
@@ -1597,17 +1816,6 @@ pub async fn monitor_middleware(
                                     }
                                 }
                             }
-                            Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
-                                    }
-                                }
-                            }
                             Some("response.output_text.delta") => {
                                 if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
                                     response_content.push_str(text);
@@ -1670,29 +1878,7 @@ pub async fn monitor_middleware(
                             }
                         }
 
-                        // Token usage extraction
-                        if let Some(usage) = json
-                            .get("usage")
-                            .or(json.get("usageMetadata"))
-                            .or(json.get("response").and_then(|r| r.get("usage")))
-                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                        {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                            reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
-                            log.reasoning_tokens = log.reasoning_tokens.or(reasoning_tokens);
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
-                        }
+                        observe_stream_usage(&json, &mut observed_usage, &mut log);
                     }
                 }
 
@@ -1768,38 +1954,7 @@ pub async fn monitor_middleware(
                 );
                 timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
 
-                // 优先从 tail 兜底提取 token（若当前尚无 token 数据）
-                if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                    if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                        for line in full_tail.lines().rev() {
-                            if line.starts_with("data: ")
-                                && (line.contains("\"usage\"")
-                                    || line.contains("\"usageMetadata\""))
-                            {
-                                let json_str = line.trim_start_matches("data: ").trim();
-                                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                    if let Some(usage) = json
-                                        .get("usage")
-                                        .or(json.get("usageMetadata"))
-                                        .or(json.get("response").and_then(|r| r.get("usage")))
-                                        .or(json
-                                            .get("response")
-                                            .and_then(|r| r.get("usageMetadata")))
-                                    {
-                                        log.input_tokens = extract_input_tokens(usage);
-                                        log.output_tokens = extract_output_tokens(usage);
-                                        cached_tokens =
-                                            cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                                        reasoning_tokens = reasoning_tokens
-                                            .or_else(|| extract_reasoning_tokens(usage));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                observe_tail_usage(&last_few_bytes, &mut observed_usage, &mut log);
 
                 let has_actual_content = !response_content.is_empty()
                     || !tool_calls.is_empty()
@@ -1809,8 +1964,8 @@ pub async fn monitor_middleware(
                 if has_actual_content || log.input_tokens.is_some() || log.output_tokens.is_some() {
                     let input_toks = log.input_tokens.unwrap_or(0);
                     let output_toks = log.output_tokens.unwrap_or(0);
-                    let cached_toks = cached_tokens.or(log.cached_tokens).unwrap_or(0);
-                    let reasoning_toks = reasoning_tokens.unwrap_or(0);
+                    let cached_toks = log.cached_tokens.unwrap_or(0);
+                    let reasoning_toks = log.reasoning_tokens.unwrap_or(0);
 
                     let total_in = if cached_toks > input_toks {
                         input_toks + cached_toks
@@ -1879,34 +2034,10 @@ pub async fn monitor_middleware(
                 ));
             }
 
-            // Fallback token extraction from tail if not already extracted
-            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                    for line in full_tail.lines().rev() {
-                        if line.starts_with("data: ")
-                            && (line.contains("\"usage\"") || line.contains("\"usageMetadata\""))
-                        {
-                            let json_str = line.trim_start_matches("data: ").trim();
-                            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                if let Some(usage) = json
-                                    .get("usage")
-                                    .or(json.get("usageMetadata"))
-                                    .or(json.get("response").and_then(|r| r.get("usage")))
-                                    .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                                {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
-                                    log.cached_tokens =
-                                        log.cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Also recover usage when the main log capture contains invalid UTF-8.
+            observe_tail_usage(&last_few_bytes, &mut observed_usage, &mut log);
 
-            if log.status >= 400 {
+            if log.status >= 400 && log.error.is_none() {
                 log.error = Some("Stream Error or Failed".to_string());
             }
 
@@ -1977,14 +2108,6 @@ pub async fn monitor_middleware(
                             log.reasoning_tokens = log
                                 .reasoning_tokens
                                 .or_else(|| extract_reasoning_tokens(usage));
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
                         }
                     }
                     if is_image_route {
@@ -2454,5 +2577,74 @@ mod tests {
             ),
             "真实用户问答绝不可被误杀"
         );
+    }
+}
+
+#[cfg(test)]
+mod websocket_usage_tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use serde_json::json;
+
+    #[test]
+    fn one_generation_keeps_sparse_usage_zero_status_and_model_once() {
+        let mut usage = WebsocketTurnUsage::begin(
+            &HeaderMap::new(),
+            &json!({"model":"client","store":false}),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mapped-model", "upstream".parse().unwrap());
+        usage.response(200, &headers);
+        usage.observe(&json!({"type":"response.in_progress","response":{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80}}}}));
+        usage.observe(&json!({"type":"response.completed","response":{"usage":{"output_tokens":5,"input_tokens_details":{"cached_tokens":0}}}}));
+        usage.observe(&json!({"type":"response.failed","response":{"error":{"code":503},"usage":{"output_tokens":122}}}));
+        let (log, _) = usage.finish();
+        assert_eq!(
+            (
+                log.status,
+                log.input_tokens,
+                log.output_tokens,
+                log.cached_tokens
+            ),
+            (200, Some(100), Some(5), Some(0))
+        );
+        assert_eq!(log.mapped_model.as_deref(), Some("upstream"));
+        let mut usage = WebsocketTurnUsage::begin(&headers, &json!({}), None);
+        usage.response(429, &HeaderMap::new());
+        usage.observe(&json!({"type":"error","error":{"code":"rate_limited","message":"retry"},"usage":{"input_tokens":12}}));
+        let (log, _) = usage.finish();
+        assert_eq!(
+            (log.status, log.input_tokens, log.output_tokens),
+            (429, Some(12), None)
+        );
+        let mut usage = WebsocketTurnUsage::begin(&headers, &json!({}), None);
+        usage.observe(
+            &json!({"type":"response.in_progress","response":{"usage":{"input_tokens":9}}}),
+        );
+        let (log, _) = usage.finish();
+        assert_eq!(
+            (log.status, log.input_tokens, log.output_tokens),
+            (499, Some(9), None)
+        );
+    }
+
+    #[test]
+    fn skip_only_the_successful_responses_upgrade() {
+        assert!(is_responses_socket_upgrade(
+            "GET",
+            "/v1/responses?mode=socket",
+            StatusCode::SWITCHING_PROTOCOLS
+        ));
+        assert!(!is_responses_socket_upgrade(
+            "GET",
+            "/v1/responses",
+            StatusCode::BAD_REQUEST
+        ));
+        assert!(!is_responses_socket_upgrade(
+            "POST",
+            "/v1/responses",
+            StatusCode::OK
+        ));
     }
 }

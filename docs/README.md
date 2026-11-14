@@ -3,6 +3,7 @@
 This folder contains developer-focused documentation (architecture, implementation details, and validation steps).
 
 ## Proxy
+- [AM / sub2api cache continuity handoff (2026-11-14)](plans/cache-continuity-handoff-20261114.md) — verified fixes, outstanding release blockers, and steps to resume development on another machine.
 - [`docs/proxy/auth.md`](proxy/auth.md) — proxy authorization modes, expected client behavior, and implementation pointers.
 - [`docs/proxy/accounts.md`](proxy/accounts.md) — account lifecycle in the proxy pool (including auto-disable on `invalid_grant`) and UI behavior.
 

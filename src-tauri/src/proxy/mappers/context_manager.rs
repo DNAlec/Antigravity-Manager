@@ -682,6 +682,11 @@ impl ContextManager {
                                         input_audio.data.len(),
                                     );
                                 }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::File { file } => {
+                                    if let Some(data) = &file.file_data {
+                                        total += estimate_inline_data_tokens(file.mime_type.as_deref().unwrap_or("application/pdf"), data.len());
+                                    } else { total += 1000; }
+                                }
                                 crate::proxy::mappers::openai::models::OpenAIContentBlock::VideoUrl { video_url } => {
                                     // Video token estimation based on media payload size
                                     total += estimate_media_tokens_from_url(&video_url.url);

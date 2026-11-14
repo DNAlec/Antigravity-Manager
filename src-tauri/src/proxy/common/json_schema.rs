@@ -62,6 +62,223 @@ pub fn clean_json_schema_for_tool(value: &mut Value, _tool_name: &str) {
     clean_json_schema(value);
 }
 
+/// Validate constructs that cannot be represented losslessly by Gemini's Schema
+/// proto. Never select a preferred oneOf alternative on behalf of a caller.
+pub fn validate_tool_schema(schema: &Value) -> Result<(), String> {
+    fn walk(value: &Value, depth: usize) -> Result<(), String> {
+        if depth > MAX_CLEAN_RECURSION_DEPTH {
+            return Err("tool schema exceeds the supported nesting depth".into());
+        }
+        let Some(map) = value.as_object() else {
+            return Ok(());
+        };
+        if let Some(Value::Array(types)) = map.get("type") {
+            if types.is_empty()
+                || map.contains_key("anyOf")
+                || map.contains_key("oneOf")
+                || types.iter().any(|t| {
+                    !t.as_str().is_some_and(|t| {
+                        matches!(
+                            t.to_ascii_lowercase().as_str(),
+                            "string"
+                                | "number"
+                                | "integer"
+                                | "boolean"
+                                | "array"
+                                | "object"
+                                | "null"
+                        )
+                    })
+                })
+            {
+                return Err(
+                    "tool schema type array cannot be combined losslessly with another union"
+                        .into(),
+                );
+            }
+        }
+        if let Some(all_of) = map.get("allOf") {
+            if map.contains_key("additionalProperties") || map.contains_key("unevaluatedProperties")
+            {
+                return Err(
+                    "closed-object allOf cannot be represented losslessly in Gemini".into(),
+                );
+            }
+            let Some(branches) = all_of.as_array() else {
+                return Err("tool schema allOf must be an array".into());
+            };
+            let mut combined = map.clone();
+            combined.remove("allOf");
+            for branch in branches {
+                let Some(branch) = branch.as_object() else {
+                    return Err("tool schema allOf requires object schemas".into());
+                };
+                for (key, value) in branch {
+                    if matches!(key.as_str(), "description" | "title" | "required") {
+                        continue;
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "allOf" | "additionalProperties" | "unevaluatedProperties"
+                    ) {
+                        return Err("nested or closed-object allOf cannot be represented losslessly in Gemini".into());
+                    }
+                    if key == "properties" {
+                        if let Some(props) = value.as_object() {
+                            let dest = combined.entry(key.clone()).or_insert_with(|| json!({}));
+                            let Some(dest) = dest.as_object_mut() else {
+                                return Err("invalid properties in allOf".into());
+                            };
+                            for (name, schema) in props {
+                                if dest.get(name).is_some_and(|old| old != schema) {
+                                    return Err("overlapping allOf property constraints cannot be represented losslessly in Gemini".into());
+                                }
+                                dest.insert(name.clone(), schema.clone());
+                            }
+                        }
+                    } else {
+                        if combined.get(key).is_some_and(|old| old != value) {
+                            return Err("conflicting allOf constraints cannot be represented losslessly in Gemini".into());
+                        }
+                        combined.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            // The accepted fragments must remain representable once combined;
+            // for example allOf must not hide a type-array/anyOf intersection.
+            return walk(&Value::Object(combined), depth);
+        }
+        if let Some(one_of) = map.get("oneOf") {
+            if map.contains_key("anyOf")
+                || !one_of
+                    .as_array()
+                    .is_some_and(|branches| disjoint_schema_union(branches))
+            {
+                return Err("tool schema oneOf alternatives must have disjoint explicit types to preserve their constraints in Gemini".into());
+            }
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(children) = map.get(key).and_then(Value::as_object) {
+                for child in children.values() {
+                    walk(child, depth + 1)?;
+                }
+            }
+        }
+        if let Some(items) = map.get("items") {
+            walk(items, depth + 1)?;
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(children) = map.get(key).and_then(Value::as_array) {
+                for child in children {
+                    walk(child, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn check_refs(
+        value: &Value,
+        root: &Value,
+        defs: &serde_json::Map<String, Value>,
+        active: &mut std::collections::HashSet<String>,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth > MAX_REF_RECURSION_DEPTH {
+            return Err("tool schema reference expansion exceeds the supported depth".into());
+        }
+        let Some(map) = value.as_object() else {
+            return Ok(());
+        };
+        if let Some(reference) = map.get("$ref") {
+            let reference = reference
+                .as_str()
+                .ok_or("tool schema $ref must be a string")?;
+            let pointer = reference
+                .strip_prefix('#')
+                .ok_or("external tool schema references cannot be resolved")?;
+            let target = root
+                .pointer(pointer)
+                .filter(|v| v.is_object())
+                .ok_or("unresolved tool schema reference")?;
+            let name = reference.rsplit('/').next().unwrap_or_default();
+            if defs.get(name) != Some(target) {
+                return Err(
+                    "tool schema reference is outside the supported definition scope".into(),
+                );
+            }
+            if !active.insert(reference.to_string()) {
+                return Err("recursive tool schemas cannot be represented by Gemini Schema".into());
+            }
+            for (key, value) in map {
+                if !matches!(key.as_str(), "$ref" | "description" | "title")
+                    && target.get(key).is_some_and(|other| other != value)
+                {
+                    return Err(
+                        "tool schema reference siblings have overlapping constraints".into(),
+                    );
+                }
+            }
+            check_refs(target, root, defs, active, depth + 1)?;
+            active.remove(reference);
+        }
+        if let Some(props) = map.get("properties").and_then(Value::as_object) {
+            for child in props.values() {
+                check_refs(child, root, defs, active, depth + 1)?;
+            }
+        }
+        if let Some(items) = map.get("items") {
+            check_refs(items, root, defs, active, depth + 1)?;
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(items) = map.get(key).and_then(Value::as_array) {
+                for item in items {
+                    check_refs(item, root, defs, active, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    // Validate the same expanded constraints the mapper will merge. Otherwise
+    // an allOf $ref could hide a conflicting property until after validation.
+    let mut expanded = schema.clone();
+    let mut defs = serde_json::Map::new();
+    collect_all_defs(&expanded, &mut defs);
+    check_refs(
+        schema,
+        schema,
+        &defs,
+        &mut std::collections::HashSet::new(),
+        0,
+    )?;
+    if let Some(map) = expanded.as_object_mut() {
+        map.remove("$defs");
+        map.remove("definitions");
+        flatten_refs(map, &defs, 0, &mut std::collections::HashSet::new());
+    }
+    walk(&expanded, 0)
+}
+
+fn disjoint_schema_union(branches: &[Value]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    !branches.is_empty()
+        && branches.iter().all(|branch| {
+            let Some(kind) = branch.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            let kind = kind.to_ascii_lowercase();
+            if !matches!(
+                kind.as_str(),
+                "string" | "number" | "integer" | "boolean" | "object" | "array" | "null"
+            ) || (kind == "integer" && seen.contains("number"))
+                || (kind == "number" && seen.contains("integer"))
+                || !seen.insert(kind)
+            {
+                return false;
+            }
+            !branch.get("nullable").is_some_and(|v| v == true) || seen.insert("null".to_string())
+        })
+}
+
 /// [NEW #952] 递归收集所有层级的 $defs 和 definitions
 ///
 /// MCP 工具的 schema 可能在任意嵌套层级定义 $defs，而非仅在根层级。
@@ -167,17 +384,7 @@ fn flatten_refs(
                 if map.contains_key("$ref") {
                     flatten_refs(map, defs, depth + 1, active_refs);
                 } else {
-                    for (_, v) in map.iter_mut() {
-                        if let Value::Object(child_map) = v {
-                            flatten_refs(child_map, defs, depth + 1, active_refs);
-                        } else if let Value::Array(arr) = v {
-                            for item in arr {
-                                if let Value::Object(item_map) = item {
-                                    flatten_refs(item_map, defs, depth + 1, active_refs);
-                                }
-                            }
-                        }
-                    }
+                    flatten_child_refs(map, defs, depth, active_refs);
                 }
                 active_refs.remove(ref_name);
                 return;
@@ -202,15 +409,31 @@ fn flatten_refs(
         }
     }
 
-    // 遍历子节点 (仅当当前 map 原生未持有顶层 $ref 时执行，避免双重重复遍历)
-    for (_, v) in map.iter_mut() {
-        if let Value::Object(child_map) = v {
-            flatten_refs(child_map, defs, depth + 1, active_refs);
-        } else if let Value::Array(arr) = v {
-            for item in arr {
-                if let Value::Object(item_map) = item {
-                    flatten_refs(item_map, defs, depth + 1, active_refs);
-                }
+    flatten_child_refs(map, defs, depth, active_refs);
+}
+
+fn flatten_child_refs(
+    map: &mut serde_json::Map<String, Value>,
+    defs: &serde_json::Map<String, Value>,
+    depth: usize,
+    active_refs: &mut std::collections::HashSet<String>,
+) {
+    // A properties map is a dictionary of business names, not a schema node.
+    // Only its values may contain schema keywords such as $ref.
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = map.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut().filter_map(Value::as_object_mut) {
+                flatten_refs(child, defs, depth + 1, active_refs);
+            }
+        }
+    }
+    if let Some(items) = map.get_mut("items").and_then(Value::as_object_mut) {
+        flatten_refs(items, defs, depth + 1, active_refs);
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(items) = map.get_mut(key).and_then(Value::as_array_mut) {
+            for child in items.iter_mut().filter_map(Value::as_object_mut) {
+                flatten_refs(child, defs, depth + 1, active_refs);
             }
         }
     }
@@ -263,7 +486,7 @@ fn apply_minimal_failsafe(root: &mut Value) {
                         map.insert("items".to_string(), json!({ "type": "string" }));
                     }
                 } else if is_object {
-                    if !map.contains_key("type") {
+                    if !map.contains_key("type") && !map.contains_key("anyOf") {
                         map.insert("type".to_string(), Value::String("object".to_string()));
                     }
                     map.remove("items");
@@ -308,14 +531,65 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
     match value {
         Value::Object(map) => {
-            // 0. [NEW] 合并 allOf
+            // Resolve compositions before inferring a type from properties/items.
+            // allOf can introduce a type array, while oneOf must already be a
+            // union when the structural normalization below runs.
             merge_all_of(map);
+            if !map.contains_key("anyOf")
+                && map
+                    .get("oneOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|branches| disjoint_schema_union(branches))
+            {
+                if let Some(branches) = map.remove("oneOf") {
+                    map.insert("anyOf".to_string(), branches);
+                }
+            }
+            if let Some(Value::Array(types)) = map.get("type").cloned() {
+                if !map.contains_key("anyOf") && !map.contains_key("oneOf") {
+                    // JSON Schema applies these keywords only to their own
+                    // types. Move them into the matching alternatives before
+                    // array defaults or object healing can change their meaning.
+                    let constraints: Vec<_> = [
+                        ("items", "array"),
+                        ("minItems", "array"),
+                        ("maxItems", "array"),
+                        ("properties", "object"),
+                        ("required", "object"),
+                        ("minProperties", "object"),
+                        ("maxProperties", "object"),
+                        ("minLength", "string"),
+                        ("maxLength", "string"),
+                        ("pattern", "string"),
+                        ("minimum", "number"),
+                        ("maximum", "number"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, kind)| map.remove(key).map(|value| (key, kind, value)))
+                    .collect();
+                    let branches = types
+                        .iter()
+                        .map(|kind| {
+                            let mut branch = json!({"type":kind});
+                            let kind = kind.as_str().unwrap_or_default().to_ascii_lowercase();
+                            for (key, target, constraint) in &constraints {
+                                if kind == *target || (kind == "integer" && *target == "number") {
+                                    branch[*key] = constraint.clone();
+                                }
+                            }
+                            branch
+                        })
+                        .collect::<Vec<_>>();
+                    map.remove("type");
+                    map.insert("anyOf".into(), json!(branches));
+                }
+            }
 
             // 0.1 [NEW #3327] 规范化 const 关键字 (转换为 enum 与对应 type)
             // Gemini/Vertex 的 Schema proto 不支持 const，直接传入会导致 400 INVALID_ARGUMENT
             // 例如 {"const": "element"} -> {"type": "string", "enum": ["element"]}
             if let Some(const_val) = map.remove("const") {
-                if !map.contains_key("type") {
+                if !map.contains_key("type") && !map.contains_key("anyOf") {
                     let inferred_type = match &const_val {
                         Value::String(_) => Some("string"),
                         Value::Number(n) => {
@@ -357,8 +631,9 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
             if is_explicit_array {
                 map.remove("properties");
-            } else if map.get("type").and_then(|t| t.as_str()) == Some("object")
-                || map.contains_key("properties")
+            } else if !map.contains_key("anyOf")
+                && (map.get("type").and_then(|t| t.as_str()) == Some("object")
+                    || map.contains_key("properties"))
             {
                 if let Some(items) = map.remove("items") {
                     tracing::warn!("[Schema-Normalization] Found 'items' in an Object-like node. Moving content to 'properties'.");
@@ -400,23 +675,16 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     props.remove(k);
                 }
 
-                let mut nullable_keys = std::collections::HashSet::new();
-                for (k, v) in props.iter_mut() {
+                for v in props.values_mut() {
                     // properties 的每一个值都必须是一个独立的 Schema 节点
-                    if clean_json_schema_recursive(v, true, depth + 1) {
-                        nullable_keys.insert(k.clone());
-                    }
+                    clean_json_schema_recursive(v, true, depth + 1);
                 }
                 let valid_keys: std::collections::HashSet<String> = props.keys().cloned().collect();
 
                 if let Some(Value::Array(req_arr)) = map.get_mut("required") {
                     req_arr.retain(|r| {
                         r.as_str()
-                            .map(|s| {
-                                valid_keys.contains(s)
-                                    && !nullable_keys.contains(s)
-                                    && !dropped_keys.iter().any(|d| d == s)
-                            })
+                            .map(|s| valid_keys.contains(s) && !dropped_keys.iter().any(|d| d == s))
                             .unwrap_or(false)
                     });
                     if req_arr.is_empty() {
@@ -425,7 +693,7 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
 
                 // [NEW] 隐式类型注入：如果有 properties 但没 type，补全为 object
-                if !map.contains_key("type") {
+                if !map.contains_key("type") && !map.contains_key("anyOf") {
                     map.insert("type".to_string(), Value::String("object".to_string()));
                 }
             }
@@ -441,7 +709,7 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 clean_json_schema_recursive(items, true, depth + 1);
 
                 // [NEW] 隐式类型注入：如果有 items 但没 type，补全为 array
-                if !map.contains_key("type") {
+                if !map.contains_key("type") && !map.contains_key("anyOf") {
                     map.insert("type".to_string(), Value::String("array".to_string()));
                 }
             }
@@ -474,68 +742,81 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
             }
 
-            // 1.5. [FIX] 递归清理 anyOf/oneOf 数组中的每个分支
-            // 必须在合并逻辑之前执行，确保合并的分支已经被清洗
-            if let Some(Value::Array(any_of)) = map.get_mut("anyOf") {
-                for branch in any_of.iter_mut() {
+            // Gemini Schema supports anyOf. Selecting a single branch silently
+            // changes the tool contract (for example, integer|string -> string).
+            let can_inline_union = map.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "anyOf" | "title" | "description" | "default" | "$schema"
+                )
+            });
+            let parent_items = map.get("items").cloned();
+            if let Some(Value::Array(branches)) = map.get_mut("anyOf") {
+                let is_null = |v: &Value| {
+                    v.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("null"))
+                        && v.as_object().is_some_and(|o| o.len() == 1)
+                };
+                let had_null = can_inline_union
+                    && branches.iter().any(|v| !is_null(v))
+                    && branches.iter().any(|v| {
+                        v.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case("null"))
+                            && v.as_object().is_some_and(|o| o.len() == 1)
+                    });
+                if had_null {
+                    branches.retain(|v| {
+                        !(v.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case("null"))
+                            && v.as_object().is_some_and(|o| o.len() == 1))
+                    });
+                }
+                for branch in branches {
+                    if let (Some(items), Some(branch_map)) =
+                        (parent_items.as_ref(), branch.as_object_mut())
+                    {
+                        merge_all_of(branch_map);
+                        let accepts_array = match branch_map.get("type") {
+                            Some(Value::String(kind)) => kind.eq_ignore_ascii_case("array"),
+                            Some(Value::Array(types)) => types.iter().any(|kind| {
+                                kind.as_str()
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("array"))
+                            }),
+                            _ => {
+                                branch_map.contains_key("anyOf") || branch_map.contains_key("oneOf")
+                            }
+                        };
+                        if accepts_array {
+                            // Parent and explicit branch constraints remain a
+                            // conjunction. Inherit only a missing item schema,
+                            // preventing the default string items from adding
+                            // an unrelated restriction to this alternative.
+                            branch_map.entry("items").or_insert_with(|| items.clone());
+                        }
+                    }
                     clean_json_schema_recursive(branch, true, depth + 1);
                 }
-            }
-            if let Some(Value::Array(one_of)) = map.get_mut("oneOf") {
-                for branch in one_of.iter_mut() {
-                    clean_json_schema_recursive(branch, true, depth + 1);
+                if had_null {
+                    map.insert("nullable".to_string(), json!(true));
                 }
-            }
-
-            // 2. [FIX #815] 处理 anyOf/oneOf 联合类型: 合并属性或择优选择分支
-            let mut union_to_merge = None;
-            if let Some(Value::Array(any_of)) = map.get("anyOf") {
-                union_to_merge = Some(any_of.clone());
-            } else if let Some(Value::Array(one_of)) = map.get("oneOf") {
-                union_to_merge = Some(one_of.clone());
-            }
-
-            if let Some(union_array) = union_to_merge {
-                if let Some(best_branch) = extract_best_schema_from_union(&union_array) {
-                    if let Value::Object(branch_obj) = best_branch {
-                        // 合并分支属性到当前 map
-                        for (k, v) in branch_obj {
-                            if k == "properties" {
-                                if let Some(target_props) = map
-                                    .entry("properties".to_string())
-                                    .or_insert_with(|| Value::Object(serde_json::Map::new()))
-                                    .as_object_mut()
-                                {
-                                    if let Some(source_props) = v.as_object() {
-                                        for (pk, pv) in source_props {
-                                            target_props
-                                                .entry(pk.clone())
-                                                .or_insert_with(|| pv.clone());
-                                        }
-                                    }
-                                }
-                            } else if k == "required" {
-                                if let Some(target_req) = map
-                                    .entry("required".to_string())
-                                    .or_insert_with(|| Value::Array(Vec::new()))
-                                    .as_array_mut()
-                                {
-                                    if let Some(source_req) = v.as_array() {
-                                        for rv in source_req {
-                                            if !target_req.contains(rv) {
-                                                target_req.push(rv.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if !map.contains_key(&k) {
-                                map.insert(k, v);
+                if can_inline_union
+                    && map
+                        .get("anyOf")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.len() == 1)
+                {
+                    if let Some(Value::Array(mut branches)) = map.remove("anyOf") {
+                        if let Some(Value::Object(branch)) = branches.pop() {
+                            for (key, value) in branch {
+                                map.entry(key).or_insert(value);
                             }
                         }
                     }
                 }
             }
-
             // 3. [SAFETY] 检查当前对象是否为 JSON Schema 节点
             // 只有当对象看起来像 Schema (包含 type, properties, items, enum, anyOf 等) 时，才执行白名单过滤。
             // 否则，如果它是一个普通的 Value (如 request.rs 中的 functionCall 对象)，直接应用激进过滤会破坏结构。
@@ -547,6 +828,18 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 "items",
                 "enum",
                 "title",
+                "anyOf",
+                "oneOf",
+                "nullable",
+                "minItems",
+                "maxItems",
+                "minLength",
+                "maxLength",
+                "minimum",
+                "maximum",
+                "pattern",
+                "minProperties",
+                "maxProperties",
             ];
 
             let has_standard_keyword = map.keys().any(|k| allowed_fields.contains(&k.as_str()));
@@ -621,13 +914,11 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                         if let Some(keys) = &valid_prop_keys {
                             req_arr
                                 .retain(|k| k.as_str().map(|s| keys.contains(s)).unwrap_or(false));
-                        } else {
-                            req_arr.clear();
                         }
                     }
                 }
 
-                if !map.contains_key("type") {
+                if !map.contains_key("type") && !map.contains_key("anyOf") {
                     if map.contains_key("enum") {
                         map.insert("type".to_string(), Value::String("string".to_string()));
                     } else if map.contains_key("properties") {
@@ -652,11 +943,7 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     match type_val {
                         Value::String(s) => {
                             let lower = s.to_lowercase();
-                            if lower == "null" {
-                                is_effectively_nullable = true;
-                            } else {
-                                selected_type = Some(lower);
-                            }
+                            selected_type = Some(lower);
                         }
                         Value::Array(arr) => {
                             for item in arr {
@@ -750,7 +1037,7 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 fn merge_all_of(map: &mut serde_json::Map<String, Value>) {
     if let Some(Value::Array(all_of)) = map.remove("allOf") {
         let mut merged_properties = serde_json::Map::new();
-        let mut merged_required = std::collections::HashSet::new();
+        let mut merged_required = Vec::new();
         let mut other_fields = serde_json::Map::new();
 
         for sub_schema in all_of {
@@ -766,7 +1053,9 @@ fn merge_all_of(map: &mut serde_json::Map<String, Value>) {
                 if let Some(Value::Array(reqs)) = sub_map.get("required") {
                     for req in reqs {
                         if let Some(s) = req.as_str() {
-                            merged_required.insert(s.to_string());
+                            if !merged_required.iter().any(|required| required == s) {
+                                merged_required.push(s.to_string());
+                            }
                         }
                     }
                 }
@@ -819,43 +1108,6 @@ fn merge_all_of(map: &mut serde_json::Map<String, Value>) {
             }
         }
     }
-}
-
-/// [NEW] 计算 Schema 分支的复杂度得分 (用于 anyOf/oneOf 择优)
-/// 评分标准: Object (3) > Array (2) > Scalar (1) > Null (0)
-fn score_schema_option(val: &Value) -> i32 {
-    if let Value::Object(obj) = val {
-        if obj.contains_key("properties")
-            || obj.get("type").and_then(|t| t.as_str()) == Some("object")
-        {
-            return 3;
-        }
-        if obj.contains_key("items") || obj.get("type").and_then(|t| t.as_str()) == Some("array") {
-            return 2;
-        }
-        if let Some(type_str) = obj.get("type").and_then(|t| t.as_str()) {
-            if type_str != "null" {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-/// 从 anyOf/oneOf 联合类型数组中选取最佳非 null Schema 分支
-fn extract_best_schema_from_union(union_array: &[Value]) -> Option<Value> {
-    let mut best_option: Option<&Value> = None;
-    let mut best_score = -1;
-
-    for item in union_array {
-        let score = score_schema_option(item);
-        if score > best_score {
-            best_score = score;
-            best_option = Some(item);
-        }
-    }
-
-    best_option.cloned()
 }
 
 /// 修正工具调用参数的类型，使其符合 schema 定义
@@ -960,6 +1212,213 @@ fn fix_single_arg_recursive(value: &mut Value, schema: &Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_reference_keyword_as_business_property_is_preserved() {
+        let mut schema = serde_json::json!({"type":"object","properties":{"$ref":{"type":"string"},"cache_control":{"type":"string"}},"required":["$ref","cache_control"]});
+        super::validate_tool_schema(&schema).unwrap();
+        let original = schema.clone();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn r19_unresolved_recursive_and_overlapping_refs_fail_before_fallback() {
+        for schema in [
+            serde_json::json!({"$ref":"#/$defs/missing"}),
+            serde_json::json!({"$defs":{"A":{"type":"object","properties":{"next":{"$ref":"#/$defs/A"}}}},"$ref":"#/$defs/A"}),
+            serde_json::json!({"$defs":{"A":{"type":"string"}},"$ref":"#/$defs/A","type":"integer"}),
+        ] {
+            assert!(super::validate_tool_schema(&schema).is_err());
+        }
+    }
+
+    #[test]
+    fn r19_composed_reference_constraints_are_validated_after_expansion() {
+        let conflicting = serde_json::json!({"$defs":{"A":{"type":"object","properties":{"x":{"type":"string"}}}},"allOf":[{"$ref":"#/$defs/A"},{"properties":{"x":{"type":"integer"}}}]});
+        assert!(super::validate_tool_schema(&conflicting).is_err());
+        let disjoint = serde_json::json!({"$defs":{"A":{"type":"string"},"B":{"type":"integer"}},"oneOf":[{"$ref":"#/$defs/A"},{"$ref":"#/$defs/B"}]});
+        super::validate_tool_schema(&disjoint).unwrap();
+        let mut cleaned = disjoint;
+        super::clean_json_schema(&mut cleaned);
+        assert_eq!(
+            cleaned,
+            serde_json::json!({"anyOf":[{"type":"string"},{"type":"integer"}]})
+        );
+    }
+
+    #[test]
+    fn r19_parent_and_single_alternative_constraints_both_survive() {
+        let mut schema = serde_json::json!({"required":["a"],"anyOf":[{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["b"]}]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema["required"], serde_json::json!(["a"]));
+        assert_eq!(schema["anyOf"][0]["required"], serde_json::json!(["b"]));
+        let mut schema =
+            serde_json::json!({"minLength":1,"anyOf":[{"type":"string","minLength":5}]});
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema["minLength"], 1);
+        assert_eq!(schema["anyOf"][0]["minLength"], 5);
+    }
+
+    #[test]
+    fn r19_type_arrays_and_allof_never_pick_one_constraint() {
+        let mut schema = serde_json::json!({"type":["string","integer"]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({"anyOf":[{"type":"string"},{"type":"integer"}]})
+        );
+        for bad in [
+            serde_json::json!({"allOf":[{"type":"string"},{"type":"integer"}]}),
+            serde_json::json!({"allOf":[{"properties":{"a":{"type":"string"}}},{"properties":{"a":{"type":"integer"}}}]}),
+            serde_json::json!({"additionalProperties":false,"allOf":[{"properties":{"a":{"type":"string"}}}]}),
+        ] {
+            assert!(super::validate_tool_schema(&bad).is_err());
+        }
+        let mut schema = serde_json::json!({"allOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},{"type":"object","properties":{"b":{"type":"integer"}},"required":["b"]}]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema["properties"]["a"]["type"], "string");
+        assert_eq!(schema["properties"]["b"]["type"], "integer");
+        let req = schema["required"].as_array().unwrap();
+        assert_eq!(req.len(), 2);
+        assert!(req.contains(&serde_json::json!("a")) && req.contains(&serde_json::json!("b")));
+    }
+
+    #[test]
+    fn r19_type_union_keeps_constraints_on_their_applicable_branch() {
+        for (mut schema, expected) in [
+            (
+                json!({"type":["array","null"],"items":{"type":"integer"},"minItems":1}),
+                json!({"type":"array","items":{"type":"integer"},"minItems":1,"nullable":true}),
+            ),
+            (
+                json!({"type":["array","object"],"items":{"type":"integer"},"minItems":1,"properties":{"x":{"type":"integer"}},"required":["x"],"maxProperties":2}),
+                json!({"anyOf":[{"type":"array","items":{"type":"integer"},"minItems":1},{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"maxProperties":2}]}),
+            ),
+            (
+                json!({"type":["string","integer","boolean"],"minLength":2,"pattern":"^a","minimum":3}),
+                json!({"anyOf":[{"type":"string","minLength":2,"pattern":"^a"},{"type":"integer","minimum":3},{"type":"boolean"}]}),
+            ),
+        ] {
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(schema, expected);
+        }
+    }
+
+    #[test]
+    fn r19_compositions_normalize_before_structural_type_inference() {
+        for (mut schema, expected) in [
+            (
+                json!({"allOf":[{"type":["string","integer"]}]}),
+                json!({"anyOf":[{"type":"string"},{"type":"integer"}]}),
+            ),
+            (
+                json!({"allOf":[{"type":["array","null"]},{"items":{"type":"integer"}}]}),
+                json!({"type":"array","items":{"type":"integer"},"nullable":true}),
+            ),
+            (
+                json!({"oneOf":[{"type":"string"},{"type":"integer"}],"properties":{"x":{"type":"boolean"}}}),
+                json!({"anyOf":[{"type":"string"},{"type":"integer"}],"properties":{"x":{"type":"boolean"}}}),
+            ),
+        ] {
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(schema, expected);
+        }
+    }
+
+    #[test]
+    fn r19_composed_union_constraints_fail_before_lossy_fallbacks() {
+        for schema in [
+            json!({"allOf":[{"type":["string","integer"]}],"anyOf":[{"type":"integer"}]}),
+            json!({"allOf":[{"type":["string","integer"]},{"oneOf":[{"type":"integer"}]}]}),
+        ] {
+            assert!(super::validate_tool_schema(&schema).is_err(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn r19_union_parent_items_prevent_incompatible_array_defaults() {
+        for keyword in ["anyOf", "oneOf"] {
+            let mut schema =
+                json!({keyword:[{"type":"array"},{"type":"null"}],"items":{"type":"integer"}});
+            super::validate_tool_schema(&schema).unwrap();
+            super::clean_json_schema(&mut schema);
+            assert_eq!(
+                schema,
+                json!({"anyOf":[{"type":"array","items":{"type":"integer"}},{"type":"null"}],"items":{"type":"integer"}})
+            );
+        }
+        let mut schema = json!({"allOf":[{"anyOf":[{"type":"array"},{"type":"object","properties":{"y":{"type":"boolean"}}}]},{"items":{"type":"integer"},"properties":{"x":{"type":"string"}},"required":["x"]}]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            json!({"anyOf":[{"type":"array","items":{"type":"integer"}},{"type":"object","properties":{"y":{"type":"boolean"}}}],"items":{"type":"integer"},"properties":{"x":{"type":"string"}},"required":["x"]})
+        );
+    }
+
+    #[test]
+    fn r19_union_parent_and_explicit_branch_items_remain_conjoined() {
+        let mut schema = json!({"anyOf":[{"type":"array","items":{"type":"integer","minimum":2}},{"anyOf":[{"type":"array"},{"type":"null"}]}],"items":{"type":"integer","maximum":5}});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(schema["items"], json!({"type":"integer","maximum":5}));
+        assert_eq!(
+            schema["anyOf"][0]["items"],
+            json!({"type":"integer","minimum":2})
+        );
+        assert_eq!(
+            schema["anyOf"][1]["anyOf"][0]["items"],
+            json!({"type":"integer","maximum":5})
+        );
+    }
+
+    #[test]
+    fn r19_nullable_union_properties_remain_required() {
+        let mut schema = json!({"type":"object","properties":{"a":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["a"]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            json!({"type":"object","properties":{"a":{"type":"string","nullable":true}},"required":["a"]})
+        );
+    }
+
+    #[test]
+    fn r19_oneof_keeps_disjoint_alternatives_and_rejects_ambiguous_overlap() {
+        let mut schema = serde_json::json!({"oneOf":[{"type":"string"},{"type":"integer"}]});
+        super::validate_tool_schema(&schema).unwrap();
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({"anyOf":[{"type":"string"},{"type":"integer"}]})
+        );
+        for schema in [
+            serde_json::json!({"oneOf":[{"type":"number"},{"type":"integer"}]}),
+            serde_json::json!({"oneOf":[{"type":"object","properties":{"a":{"type":"string"}}},{"type":"object","properties":{"b":{"type":"string"}}}]}),
+        ] {
+            assert!(super::validate_tool_schema(&schema).is_err());
+        }
+    }
+
+    #[test]
+    fn r19_anyof_does_not_relax_parent_constraints_or_lose_null_only_case() {
+        let mut schema =
+            serde_json::json!({"type":"string","anyOf":[{"type":"number"},{"type":"null"}]});
+        super::clean_json_schema(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({"type":"string","anyOf":[{"type":"number"},{"type":"null"}]})
+        );
+        let mut null_only = serde_json::json!({"anyOf":[{"type":"null"}]});
+        super::clean_json_schema(&mut null_only);
+        assert_eq!(null_only, serde_json::json!({"type":"null"}));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1084,8 +1543,8 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["location"]["type"], "string");
 
-        // 2. 验证非标准约束字段被安全移除，且描述保持纯透传不被篡改
-        assert!(schema["properties"]["location"].get("minLength").is_none());
+        // Supported constraints must survive the bridge unchanged.
+        assert_eq!(schema["properties"]["location"]["minLength"], 1);
         assert!(schema["properties"]["location"].get("format").is_none());
         assert_eq!(
             schema["properties"]["location"]["description"],
@@ -1096,10 +1555,10 @@ mod tests {
         assert!(schema["properties"].get("pattern").is_some());
         assert_eq!(schema["properties"]["pattern"]["type"], "object");
 
-        // 4. 验证内部的 pattern 校验字段被移除，且描述保持原样
-        assert!(schema["properties"]["pattern"]["properties"]["regex"]
-            .get("pattern")
-            .is_none());
+        assert_eq!(
+            schema["properties"]["pattern"]["properties"]["regex"]["pattern"],
+            "^[a-z]+$"
+        );
         assert_eq!(
             schema["properties"]["pattern"]["properties"]["regex"]["description"],
             "Regex pattern"
@@ -1252,7 +1711,10 @@ mod tests {
 
         // type 已存在，不应被 anyOf 中的类型覆盖
         assert_eq!(schema["properties"]["name"]["type"], "string");
-        assert!(schema["properties"]["name"].get("anyOf").is_none());
+        assert_eq!(
+            schema["properties"]["name"]["anyOf"],
+            json!([{"type":"number"}])
+        );
     }
 
     // [NEW TEST] 验证 Issue #815: anyOf 内部属性不丢失
@@ -1344,10 +1806,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("User name"));
-        assert!(schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("(nullable)"));
+        assert_eq!(schema["nullable"], true);
     }
 
     // [NEW TEST] 验证 anyOf 内部的 propertyNames 被移除
@@ -1812,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_any_of_best_branch_selection() {
+    fn test_any_of_preserves_all_non_null_branches() {
         let mut schema = json!({
             "anyOf": [
                 { "type": "string" },
@@ -1823,10 +2282,11 @@ mod tests {
 
         clean_json_schema(&mut schema);
 
-        // 验证选择了分数最高的 Object 分支
-        assert_eq!(schema["type"], "object");
-        assert!(schema.get("properties").is_some());
-        assert_eq!(schema["properties"]["foo"]["type"], "string");
+        assert_eq!(schema["anyOf"].as_array().unwrap().len(), 2);
+        assert_eq!(schema["anyOf"][0]["type"], "string");
+        assert_eq!(schema["anyOf"][1]["type"], "object");
+        assert_eq!(schema["anyOf"][1]["properties"]["foo"]["type"], "string");
+        assert_eq!(schema["nullable"], true);
     }
 
     #[test]
@@ -1909,14 +2369,15 @@ mod tests {
 
         clean_json_schema(&mut schema2);
 
-        let target_props = &schema2["properties"]["target"]["properties"];
-        assert!(target_props.get("type").is_some());
-        assert_eq!(target_props["type"]["type"], "string");
-        assert_eq!(target_props["type"]["enum"], json!(["element"]));
-        assert!(target_props["type"].get("const").is_none());
-
-        // 验证没有非合法的 Schema 结构 (如 properties 嵌套了 "element" 标量字符串)
-        assert!(target_props["type"].get("properties").is_none());
+        let branches = schema2["properties"]["target"]["anyOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        for (branch, discriminator) in branches.iter().zip(["element", "coordinate"]) {
+            let target_props = &branch["properties"];
+            assert_eq!(target_props["type"]["type"], "string");
+            assert_eq!(target_props["type"]["enum"], json!([discriminator]));
+            assert!(target_props["type"].get("const").is_none());
+            assert!(target_props["type"].get("properties").is_none());
+        }
     }
 
     #[test]
@@ -2187,9 +2648,6 @@ mod tests {
 
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["items"], json!({ "type": "string" }));
-        assert!(schema["description"]
-            .as_str()
-            .unwrap_or("")
-            .contains("(nullable)"));
+        assert_eq!(schema["nullable"], true);
     }
 }

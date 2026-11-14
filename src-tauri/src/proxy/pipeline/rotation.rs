@@ -34,6 +34,54 @@ pub fn set_request_429_grace_ms(ms: u64) {
     REQUEST_429_GRACE_MS.store(ms.clamp(200, 10_000), Ordering::Relaxed);
 }
 
+fn is_hard_quota_exhausted(error_text: &str, delay_ms: Option<u64>) -> bool {
+    match UpstreamClassification::structured_429_signal(error_text) {
+        Some(Structured429Signal::HardQuota) => true,
+        Some(Structured429Signal::RequestLevel)
+        | Some(Structured429Signal::ExplicitDelay)
+        | Some(Structured429Signal::Unknown) => false,
+        None => {
+            let lower = error_text.to_lowercase();
+            (delay_ms.is_none() || delay_ms.is_some_and(|ms| ms > 1_800_000))
+                && (lower.contains("exceeded your current quota")
+                    || lower.contains("insufficient_quota")
+                    || lower.contains("credits")
+                    || lower.contains("zero_quota")
+                    || lower.contains("weekly quota")
+                    || lower.contains("daily quota")
+                    || lower.contains("per day")
+                    || lower.contains("individual quota")
+                    || lower.contains("quotaresetdelay")
+                    || (lower.contains("quota_exhausted")
+                        && (!lower.contains("resource has been exhausted")
+                            || lower.contains("quotaresetdelay"))))
+        }
+    }
+}
+
+pub(super) fn cache_first_preserves_failure(
+    status_code: u16,
+    error_text: &str,
+    retry_after: Option<&str>,
+    scheduling: &crate::proxy::sticky_config::StickySessionConfig,
+    cache_bound: bool,
+) -> bool {
+    if scheduling.mode != crate::proxy::sticky_config::SchedulingMode::CacheFirst || !cache_bound {
+        return false;
+    }
+    let classification = UpstreamClassification::classify(status_code, error_text, retry_after);
+    if classification.is_model_not_found() || classification.is_internal_gateway_message() {
+        return false;
+    }
+    if status_code == 429 {
+        let delay_ms = crate::proxy::upstream::retry::parse_retry_delay(error_text, retry_after);
+        !is_hard_quota_exhausted(error_text, delay_ms)
+            && !delay_ms.is_some_and(|ms| ms > scheduling.max_wait_seconds.saturating_mul(1000))
+    } else {
+        matches!(status_code, 500 | 502 | 503 | 504 | 529)
+    }
+}
+
 /// 重试策略枚举
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryStrategy {
@@ -54,9 +102,18 @@ pub struct RequestRetryState {
     grace_retried_accounts: HashSet<String>,
     /// 已在本次请求内因上游终态原地重放过的账号（每账号每请求至多一次）
     terminal_retried_accounts: HashSet<String>,
+    /// Only server retry policy may set the response marker consumed by outer gateways.
+    preserve_cache_affinity: bool,
 }
 
 impl RequestRetryState {
+    /// Response policy belongs to the current attempt; retry allowances belong
+    /// to the whole request. Call after the global budget gate so exhausting the
+    /// budget while waiting still retains the previous protective decision.
+    pub fn begin_attempt(&mut self) {
+        self.preserve_cache_affinity = false;
+    }
+
     /// 上游终态（首字节 / 上传 / 传输层断连 / 全局预算 / 重放上限）后的统一裁决
     ///
     /// 四个协议适配器共用：调度模式只在这里参与决策，适配器只执行返回的计划。
@@ -79,7 +136,125 @@ impl RequestRetryState {
             self.terminal_retried_accounts
                 .insert(account_id.to_string());
         }
+        self.preserve_on_stop(mode, cache_bound);
         plan
+    }
+
+    pub fn preserve_on_stop(
+        &mut self,
+        mode: crate::proxy::sticky_config::SchedulingMode,
+        cache_bound: bool,
+    ) -> bool {
+        self.preserve_cache_affinity =
+            mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst && cache_bound;
+        self.preserve_cache_affinity
+    }
+
+    /// A bound account still cooling down is an intentional CacheFirst stop, not
+    /// pool exhaustion. The TokenManager generates this prefix internally.
+    pub fn preserve_token_error(&mut self, error: &str) {
+        self.preserve_cache_affinity = error.starts_with("CacheFirst bound account ")
+            || crate::proxy::session_bindings::is_session_binding_changed_error(error);
+    }
+
+    /// Collection may already have consumed output: preserve affinity without replaying.
+    pub fn preserve_http_stop(
+        &mut self,
+        status_code: u16,
+        error_text: &str,
+        scheduling: &crate::proxy::sticky_config::StickySessionConfig,
+        cache_bound: bool,
+    ) {
+        self.preserve_cache_affinity =
+            cache_first_preserves_failure(status_code, error_text, None, scheduling, cache_bound);
+    }
+
+    /// Authorize a prepared payload repair before publishing its body/flag changes.
+    /// CacheFirst transient repairs share the bounded replay of HTTP/transport retries.
+    /// Request repairs and other modes retain their existing per-repair limits.
+    pub fn authorize_payload_repair(
+        &mut self,
+        account_id: &str,
+        requested_delay_ms: u64,
+        server_delay_ms: Option<u64>,
+        scheduling: &crate::proxy::sticky_config::StickySessionConfig,
+        cache_bound: bool,
+    ) -> Option<u64> {
+        let preserve = scheduling.mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst
+            && cache_bound;
+        let delay_ms = requested_delay_ms.max(server_delay_ms.unwrap_or(0));
+        if crate::proxy::upstream::request_policy::request_policy().single_attempt
+            || crate::proxy::pipeline::budget::remaining_secs().is_some_and(|remaining| {
+                delay_ms
+                    .saturating_add(crate::proxy::pipeline::budget::MIN_ATTEMPT_BUDGET_SECS * 1000)
+                    > remaining.saturating_mul(1000)
+            })
+            || (preserve
+                && (delay_ms > scheduling.max_wait_seconds.saturating_mul(1000)
+                    || self.terminal_retried_accounts.contains(account_id)))
+        {
+            return None;
+        }
+        if preserve {
+            self.terminal_retried_accounts
+                .insert(account_id.to_string());
+            self.preserve_cache_affinity = true;
+        }
+        Some(delay_ms)
+    }
+
+    /// Keep transient text failures on their warm account in CacheFirst mode.
+    /// Shares the terminal replay allowance, so alternating HTTP/transport failures
+    /// cannot grant fresh retries. Invalid credentials, unavailable models and hard
+    /// quota exhaustion retain the ordinary account recovery policy.
+    pub fn cache_first_failure(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        scheduling: &crate::proxy::sticky_config::StickySessionConfig,
+        cache_bound: bool,
+    ) -> Option<RetryStrategy> {
+        self.preserve_cache_affinity = cache_first_preserves_failure(
+            status_code,
+            error_text,
+            retry_after,
+            scheduling,
+            cache_bound,
+        );
+        if !self.preserve_cache_affinity {
+            return None;
+        }
+        let delay_ms = crate::proxy::upstream::retry::parse_retry_delay(error_text, retry_after);
+        let delay_ms = delay_ms.unwrap_or_else(|| REQUEST_429_GRACE_MS.load(Ordering::Relaxed));
+        // Do not retry before a server-specified delay or wait beyond the user's cap.
+        if delay_ms > scheduling.max_wait_seconds.saturating_mul(1000)
+            || crate::proxy::pipeline::budget::remaining_secs()
+                .is_some_and(|remaining| delay_ms >= remaining.saturating_mul(1000))
+            || crate::proxy::upstream::request_policy::request_policy().single_attempt
+            || !self
+                .terminal_retried_accounts
+                .insert(account_id.to_string())
+        {
+            return Some(RetryStrategy::NoRetry);
+        }
+        Some(RetryStrategy::GraceRetry(Duration::from_millis(delay_ms)))
+    }
+
+    /// A CacheFirst stop must survive an outer gateway's normal 502/503 failover.
+    /// This is a response-only signal; no incoming header is consulted.
+    pub fn finish_error_response(
+        &self,
+        mut response: axum::response::Response,
+    ) -> axum::response::Response {
+        if self.preserve_cache_affinity {
+            response.headers_mut().insert(
+                "x-am-cache-affinity",
+                axum::http::HeaderValue::from_static("preserve"),
+            );
+        }
+        response
     }
 
     pub fn determine_strategy(
@@ -189,6 +364,15 @@ pub fn next_rotation_attempt(
         max_attempts,
         retry_same_account,
     )
+}
+
+/// A token acquisition timeout does not invalidate the warm account. Preserve an
+/// explicit rotation already requested by credential/quota recovery.
+pub fn token_retry_force_rotate(
+    force_rotate: bool,
+    mode: crate::proxy::sticky_config::SchedulingMode,
+) -> bool {
+    force_rotate || mode != crate::proxy::sticky_config::SchedulingMode::CacheFirst
 }
 
 /// 调度模式是否允许「在当前账号原地等待」（GraceRetry）
@@ -331,40 +515,14 @@ pub fn determine_retry_strategy_adaptive(
             // 注意：Google 标准通用 429 的 "resource has been exhausted (e.g. check quota)" 属于无明确延迟的通用流控/TPM拒绝，
             // 严禁归入硬配额，否则将导致全池快速轮换遍历并引发全池 30 秒级联锁定 (#3506)。
             // 但若明确包含 multi-day/跨小时超长重置延迟 (如 quotaResetDelay: 68h / retryDelay > 30min)，则明确属于周期硬配额耗尽。
-            let is_long_delay = parsed_delay
-                .as_ref()
-                .map(|d| d.actual_wait_ms() > 1800_000)
-                .unwrap_or(false);
             // [Fixes #3901] 结构化 429 信号优先于消息关键词：
             // - QuotaFailure → 账号级硬配额，快速切号；
             // - RetryInfo / 请求级 / 未知 details → 不作为硬配额，交给后续 GraceRetry/轮换逻辑；
             // - 无结构化 details 时才回退到关键词表。
-            let structured_429 = if status_code == 429 {
-                UpstreamClassification::structured_429_signal(error_text)
-            } else {
-                None
-            };
-            let is_hard_quota_exhausted = match structured_429 {
-                Some(Structured429Signal::HardQuota) => true,
-                Some(Structured429Signal::RequestLevel)
-                | Some(Structured429Signal::ExplicitDelay)
-                | Some(Structured429Signal::Unknown) => false,
-                None => {
-                    (parsed_delay.is_none() || is_long_delay)
-                        && (lower.contains("exceeded your current quota")
-                            || lower.contains("insufficient_quota")
-                            || lower.contains("credits")
-                            || lower.contains("zero_quota")
-                            || lower.contains("weekly quota")
-                            || lower.contains("daily quota")
-                            || lower.contains("per day")
-                            || lower.contains("individual quota")
-                            || lower.contains("quotaresetdelay")
-                            || (lower.contains("quota_exhausted")
-                                && (!lower.contains("resource has been exhausted")
-                                    || lower.contains("quotaresetdelay"))))
-                }
-            };
+            let is_hard_quota_exhausted = is_hard_quota_exhausted(
+                error_text,
+                parsed_delay.as_ref().map(|d| d.actual_wait_ms()),
+            );
 
             // 多账号环境下，账号级硬配额枯竭在第一轮立即切换下一个账号（50ms 闪电切号，避免 CPU 空转并快速恢复响应）
             if is_hard_quota_exhausted && attempt < pool_size {
@@ -701,6 +859,293 @@ pub fn record_attempted_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_repair_shares_cache_first_replay_allowance() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        assert_eq!(
+            state.authorize_payload_repair("warm", 50, None, &scheduling, true),
+            Some(50)
+        );
+        assert_eq!(
+            state.cache_first_failure("warm", 503, "overloaded", None, &scheduling, true),
+            Some(RetryStrategy::NoRetry)
+        );
+
+        let mut state = RequestRetryState::default();
+        assert!(matches!(
+            state.cache_first_failure("warm", 503, "overloaded", None, &scheduling, true),
+            Some(RetryStrategy::GraceRetry(_))
+        ));
+        assert_eq!(
+            state.authorize_payload_repair("warm", 50, None, &scheduling, true),
+            None
+        );
+    }
+
+    #[test]
+    fn payload_repair_respects_server_delay_and_wait_cap() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            max_wait_seconds: 2,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        assert_eq!(
+            state.authorize_payload_repair("warm", 50, Some(3000), &scheduling, true),
+            None
+        );
+        assert!(state.terminal_retried_accounts.is_empty());
+        assert_eq!(
+            state.authorize_payload_repair("warm", 50, Some(1000), &scheduling, true),
+            Some(1000)
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_repair_reserves_budget_for_next_attempt() {
+        use crate::proxy::pipeline::budget;
+        let ctx = budget::RequestContext::new(std::time::Instant::now() + Duration::from_secs(4));
+        budget::scope(ctx, async {
+            let mut state = RequestRetryState::default();
+            assert_eq!(
+                state.authorize_payload_repair("warm", 50, None, &Default::default(), true),
+                None
+            );
+            assert!(state.terminal_retried_accounts.is_empty());
+        })
+        .await;
+    }
+
+    #[test]
+    fn cache_first_new_attempt_clears_response_marker_but_keeps_retry_budget() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        assert!(matches!(
+            state.cache_first_failure("warm", 503, "temporary", None, &scheduling, true),
+            Some(RetryStrategy::GraceRetry(_))
+        ));
+        state.begin_attempt();
+        assert!(!state
+            .finish_error_response(axum::response::Response::new(axum::body::Body::empty()))
+            .headers()
+            .contains_key("x-am-cache-affinity"));
+        assert_eq!(
+            state.cache_first_failure("warm", 503, "temporary", None, &scheduling, true),
+            Some(RetryStrategy::NoRetry)
+        );
+    }
+
+    #[test]
+    fn cache_first_token_retry_keeps_explicit_recovery_only() {
+        use crate::proxy::sticky_config::SchedulingMode;
+        assert!(!token_retry_force_rotate(false, SchedulingMode::CacheFirst));
+        assert!(token_retry_force_rotate(true, SchedulingMode::CacheFirst));
+        assert!(token_retry_force_rotate(false, SchedulingMode::Balance));
+        assert!(token_retry_force_rotate(
+            false,
+            SchedulingMode::PerformanceFirst
+        ));
+    }
+
+    #[test]
+    fn collection_and_cooldown_stops_mark_only_cache_preserving_errors() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        state.preserve_http_stop(503, "upstream interrupted", &scheduling, true);
+        assert!(state.preserve_cache_affinity);
+        assert!(
+            state.terminal_retried_accounts.is_empty(),
+            "collection must not schedule a replay"
+        );
+        state.preserve_http_stop(429, "insufficient_quota", &scheduling, true);
+        assert!(!state.preserve_cache_affinity);
+        state.preserve_token_error(
+            "CacheFirst bound account is still in QoS cooldown or probing; retry later.",
+        );
+        assert!(state.preserve_cache_affinity);
+        state.preserve_token_error("Token pool is empty");
+        assert!(!state.preserve_cache_affinity);
+        assert!(!state.preserve_on_stop(SchedulingMode::Balance, true));
+        assert!(!state.preserve_on_stop(SchedulingMode::CacheFirst, false));
+    }
+
+    #[test]
+    fn cache_first_transient_failures_retry_once_and_keep_outer_affinity() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        for status in [429, 500, 502, 503, 504, 529] {
+            let mut state = RequestRetryState::default();
+            let first = state.cache_first_failure(
+                "warm",
+                status,
+                "temporary error",
+                None,
+                &scheduling,
+                true,
+            );
+            assert!(
+                matches!(first, Some(RetryStrategy::GraceRetry(_))),
+                "{status}"
+            );
+            assert_eq!(
+                state.cache_first_failure(
+                    "warm",
+                    status,
+                    "temporary error",
+                    None,
+                    &scheduling,
+                    true
+                ),
+                Some(RetryStrategy::NoRetry),
+                "{status} must stop on its warm account"
+            );
+            let response = state
+                .finish_error_response(axum::response::Response::new(axum::body::Body::empty()));
+            assert_eq!(response.headers()["x-am-cache-affinity"], "preserve");
+        }
+    }
+
+    #[test]
+    fn cache_first_does_not_block_account_recovery_or_image_routing() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let mut scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let quota =
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure"}]}}"#;
+        for (status, body, retry_after, cache_bound) in [
+            (401, "unauthorized", None, true),
+            (403, "forbidden", None, true),
+            (500, "model not found", None, true),
+            (502, "no quota accounts", None, true),
+            (429, "insufficient_quota", None, true),
+            (429, quota, None, true),
+            (429, "temporary rate limit", Some("61"), true),
+            (503, "temporary error", None, false),
+        ] {
+            let mut state = RequestRetryState::default();
+            assert_eq!(
+                state.cache_first_failure(
+                    "warm",
+                    status,
+                    body,
+                    retry_after,
+                    &scheduling,
+                    cache_bound
+                ),
+                None
+            );
+            let response = state
+                .finish_error_response(axum::response::Response::new(axum::body::Body::empty()));
+            assert!(!response.headers().contains_key("x-am-cache-affinity"));
+        }
+        for mode in [SchedulingMode::Balance, SchedulingMode::PerformanceFirst] {
+            scheduling.mode = mode;
+            assert_eq!(
+                RequestRetryState::default().cache_first_failure(
+                    "warm",
+                    503,
+                    "temporary",
+                    None,
+                    &scheduling,
+                    true
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn cache_first_http_and_transport_share_the_replay_allowance() {
+        use crate::proxy::pipeline::terminal::{TerminalNextStep, UpstreamTerminal};
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        assert!(matches!(
+            state.cache_first_failure("warm", 503, "temporary", None, &scheduling, true),
+            Some(RetryStrategy::GraceRetry(_))
+        ));
+        let plan = state.plan_terminal(
+            "warm",
+            UpstreamTerminal::TransportReset.disposition(),
+            scheduling.mode,
+            true,
+        );
+        assert_eq!(plan.next, TerminalNextStep::Stop);
+        assert!(!plan.abandon_sticky_account);
+
+        let mut state = RequestRetryState::default();
+        assert_eq!(
+            state
+                .plan_terminal(
+                    "warm",
+                    UpstreamTerminal::TransportReset.disposition(),
+                    scheduling.mode,
+                    true
+                )
+                .next,
+            TerminalNextStep::RetrySameAccount
+        );
+        assert_eq!(
+            state.cache_first_failure("warm", 429, "temporary", None, &scheduling, true),
+            Some(RetryStrategy::NoRetry)
+        );
+        // A genuine credential failure after a retry must not inherit the stop marker.
+        assert_eq!(
+            state.cache_first_failure("warm", 401, "unauthorized", None, &scheduling, true),
+            None
+        );
+        assert!(!state
+            .finish_error_response(axum::response::Response::new(axum::body::Body::empty()))
+            .headers()
+            .contains_key("x-am-cache-affinity"));
+    }
+
+    #[test]
+    fn cache_first_honors_retry_delay_and_wait_cap() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+        let scheduling = StickySessionConfig {
+            mode: SchedulingMode::CacheFirst,
+            max_wait_seconds: 2,
+            ..Default::default()
+        };
+        let mut state = RequestRetryState::default();
+        assert_eq!(
+            state.cache_first_failure("warm", 429, "temporary", Some("2"), &scheduling, true),
+            Some(RetryStrategy::GraceRetry(Duration::from_secs(2)))
+        );
+        let mut state = RequestRetryState::default();
+        assert_eq!(
+            state.cache_first_failure("warm", 503, "temporary", Some("3"), &scheduling, true),
+            Some(RetryStrategy::NoRetry)
+        );
+        assert!(state
+            .finish_error_response(axum::response::Response::new(axum::body::Body::empty()))
+            .headers()
+            .contains_key("x-am-cache-affinity"));
+    }
 
     #[test]
     fn terminal_retries_same_account_only_once_per_request() {

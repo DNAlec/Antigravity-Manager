@@ -100,6 +100,44 @@ impl InboundThinkingPipeline {
         session_id: Option<&str>,
         is_retry: bool,
     ) {
+        Self::process_contents_with_text_stage(
+            contents,
+            target_model,
+            is_thinking_enabled,
+            session_id,
+            is_retry,
+            false,
+        );
+    }
+
+    /// Request mappers defer text hydration until the handler has finished
+    /// sanitization/context transforms; direct pipeline callers retain the
+    /// complete hydration contract above.
+    pub fn process_contents_deferred_text(
+        contents: &mut Vec<Value>,
+        target_model: &str,
+        is_thinking_enabled: bool,
+        session_id: Option<&str>,
+        is_retry: bool,
+    ) {
+        Self::process_contents_with_text_stage(
+            contents,
+            target_model,
+            is_thinking_enabled,
+            session_id,
+            is_retry,
+            true,
+        );
+    }
+
+    fn process_contents_with_text_stage(
+        contents: &mut Vec<Value>,
+        target_model: &str,
+        is_thinking_enabled: bool,
+        session_id: Option<&str>,
+        is_retry: bool,
+        defer_text: bool,
+    ) {
         let is_claude = target_model.to_lowercase().contains("claude");
 
         // 0. 工具调用 ID 统一归一化治理（Pipeline First）：
@@ -162,6 +200,14 @@ impl InboundThinkingPipeline {
 
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 if is_model {
+                    // The late text stage must capture new client thoughts
+                    // before applying the final target-family wire shape.
+                    let defer_turn_thought = defer_text
+                        && is_thinking_enabled
+                        && !is_retry
+                        && !parts.iter().any(|p| {
+                            p.get("functionCall").is_some() || p.get("functionResponse").is_some()
+                        });
                     let mut thinking_part = None;
                     let mut extra_thinking_parts = Vec::new();
                     let mut other_parts = Vec::new();
@@ -282,12 +328,15 @@ impl InboundThinkingPipeline {
 
                             // Gemini 历史不回传思考正文（Mac IDE 0 次回传，桌面端回传也能通）。
                             // Claude 两边都回传思考正文，保留。
-                            if is_claude {
+                            if is_claude || defer_turn_thought {
                                 if thinking_part.is_none() {
                                     thinking_part = Some(thought_obj);
                                 } else if !final_thought_text.is_empty() {
-                                    extra_thinking_parts
-                                        .push(json!({ "text": final_thought_text }));
+                                    extra_thinking_parts.push(if defer_turn_thought {
+                                        json!({ "text": final_thought_text, "thought": true })
+                                    } else {
+                                        json!({ "text": final_thought_text })
+                                    });
                                 }
                             }
                         } else {
@@ -461,7 +510,7 @@ impl InboundThinkingPipeline {
                     // Anthropic 验签引擎约束：若存在 thought: true 部件，该轮必须具有合法真实签名；
                     // 若该轮没有任何合法的 Claude 真实签名（例如从 Gemini 跨模型切过来，或无签名的历史思考）：
                     // 严禁组装出无签名的 thought: true 部件。有其他部件时直接丢弃思考块；无其他部件时降级为纯文本。
-                    if is_claude {
+                    if is_claude && !defer_turn_thought {
                         let claude_has_sig = placeholder_sig.as_deref().is_some_and(|s| {
                             crate::proxy::thinking_store::is_real_signature(s)
                                 && crate::proxy::thinking_store::is_claude_signature(s)
@@ -513,7 +562,6 @@ impl InboundThinkingPipeline {
                 // 1. 若客户端回传的 functionCall.args 为 JSON 字符串，尝试反序列化为 Object，防上游 400
                 // 2. 若客户端回传的 functionResponse.response 为非 Object，自动包装为 {"output": response}
                 // 3. 多模态工具响应深度解构：确保全协议 (OpenAI / Claude / Gemini / Responses) 的工具结果中夹带的图片均被提升为独立的 inlineData 视觉感知输入
-                let mut extra_inline_parts = Vec::new();
                 for part in parts.iter_mut() {
                     if let Some(fc) = part.get_mut("functionCall") {
                         if let Some(args_val) = fc.get_mut("args") {
@@ -527,6 +575,7 @@ impl InboundThinkingPipeline {
                         }
                     }
                     if let Some(fr) = part.get_mut("functionResponse") {
+                        let mut extra_inline_parts = Vec::new();
                         // 不按工具名豁免。名字会随协议改写（local_shell_call → shell）。
                         // 日志里的 data:image 由 extract_multimodal_from_tool_text 按形态拒绝。
                         if let Some(resp) = fr.get_mut("response") {
@@ -563,9 +612,16 @@ impl InboundThinkingPipeline {
                                 }
                             }
                         }
+                        if !extra_inline_parts.is_empty() {
+                            if let Some(obj) = fr.as_object_mut() {
+                                let media = obj.entry("parts").or_insert_with(|| json!([]));
+                                if let Some(media) = media.as_array_mut() {
+                                    media.extend(extra_inline_parts);
+                                }
+                            }
+                        }
                     }
                 }
-                parts.extend(extra_inline_parts);
             }
         }
 
@@ -580,31 +636,45 @@ impl InboundThinkingPipeline {
         });
         if (is_thinking_enabled || has_function_call) && !is_retry {
             if let Some(s_id) = session_id {
-                crate::proxy::thinking_store::hydrate_gemini_contents_with_model(
-                    s_id,
-                    contents,
-                    Some(target_model),
-                );
+                if defer_text {
+                    crate::proxy::thinking_store::hydrate_gemini_tool_contents_with_model(
+                        s_id,
+                        contents,
+                        Some(target_model),
+                    );
+                } else {
+                    crate::proxy::thinking_store::hydrate_gemini_contents_with_model(
+                        s_id,
+                        contents,
+                        Some(target_model),
+                    );
+                }
             }
         }
 
         // 3. 终审把关与脱敏规范化 (Finalize)
-        crate::proxy::thinking_store::finalize_gemini_contents_thinking_with_options(
-            contents,
-            is_thinking_enabled,
-            Some(target_model),
-            session_id,
-            is_retry,
-        );
+        if defer_text {
+            crate::proxy::thinking_store::finalize_gemini_tool_contents_thinking_with_options(
+                contents,
+                is_thinking_enabled,
+                Some(target_model),
+                session_id,
+                is_retry,
+            );
+        } else {
+            crate::proxy::thinking_store::finalize_gemini_contents_thinking_with_options(
+                contents,
+                is_thinking_enabled,
+                Some(target_model),
+                session_id,
+                is_retry,
+            );
+        }
 
-        // 4. 工具回执 role 归一化（对齐官方 Antigravity 形态，Gemini -> model, Claude -> user）。
-        //    必须放在**末位**：若前置，回执轮会进入上面的 `is_model` 分支，
-        //    从而跳过 `role == "user"` 分支里的多模态解构（图片提升为 inlineData）。
-        Self::normalize_function_response_roles(contents, target_model);
-
-        // 5. 全协议多模态保鲜滑动窗口与累积容量治理（Pipeline First）：
+        // Prune while media still belongs to its tool result. Legacy projection
+        // below numbers only the surviving images, including parallel calls.
         let multimodal_cfg = crate::proxy::config::get_multimodal_config();
-        Self::apply_multimodal_sliding_window_and_limits(contents, &multimodal_cfg);
+        Self::finalize_tool_media(contents, target_model, &multimodal_cfg);
     }
 
     /// [Signature-Retry] 流水线统一处理签名（协议无关）。
@@ -807,17 +877,18 @@ impl InboundThinkingPipeline {
         stripped
     }
 
-    /// 全协议多模态历史保鲜滑动窗口与累积容量治理（Pipeline First）：
-    /// 1. 扫描所有 contents 中的图片 parts（包括 inlineData base64 与 fileData 远程直链）
-    /// 2. 若启用了保鲜滑动窗口（enable_sliding_window=true 且 max_fresh_images > 0）：
-    ///    - 逆序保鲜最近的 N 张图片（从最新轮次往前计数），保留其完整数据；
-    ///    - 对超出保鲜窗口的早期历史图片：
-    ///      * inlineData (Base64)：剥离 Base64 并替换为结构化占位符 `[Historical Image #k: omitted to preserve context (mime)]`
-    ///      * fileData (远程直链)：若 strip_remote_urls=true，亦替换为 `[Historical Remote Image #k: omitted to preserve context]`；否则完整保留 URL
-    /// 3. 内存防爆与累积容量兜底（max_total_image_mb）：
-    ///    - 统计剩余所有 inlineData 图片的总字节大小
-    ///    - 若依然超出上限，执行 LRU / Recency-First 淘汰：自底向上（从最早的历史轮次）继续将旧图剥离为占位符，
-    ///      绝对力保当前轮（最新轮次）的视觉感知输入完好无损！
+    fn finalize_tool_media(
+        contents: &mut Vec<Value>,
+        target_model: &str,
+        config: &crate::proxy::config::MultimodalConfig,
+    ) {
+        Self::apply_multimodal_sliding_window_and_limits(contents, config);
+        Self::normalize_function_response_roles(contents, target_model);
+    }
+
+    /// Apply one chronological count or decoded-byte window to top-level images
+    /// and anonymous tool attachments. Keep the newest image; remote URLs are
+    /// removed only when configured. Nested media cannot contain text markers.
     pub fn apply_multimodal_sliding_window_and_limits(
         contents: &mut [Value],
         config: &crate::proxy::config::MultimodalConfig,
@@ -827,148 +898,145 @@ impl InboundThinkingPipeline {
             return 0;
         }
 
-        let mut image_locations: Vec<(usize, usize, bool, String, usize)> = Vec::new();
-        // (content_idx, part_idx, is_remote, mime, approx_byte_len)
-
-        for (c_idx, content) in contents.iter().enumerate() {
-            if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-                for (p_idx, part) in parts.iter().enumerate() {
-                    let inline_obj = part.get("inlineData").or_else(|| part.get("inline_data"));
-                    if let Some(obj) = inline_obj {
-                        let mime = obj
-                            .get("mimeType")
-                            .or_else(|| obj.get("mime_type"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("image/png");
-                        if mime.starts_with("image/") || mime.is_empty() {
-                            let b64_len = obj
-                                .get("data")
-                                .and_then(Value::as_str)
-                                .map_or(0, |s| s.len());
-                            let approx_bytes = b64_len.saturating_mul(3) / 4;
-                            image_locations.push((
-                                c_idx,
-                                p_idx,
-                                false,
-                                mime.to_string(),
-                                approx_bytes,
-                            ));
+        // Walk only protocol-owned media. In particular functionResponse.response
+        // is arbitrary tool data, and a named attachment may be referenced by it.
+        fn image(part: &Value, nested: bool) -> Option<(&str, Option<usize>)> {
+            let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
+            let obj = inline
+                .or_else(|| part.get("fileData"))
+                .or_else(|| part.get("file_data"))?;
+            if nested {
+                let fields = obj.as_object()?;
+                // Drop only plain anonymous blobs/URIs that we understand in full.
+                let allowed = |key: &str| {
+                    matches!(key, "mimeType" | "mime_type")
+                        || if inline.is_some() {
+                            key == "data"
+                        } else {
+                            matches!(key, "fileUri" | "file_uri")
                         }
-                    } else {
-                        let file_obj = part.get("fileData").or_else(|| part.get("file_data"));
-                        if let Some(obj) = file_obj {
-                            let uri = obj
-                                .get("fileUri")
-                                .or_else(|| obj.get("file_uri"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            let mime = obj
-                                .get("mimeType")
-                                .or_else(|| obj.get("mime_type"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("image/jpeg");
-                            if uri.starts_with("http://") || uri.starts_with("https://") {
-                                image_locations.push((
-                                    c_idx,
-                                    p_idx,
-                                    true,
-                                    mime.to_string(),
-                                    uri.len(),
-                                ));
-                            }
-                        }
-                    }
+                };
+                if part.as_object()?.len() != 1 || !fields.keys().all(|k| allowed(k)) {
+                    return None;
                 }
+            }
+            let mime = obj
+                .get("mimeType")
+                .or_else(|| obj.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or(if inline.is_some() {
+                    "image/png"
+                } else {
+                    "image/jpeg"
+                });
+            if !mime.starts_with("image/") && !mime.is_empty() {
+                return None;
+            }
+            if inline.is_some() {
+                let data = obj.get("data").and_then(Value::as_str);
+                if nested && data.is_none() {
+                    return None;
+                }
+                Some((mime, Some(data.map_or(0, str::len).saturating_mul(3) / 4)))
+            } else {
+                let uri = obj
+                    .get("fileUri")
+                    .or_else(|| obj.get("file_uri"))
+                    .and_then(Value::as_str)?;
+                (uri.starts_with("https://") || uri.starts_with("http://")).then_some((mime, None))
             }
         }
 
-        let total_images = image_locations.len();
-        if total_images == 0 {
-            return 0;
+        let mut sizes = Vec::new();
+        for part in contents
+            .iter()
+            .filter_map(|c| c["parts"].as_array())
+            .flatten()
+        {
+            if let Some((_, bytes)) = image(part, false) {
+                sizes.push(bytes);
+            } else if let Some(children) = part
+                .get("functionResponse")
+                .or_else(|| part.get("function_response"))
+                .and_then(|r| r["parts"].as_array())
+            {
+                sizes.extend(
+                    children
+                        .iter()
+                        .filter_map(|child| image(child, true).map(|(_, bytes)| bytes)),
+                );
+            }
         }
-
-        let mut pruned_count = 0;
-
-        if config.strategy.eq_ignore_ascii_case("memory") {
-            // =========================================================================
-            // 策略二：基于累积内存体积滑动保鲜 (Memory-Based Strategy)
-            // 逆序从最新轮次往前回溯累加 Base64 字节，超出配额的更早历史图片剥离降级
-            // =========================================================================
-            let budget_bytes = config.max_total_image_mb.max(1).saturating_mul(1024 * 1024);
-            let mut accumulated_bytes = 0usize;
-            let mut keep_from_idx = 0usize;
-
-            // 逆序扫描：从最新的一张图片（total_images - 1）往回计算
-            for (i, (_, _, is_remote, _, bytes)) in image_locations.iter().enumerate().rev() {
-                if !*is_remote {
-                    // 最新的一张图片永远保留；其余图片在预算内保留
-                    if accumulated_bytes.saturating_add(*bytes) <= budget_bytes
-                        || i == total_images - 1
-                    {
-                        accumulated_bytes = accumulated_bytes.saturating_add(*bytes);
-                    } else {
-                        keep_from_idx = i + 1;
+        let total_images = sizes.len();
+        let memory = config.strategy.eq_ignore_ascii_case("memory");
+        let keep_from = if memory {
+            let budget = config.max_total_image_mb.max(1).saturating_mul(1024 * 1024);
+            let mut used = 0usize;
+            let mut first = 0;
+            for (i, size) in sizes.iter().enumerate().rev() {
+                if let Some(bytes) = size {
+                    used = used.saturating_add(*bytes);
+                    if used > budget && i != total_images - 1 {
+                        first = i + 1;
                         break;
                     }
                 }
             }
-
-            // 对超出内存预算的早期历史图片进行剥离
-            for i in 0..keep_from_idx {
-                let (c_idx, p_idx, is_remote, mime, _) = &image_locations[i];
-                let seq = i + 1;
-                if *is_remote {
-                    if config.strip_remote_urls {
-                        if let Some(parts) = contents[*c_idx]
-                            .get_mut("parts")
-                            .and_then(Value::as_array_mut)
-                        {
-                            parts[*p_idx] = json!({
-                                "text": format!("[Historical Remote Image #{}: omitted due to memory budget]", seq)
-                            });
-                            pruned_count += 1;
-                        }
-                    }
-                } else if let Some(parts) = contents[*c_idx]
-                    .get_mut("parts")
-                    .and_then(Value::as_array_mut)
-                {
-                    parts[*p_idx] = json!({
-                        "text": format!("[Historical Image #{}: omitted due to memory budget ({}, {} MB max)]", seq, mime, config.max_total_image_mb)
-                    });
-                    pruned_count += 1;
-                }
-            }
+            first
+        } else if config.max_fresh_images > 0 {
+            total_images.saturating_sub(config.max_fresh_images)
         } else {
-            // =========================================================================
-            // 策略一：基于图片张数滑动保鲜 (Count-Based Strategy)
-            // 逆序保鲜最近的 N 张图片，超过 N 张的早期历史图片剥离降级
-            // =========================================================================
-            if config.max_fresh_images > 0 && total_images > config.max_fresh_images {
-                let to_prune = total_images.saturating_sub(config.max_fresh_images);
-                for i in 0..to_prune {
-                    let (c_idx, p_idx, is_remote, mime, _) = &image_locations[i];
-                    let seq = i + 1;
-                    if *is_remote {
-                        if config.strip_remote_urls {
-                            if let Some(parts) = contents[*c_idx]
-                                .get_mut("parts")
-                                .and_then(Value::as_array_mut)
-                            {
-                                parts[*p_idx] = json!({
-                                    "text": format!("[Historical Remote Image #{}: omitted to preserve context]", seq)
-                                });
-                                pruned_count += 1;
-                            }
-                        }
-                    } else if let Some(parts) = contents[*c_idx]
-                        .get_mut("parts")
-                        .and_then(Value::as_array_mut)
-                    {
-                        parts[*p_idx] = json!({
-                            "text": format!("[Historical Image #{}: omitted to preserve context ({})]", seq, mime)
-                        });
-                        pruned_count += 1;
+            0
+        };
+        if keep_from == 0 {
+            return 0;
+        }
+
+        let mut index = 0;
+        let mut pruned_count = 0;
+        let mut prune = |remote: bool| {
+            index += 1;
+            if index <= keep_from && (!remote || config.strip_remote_urls) {
+                pruned_count += 1;
+                Some(index)
+            } else {
+                None
+            }
+        };
+        for part in contents
+            .iter_mut()
+            .filter_map(|c| c.get_mut("parts")?.as_array_mut())
+            .flatten()
+        {
+            if let Some((mime, bytes)) = image(part, false) {
+                if let Some(seq) = prune(bytes.is_none()) {
+                    let text = match (memory,bytes.is_none()) {
+                        (true,true) => format!("[Historical Remote Image #{seq}: omitted due to memory budget]"),
+                        (true,false) => format!("[Historical Image #{seq}: omitted due to memory budget ({mime}, {} MB max)]", config.max_total_image_mb),
+                        (false,true) => format!("[Historical Remote Image #{seq}: omitted to preserve context]"),
+                        (false,false) => format!("[Historical Image #{seq}: omitted to preserve context ({mime})]"),
+                    };
+                    *part = json!({"text":text});
+                }
+            } else {
+                let key = if part.get("functionResponse").is_some() {
+                    "functionResponse"
+                } else {
+                    "function_response"
+                };
+                let Some(response) = part.get_mut(key).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if let Some(children) = response.get_mut("parts").and_then(Value::as_array_mut) {
+                    let before = children.len();
+                    children.retain(|child| {
+                        !image(child, true)
+                            .is_some_and(|(_, bytes)| prune(bytes.is_none()).is_some())
+                    });
+                    // FunctionResponsePart accepts only media. The optional attachment
+                    // can disappear; its owner, status and application payload must not.
+                    if before != 0 && children.is_empty() {
+                        response.remove("parts");
                     }
                 }
             }
@@ -1369,7 +1437,10 @@ impl InboundThinkingPipeline {
         }
         /// part 是否仅为随行媒体（无文本、无回执、无调用）。
         fn is_media(p: &Value) -> bool {
-            (p.get("inlineData").is_some() || p.get("inline_data").is_some())
+            (p.get("inlineData").is_some()
+                || p.get("inline_data").is_some()
+                || p.get("fileData").is_some()
+                || p.get("file_data").is_some())
                 && p.get("text").is_none()
                 && !has_fr(p)
                 && p.get("functionCall").is_none()
@@ -1444,6 +1515,8 @@ impl InboundThinkingPipeline {
                                         resp_obj
                                             .insert("system_reminder".to_string(), json!(combined));
                                     }
+                                } else if resp_obj.contains_key("error") {
+                                    resp_obj.insert("system_reminder".to_string(), json!(combined));
                                 } else {
                                     resp_obj.insert("output".to_string(), json!(combined));
                                 }
@@ -1569,6 +1642,17 @@ impl InboundThinkingPipeline {
             merged.push(content);
         }
 
+        // Preserve nested image ownership on Gemini 3+. On older wire formats
+        // translate result images only after all adjacent results are merged,
+        // so references name their positions in the final group of images.
+        if !crate::proxy::model_specs::is_gemini_v3_or_above(target_model) {
+            for turn in &mut merged {
+                if let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) {
+                    Self::project_legacy_tool_images(parts);
+                }
+            }
+        }
+
         // [Pipeline First] 回执轮部件稳定双阶段分区（Stable Partition）：
         // 彻底根除并发多模态（带图）工具回执中媒体插队破坏 functionResponse 连续性的问题 (Fixes #3560, #3094)。
         // 严格遵循上游工具回执状态机规范：同一轮次中，所有的 functionResponse 必须紧凑连续置顶在前，
@@ -1654,6 +1738,100 @@ impl InboundThinkingPipeline {
         }
 
         rewritten
+    }
+
+    /// The legacy wire puts anonymous media after the whole group of results.
+    /// Add one-based media positions to the owning result when ambiguous.
+    /// Never detach a named attachment (a tool may refer to its displayName).
+    fn project_legacy_tool_images(parts: &mut Vec<Value>) {
+        let parallel = parts
+            .iter()
+            .filter(|p| p.get("functionResponse").is_some())
+            .count()
+            > 1;
+        let existing_media = parts
+            .iter()
+            .filter(|p| {
+                p.get("inlineData").is_some()
+                    || p.get("inline_data").is_some()
+                    || p.get("fileData").is_some()
+                    || p.get("file_data").is_some()
+            })
+            .count();
+        let mut lifted = Vec::new();
+        for part in parts.iter_mut() {
+            let Some(fr) = part
+                .get_mut("functionResponse")
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            if !fr
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    !items.is_empty()
+                        && items.iter().all(|p| {
+                            if !p.as_object().is_some_and(|obj| obj.len() == 1) {
+                                return false;
+                            }
+                            let (data, payload) = if let Some(data) =
+                                p.get("inlineData").or_else(|| p.get("inline_data"))
+                            {
+                                (data, "data")
+                            } else if let Some(data) =
+                                p.get("fileData").or_else(|| p.get("file_data"))
+                            {
+                                (
+                                    data,
+                                    if data.get("fileUri").is_some() {
+                                        "fileUri"
+                                    } else {
+                                        "file_uri"
+                                    },
+                                )
+                            } else {
+                                return false;
+                            };
+                            data.as_object().is_some_and(|d| {
+                                d.len() == 2
+                                    && d.get(payload)
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                                    && d.get("mimeType")
+                                        .or_else(|| d.get("mime_type"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                            })
+                        })
+                })
+            {
+                continue;
+            }
+            // Only the output/error envelopes produced by this bridge can
+            // accept our annotation. Do not overwrite caller-owned fields.
+            if !fr
+                .get("response")
+                .and_then(Value::as_object)
+                .is_some_and(|r| {
+                    (r.contains_key("output") || r.contains_key("error"))
+                        && r.keys()
+                            .all(|k| matches!(k.as_str(), "output" | "error" | "system_reminder"))
+                })
+            {
+                continue;
+            }
+            let Some(Value::Array(images)) = fr.remove("parts") else {
+                continue;
+            };
+            if parallel || existing_media > 0 {
+                let first = existing_media + lifted.len() + 1;
+                fr.get_mut("response").expect("validated response")["attached_media_positions"] =
+                    json!((first..first + images.len()).collect::<Vec<_>>());
+            }
+            lifted.extend(images);
+        }
+        parts.extend(lifted);
     }
 
     /// 统一进站思考配置与参数治理（流水线节点）：
@@ -2202,7 +2380,7 @@ impl InboundThinkingPipeline {
         // 核心规范（对齐官方抓包 Ground Truth）：
         // 1. Claude 模型对接 Anthropic 官方验签引擎，只认真实密码学签名，严禁注入任何哨兵！
         // 2. Gemini 原生工具调用：一轮中如果已有部件（首个工具或正文）携带真实签名，后续并发工具必须保持留空无签名状态；整轮无签名才给首个工具补 Base64 哨兵；
-        // 3. 跨模型切回 Gemini 时的异构工具调用（来自 Claude 的工具，如 toolu_ 前缀）：每一个异构 functionCall 均统一赋予 Base64 哨兵免检通行证，正文绝对不带哨兵！
+        // 3. 跨模型切回 Gemini 时的异构工具调用（来自 Claude 的工具，如 toolu_ 前缀）：仅对没有可恢复 Gemini 签名的 toolu_ 调用补哨兵；保留同轮其他部件。
         let is_claude = target_model.to_lowercase().contains("claude")
             || crate::models::OfficialModelCatalog::get(target_model)
                 .map(|m| m.is_claude())
@@ -2212,23 +2390,31 @@ impl InboundThinkingPipeline {
             if let Some(contents_arr) = canonical_contents.as_array_mut() {
                 for content in contents_arr.iter_mut() {
                     if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                        // 判定是否包含来自 Claude 的异构工具调用
-                        let has_foreign_claude_tools = parts.iter().any(|p| {
-                            p.get("functionCall")
-                                .and_then(|fc| fc.get("id"))
-                                .and_then(|id| id.as_str())
-                                .map_or(false, |id| id.starts_with("toolu_"))
-                        });
-
-                        if has_foreign_claude_tools {
-                            // 官方抓包第 41 段铁证：对来自 Claude 的异构工具调用，每一个 functionCall 均赋予 Base64 哨兵通行证
-                            for part in parts.iter_mut() {
-                                if part.get("functionCall").is_some() {
-                                    part["thoughtSignature"] =
-                                        json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE);
-                                }
+                        let mut saw_foreign_id = false;
+                        for part in parts.iter_mut() {
+                            if !part
+                                .pointer("/functionCall/id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id.starts_with("toolu_"))
+                            {
+                                continue;
                             }
-                        } else {
+                            saw_foreign_id = true;
+                            // ID namespaces are chosen by clients/adapters. A recovered
+                            // Gemini signature is stronger evidence than the tool ID.
+                            let signed = part
+                                .get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .and_then(Value::as_str)
+                                .is_some_and(
+                                    crate::proxy::thinking_store::is_likely_gemini_signature,
+                                );
+                            if !signed {
+                                part["thoughtSignature"] =
+                                    json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE);
+                            }
+                        }
+                        if !saw_foreign_id {
                             // Gemini 原生工具调用：仅当整轮没有任何签名时，才为首个 functionCall 补齐官方 Base64 哨兵；并发后续留空
                             let turn_has_signature = parts.iter().any(|p| {
                                 p.get("thoughtSignature")
@@ -2855,6 +3041,138 @@ impl InboundThinkingPipeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_mixed_tool_documents_and_images_keep_owner_on_legacy_targets() {
+        let media = vec![
+            json!({"inlineData":{"mimeType":"application/pdf","data":"JVBERg=="}}),
+            json!({"inlineData":{"mimeType":"image/png","data":"AQ=="}}),
+            json!({"fileData":{"mimeType":"application/pdf","fileUri":"https://example.org/report.pdf"}}),
+        ];
+        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
+            let mut turns = vec![
+                json!({"role":"user","parts":[{"text":"go"}]}),
+                json!({"role":"model","parts":[{"functionCall":{"name":"inspect","id":"a","args":{}}},{"functionCall":{"name":"inspect","id":"b","args":{}}}]}),
+                json!({"role":"user","parts":[{"functionResponse":{"id":"a","name":"inspect","response":{"output":"done"},"parts":media}},{"functionResponse":{"id":"b","name":"inspect","response":{"output":"done"}}}]}),
+            ];
+            super::InboundThinkingPipeline::finalize_tool_media(
+                &mut turns,
+                model,
+                &crate::proxy::config::MultimodalConfig::default(),
+            );
+            let parts: Vec<_> = turns
+                .iter()
+                .flat_map(|t| t["parts"].as_array().unwrap())
+                .collect();
+            let responses: Vec<_> = parts
+                .iter()
+                .filter_map(|p| p.get("functionResponse"))
+                .collect();
+            if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
+                assert_eq!(responses[0]["parts"], json!(media));
+            } else {
+                assert_eq!(
+                    responses[0]["response"]["attached_media_positions"],
+                    json!([1, 2, 3])
+                );
+                assert!(responses[0].get("parts").is_none());
+                let delivered: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p.get("inlineData").is_some() || p.get("fileData").is_some())
+                    .map(|p| (*p).clone())
+                    .collect();
+                assert_eq!(delivered, media);
+                if model.starts_with("gemini") {
+                    assert_eq!(turns.last().unwrap()["role"], "user");
+                }
+            }
+            assert!(responses[1].get("parts").is_none());
+            assert!(responses[1]["response"]
+                .get("attached_media_positions")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn r19_document_urls_do_not_consume_image_window_capacity() {
+        let mut turns = vec![json!({"role":"user","parts":[
+            {"inlineData":{"mimeType":"image/png","data":"AQ=="}},
+            {"fileData":{"mimeType":"application/pdf","fileUri":"https://example.org/a.pdf"}}
+        ]})];
+        let original = turns.clone();
+        let count = super::InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(
+            &mut turns,
+            &crate::proxy::config::MultimodalConfig {
+                max_fresh_images: 1,
+                strip_remote_urls: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(count, 0);
+        assert_eq!(turns, original);
+    }
+
+    #[test]
+    fn r19_media_window_numbers_surviving_attachments_by_owner() {
+        let image = |data| json!({"inlineData":{"mimeType":"image/png","data":data}});
+        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
+            for limit in [1, 2] {
+                let mut turns = vec![
+                    json!({"role":"user","parts":[{"text":"go"}]}),
+                    json!({"role":"model","parts":[{"functionCall":{"name":"inspect","id":"a","args":{}}},{"functionCall":{"name":"inspect","id":"b","args":{}}}]}),
+                    json!({"role":"user","parts":[{"functionResponse":{"name":"inspect","id":"a","response":{"output":"A"},"parts":[image("red")]}},{"functionResponse":{"name":"inspect","id":"b","response":{"output":"B"},"parts":[image("blue")]}}]}),
+                ];
+                super::InboundThinkingPipeline::finalize_tool_media(
+                    &mut turns,
+                    model,
+                    &crate::proxy::config::MultimodalConfig {
+                        max_fresh_images: limit,
+                        ..Default::default()
+                    },
+                );
+                let parts: Vec<_> = turns
+                    .iter()
+                    .flat_map(|t| t["parts"].as_array().unwrap())
+                    .collect();
+                let results: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| p.get("functionResponse"))
+                    .collect();
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0]["response"]["output"], "A");
+                assert_eq!(results[1]["response"]["output"], "B");
+                if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
+                    assert_eq!(
+                        results[0]["parts"][0]["inlineData"]["data"].as_str(),
+                        (limit == 2).then_some("red")
+                    );
+                    assert_eq!(results[1]["parts"][0]["inlineData"]["data"], "blue");
+                } else {
+                    let images: Vec<_> = parts.iter().filter_map(|p| p.get("inlineData")).collect();
+                    assert_eq!(images.len(), limit);
+                    assert_eq!(images.last().unwrap()["data"], "blue");
+                    if limit == 1 {
+                        assert!(results[0]["response"]
+                            .get("attached_media_positions")
+                            .is_none());
+                        assert_eq!(
+                            results[1]["response"]["attached_media_positions"],
+                            json!([1])
+                        );
+                    } else {
+                        assert_eq!(
+                            results[0]["response"]["attached_media_positions"],
+                            json!([1])
+                        );
+                        assert_eq!(
+                            results[1]["response"]["attached_media_positions"],
+                            json!([2])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -4386,6 +4704,92 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_share_the_top_level_count_and_memory_window() {
+        let cfg = crate::proxy::config::MultimodalConfig {
+            enable_sliding_window: true,
+            strategy: "count".into(),
+            max_fresh_images: 1,
+            strip_remote_urls: true,
+            max_total_image_mb: 1,
+        };
+        let inline = |data: &str| json!({"inlineData":{"mimeType":"image/png","data":data}});
+        let named =
+            json!({"inlineData":{"mimeType":"image/png","displayName":"referenced","data":"kept"}});
+        let pdf = json!({"file_data":{"mime_type":"application/pdf","file_uri":"https://example.org/book"}});
+        let remote =
+            json!({"fileData":{"mimeType":"image/png","fileUri":"https://example.org/image"}});
+        let payload =
+            json!({"error":{"parts":[inline("application data")],"attached_media_positions":[11]}});
+        let contents = vec![
+            json!({"role":"model","parts":[{"functionResponse":{"id":"A","name":"scan","response":payload,"parts":[inline("old"),remote,named,pdf]}}]}),
+            json!({"role":"model","parts":[inline("next"),{"functionResponse":{"id":"B","name":"scan","response":{"output":false},"parts":[inline("latest")]}}]}),
+        ];
+        let mut actual = contents.clone();
+        assert_eq!(
+            InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(&mut actual, &cfg),
+            3
+        );
+        assert_eq!(
+            actual[0]["parts"][0]["functionResponse"],
+            json!({"id":"A","name":"scan","response":payload,"parts":[named,pdf]})
+        );
+        assert_eq!(
+            actual[1]["parts"][0]["text"],
+            "[Historical Image #3: omitted to preserve context (image/png)]"
+        );
+        assert_eq!(actual[1]["parts"][1], contents[1]["parts"][1]);
+
+        let mut no_remote_prune = contents.clone();
+        let keep_remote = crate::proxy::config::MultimodalConfig {
+            strip_remote_urls: false,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(
+                &mut no_remote_prune,
+                &keep_remote
+            ),
+            2
+        );
+        assert_eq!(
+            no_remote_prune[0]["parts"][0]["functionResponse"]["parts"],
+            json!([remote, named, pdf])
+        );
+        let mut disabled = contents.clone();
+        assert_eq!(
+            InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(
+                &mut disabled,
+                &crate::proxy::config::MultimodalConfig {
+                    enable_sliding_window: false,
+                    ..cfg.clone()
+                }
+            ),
+            0
+        );
+        assert_eq!(disabled, contents);
+
+        let large_image = "A".repeat(1024 * 1024); // two decoded images exceed 1 MiB
+        let mut memory = vec![
+            json!({"parts":[{"function_response":{"id":"A","response":payload,"parts":[inline(&large_image)]}},inline(&large_image)]}),
+        ];
+        assert_eq!(
+            InboundThinkingPipeline::apply_multimodal_sliding_window_and_limits(
+                &mut memory,
+                &crate::proxy::config::MultimodalConfig {
+                    strategy: "memory".into(),
+                    ..cfg
+                }
+            ),
+            1
+        );
+        assert_eq!(
+            memory[0]["parts"][0]["function_response"],
+            json!({"id":"A","response":payload})
+        );
+        assert_eq!(memory[0]["parts"][1], inline(&large_image));
+    }
+
+    #[test]
     fn test_multimodal_sliding_window_remote_urls_option() {
         let mut contents = vec![
             json!({
@@ -5535,5 +5939,148 @@ mod tests {
         assert!(parts2[2].get("thoughtSignature").is_none());
         assert_eq!(parts2[3]["thoughtSignature"], claude_sig);
         assert!(parts2[4].get("thoughtSignature").is_none());
+    }
+}
+
+#[cfg(test)]
+mod mixed_tool_id_signature_tests {
+    use crate::proxy::pipeline::inbound::InboundThinkingPipeline as Pipe;
+    use crate::proxy::thinking_store::{
+        capture_gemini_response_with_context, compute_response_text_anchor,
+        finalize_request_text_context, is_sentinel_signature,
+    };
+    use base64::Engine;
+    use serde_json::{json, Value};
+    #[test]
+    fn signed_parallel_tools_survive_a_mixed_id_namespace() {
+        let sig = |seed: u8| {
+            let mut v = vec![0x12];
+            v.extend([seed; 48]);
+            base64::engine::general_purpose::STANDARD.encode(v)
+        };
+        let a = sig(b'A');
+        let b = sig(b'B');
+        let model = "gemini-2.5-flash";
+        for (label, ids) in [
+            ("native", &["call_A", "call_B"][..]),
+            ("bridge", &["toolu_generatedA", "toolu_generatedB"][..]),
+            ("mixed", &["call_A", "toolu_generatedB"][..]),
+        ] {
+            let sid = format!("r16-gate-{label}");
+            let user = json!({"role":"user","parts":[{"text":"Read both."}]});
+            let mut parts = vec![];
+            for (i, signature) in [&a, &b].into_iter().enumerate() {
+                parts.push(json!({"functionCall":{"name":format!("read_{i}"),"args":{}},"thoughtSignature":signature}));
+            }
+            let res = json!({"candidates":[{"content":{"role":"model","parts":parts.clone()},"finishReason":"STOP"}]});
+            capture_gemini_response_with_context(
+                &sid,
+                &res,
+                Some(&user),
+                Some(&compute_response_text_anchor(std::slice::from_ref(&user))),
+            );
+            for (i, id) in ids.iter().enumerate() {
+                parts[i]["functionCall"]["id"] = json!(id);
+            }
+            let mut h = vec![
+                user,
+                json!({"role":"model","parts":parts}),
+                json!({"role":"user","parts":[{"functionResponse":{"name":"read_0","response":{"output":"ok"}}},{"functionResponse":{"name":"read_1","response":{"output":"ok"}}}]}),
+            ];
+            Pipe::process_contents_deferred_text(&mut h, model, true, Some(&sid), false);
+            let signatures = |v: &Value| {
+                v[1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.get("functionCall").is_some())
+                    .map(|p| match p["thoughtSignature"].as_str() {
+                        Some(x) if x == a => "A",
+                        Some(x) if x == b => "B",
+                        Some(x) if is_sentinel_signature(x) => "sentinel",
+                        _ => "none",
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut body = json!({"contents":h});
+            let before = signatures(&body["contents"]);
+            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None);
+            let mut final_contents = body["contents"].as_array().unwrap().clone();
+            finalize_request_text_context(&sid, &mut final_contents, model, true, false);
+            let after = signatures(&json!(final_contents));
+            assert_eq!(before, ["A", "B"]);
+            assert_eq!(after, ["A", "B"]);
+        }
+    }
+}
+#[cfg(test)]
+mod reconstructed_tool_signature_tests {
+    use crate::proxy::pipeline::inbound::InboundThinkingPipeline as Pipe;
+    use crate::proxy::thinking_store::{
+        capture_gemini_response_with_context, compute_response_text_anchor,
+        finalize_request_text_context, is_sentinel_signature,
+    };
+    use base64::Engine;
+    use serde_json::{json, Value};
+    #[test]
+    fn idless_upstream_signed_tool_survives_standard_messages_replay() {
+        let sig = |seed: u8| {
+            let mut v = vec![0x12];
+            v.extend([seed; 48]);
+            base64::engine::general_purpose::STANDARD.encode(v)
+        };
+        let a = sig(b'A');
+        let b = sig(b'B');
+        let model = "gemini-2.5-flash";
+        for (label, ids) in [
+            ("native", &["call_A"][..]),
+            ("bridge", &["toolu_generatedA"][..]),
+        ] {
+            let sid = format!("r16-reconstruct-{label}");
+            let user = json!({"role":"user","parts":[{"text":"Read both."}]});
+            let mut parts = vec![];
+            for (i, signature) in [&a].into_iter().enumerate() {
+                parts.push(json!({"functionCall":{"name":format!("read_{i}"),"args":{}},"thoughtSignature":signature}));
+            }
+            let res = json!({"candidates":[{"content":{"role":"model","parts":parts.clone()},"finishReason":"STOP"}]});
+            capture_gemini_response_with_context(
+                &sid,
+                &res,
+                Some(&user),
+                Some(&compute_response_text_anchor(std::slice::from_ref(&user))),
+            );
+            for (i, id) in ids.iter().enumerate() {
+                parts[i]["functionCall"]["id"] = json!(id);
+                parts[i].as_object_mut().unwrap().remove("thoughtSignature");
+            }
+            let mut h = vec![
+                user,
+                json!({"role":"model","parts":parts}),
+                json!({"role":"user","parts":[{"functionResponse":{"name":"read_0","response":{"output":"ok"}}}]}),
+            ];
+            Pipe::process_contents_deferred_text(&mut h, model, true, Some(&sid), false);
+            let signatures = |v: &Value| {
+                v[1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.get("functionCall").is_some())
+                    .map(|p| match p["thoughtSignature"].as_str() {
+                        Some(x) if x == a => "A",
+                        Some(x) if x == b => "B",
+                        Some(x) if is_sentinel_signature(x) => "sentinel",
+                        _ => "none",
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut body = json!({"contents":h});
+            let before = signatures(&body["contents"]);
+            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None);
+            let mut final_contents = body["contents"].as_array().unwrap().clone();
+            finalize_request_text_context(&sid, &mut final_contents, model, true, false);
+            let after = signatures(&json!(final_contents));
+            assert_eq!(before, ["A"]);
+            assert_eq!(after, ["A"]);
+        }
     }
 }

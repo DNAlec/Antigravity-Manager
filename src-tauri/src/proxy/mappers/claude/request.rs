@@ -164,22 +164,30 @@ pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
-/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
-///
-/// 用于处理嵌套结构和非标准位置的 cache_control。
-/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
+/// Strip cache hints only from protocol envelopes. Tool schemas, arguments,
+/// and result payloads are caller-owned JSON and may use the same property name.
 fn deep_clean_cache_control(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            if map.remove("cache_control").is_some() {
-                tracing::debug!("[DEBUG-593] Removed cache_control from nested JSON object");
-            }
-            for (_, v) in map.iter_mut() {
-                deep_clean_cache_control(v);
+            map.remove("cache_control");
+            map.remove("prompt_cache_breakpoint");
+            for key in [
+                "request",
+                "contents",
+                "systemInstruction",
+                "parts",
+                "tools",
+                "functionDeclarations",
+                "functionCall",
+                "functionResponse",
+            ] {
+                if let Some(child) = map.get_mut(key) {
+                    deep_clean_cache_control(child);
+                }
             }
         }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
+        Value::Array(items) => {
+            for item in items {
                 deep_clean_cache_control(item);
             }
         }
@@ -195,75 +203,29 @@ fn deep_clean_cache_control(value: &mut Value) {
 /// thinking/redacted_thinking blocks always come before other block types.
 fn sort_thinking_blocks_first(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if msg.role == "assistant" {
-            if let MessageContent::Array(blocks) = &mut msg.content {
-                // [FIX #709] Triple-stage partition: [Thinking, Text, ToolUse]
-                // This ensures protocol compliance while maintaining logical order.
-
-                let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
-                let mut text_blocks: Vec<ContentBlock> = Vec::new();
-                let mut tool_blocks: Vec<ContentBlock> = Vec::new();
-                let mut other_blocks: Vec<ContentBlock> = Vec::new();
-
-                let original_len = blocks.len();
-                let mut needs_reorder = false;
-                let mut saw_non_thinking = false;
-
-                for (_i, block) in blocks.iter().enumerate() {
-                    match block {
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            if saw_non_thinking {
-                                needs_reorder = true;
-                            }
-                        }
-                        ContentBlock::Text { .. } => {
-                            saw_non_thinking = true;
-                        }
-                        ContentBlock::ToolUse { .. } => {
-                            saw_non_thinking = true;
-                            // Check if tool is after text (this is normal, but we want a strict group order)
-                        }
-                        _ => saw_non_thinking = true,
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let MessageContent::Array(blocks) = &mut msg.content {
+            // Only thought blocks have an ordering constraint. Moving text past a
+            // tool call changes both the conversation and its cached prefix.
+            if blocks.len() <= 1 {
+                continue;
+            }
+            let mut thinking = Vec::new();
+            let mut rest = Vec::new();
+            for block in blocks.drain(..) {
+                match &block {
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                        thinking.push(block);
                     }
-                }
-
-                if needs_reorder || original_len > 1 {
-                    // For safety, we always perform the triple partition if there's more than one block.
-                    // This also handles empty text block filtering.
-                    for block in blocks.drain(..) {
-                        match &block {
-                            ContentBlock::Thinking { .. }
-                            | ContentBlock::RedactedThinking { .. } => {
-                                thinking_blocks.push(block);
-                            }
-                            ContentBlock::Text { text } => {
-                                // Filter out purely empty or structural text like "(no content)"
-                                if !text.trim().is_empty() && text != "(no content)" {
-                                    text_blocks.push(block);
-                                }
-                            }
-                            ContentBlock::ToolUse { .. } => {
-                                tool_blocks.push(block);
-                            }
-                            _ => {
-                                other_blocks.push(block);
-                            }
-                        }
-                    }
-
-                    // Reconstruct in strict order: Thinking -> Text/Other -> Tool
-                    blocks.extend(thinking_blocks);
-                    blocks.extend(text_blocks);
-                    blocks.extend(other_blocks);
-                    blocks.extend(tool_blocks);
-
-                    if needs_reorder {
-                        tracing::warn!(
-                            "[FIX #709] Reordered assistant messages to [Thinking, Text, Tool] structure."
-                        );
-                    }
+                    ContentBlock::Text { text }
+                        if text.trim().is_empty() || text == "(no content)" => {}
+                    _ => rest.push(block),
                 }
             }
+            blocks.extend(thinking);
+            blocks.extend(rest);
         }
     }
 }
@@ -759,10 +721,7 @@ pub fn transform_claude_request_in_timed(
 
     crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
 
-    // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
-    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
     deep_clean_cache_control(&mut body);
-    tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
     // [DEFENSE] 净化所有 contents 中的 inlineData，过滤或降级空数据/损坏数据
     if let Some(inner) = body.get_mut("request") {
@@ -999,7 +958,6 @@ fn build_contents(
             }
         }
         MessageContent::Array(blocks) => {
-            let mut turn_tool_media_parts = Vec::new();
             for item in blocks {
                 match item {
                     ContentBlock::Text { text } => {
@@ -1333,6 +1291,20 @@ fn build_contents(
                             _ => content.to_string(),
                         };
 
+                        // FunctionResponsePart accepts media, not text. Keep validation
+                        // notices with the same result instead of emitting orphan parts.
+                        extra_parts.retain(|part| {
+                            if let Some(notice) = part.get("text").and_then(Value::as_str) {
+                                if !merged_content.is_empty() {
+                                    merged_content.push('\n');
+                                }
+                                merged_content.push_str(notice);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
                         // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
                         if merged_content.trim().is_empty() {
                             if is_error.unwrap_or(false) {
@@ -1343,19 +1315,20 @@ fn build_contents(
                             }
                         }
 
-                        let part = json!({
-                            "functionResponse": {
-                                "name": func_name,
-                                "response": {"output": merged_content},
-                                "id": tool_use_id
-                            }
+                        let result_key = if is_error.unwrap_or(false) {
+                            "error"
+                        } else {
+                            "output"
+                        };
+                        let mut response = json!({
+                            "name": func_name,
+                            "response": { (result_key): merged_content },
+                            "id": tool_use_id
                         });
-
-                        // 危险测试分支法则：ToolResult (functionResponse) 绝不携带签名
-                        parts.push(part);
-
-                        // 暂存随行媒体 parts，确保同一轮中所有 functionResponse 置顶连续，多模态媒体统一延后追加
-                        turn_tool_media_parts.extend(extra_parts);
+                        if !extra_parts.is_empty() {
+                            response["parts"] = Value::Array(extra_parts);
+                        }
+                        parts.push(json!({ "functionResponse": response }));
 
                         // 标记状态，用于下一条 User 消息的去重判断
                         *previous_was_tool_result = true;
@@ -1368,7 +1341,6 @@ fn build_contents(
                     }
                 }
             }
-            parts.extend(turn_tool_media_parts);
         }
     }
 
@@ -1608,7 +1580,7 @@ fn build_google_contents(
         is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model);
 
     let think_start = std::time::Instant::now();
-    crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+    crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
         &mut contents,
         mapped_model,
         should_finalize_thinking,
@@ -1690,6 +1662,7 @@ fn build_tools(
                 "type": "object",
                 "properties": {}
             }));
+            crate::proxy::common::json_schema::validate_tool_schema(&input_schema)?;
             crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
             crate::proxy::mappers::openai::request::enforce_uppercase_types(&mut input_schema);
 
@@ -1846,6 +1819,78 @@ use crate::proxy::mappers::common_utils::is_model_compatible;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r19_cache_hints_do_not_erase_tool_business_fields() {
+        for color in ["red", "blue"] {
+            let req:ClaudeRequest=serde_json::from_value(json!({
+                "model":"claude-sonnet-4-6",
+                "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
+                    "cache_control":{"type":"string"},"choice":{"anyOf":[{"type":"string"},{"type":"integer"}]},
+                    "items":{"type":"array","minItems":2,"items":{"type":"string"}}
+                },"required":["cache_control","choice"]}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"inspect","input":{"cache_control":color,"choice":3}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"done"}]}]
+            })).unwrap();
+            let body =
+                transform_claude_request_in(&req, "p", false, None, "r19-schema", None).unwrap();
+            let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+            assert_eq!(schema["properties"]["cache_control"]["type"], "STRING");
+            assert_eq!(
+                schema["properties"]["choice"]["anyOf"],
+                json!([{"type":"STRING"},{"type":"INTEGER"}])
+            );
+            assert_eq!(schema["properties"]["items"]["minItems"], 2);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("cache_control")));
+            let parts: Vec<_> = body["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|t| t["parts"].as_array().unwrap())
+                .collect();
+            let call = parts.iter().find_map(|p| p.get("functionCall")).unwrap();
+            assert_eq!(call["args"]["cache_control"], color);
+            assert_eq!(call["args"]["choice"], 3);
+            assert!(parts.iter().all(|p| p.get("cache_control").is_none()));
+        }
+    }
+
+    #[test]
+    fn r19_tool_type_unions_preserve_final_array_and_object_constraints() {
+        let req: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-6",
+            "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
+                "ids":{"type":["array","null"],"items":{"type":"integer"},"minItems":1},
+                "inherited":{"anyOf":[{"type":"array"},{"type":"null"}],"items":{"type":"integer"}},
+                "value":{"type":["array","object"],"items":{"type":"integer"},"properties":{"x":{"type":"integer"}},"required":["x"]},
+                "choice":{"allOf":[{"type":["string","integer"]}]}
+            },"required":["ids","value"]}}],
+            "messages":[{"role":"user","content":"Inspect [1]"}]
+        })).unwrap();
+        let body = transform_claude_request_in(&req, "p", false, None, "r19-union", None).unwrap();
+        let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(
+            schema["properties"]["ids"],
+            json!({"type":"ARRAY","items":{"type":"INTEGER"},"minItems":1,"nullable":true})
+        );
+        assert_eq!(
+            schema["properties"]["inherited"],
+            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"NULL"}],"items":{"type":"INTEGER"}})
+        );
+        assert_eq!(
+            schema["properties"]["value"],
+            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"OBJECT","properties":{"x":{"type":"INTEGER"}},"required":["x"]}]})
+        );
+        assert_eq!(
+            schema["properties"]["choice"],
+            json!({"anyOf":[{"type":"STRING"},{"type":"INTEGER"}]})
+        );
+        assert_eq!(schema["required"], json!(["ids", "value"]));
+    }
+
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::ThinkingBudgetConfig;
@@ -2087,7 +2132,7 @@ mod tests {
         // Check removed fields
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("additionalProperties").is_none());
-        assert!(schema["properties"]["location"].get("minLength").is_none());
+        assert_eq!(schema["properties"]["location"]["minLength"], 1);
         assert!(schema["properties"]["unit"].get("default").is_none());
         assert!(schema["properties"]["date"].get("format").is_none());
 
@@ -2542,6 +2587,70 @@ mod tests {
             }
         } else {
             panic!("Expected Array content");
+        }
+    }
+
+    #[test]
+    fn test_thinking_sort_preserves_text_tool_order_and_signatures() {
+        let cases = [
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
+                {"type":"text","text":"after"}
+            ]),
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
+                {"type":"thinking","thinking":"reason","signature":"stable-signature"},
+                {"type":"text","text":"after"},
+                {"type":"redacted_thinking","data":"opaque-redacted"}
+            ]),
+        ];
+        for original in cases {
+            let expected_rest: Vec<_> = original
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| {
+                    !matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+                .cloned()
+                .collect();
+            let expected_thought: Vec<_> = original
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+                .cloned()
+                .collect();
+            let mut messages: Vec<Message> = serde_json::from_value(json!([
+                {"role":"assistant","content":original},
+                {"role":"user","content":[{"type":"text","text":"untouched"}]}
+            ]))
+            .unwrap();
+            let user_before = serde_json::to_value(&messages[1]).unwrap();
+            sort_thinking_blocks_first(&mut messages);
+            let actual = serde_json::to_value(&messages[0]).unwrap();
+            let blocks = actual["content"].as_array().unwrap();
+            assert_eq!(&blocks[expected_thought.len()..], expected_rest);
+            for (actual, expected) in blocks.iter().zip(&expected_thought) {
+                assert_eq!(actual["type"], expected["type"]);
+                assert_eq!(actual["signature"], expected["signature"]);
+                assert_eq!(actual["thinking"], expected["thinking"]);
+                assert_eq!(actual["data"], expected["data"]);
+            }
+            assert_eq!(serde_json::to_value(&messages[1]).unwrap(), user_before);
+            let once = serde_json::to_value(&messages).unwrap();
+            sort_thinking_blocks_first(&mut messages);
+            assert_eq!(serde_json::to_value(&messages).unwrap(), once);
         }
     }
 
@@ -3148,17 +3257,31 @@ mod tests {
             tool_choice: None,
         };
 
-        let result =
+        let mut result =
             transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
                 .expect("Transform should succeed");
 
+        crate::proxy::thinking_store::finalize_request_text_context(
+            "",
+            result["request"]["contents"].as_array_mut().unwrap(),
+            "claude-sonnet-4-6",
+            true,
+            false,
+        );
         let contents = result["request"]["contents"]
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        // 新规则：无签名思考块出站前丢弃，仅保留正文
-        assert_eq!(assistant_parts.len(), 1);
-        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
+        // The final pipeline preserves unsigned reasoning as ordinary text.
+        assert_eq!(assistant_parts.len(), 2);
+        assert_eq!(
+            assistant_parts[0]["text"],
+            "Considering the question deeply..."
+        );
+        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
+        assert!(assistant_parts
+            .iter()
+            .all(|part| part.get("thought").is_none() && part.get("thoughtSignature").is_none()));
     }
 
     #[test]
@@ -3578,6 +3701,72 @@ mod tests {
             .any(|t| t.contains("x-anthropic-billing-header:")));
         // Normal prompt must be preserved
         assert!(system_texts.contains(&"You are a helpful assistant."));
+    }
+
+    #[test]
+    fn parallel_tool_images_and_errors_keep_the_result_identity() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        for model in [
+            "claude-sonnet-4-6",
+            "gemini-2.5-flash",
+            "gemini-3.8-flash-high",
+        ] {
+            for owner in ["a", "b"] {
+                let results = ["b", "a"].map(|id| {
+                    let mut content = vec![json!({"type":"text","text":"done"})];
+                    if id == owner {
+                        content.push(json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png}}));
+                    }
+                    json!({"type":"tool_result","tool_use_id":id, "is_error":id=="b", "content":content})
+                });
+                let req: ClaudeRequest = serde_json::from_value(json!({"model":model, "messages":[
+                    {"role":"user","content":"inspect"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"a","name":"inspect","input":{}},
+                        {"type":"tool_use","id":"b","name":"inspect","input":{}}]},
+                    {"role":"user","content":results}]}))
+                .unwrap();
+                let body = transform_claude_request_in(&req, "p", false, None, "s", None).unwrap();
+                let turns = body["request"]["contents"].as_array().unwrap();
+                let parts: Vec<_> = turns
+                    .iter()
+                    .flat_map(|turn| turn["parts"].as_array().unwrap())
+                    .collect();
+                let responses: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| p.get("functionResponse"))
+                    .collect();
+                assert_eq!(responses.len(), 2);
+                assert_eq!(responses[0]["id"], "b");
+                assert_eq!(responses[0]["response"]["error"], "done");
+                assert!(responses[0]["response"].get("output").is_none());
+                assert_eq!(responses[1]["response"]["output"], "done");
+                let nested = crate::proxy::model_specs::is_gemini_v3_or_above(model);
+                for fr in responses {
+                    if nested {
+                        assert_eq!(
+                            fr["parts"][0]["inlineData"]["data"].as_str(),
+                            (fr["id"] == owner).then_some(png)
+                        );
+                    } else {
+                        assert_eq!(
+                            fr["response"].get("attached_media_positions").is_some(),
+                            fr["id"] == owner
+                        );
+                        if fr["id"] == owner {
+                            assert_eq!(fr["response"]["attached_media_positions"], json!([1]));
+                        }
+                    }
+                }
+                assert_eq!(
+                    parts
+                        .iter()
+                        .filter(|p| p["inlineData"]["data"] == png)
+                        .count(),
+                    usize::from(!nested)
+                );
+            }
+        }
     }
 
     #[test]

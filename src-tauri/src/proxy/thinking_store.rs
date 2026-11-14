@@ -4,8 +4,9 @@
 //! responses, then precisely re-injects them into the next request's `contents`
 //! even when the client dropped / truncated thinking.
 //!
-//! Matching is content-based (visible assistant text + tool ids), not turn
-//! index, so OpenAI / Anthropic / Gemini packet shapes can differ.
+//! Text turns are keyed by their visible history prefix as well as their answer;
+//! tool turns retain their causal tool ids. Repeated answers must not overwrite
+//! unrelated turns, even when clients omit all thinking and signatures.
 //!
 //! Isolation key = `{tenant}:{client_session_id}`:
 //! - tenant is a hash of the caller's API key
@@ -16,7 +17,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,10 @@ struct SessionEntry {
     last_persist_touch: Instant,
     bytes: usize,
     l2_loaded: bool,
+    // Fence delayed cold reads across explicit invalidation, pruning or removal.
+    load_epoch: Arc<()>,
+    // A warm memory window may contain only one of several persisted generations.
+    l2_has_evicted_turns: bool,
 }
 
 impl SessionEntry {
@@ -114,6 +119,8 @@ impl SessionEntry {
             last_persist_touch: Instant::now(),
             bytes: 0,
             l2_loaded: false,
+            load_epoch: Arc::new(()),
+            l2_has_evicted_turns: false,
         }
     }
 }
@@ -147,6 +154,24 @@ pub struct ThinkingStore {
     sessions: DashMap<String, SessionEntry>,
     watermarks: DashMap<String, SessionWatermark>,
     compaction_events: DashMap<String, (usize, Instant)>,
+}
+
+struct ThinkingPrunePlan {
+    snapshot: crate::modules::proxy_db::ThinkingPruneSnapshot,
+    keep_fps: Vec<String>,
+    live_tool_ids: Vec<String>,
+    live_sigs: Vec<String>,
+}
+
+impl ThinkingPrunePlan {
+    fn persist(self) {
+        let _ = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
+            &self.snapshot,
+            &self.keep_fps,
+            &self.live_tool_ids,
+            &self.live_sigs,
+        );
+    }
 }
 
 impl ThinkingStore {
@@ -205,6 +230,22 @@ impl ThinkingStore {
             return;
         }
 
+        self.record_with_loader(
+            store_key,
+            rec,
+            crate::modules::proxy_db::load_thinking_records,
+        );
+    }
+
+    fn record_with_loader(
+        &self,
+        store_key: &str,
+        rec: ThinkingRecord,
+        load: impl FnOnce(
+            &str,
+        )
+            -> Result<Vec<crate::modules::proxy_db::PersistedThinkingRecord>, String>,
+    ) {
         let rec_bytes = record_bytes(&rec);
 
         self.maybe_evict(store_key);
@@ -218,7 +259,7 @@ impl ThinkingStore {
             .map(|e| !e.l2_loaded)
             .unwrap_or(true);
         if needs_l2 {
-            let _ = self.load_turns(store_key);
+            let _ = self.load_turns_with(store_key, load);
         }
 
         let persist = {
@@ -227,12 +268,10 @@ impl ThinkingStore {
                 .entry(store_key.to_string())
                 .or_insert_with(SessionEntry::new);
             entry.last_access = Instant::now();
-            entry.l2_loaded = true;
 
-            let merge_last = entry
-                .turns
-                .last()
-                .is_some_and(|last| last.fingerprint == rec.fingerprint);
+            let merge_last = entry.turns.last().is_some_and(|last| {
+                last.fingerprint == rec.fingerprint && legacy_text_signatures_compatible(last, &rec)
+            });
 
             if merge_last {
                 let (stronger, old_text_bytes) = {
@@ -241,7 +280,7 @@ impl ThinkingStore {
                         rec.thought.len() >= last.thought.len()
                             || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
                                 > last.signature.as_ref().map(|s| s.len()).unwrap_or(0),
-                        last.thought.len() + last.visible.len(),
+                        record_bytes(last),
                     )
                 };
                 if stronger {
@@ -271,6 +310,7 @@ impl ThinkingStore {
                         break;
                     }
                     entry.turns.remove(0);
+                    entry.l2_has_evicted_turns = true;
                 }
                 entry.turns.last().cloned()
             }
@@ -315,55 +355,115 @@ impl ThinkingStore {
     }
 
     fn load_turns(&self, store_key: &str) -> Vec<Arc<ThinkingRecord>> {
-        if let Some(e) = self.sessions.get(store_key) {
-            // Trust warm non-empty memory. An empty l2_loaded entry is treated as
-            // stale (e.g. first hydrate before any capture) and reloads from SQLite.
-            if e.l2_loaded && !e.turns.is_empty() {
-                let turns = e.turns.clone();
-                drop(e);
-                if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                    entry.last_access = Instant::now();
-                }
-                return turns;
-            }
-        }
+        self.load_turns_with(store_key, crate::modules::proxy_db::load_thinking_records)
+    }
 
-        let persisted = match crate::modules::proxy_db::load_thinking_records(store_key) {
+    fn load_turns_with(
+        &self,
+        store_key: &str,
+        read: impl FnOnce(
+            &str,
+        )
+            -> Result<Vec<crate::modules::proxy_db::PersistedThinkingRecord>, String>,
+    ) -> Vec<Arc<ThinkingRecord>> {
+        let epoch = {
+            let mut entry = self
+                .sessions
+                .entry(store_key.to_owned())
+                .or_insert_with(SessionEntry::new);
+            entry.last_access = Instant::now();
+            if entry.l2_loaded && !entry.turns.is_empty() {
+                return entry.turns.clone();
+            }
+            entry.load_epoch.clone()
+        };
+        let persisted = read(store_key);
+        let Some(mut entry) = self.sessions.get_mut(store_key) else {
+            return Vec::new();
+        };
+        if !Arc::ptr_eq(&entry.load_epoch, &epoch) {
+            return entry.turns.clone();
+        }
+        if entry.l2_loaded && !entry.turns.is_empty() {
+            // Another cold load completed while SQLite was being read.
+            return entry.turns.clone();
+        }
+        let persisted = match persisted {
             Ok(records) => records,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     "[ThinkingStore] Failed to load L2 records for {}: {}",
                     store_key,
-                    e
+                    error
                 );
-                Vec::new()
+                entry.l2_loaded = false;
+                entry.l2_has_evicted_turns = true;
+                return entry.turns.clone();
             }
         };
         let loaded_len = persisted.len();
-        let mut entry = self
-            .sessions
-            .entry(store_key.to_string())
-            .or_insert_with(SessionEntry::new);
-        if entry.turns.is_empty() && !persisted.is_empty() {
-            for p in persisted {
-                let rec = ThinkingRecord {
+        let mut turns: Vec<Arc<ThinkingRecord>> = persisted
+            .into_iter()
+            .map(|p| {
+                Arc::new(ThinkingRecord {
                     fingerprint: p.fingerprint,
                     thought: p.thought,
                     signature: p.signature,
                     tool_ids: p.tool_ids,
                     tool_names: p.tool_names,
                     visible: p.visible,
-                };
-                entry.bytes += record_bytes(&rec);
-                entry.turns.push(Arc::new(rec));
+                })
+            })
+            .collect();
+        // Captures can exist only in RAM after a failed write. Match persisted
+        // fields (tool metadata is deliberately omitted from SQLite) in capture
+        // order, keeping each resident Arc available to concurrent replays.
+        if !entry.turns.is_empty() {
+            fn identity(
+                rec: &ThinkingRecord,
+            ) -> (
+                &str,
+                &str,
+                Option<std::borrow::Cow<'_, str>>,
+                Vec<std::borrow::Cow<'_, str>>,
+            ) {
+                (
+                    &rec.fingerprint,
+                    &rec.thought,
+                    rec.signature
+                        .as_deref()
+                        .map(normalize_signature_for_comparison),
+                    rec.tool_ids
+                        .iter()
+                        .map(|id| crate::proxy::common::utils::normalize_tool_id(id))
+                        .collect(),
+                )
             }
-            tracing::info!(
-                "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
-                entry.turns.len(),
-                store_key
-            );
+            let mut positions = HashMap::new();
+            for (idx, row) in turns.iter().enumerate().rev() {
+                positions
+                    .entry(identity(row))
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+            let placements: Vec<_> = entry
+                .turns
+                .iter()
+                .map(|rec| positions.get_mut(&identity(rec)).and_then(Vec::pop))
+                .collect();
+            drop(positions);
+            for (rec, at) in entry.turns.iter().zip(placements) {
+                if let Some(idx) = at {
+                    turns[idx] = rec.clone();
+                } else {
+                    turns.push(rec.clone());
+                }
+            }
         }
+        entry.bytes = turns.iter().map(|rec| record_bytes(rec)).sum();
+        entry.turns = turns;
         entry.l2_loaded = true;
+        entry.l2_has_evicted_turns = false;
         entry.last_access = Instant::now();
         entry.last_persist_touch = Instant::now();
         let turns = entry.turns.clone();
@@ -377,13 +477,36 @@ impl ThinkingStore {
     /// Capture real thinking from the inbound request without re-appending
     /// history that is already stored. Placeholder blocks are ignored.
     pub fn ingest_from_contents(&self, store_key: &str, contents: &[Value]) {
+        self.ingest_selected_contents(store_key, contents, None);
+    }
+
+    fn ingest_selected_contents(
+        &self,
+        store_key: &str,
+        contents: &[Value],
+        text_only: Option<bool>,
+    ) {
+        let incoming = self.collect_selected_records(store_key, contents, text_only);
+        self.ingest_records(
+            store_key,
+            incoming.into_iter().map(|(_, record)| record).collect(),
+        );
+    }
+
+    fn collect_selected_records(
+        &self,
+        store_key: &str,
+        contents: &[Value],
+        text_only: Option<bool>,
+    ) -> Vec<(usize, ThinkingRecord)> {
         if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let compaction_boundary = determine_compaction_boundary(contents, Some(store_key));
+        let text_anchors = compute_text_turn_anchors(contents);
 
-        let mut incoming: Vec<ThinkingRecord> = Vec::new();
+        let mut incoming = Vec::new();
         for (c_idx, content) in contents.iter().enumerate() {
             if compaction_boundary.map_or(false, |b| c_idx <= b) {
                 continue;
@@ -395,21 +518,39 @@ impl ThinkingStore {
             let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
                 continue;
             };
+            let is_text = !parts.iter().any(|p| p.get("functionCall").is_some());
+            if text_only.is_some_and(|selected| {
+                selected != is_text || parts.iter().any(|p| p.get("functionResponse").is_some())
+            }) {
+                continue;
+            }
             let preceding_turn = if c_idx > 0 {
                 contents.get(c_idx - 1)
             } else {
                 None
             };
             let anchor = compute_causal_anchor(preceding_turn);
-            let mut acc = TurnAccumulator::with_anchor(&anchor);
+            let mut acc = TurnAccumulator::with_anchor(&anchor)
+                .with_text_context_anchor(text_anchors[c_idx].clone());
             for part in parts {
                 acc.ingest_part(part);
             }
             if !acc.should_capture() {
                 continue;
             }
-            incoming.push(acc.into_record());
+            if acc.function_call_count > 1 {
+                incoming.extend(
+                    std::mem::take(&mut acc.signed_calls)
+                        .into_iter()
+                        .map(|r| (c_idx, r)),
+                );
+            }
+            incoming.push((c_idx, acc.into_record()));
         }
+        incoming
+    }
+
+    fn ingest_records(&self, store_key: &str, incoming: Vec<ThinkingRecord>) {
         if incoming.is_empty() {
             return;
         }
@@ -417,51 +558,103 @@ impl ThinkingStore {
         let existing = self.load_turns(store_key);
         let mut used = vec![false; existing.len()];
         let mut to_append = Vec::new();
-        let mut to_upgrade: Vec<(usize, ThinkingRecord)> = Vec::new();
-
-        for rec in incoming {
+        for mut rec in incoming {
+            // A signed call is not a candidate for enriching an entire model turn.
+            if rec.fingerprint.starts_with(CALL_SIGNATURE_PREFIX) {
+                if !existing.iter().any(|old| same_thinking_record(old, &rec)) {
+                    to_append.push(rec);
+                }
+                continue;
+            }
             if let Some(idx) = match_existing_record(&rec, &existing, &used) {
                 used[idx] = true;
-                if is_stronger_record(&rec, &existing[idx]) {
-                    to_upgrade.push((idx, rec));
+                let previous = &existing[idx];
+                if is_stronger_record(&rec, previous) {
+                    // A richer unsigned replay cannot choose between signed siblings.
+                    // A partial RAM window cannot establish uniqueness at all.
+                    let explicitly_matched = rec
+                        .signature
+                        .as_deref()
+                        .filter(|s| is_real_signature(s))
+                        .zip(previous.signature.as_deref())
+                        .is_some_and(|(a, b)| signatures_match(a, b));
+                    if !explicitly_matched
+                        && (self
+                            .sessions
+                            .get(store_key)
+                            .is_none_or(|entry| !entry.l2_loaded || entry.l2_has_evicted_turns)
+                            || has_ambiguous_replay_match(&rec, &existing, idx))
+                    {
+                        continue;
+                    }
+
+                    // Keep the matched generation's identity and never erase a
+                    // stronger field when a replay enriches only the other one.
+                    rec.fingerprint = previous.fingerprint.clone();
+                    if rec.thought.len() < previous.thought.len() {
+                        rec.thought.clone_from(&previous.thought);
+                    }
+                    if previous.signature.as_deref().is_some_and(is_real_signature) {
+                        rec.signature.clone_from(&previous.signature);
+                    }
+                    // Enrich the existing row, not an alias supplied by truncated history.
+                    rec.visible.clone_from(&previous.visible);
+                    rec.tool_ids.clone_from(&previous.tool_ids);
+                    rec.tool_names.clone_from(&previous.tool_names);
+                    self.upgrade_record(store_key, previous, rec);
                 }
             } else {
                 to_append.push(rec);
             }
         }
 
-        if !to_upgrade.is_empty() {
-            if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                for (idx, rec) in &to_upgrade {
-                    if *idx >= entry.turns.len() {
-                        continue;
-                    }
-                    let new_bytes = record_bytes(rec);
-                    let old_bytes = record_bytes(&entry.turns[*idx]);
-                    entry.bytes = entry
-                        .bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(new_bytes);
-                    *Arc::make_mut(&mut entry.turns[*idx]) = rec.clone();
-                }
-            }
-            if let Some((idx, rec)) = to_upgrade.last() {
-                if *idx + 1 == existing.len() {
-                    let _ = crate::modules::proxy_db::save_thinking_record(
-                        store_key,
-                        &rec.fingerprint,
-                        &rec.thought,
-                        rec.signature.as_deref(),
-                        &rec.tool_ids,
-                        &rec.tool_names,
-                        &rec.visible,
-                    );
-                }
-            }
-        }
-
         for rec in to_append {
             self.record(store_key, rec);
+        }
+    }
+
+    fn upgrade_record(
+        &self,
+        store_key: &str,
+        previous: &Arc<ThinkingRecord>,
+        upgraded: ThinkingRecord,
+    ) {
+        use crate::modules::proxy_db::{apply_thinking_upgrade, snapshot_thinking_upgrade};
+        let result = (|| -> Result<(), String> {
+            let row = snapshot_thinking_upgrade(store_key, previous)?;
+            // A prune can shift indices or another request can replace this
+            // generation between matching and this write. Revalidate the Arc
+            // itself, not its old index, before publishing either upgrade.
+            if !self.sessions.get(store_key).is_some_and(|entry| {
+                entry
+                    .turns
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, previous))
+            }) {
+                return Ok(());
+            }
+            if let Some(row) = row {
+                if !apply_thinking_upgrade(&row, &upgraded)? {
+                    return Ok(());
+                }
+            }
+            if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                if let Some(index) = entry.turns.iter().position(|r| Arc::ptr_eq(r, previous)) {
+                    entry.bytes = entry
+                        .bytes
+                        .saturating_sub(record_bytes(previous))
+                        .saturating_add(record_bytes(&upgraded));
+                    entry.turns[index] = Arc::new(upgraded);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(
+                "[ThinkingStore] Failed to upgrade historical record in {}: {}",
+                store_key,
+                error
+            );
         }
     }
 
@@ -475,6 +668,16 @@ impl ThinkingStore {
         contents: &mut Vec<Value>,
         target_model: Option<&str>,
     ) -> usize {
+        self.restore_selected_contents(store_key, contents, target_model, None)
+    }
+
+    fn restore_selected_contents(
+        &self,
+        store_key: &str,
+        contents: &mut Vec<Value>,
+        target_model: Option<&str>,
+        text_only: Option<bool>,
+    ) -> usize {
         if !crate::proxy::config::is_thinking_store_enabled() {
             return 0;
         }
@@ -484,6 +687,7 @@ impl ThinkingStore {
 
         let compaction_boundary = determine_compaction_boundary(contents, Some(store_key));
         let mut records = self.load_turns(store_key);
+        let text_anchors = compute_text_turn_anchors(contents);
 
         // 收集所有的 model 轮次元信息
         struct ModelTurnMeta {
@@ -496,8 +700,10 @@ impl ThinkingStore {
             existing_thought: String,
             existing_sig: Option<String>,
             fp: String,
+            text_anchor: String,
             matched_record_idx: Option<usize>,
             already_complete: bool,
+            ambiguous_context: bool,
         }
 
         let mut model_turns: Vec<ModelTurnMeta> = Vec::new();
@@ -513,6 +719,12 @@ impl ThinkingStore {
             let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
                 continue;
             };
+            let is_text = !parts.iter().any(|p| p.get("functionCall").is_some());
+            if text_only.is_some_and(|selected| {
+                selected != is_text || parts.iter().any(|p| p.get("functionResponse").is_some())
+            }) {
+                continue;
+            }
             let preceding_turn = if c_idx > 0 {
                 contents.get(c_idx - 1)
             } else {
@@ -550,8 +762,10 @@ impl ThinkingStore {
                 existing_thought,
                 existing_sig,
                 fp: String::new(),
+                text_anchor: text_anchors[c_idx].clone(),
                 matched_record_idx: None,
                 already_complete,
+                ambiguous_context: false,
             });
         }
 
@@ -559,6 +773,107 @@ impl ThinkingStore {
             return 0;
         }
 
+        let last_model_content_idx = model_turns.last().map(|turn| turn.content_idx);
+        let latest_session_sig =
+            crate::proxy::SignatureCache::global().get_session_signature(store_key);
+
+        // Complete the exact text candidate set before any matching phase. A
+        // partial memory window must not select one resident generation while
+        // another generation of the same prefix/answer remains only in SQLite.
+        // Full warm sessions need no extra read when the exact fingerprint is known.
+        let l2_has_evicted_turns = self
+            .sessions
+            .get(store_key)
+            .is_some_and(|entry| entry.l2_has_evicted_turns);
+        let mut l2_fingerprints = HashSet::new();
+        for turn in &mut model_turns {
+            if !turn.tool_ids.is_empty()
+                || !turn.tool_names.is_empty()
+                || turn.visible.trim().is_empty()
+            {
+                continue;
+            }
+            turn.fp = contextual_fingerprint(
+                &turn.visible,
+                &turn.tool_ids,
+                &turn.tool_names,
+                Some(&turn.text_anchor),
+            );
+            if l2_has_evicted_turns || !records.iter().any(|rec| rec.fingerprint == turn.fp) {
+                l2_fingerprints.insert(turn.fp.clone());
+                l2_fingerprints.insert(base_fingerprint(&turn.fp).to_owned());
+            }
+        }
+        if !l2_fingerprints.is_empty() {
+            let fingerprints: Vec<String> = l2_fingerprints.iter().cloned().collect();
+            match crate::modules::proxy_db::load_thinking_by_fingerprints(store_key, &fingerprints)
+            {
+                Ok(persisted) => {
+                    let mut complete: Vec<Arc<ThinkingRecord>> = persisted
+                        .into_iter()
+                        .map(|p| {
+                            Arc::new(ThinkingRecord {
+                                fingerprint: p.fingerprint,
+                                thought: p.thought,
+                                signature: p.signature,
+                                tool_ids: p.tool_ids,
+                                tool_names: p.tool_names,
+                                visible: p.visible,
+                            })
+                        })
+                        .collect();
+                    // Reuse the database's capture order (also used by a cold
+                    // load), retaining memory-only captures after a failed save.
+                    let persisted_len = complete.len();
+                    for rec in records {
+                        if !complete[..persisted_len]
+                            .iter()
+                            .any(|known| same_thinking_record(known, &rec))
+                        {
+                            complete.push(rec);
+                        }
+                    }
+                    records = complete;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[ThinkingStore] Failed to load text candidates for {}: {}",
+                        store_key,
+                        error
+                    );
+                    for turn in &mut model_turns {
+                        if l2_fingerprints.contains(&turn.fp) {
+                            // Without the full set, weaker text fallback cannot
+                            // safely decide which persisted generation to use.
+                            turn.ambiguous_context = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if l2_has_evicted_turns {
+            let ids: HashSet<_> = model_turns
+                .iter()
+                .flat_map(|turn| turn.tool_ids.iter().cloned())
+                .collect();
+            if !ids.is_empty() {
+                match crate::modules::proxy_db::load_thinking_by_tool_ids(
+                    store_key,
+                    &ids.into_iter().collect::<Vec<_>>(),
+                ) {
+                    Ok(rows) => extend_tool_candidates(&mut records, rows),
+                    Err(_) => {
+                        for turn in &mut model_turns {
+                            if !turn.tool_ids.is_empty() {
+                                turn.ambiguous_context = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        records.retain(|r| !r.fingerprint.starts_with(CALL_SIGNATURE_PREFIX));
         let mut used = vec![false; records.len()];
         let mut by_sig: HashMap<String, usize> = HashMap::new();
         let mut by_tool: HashMap<String, Vec<usize>> = HashMap::new();
@@ -583,7 +898,7 @@ impl ThinkingStore {
 
         // Phase 0: 真实签名直查（最高优先级：客户端历史若自带真实签名，直接精确反向匹配）
         for turn in model_turns.iter_mut() {
-            if turn.already_complete || turn.matched_record_idx.is_some() {
+            if turn.matched_record_idx.is_some() {
                 continue;
             }
             if let Some(ref sig) = turn.existing_sig {
@@ -595,7 +910,12 @@ impl ThinkingStore {
                             !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
                         let rec_has_tools = !records[rec_idx].tool_ids.is_empty()
                             || !records[rec_idx].tool_names.is_empty();
-                        if turn_has_tools == rec_has_tools {
+                        if turn_has_tools == rec_has_tools
+                            && (!turn_has_tools
+                                || tool_ids_compatible(&turn.tool_ids, &records[rec_idx].tool_ids))
+                            && (turn_has_tools
+                                || record_signature_matches_target(&records[rec_idx], target_model))
+                        {
                             let tool_names_match = if turn.tool_names.is_empty()
                                 || records[rec_idx].tool_names.is_empty()
                             {
@@ -621,46 +941,81 @@ impl ThinkingStore {
             {
                 continue;
             }
-            for id in &turn.tool_ids {
-                let norm = crate::proxy::common::utils::normalize_tool_id(id);
-                let idxs = by_tool
-                    .get(norm.as_ref())
-                    .or_else(|| by_tool.get(id.as_str()));
-                let Some(idxs) = idxs else {
-                    continue;
-                };
-                if let Some(&rec_idx) = idxs.iter().find(|&&i| {
-                    if used[i] {
-                        return false;
-                    }
-                    // 严密防御工具名不匹配：防止 ID 碰撞导致把其他工具的思考与签名挂到当前工具上！
-                    if !turn.tool_names.is_empty() && !records[i].tool_names.is_empty() {
-                        if turn.tool_names != records[i].tool_names {
-                            return false;
-                        }
-                    }
-                    true
-                }) {
-                    turn.matched_record_idx = Some(rec_idx);
-                    used[rec_idx] = true;
-                    break;
+            if turn.ambiguous_context {
+                continue;
+            }
+            let mut candidates: Vec<usize> = turn
+                .tool_ids
+                .iter()
+                .filter_map(|id| by_tool.get(id))
+                .flatten()
+                .copied()
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            let eligible = candidates.into_iter().filter(|&i| {
+                turn.tool_names.is_empty()
+                    || records[i].tool_names.is_empty()
+                    || turn.tool_names == records[i].tool_names
+            });
+            // Used siblings still prove an unsigned alias is ambiguous.
+            match select_tool_generation(
+                &turn.tool_ids,
+                turn.existing_sig.as_deref(),
+                &records,
+                eligible,
+            ) {
+                ToolMatch::Found(i) if !used[i] => {
+                    turn.matched_record_idx = Some(i);
+                    used[i] = true;
                 }
+                ToolMatch::Found(_) | ToolMatch::Conflict => turn.ambiguous_context = true,
+                ToolMatch::Missing => {}
+            }
+        }
+
+        // Legacy rows have no prefix identity. Preserve their established
+        // ordered full-history migration, but never infer an ordering from a
+        // shortened replay or a conflicting explicit signed generation.
+        let mut legacy_replay_slots = HashMap::<String, usize>::new();
+        let mut legacy_replay_conflicts = HashSet::new();
+        for turn in &model_turns {
+            if !turn.tool_ids.is_empty()
+                || !turn.tool_names.is_empty()
+                || turn.matched_record_idx.is_some()
+            {
+                continue;
+            }
+            let key = base_fingerprint(&turn.fp).to_owned();
+            if turn.existing_sig.as_deref().is_some_and(is_real_signature) {
+                legacy_replay_conflicts.insert(key);
+            } else if !turn.already_complete && !turn.ambiguous_context {
+                *legacy_replay_slots.entry(key).or_default() += 1;
             }
         }
 
         // Phase 2: 完整指纹匹配（正向保序匹配，杜绝修剪后逆向滑窗相位错位）
         for turn in model_turns.iter_mut() {
-            if turn.already_complete || turn.matched_record_idx.is_some() {
+            if turn.already_complete || turn.ambiguous_context || turn.matched_record_idx.is_some()
+            {
                 continue;
             }
             if turn.fp.is_empty() {
-                turn.fp = fingerprint(&turn.visible, &turn.tool_ids, &turn.tool_names);
+                turn.fp = contextual_fingerprint(
+                    &turn.visible,
+                    &turn.tool_ids,
+                    &turn.tool_names,
+                    Some(&turn.text_anchor),
+                );
             }
             let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
-            let Some(idxs) = by_fp.get(turn.fp.as_str()) else {
-                continue;
-            };
-            if let Some(&rec_idx) = idxs.iter().find(|&&i| {
+            let exact = by_fp.get(turn.fp.as_str());
+            // Old databases have unscoped fingerprints. Only those legacy
+            // records may be considered after an exact contextual lookup.
+            let legacy = (!turn_has_tools)
+                .then(|| by_fp.get(base_fingerprint(&turn.fp)))
+                .flatten();
+            let eligible = |i: usize| {
                 if used[i] {
                     return false;
                 }
@@ -669,13 +1024,78 @@ impl ThinkingStore {
                 if rec_has_tools != turn_has_tools {
                     return false;
                 }
+                if !turn_has_tools && !record_signature_matches_target(&records[i], target_model) {
+                    return false;
+                }
+                if !turn_has_tools
+                    && turn
+                        .existing_sig
+                        .as_deref()
+                        .zip(records[i].signature.as_deref())
+                        .is_some_and(|(a, b)| !signatures_match(a, b))
+                {
+                    return false;
+                }
                 if !turn.tool_names.is_empty() && !records[i].tool_names.is_empty() {
                     if turn.tool_names != records[i].tool_names {
                         return false;
                     }
                 }
                 true
-            }) {
+            };
+            let exact_candidates: Vec<usize> = exact
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| eligible(i))
+                .collect();
+            let exact_match = if !turn_has_tools && !exact_candidates.is_empty() {
+                let authority = turn.existing_sig.as_deref().or_else(|| {
+                    (last_model_content_idx == Some(turn.content_idx))
+                        .then_some(latest_session_sig.as_deref())
+                        .flatten()
+                });
+                select_contextual_text_record(&records, &exact_candidates, authority)
+            } else {
+                exact_candidates.first().copied()
+            };
+            if !turn_has_tools && !exact_candidates.is_empty() && exact_match.is_none() {
+                // Distinct signed generations of the very same prompt/answer
+                // cannot be distinguished by text alone. Do not let a weaker
+                // similarity, legacy or SQLite fallback choose one arbitrarily.
+                turn.ambiguous_context = true;
+                continue;
+            }
+            let legacy_candidates: Vec<_> = legacy
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| eligible(i))
+                .collect();
+            let authority = turn.existing_sig.as_deref().or_else(|| {
+                (last_model_content_idx == Some(turn.content_idx))
+                    .then_some(latest_session_sig.as_deref())
+                    .flatten()
+            });
+            let legacy_match =
+                select_contextual_text_record(&records, &legacy_candidates, authority).or_else(
+                    || {
+                        let key = base_fingerprint(&turn.fp);
+                        (!legacy_replay_conflicts.contains(key)
+                            && legacy_replay_slots.get(key).copied().unwrap_or(0)
+                                >= legacy_candidates.len())
+                        .then(|| legacy_candidates.first().copied())
+                        .flatten()
+                    },
+                );
+            if exact_match.is_none() && !legacy_candidates.is_empty() && legacy_match.is_none() {
+                // Old rows lack prefix fingerprints, but differing signatures
+                // still prove that text alone cannot select a generation.
+                turn.ambiguous_context = true;
+                continue;
+            }
+            let matched = exact_match.or(legacy_match);
+            if let Some(rec_idx) = matched {
                 turn.matched_record_idx = Some(rec_idx);
                 used[rec_idx] = true;
             }
@@ -686,6 +1106,7 @@ impl ThinkingStore {
         // was O(turns * records * visible_len) and stalled 10s+ at ~300K context.
         let needs_phase3 = model_turns.iter().any(|t| {
             !t.already_complete
+                && !t.ambiguous_context
                 && t.matched_record_idx.is_none()
                 && t.tool_ids.is_empty()
                 && t.tool_names.is_empty()
@@ -701,7 +1122,10 @@ impl ThinkingStore {
         };
         if needs_phase3 {
             for turn in model_turns.iter_mut() {
-                if turn.already_complete || turn.matched_record_idx.is_some() {
+                if turn.already_complete
+                    || turn.ambiguous_context
+                    || turn.matched_record_idx.is_some()
+                {
                     continue;
                 }
                 let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
@@ -716,7 +1140,17 @@ impl ThinkingStore {
                 }
                 for (rec_idx, rec) in records.iter().enumerate() {
                     let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
-                    if used[rec_idx] || rec_has_tools || rec_norms[rec_idx].is_empty() {
+                    if used[rec_idx]
+                        || rec_has_tools
+                        || !record_signature_matches_target(rec, target_model)
+                        || rec_norms[rec_idx].is_empty()
+                        || !text_context_matches(&rec.fingerprint, &turn.text_anchor)
+                        || turn
+                            .existing_sig
+                            .as_deref()
+                            .zip(rec.signature.as_deref())
+                            .is_some_and(|(a, b)| !signatures_match(a, b))
+                    {
                         continue;
                     }
                     let norm_rec = &rec_norms[rec_idx];
@@ -739,9 +1173,10 @@ impl ThinkingStore {
         }
 
         // Phase 3.5: L2 SQLite 精准穿透回捞 (针对超过内存容量淘汰或冷启动的历史轮次)
-        // 核心原则：淘汰轮次绝不盲目降级占位符！优先通过 signature / tool_id / fingerprint 从 SQLite 索引中精准回捞
+        // Exact text fingerprints were loaded before matching; only authoritative signatures / tool ids need a point lookup here.
         for turn in model_turns.iter_mut() {
-            if turn.already_complete || turn.matched_record_idx.is_some() {
+            if turn.already_complete || turn.ambiguous_context || turn.matched_record_idx.is_some()
+            {
                 continue;
             }
 
@@ -764,7 +1199,11 @@ impl ThinkingStore {
                     let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
                     let rec_has_tools =
                         !persisted.tool_ids.is_empty() || !persisted.tool_names.is_empty();
-                    if turn_has_tools == rec_has_tools {
+                    if !persisted.fingerprint.starts_with(CALL_SIGNATURE_PREFIX)
+                        && turn_has_tools == rec_has_tools
+                        && (!turn_has_tools
+                            || tool_ids_compatible(&turn.tool_ids, &persisted.tool_ids))
+                    {
                         fetched_rec = Some(ThinkingRecord {
                             fingerprint: persisted.fingerprint,
                             thought: persisted.thought,
@@ -777,51 +1216,18 @@ impl ThinkingStore {
                 }
             }
 
-            // 1. 工具调用精准穿透点查 (利用 primary_tool_id Partial Index，纳秒级命中)
-            if fetched_rec.is_none() && !turn.tool_ids.is_empty() {
-                for id in &turn.tool_ids {
-                    if let Ok(Some(persisted)) =
-                        crate::modules::proxy_db::load_thinking_by_tool_id(store_key, id)
-                    {
-                        let tool_names_match =
-                            if turn.tool_names.is_empty() || persisted.tool_names.is_empty() {
-                                true
-                            } else {
-                                turn.tool_names == persisted.tool_names
-                            };
-                        if tool_names_match {
-                            fetched_rec = Some(ThinkingRecord {
-                                fingerprint: persisted.fingerprint,
-                                thought: persisted.thought,
-                                signature: persisted.signature,
-                                tool_ids: persisted.tool_ids,
-                                tool_names: persisted.tool_names,
-                                visible: persisted.visible,
-                            });
-                            break;
-                        }
-                    }
-                }
-            } else if fetched_rec.is_none() && !turn.visible.trim().is_empty() {
-                // 2. 纯文本轮次精准穿透点查 (利用 idx_thinking_rec_fp 索引)
-                if turn.fp.is_empty() {
-                    turn.fp = fingerprint(&turn.visible, &turn.tool_ids, &turn.tool_names);
-                }
-                if let Ok(Some(persisted)) =
-                    crate::modules::proxy_db::load_thinking_by_fingerprint(store_key, &turn.fp)
-                {
-                    fetched_rec = Some(ThinkingRecord {
-                        fingerprint: persisted.fingerprint,
-                        thought: persisted.thought,
-                        signature: persisted.signature,
-                        tool_ids: persisted.tool_ids,
-                        tool_names: persisted.tool_names,
-                        visible: persisted.visible,
-                    });
-                }
-            }
-
+            // Tool candidates are resolved as a complete set above. A single
+            // latest SQLite row is not authority to choose a generation.
             if let Some(rec) = fetched_rec {
+                let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
+                if (!turn_has_tools && !record_signature_matches_target(&rec, target_model))
+                    || records
+                        .iter()
+                        .zip(&used)
+                        .any(|(known, used)| *used && same_thinking_record(known, &rec))
+                {
+                    continue;
+                }
                 let rec_arc = Arc::new(rec);
                 records.push(rec_arc.clone());
                 used.push(true);
@@ -837,7 +1243,10 @@ impl ThinkingStore {
 
         // Phase 4: 尾部优先的逆向兜底匹配（仅限纯文本轮次，绝不跨轮借用工具签名造成下轮突变！）
         if let Some(last_turn) = model_turns.last_mut() {
-            if !last_turn.already_complete && last_turn.matched_record_idx.is_none() {
+            if !last_turn.already_complete
+                && !last_turn.ambiguous_context
+                && last_turn.matched_record_idx.is_none()
+            {
                 let last_turn_has_tools =
                     !last_turn.tool_ids.is_empty() || !last_turn.tool_names.is_empty();
                 if !last_turn_has_tools {
@@ -848,6 +1257,13 @@ impl ThinkingStore {
                             }
                             let r_has_tools = !r.tool_ids.is_empty() || !r.tool_names.is_empty();
                             !r_has_tools
+                                && record_signature_matches_target(r, target_model)
+                                && text_context_matches(&r.fingerprint, &last_turn.text_anchor)
+                                && !last_turn
+                                    .existing_sig
+                                    .as_deref()
+                                    .zip(r.signature.as_deref())
+                                    .is_some_and(|(a, b)| !signatures_match(a, b))
                         })
                     {
                         last_turn.matched_record_idx = Some(last_unused_rec_idx);
@@ -1141,6 +1557,7 @@ impl ThinkingStore {
 
         // 1. 精准净化内存缓存 (RAM)
         if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            entry.load_epoch = Arc::new(());
             let mut new_turns = Vec::with_capacity(entry.turns.len());
             for rec in &entry.turns {
                 if let Some(ref sig) = rec.signature {
@@ -1190,6 +1607,7 @@ impl ThinkingStore {
 
         let mut cleared = 0;
         if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            entry.load_epoch = Arc::new(());
             let mut new_turns = Vec::with_capacity(entry.turns.len());
             for rec in &entry.turns {
                 if rec.signature.is_some() {
@@ -1218,8 +1636,18 @@ impl ThinkingStore {
     /// Drop thinking records that no longer appear in the (possibly compressed) history.
     /// Always keeps the newest 2 turns so the latest unused response thinking is not lost.
     pub fn prune_orphaned_records(&self, store_key: &str, contents: &[Value]) {
+        if let Some(plan) = self.prepare_orphaned_records_prune(store_key, contents) {
+            plan.persist();
+        }
+    }
+
+    fn prepare_orphaned_records_prune(
+        &self,
+        store_key: &str,
+        contents: &[Value],
+    ) -> Option<ThinkingPrunePlan> {
         if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
-            return;
+            return None;
         }
 
         let mem_turns = self
@@ -1228,18 +1656,36 @@ impl ThinkingStore {
             .map(|e| e.turns.len())
             .unwrap_or(0);
         if mem_turns == 0 {
-            return;
+            return None;
         }
         let live_turn_count = contents.iter().filter(|c| is_model_or_assistant(c)).count();
         // Typical agent path: stored turns ≈ live model turns. Skip inspect/fingerprint/SQLite.
         if mem_turns <= live_turn_count.saturating_add(2) {
-            return;
+            return None;
         }
+
+        // Snapshot before taking the RAM write guard. A concurrent capture can
+        // then finish both writes without an old prune deleting its new version.
+        // Never hold a SQLite guard while acquiring a DashMap shard (or vice versa).
+        let snapshot =
+            match crate::modules::proxy_db::snapshot_thinking_records_for_prune(store_key) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        "[ThinkingStore] Skipping prune for {}: {}",
+                        store_key,
+                        error
+                    );
+                    return None;
+                }
+            };
 
         let mut live_tool_ids = std::collections::HashSet::new();
         let mut live_fps = std::collections::HashSet::new();
         let mut live_sigs = std::collections::HashSet::new();
         let mut live_visibles: Vec<String> = Vec::new();
+        let mut live_text_anchors = std::collections::HashSet::new();
+        let text_anchors = compute_text_turn_anchors(contents);
 
         for (c_idx, content) in contents.iter().enumerate() {
             if !is_model_or_assistant(content) {
@@ -1256,6 +1702,15 @@ impl ThinkingStore {
             let anchor = compute_causal_anchor(preceding_turn);
             let (visible, tool_ids, tool_names, _) = inspect_parts_with_anchor(parts, &anchor);
             live_fps.insert(fingerprint(&visible, &tool_ids, &tool_names));
+            live_fps.insert(contextual_fingerprint(
+                &visible,
+                &tool_ids,
+                &tool_names,
+                Some(&text_anchors[c_idx]),
+            ));
+            if tool_ids.is_empty() && tool_names.is_empty() {
+                live_text_anchors.insert(text_anchors[c_idx].as_str());
+            }
             for id in tool_ids {
                 live_tool_ids.insert(id);
             }
@@ -1277,10 +1732,10 @@ impl ThinkingStore {
 
         let keep_fps = {
             let Some(mut entry) = self.sessions.get_mut(store_key) else {
-                return;
+                return None;
             };
             if entry.turns.len() <= live_turn_count.saturating_add(2) {
-                return;
+                return None;
             }
 
             let rec_norms: Vec<String> = entry
@@ -1299,7 +1754,10 @@ impl ThinkingStore {
                 let matched_tool = rec.tool_ids.iter().any(|id| live_tool_ids.contains(id));
                 let matched_fp = live_fps.contains(&rec.fingerprint);
                 let norm_rec = &rec_norms[i];
-                let matched_text = !norm_rec.is_empty()
+                let context_live = text_fingerprint_context(&rec.fingerprint)
+                    .map_or(true, |(anchor, _)| live_text_anchors.contains(anchor));
+                let matched_text = context_live
+                    && !norm_rec.is_empty()
                     && live_visibles.iter().any(|v| {
                         v == norm_rec || v.starts_with(norm_rec) || norm_rec.starts_with(v)
                     });
@@ -1310,13 +1768,22 @@ impl ThinkingStore {
             }
 
             if keep.len() == entry.turns.len() {
-                return;
+                return None;
             }
 
             let dropped = entry.turns.len() - keep.len();
             entry.bytes = keep.iter().map(|r| record_bytes(r)).sum();
-            let fps: Vec<String> = keep.iter().map(|r| r.fingerprint.clone()).collect();
+            // Live generations can remain only in SQLite: an ambiguous text
+            // match is intentionally not hydrated, for example. RAM survivors
+            // alone are therefore not an authoritative database keep list.
+            live_fps.extend(keep.iter().map(|r| r.fingerprint.clone()));
+            let fps: Vec<String> = live_fps.into_iter().collect();
             entry.turns = keep;
+            entry.load_epoch = Arc::new(());
+            // SQLite can retain other generations of a surviving fingerprint,
+            // or captures protected by the prune snapshot's write revisions.
+            // RAM is now a partial candidate set even below the capacity limit.
+            entry.l2_has_evicted_turns = true;
             tracing::info!(
                 "[ThinkingStore] Pruned {} orphaned thinking record(s) after context compression for session {}",
                 dropped,
@@ -1325,10 +1792,12 @@ impl ThinkingStore {
             fps
         };
 
-        // Delete orphans by fingerprint. Never DELETE+re-INSERT the kept blobs.
-        let _ = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
-            store_key, &keep_fps,
-        );
+        Some(ThinkingPrunePlan {
+            snapshot,
+            keep_fps,
+            live_tool_ids: live_tool_ids.into_iter().collect(),
+            live_sigs: live_sigs.into_iter().collect(),
+        })
     }
 
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
@@ -1445,7 +1914,10 @@ pub struct TurnAccumulator {
     tool_ids: Vec<String>,
     tool_names: Vec<String>,
     context_anchor: String,
+    text_context_anchor: Option<String>,
     function_call_count: usize,
+    // Individual signatures must never be inferred from the longest signature in a turn.
+    signed_calls: Vec<ThinkingRecord>,
 }
 
 impl TurnAccumulator {
@@ -1461,8 +1933,17 @@ impl TurnAccumulator {
             tool_ids: Vec::new(),
             tool_names: Vec::new(),
             context_anchor: anchor.into(),
+            text_context_anchor: None,
             function_call_count: 0,
+            signed_calls: Vec::new(),
         }
+    }
+
+    /// The full visible request prefix distinguishes repeated text-only turns.
+    /// Keep the separate causal anchor unchanged for synthetic tool ids.
+    pub fn with_text_context_anchor(mut self, anchor: impl Into<String>) -> Self {
+        self.text_context_anchor = Some(anchor.into());
+        self
     }
 
     pub fn ingest_part(&mut self, part: &Value) {
@@ -1512,6 +1993,29 @@ impl TurnAccumulator {
             );
             self.function_call_count += 1;
 
+            if let Some(signature) = part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(Value::as_str)
+                .filter(|s| is_real_signature(s) && is_likely_gemini_signature(s))
+            {
+                let ids: Vec<_> = std::iter::once(synthetic.clone())
+                    .chain(explicit_id.clone().filter(|id| id != &synthetic))
+                    .collect();
+                let names = vec![name.clone()];
+                self.signed_calls.push(ThinkingRecord {
+                    fingerprint: format!(
+                        "{CALL_SIGNATURE_PREFIX}{}",
+                        fingerprint("", &ids, &names)
+                    ),
+                    thought: String::new(),
+                    signature: Some(signature.to_owned()),
+                    tool_ids: ids,
+                    tool_names: names,
+                    visible: String::new(),
+                });
+            }
+
             // 核心演进：全面转战因果伪哈希 ID！首位强制存入确定性 synthetic ID，客户端 real_id 紧随其后作为元数据兜底
             if !self.tool_ids.iter().any(|x| x == &synthetic) {
                 self.tool_ids.push(synthetic.clone());
@@ -1527,6 +2031,10 @@ impl TurnAccumulator {
                 self.tool_names.push(name);
             }
         }
+    }
+
+    pub(crate) fn observed_signature(&self) -> Option<&str> {
+        self.signature.as_deref()
     }
 
     pub fn record_tool_id(&mut self, tool_name: &str, real_id: &str) {
@@ -1549,7 +2057,12 @@ impl TurnAccumulator {
     }
 
     fn into_record(self) -> ThinkingRecord {
-        let fp = fingerprint(&self.visible, &self.tool_ids, &self.tool_names);
+        let fp = contextual_fingerprint(
+            &self.visible,
+            &self.tool_ids,
+            &self.tool_names,
+            self.text_context_anchor.as_deref(),
+        );
         ThinkingRecord {
             fingerprint: fp,
             thought: self.thought,
@@ -1560,9 +2073,16 @@ impl TurnAccumulator {
         }
     }
 
-    pub fn commit(self, store_key: &str) {
+    pub fn commit(mut self, store_key: &str) {
         if store_key.is_empty() || !self.should_capture() {
             return;
+        }
+        // Keep the ordinary thinking record for thought/text hydration. Store independent
+        // signed calls separately, using the same scoped and generation-aware SQLite store.
+        if self.function_call_count > 1 {
+            for call in std::mem::take(&mut self.signed_calls) {
+                ThinkingStore::global().record(store_key, call);
+            }
         }
         let rec = self.into_record();
         tracing::debug!(
@@ -1580,6 +2100,7 @@ pub fn capture_gemini_contents(store_key: &str, contents: &[Value]) {
     if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
         return;
     }
+    let text_anchors = compute_text_turn_anchors(contents);
     for (c_idx, content) in contents.iter().enumerate() {
         let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
         if role != "model" && role != "assistant" {
@@ -1592,7 +2113,12 @@ pub fn capture_gemini_contents(store_key: &str, contents: &[Value]) {
                 None
             };
             let anchor = compute_causal_anchor(preceding_turn);
-            capture_gemini_parts_with_anchor(store_key, parts, &anchor);
+            capture_gemini_parts_with_context(
+                store_key,
+                parts,
+                &anchor,
+                Some(&text_anchors[c_idx]),
+            );
         }
     }
 }
@@ -1624,6 +2150,124 @@ pub fn hydrate_gemini_contents_with_model(
     }
     store.prune_orphaned_records(store_key, contents);
     restored
+}
+
+/// The early pipeline still aligns tools before protocol finalization. Text
+/// identities depend on the final sanitized prefix, so neither capture nor
+/// pruning of text records belongs in this pre-transit stage.
+pub fn hydrate_gemini_tool_contents_with_model(
+    store_key: &str,
+    contents: &mut Vec<Value>,
+    target_model: Option<&str>,
+) -> usize {
+    if store_key.is_empty() {
+        return 0;
+    }
+    let store = ThinkingStore::global();
+    store.touch_session(store_key);
+    let restored = store.restore_selected_contents(store_key, contents, target_model, Some(false));
+    store.ingest_selected_contents(store_key, contents, Some(false));
+    // Pruning is session-wide, including SQLite rows outside the RAM window.
+    // Wait for finalize_request_text_context to recover text against the final
+    // prefix before deciding which generations have actually left the history.
+    restored
+}
+
+/// Run once after request sanitization/context transforms and before upload.
+/// The same final visible prefix drives both hydration and response capture.
+pub fn finalize_request_text_context(
+    store_key: &str,
+    contents: &mut Vec<Value>,
+    target_model: &str,
+    thinking_enabled: bool,
+    is_retry: bool,
+) -> String {
+    if !store_key.is_empty() && thinking_enabled && !is_retry {
+        let store = ThinkingStore::global();
+        let mut anchor = compute_response_text_anchor(contents);
+        let mut incoming = std::collections::BTreeMap::<usize, ThinkingRecord>::new();
+        let mut converged = false;
+        // Restoring a downgraded thought can remove visible text, while the
+        // finalizer can turn an unsigned thought back into visible text. Later
+        // turns must match the resulting prefix. Normally this is one pass;
+        // only a visible change warrants another, bounded by the history size.
+        for _ in 0..=contents.len() {
+            store.restore_selected_contents(store_key, contents, Some(target_model), Some(true));
+            // Keep the full thoughts before Gemini's wire shape drops them.
+            // Assign their context identities only after finalization settles.
+            for (idx, mut record) in store.collect_selected_records(store_key, contents, Some(true))
+            {
+                if let Some(previous) = incoming.get(&idx) {
+                    // A later pass may see only the signature or downgraded
+                    // visible text after Gemini removed a new client-supplied
+                    // thought. Preserve that capture until the stable commit.
+                    // Different signed generations must never be combined.
+                    if record.visible == previous.visible
+                        && legacy_text_signatures_compatible(previous, &record)
+                    {
+                        if previous.thought.len() > record.thought.len() {
+                            record.thought = previous.thought.clone();
+                        }
+                        if record.signature.is_none() {
+                            record.signature = previous.signature.clone();
+                        }
+                    }
+                }
+                incoming.insert(idx, record);
+            }
+            finalize_gemini_contents_with_stage(
+                contents,
+                thinking_enabled,
+                Some(target_model),
+                Some(store_key),
+                false,
+                None,
+                false,
+            );
+            let next_anchor = compute_response_text_anchor(contents);
+            if next_anchor == anchor {
+                converged = true;
+                break;
+            }
+            anchor = next_anchor;
+        }
+        let anchors = compute_text_turn_anchors(contents);
+        let records = incoming
+            .into_iter()
+            .map(|(idx, mut record)| {
+                record.fingerprint = contextual_fingerprint(
+                    &record.visible,
+                    &record.tool_ids,
+                    &record.tool_names,
+                    Some(&anchors[idx]),
+                );
+                record
+            })
+            .collect();
+        store.ingest_records(store_key, records);
+        if converged {
+            store.prune_orphaned_records(store_key, contents);
+        } else {
+            // Never delete history based on an unsettled projection.
+            tracing::warn!(
+                "[ThinkingStore] Visible prefix did not settle for {}",
+                store_key
+            );
+        }
+        return anchor;
+    }
+    // Finish text only after the exact-context restore. A session's latest
+    // signature is not evidence that an unrelated historical text turn owns it.
+    finalize_gemini_contents_with_stage(
+        contents,
+        thinking_enabled,
+        Some(target_model),
+        Some(store_key),
+        is_retry,
+        None,
+        false,
+    );
+    compute_response_text_anchor(contents)
 }
 
 fn is_model_or_assistant(content: &Value) -> bool {
@@ -1667,7 +2311,19 @@ pub fn capture_gemini_parts(store_key: &str, parts: &[Value]) {
 }
 
 pub fn capture_gemini_parts_with_anchor(store_key: &str, parts: &[Value], anchor: &str) {
+    capture_gemini_parts_with_context(store_key, parts, anchor, None);
+}
+
+pub fn capture_gemini_parts_with_context(
+    store_key: &str,
+    parts: &[Value],
+    anchor: &str,
+    text_context_anchor: Option<&str>,
+) {
     let mut acc = TurnAccumulator::with_anchor(anchor);
+    if let Some(anchor) = text_context_anchor {
+        acc = acc.with_text_context_anchor(anchor);
+    }
     for part in parts {
         acc.ingest_part(part);
     }
@@ -1683,16 +2339,29 @@ pub fn capture_gemini_response_with_preceding(
     response: &Value,
     preceding: Option<&Value>,
 ) {
+    capture_gemini_response_with_context(store_key, response, preceding, None);
+}
+
+pub fn capture_gemini_response_with_context(
+    store_key: &str,
+    response: &Value,
+    preceding: Option<&Value>,
+    text_context_anchor: Option<&str>,
+) {
     let raw = response.get("response").unwrap_or(response);
-    if let Some(parts) = raw
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-    {
-        let anchor = compute_causal_anchor(preceding);
-        capture_gemini_parts_with_anchor(store_key, parts, &anchor);
+    let anchor = compute_causal_anchor(preceding);
+    if let Some(candidates) = raw.get("candidates").and_then(Value::as_array) {
+        if crate::proxy::mappers::gemini::candidate_indices(candidates).is_none() {
+            return;
+        }
+        for candidate in candidates {
+            if let Some(parts) = candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+            {
+                capture_gemini_parts_with_context(store_key, parts, &anchor, text_context_anchor);
+            }
+        }
     }
 }
 
@@ -1917,6 +2586,45 @@ pub fn finalize_gemini_contents_thinking_with_options(
     session_id: Option<&str>,
     untrusted_signatures: bool,
 ) {
+    finalize_gemini_contents_with_stage(
+        contents,
+        is_thinking_enabled,
+        target_model,
+        session_id,
+        untrusted_signatures,
+        None,
+        true,
+    );
+}
+
+pub fn finalize_gemini_tool_contents_thinking_with_options(
+    contents: &mut [Value],
+    is_thinking_enabled: bool,
+    target_model: Option<&str>,
+    session_id: Option<&str>,
+    untrusted_signatures: bool,
+) {
+    finalize_gemini_contents_with_stage(
+        contents,
+        is_thinking_enabled,
+        target_model,
+        session_id,
+        untrusted_signatures,
+        Some(false),
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_gemini_contents_with_stage(
+    contents: &mut [Value],
+    is_thinking_enabled: bool,
+    target_model: Option<&str>,
+    session_id: Option<&str>,
+    untrusted_signatures: bool,
+    text_only: Option<bool>,
+    allow_session_text_fallback: bool,
+) {
     let compaction_boundary = determine_compaction_boundary(contents, session_id);
 
     // 预先计算每一轮的前置因果锚点 (causal anchor)，以便无 ID 的 Gemini 原生工具调用也能合成确定性 ID
@@ -1987,15 +2695,17 @@ pub fn finalize_gemini_contents_thinking_with_options(
 
     // 预先计算最后一个 model / 工具调用轮次的索引
     let last_model_idx = contents.iter().enumerate().rposition(|(_, m)| {
-        matches!(
-            m.get("role").and_then(|r| r.as_str()),
-            Some("model") | Some("assistant")
-        ) || m
-            .get("parts")
-            .and_then(|p| p.as_array())
-            .map_or(false, |parts| {
-                parts.iter().any(|p| p.get("functionCall").is_some())
-            })
+        let parts = m.get("parts").and_then(Value::as_array);
+        let has_fc =
+            parts.is_some_and(|parts| parts.iter().any(|p| p.get("functionCall").is_some()));
+        let has_fr =
+            parts.is_some_and(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()));
+        has_fc
+            || (!has_fr
+                && matches!(
+                    m.get("role").and_then(|r| r.as_str()),
+                    Some("model") | Some("assistant")
+                ))
     });
 
     for (msg_idx, msg) in contents.iter_mut().enumerate() {
@@ -2007,21 +2717,40 @@ pub fn finalize_gemini_contents_thinking_with_options(
             .map_or(false, |parts| {
                 parts.iter().any(|p| p.get("functionCall").is_some())
             });
+        // The Google envelope normalizes functionResponse turns to model, but
+        // they are still tool results and cannot own a model thought signature.
+        let is_tool_response = !has_fc
+            && msg
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()));
         if has_fc && msg.get("role").and_then(|r| r.as_str()) == Some("user") {
             msg["role"] = json!("model");
         }
-        let is_model = matches!(
-            msg.get("role").and_then(|r| r.as_str()),
-            Some("model") | Some("assistant")
-        ) || has_fc;
+        let is_model = !is_tool_response
+            && (matches!(
+                msg.get("role").and_then(|r| r.as_str()),
+                Some("model") | Some("assistant")
+            ) || has_fc);
+
+        if is_model && text_only.is_some_and(|selected| selected == has_fc) {
+            pending_thought_sig = None;
+            continue;
+        }
 
         if !is_model {
+            // Only adjacent fragments of one model response can hand off a
+            // pending signature; a new user prompt or tool result ends it.
+            pending_thought_sig = None;
             // 非 model 轮次（如 user 轮次的 functionResponse）：清洗可能混入的误标签名
             if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts.iter_mut() {
                     if let Some(obj) = part.as_object_mut() {
                         obj.remove("thought_signature");
-                        if is_in_compaction_history || obj.contains_key("functionResponse") {
+                        if is_in_compaction_history
+                            || is_tool_response
+                            || obj.contains_key("functionResponse")
+                        {
                             obj.remove("thoughtSignature");
                         }
                     }
@@ -2053,6 +2782,13 @@ pub fn finalize_gemini_contents_thinking_with_options(
                 .map(|m| m.to_lowercase().contains("claude"))
                 .unwrap_or(false);
 
+            let parallel = !is_claude_turn && has_parallel_calls(&other_parts);
+            if parallel && !untrusted_signatures && !is_in_compaction_history {
+                if let Some(sid) = session_id {
+                    restore_parallel_signatures(sid, _anchor, &mut other_parts);
+                }
+            }
+
             // 1. 提取当前轮次已有合法的真实签名 (纯检查当前轮部件自带签名，必须严格校验合法性！)
             // [Pipeline First] 若存在 functionCall 强制优先从 functionCall 提取合法签名，
             // 避免前面紧随的 text 说明正文误抢签名导致真实工具调用凭据丢失或绕过 tool_signatures 穿透查库。
@@ -2074,8 +2810,62 @@ pub fn finalize_gemini_contents_thinking_with_options(
                 }
             };
 
+            // A synthetic alias or a session-wide hint is weaker than a
+            // conflicting generation in ThinkingStore. Do not let finalization
+            // reinsert a signature hydration intentionally declined.
+            let mut tool_conflict = parallel;
+            let checked_tool_sig = if has_fc
+                && !parallel
+                && turn_real_sig.is_none()
+                && !untrusted_signatures
+                && !is_in_compaction_history
+            {
+                session_id.and_then(|sid| {
+                    let (_, ids, _, _) = inspect_parts_with_anchor(&other_parts, _anchor);
+                    let store = ThinkingStore::global();
+                    let mut rows = store.load_turns(sid);
+                    if store
+                        .sessions
+                        .get(sid)
+                        .is_some_and(|e| e.l2_has_evicted_turns)
+                    {
+                        match crate::modules::proxy_db::load_thinking_by_tool_ids(sid, &ids) {
+                            Ok(more) => extend_tool_candidates(&mut rows, more),
+                            Err(_) => {
+                                tool_conflict = true;
+                                return None;
+                            }
+                        }
+                    }
+                    match select_tool_generation(
+                        &ids,
+                        None,
+                        &rows,
+                        (0..rows.len())
+                            .filter(|&i| !rows[i].fingerprint.starts_with(CALL_SIGNATURE_PREFIX)),
+                    ) {
+                        ToolMatch::Conflict => {
+                            tool_conflict = true;
+                            None
+                        }
+                        ToolMatch::Found(i) => rows[i]
+                            .signature
+                            .clone()
+                            .filter(|sig| is_valid_family_sig(sig)),
+                        ToolMatch::Missing => None,
+                    }
+                })
+            } else {
+                None
+            };
             let cached_tool_sig: Option<String> =
-                if !untrusted_signatures && !is_in_compaction_history && turn_real_sig.is_none() {
+                if checked_tool_sig.is_some() {
+                    checked_tool_sig
+                } else if !tool_conflict
+                    && !untrusted_signatures
+                    && !is_in_compaction_history
+                    && turn_real_sig.is_none()
+                {
                     let mut found_sig = None;
                     let mut fc_counter = 0usize;
                     for p in &other_parts {
@@ -2168,7 +2958,9 @@ pub fn finalize_gemini_contents_thinking_with_options(
                 };
 
             let is_last_model_turn = last_model_idx == Some(msg_idx);
-            let cached_session_sig: Option<String> = if !untrusted_signatures
+            let cached_session_sig: Option<String> = if !tool_conflict
+                && !untrusted_signatures
+                && (has_fc || allow_session_text_fallback)
                 && is_last_model_turn
                 && turn_real_sig.is_none()
                 && cached_tool_sig.is_none()
@@ -2252,7 +3044,7 @@ pub fn finalize_gemini_contents_thinking_with_options(
                     (Some(sig.clone()), true)
                 } else if let Some(ref sig) = cached_session_sig {
                     (Some(sig.clone()), true)
-                } else if let Some(sig) = pending_thought_sig.take() {
+                } else if let Some(sig) = pending_thought_sig.take().filter(|_| !tool_conflict) {
                     (Some(sig), false)
                 } else if !is_claude_turn
                     && other_parts.iter().any(|p| p.get("functionCall").is_some())
@@ -2380,7 +3172,7 @@ pub fn explicit_session_id_with_query(
 
 /// 稳定会话号的唯一优先级：
 /// 产品会话头（`x-claude-code-session-id` 最先）→ 其它通配会话头 →
-/// 通用 `x-session-id` → 别名头 → query → body 稳定字段。
+/// 通用 `x-session-id` → `x-session-affinity` → 别名头 → query → body 稳定字段。
 /// `previous_response_id` 是每轮游标，不在名单里。
 pub fn stable_session_winner(
     headers: &HeaderMap,
@@ -2419,6 +3211,7 @@ const GENERIC_SESSION_HEADER: &str = "x-session-id";
 
 /// Non-session-named aliases. Lowest header priority after `x-session-id`.
 const ALIAS_SESSION_HEADERS: &[&str] = &[
+    "x-session-affinity",
     "x-conversation-id",
     "conversation-id",
     "x-chat-id",
@@ -2844,6 +3637,12 @@ pub fn ensure_raw_claude_thought_signature(sig: &str) -> String {
 /// 统一归一化为原始客户端签名形式 (Eu8... 或 CAQS...)，使 "RXU4..." 与 "Eu8..."、"Q0FR..." 与 "CAQS..." 判定为相同签名
 pub fn normalize_signature_for_comparison(sig: &str) -> std::borrow::Cow<'_, str> {
     use base64::Engine;
+    // SQLite heals legacy raw Gemini signatures to this same wire representation.
+    if sig.as_bytes().first() == Some(&0x12) {
+        return std::borrow::Cow::Owned(
+            base64::engine::general_purpose::STANDARD.encode(sig.as_bytes()),
+        );
+    }
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(sig) {
         if is_wrapped_claude_payload(&decoded) {
             if let Ok(s) = String::from_utf8(decoded) {
@@ -2992,7 +3791,18 @@ pub fn place_turn_signature_scoped(
     // 必须经过严格校验（is_real_signature && is_likely_gemini_signature），只有合法才接受！
     // 优先抢救 functionCall 自带的真实签名，无工具调用时抢救首个非思考正文部件签名。
     let has_fc = parts.iter().any(|p| p.get("functionCall").is_some());
-    let own_sig = extract_turn_signature(parts, prefer_function_call, !prefer_function_call);
+    let parallel = prefer_function_call && has_parallel_calls(parts);
+    // A sibling's signature, a legacy turn-wide record, or the session's last
+    // signature is not evidence that this particular function call owns it.
+    let fallback_sig = fallback_sig.filter(|_| !parallel);
+    let own_sig = if parallel {
+        parts
+            .iter()
+            .find(|p| p.get("functionCall").is_some())
+            .and_then(|p| extract_part_signature(p, false))
+    } else {
+        extract_turn_signature(parts, prefer_function_call, !prefer_function_call)
+    };
 
     // 2. 占位文本清理：若本轮包含 functionCall，清理混入的无意义占位正文（如 "..."、"·" 等客户端/中间件遗留脏数据）
     if has_fc {
@@ -3164,10 +3974,417 @@ fn record_bytes(rec: &ThinkingRecord) -> usize {
     rec.thought.len() + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0) + rec.visible.len()
 }
 
+const TEXT_FINGERPRINT_VERSION: &str = "text-v2:";
+
+fn text_fingerprint_context(fp: &str) -> Option<(&str, &str)> {
+    fp.strip_prefix(TEXT_FINGERPRINT_VERSION)?.split_once(':')
+}
+
+fn base_fingerprint(fp: &str) -> &str {
+    text_fingerprint_context(fp).map_or(fp, |(_, base)| base)
+}
+
+fn contextual_fingerprint(
+    visible: &str,
+    tool_ids: &[String],
+    tool_names: &[String],
+    text_anchor: Option<&str>,
+) -> String {
+    let base = fingerprint(visible, tool_ids, tool_names);
+    if tool_ids.is_empty() && tool_names.is_empty() {
+        if let Some(anchor) = text_anchor.filter(|a| !a.is_empty()) {
+            return format!("{TEXT_FINGERPRINT_VERSION}{anchor}:{base}");
+        }
+    }
+    base
+}
+
+fn text_context_matches(fp: &str, anchor: &str) -> bool {
+    text_fingerprint_context(fp).is_none_or(|(stored, _)| stored == anchor)
+}
+
+fn same_thinking_record(a: &ThinkingRecord, b: &ThinkingRecord) -> bool {
+    a.fingerprint == b.fingerprint
+        && a.thought == b.thought
+        && a.visible == b.visible
+        && a.tool_ids == b.tool_ids
+        && a.tool_names == b.tool_names
+        && match (a.signature.as_deref(), b.signature.as_deref()) {
+            (Some(a), Some(b)) => signatures_match(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn record_signature_matches_target(record: &ThinkingRecord, target_model: Option<&str>) -> bool {
+    let Some(signature) = record.signature.as_deref().filter(|s| is_real_signature(s)) else {
+        return true;
+    };
+    match target_model.map(str::to_ascii_lowercase) {
+        Some(model) if model.contains("claude") => is_claude_signature(signature),
+        Some(model) if model.contains("gemini") => is_likely_gemini_signature(signature),
+        _ => true,
+    }
+}
+
+/// `candidates` have already matched the exact visible prefix and target family.
+/// A session signature can resolve that set, but cannot introduce a candidate
+/// from another turn or override an explicit signature supplied by the client.
+fn select_contextual_text_record(
+    records: &[Arc<ThinkingRecord>],
+    candidates: &[usize],
+    authority: Option<&str>,
+) -> Option<usize> {
+    if let Some(signature) = authority.filter(|s| is_real_signature(s)) {
+        if let Some(&idx) = candidates.iter().find(|&&idx| {
+            records[idx]
+                .signature
+                .as_deref()
+                .is_some_and(|stored| signatures_match(signature, stored))
+        }) {
+            return Some(idx);
+        }
+    }
+    let signed: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            records[idx]
+                .signature
+                .as_deref()
+                .is_some_and(is_real_signature)
+        })
+        .collect();
+    let Some(&first) = signed.first() else {
+        return candidates.first().copied();
+    };
+    let signature = records[first]
+        .signature
+        .as_deref()
+        .expect("signed candidate");
+    signed
+        .iter()
+        .all(|&idx| {
+            records[idx]
+                .signature
+                .as_deref()
+                .is_some_and(|other| signatures_match(signature, other))
+        })
+        .then_some(first)
+}
+
+/// Two different real signatures are
+/// evidence of separate turns, never a reason to overwrite the older response.
+/// Shared with SQLite so memory eviction/restart cannot reintroduce the merge.
+pub(crate) fn text_record_signatures_compatible(
+    _fingerprint: &str,
+    old_signature: Option<&str>,
+    new_signature: Option<&str>,
+) -> bool {
+    match (
+        old_signature.filter(|s| is_real_signature(s)),
+        new_signature.filter(|s| is_real_signature(s)),
+    ) {
+        (Some(old), Some(new)) => signatures_match(old, new),
+        _ => true,
+    }
+}
+
+/// Real client IDs distinguish generations that share a deterministic tool
+/// alias. If one side lacks a real ID, the unique causal match is still useful.
+pub(crate) fn tool_ids_compatible(a: &[String], b: &[String]) -> bool {
+    let real = |id: &&String| !crate::modules::proxy_db::is_synthetic_tool_id(id);
+    let mut lhs = a.iter().filter(real).peekable();
+    let mut rhs = b.iter().filter(real).peekable();
+    lhs.peek().is_none() || rhs.peek().is_none() || lhs.eq(rhs)
+}
+
+fn extend_tool_candidates(
+    records: &mut Vec<Arc<ThinkingRecord>>,
+    persisted: Vec<crate::modules::proxy_db::PersistedThinkingRecord>,
+) {
+    for p in persisted {
+        if !records.iter().any(|r| {
+            r.fingerprint == p.fingerprint
+                && r.thought == p.thought
+                && r.tool_ids == p.tool_ids
+                && r.signature
+                    .as_deref()
+                    .map(normalize_signature_for_comparison)
+                    == p.signature
+                        .as_deref()
+                        .map(normalize_signature_for_comparison)
+        }) {
+            records.push(Arc::new(ThinkingRecord {
+                fingerprint: p.fingerprint,
+                thought: p.thought,
+                signature: p.signature,
+                tool_ids: p.tool_ids,
+                tool_names: p.tool_names,
+                visible: p.visible,
+            }));
+        }
+    }
+}
+const CALL_SIGNATURE_PREFIX: &str = "parallel-call-v1:";
+
+fn has_parallel_calls(parts: &[Value]) -> bool {
+    parts
+        .iter()
+        .filter(|p| p.get("functionCall").is_some())
+        .nth(1)
+        .is_some()
+}
+
+/// Look up each call against *all* its persisted generations before choosing a
+/// signature. A native ID may disambiguate a shared causal alias; with no such
+/// evidence two different signatures for that alias must remain unresolved.
+fn restore_parallel_signatures(sid: &str, anchor: &str, parts: &mut [Value]) {
+    let mut pending = Vec::new();
+    for (ordinal, (i, part)) in parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.get("functionCall").is_some())
+        .enumerate()
+    {
+        if extract_part_signature(part, false)
+            .as_deref()
+            .is_some_and(is_real_signature)
+        {
+            continue;
+        }
+        let fc = &part["functionCall"];
+        let name = fc["name"].as_str().unwrap_or("unknown");
+        let synthetic = synthesize_tool_id(name, fc.get("args"), anchor, ordinal);
+        let ids: Vec<_> = std::iter::once(synthetic)
+            .chain(
+                fc["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| crate::proxy::common::utils::normalize_tool_id(id).into_owned()),
+            )
+            .collect();
+        pending.push((i, ids));
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let store = ThinkingStore::global();
+    let mut rows = store.load_turns(sid);
+    if store
+        .sessions
+        .get(sid)
+        .is_some_and(|s| !s.l2_loaded || s.l2_has_evicted_turns)
+    {
+        let ids = pending
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let Ok(more) = crate::modules::proxy_db::load_thinking_by_tool_ids(sid, &ids) else {
+            return;
+        };
+        extend_tool_candidates(&mut rows, more);
+    }
+    rows.retain(|r| r.fingerprint.starts_with(CALL_SIGNATURE_PREFIX));
+    for (i, ids) in pending {
+        if let ToolMatch::Found(n) = select_tool_generation(&ids, None, &rows, 0..rows.len()) {
+            if let Some(sig) = rows[n]
+                .signature
+                .as_deref()
+                .filter(|s| is_likely_gemini_signature(s))
+            {
+                parts[i]["thoughtSignature"] = json!(sig);
+            }
+        }
+    }
+}
+
+enum ToolMatch {
+    Missing,
+    Conflict,
+    Found(usize),
+}
+
+fn select_tool_generation(
+    ids: &[String],
+    signature: Option<&str>,
+    records: &[Arc<ThinkingRecord>],
+    candidates: impl IntoIterator<Item = usize>,
+) -> ToolMatch {
+    let signature = signature.filter(|s| is_real_signature(s));
+    let mut matched = Vec::new();
+    let mut exact = false;
+    let mut saw = false;
+    for idx in candidates {
+        let row = &records[idx];
+        if !ids.iter().any(|id| row.tool_ids.contains(id)) {
+            continue;
+        }
+        saw = true;
+        if !tool_ids_compatible(ids, &row.tool_ids)
+            || !text_record_signatures_compatible("", signature, row.signature.as_deref())
+        {
+            continue;
+        }
+        let strong = ids.iter().any(|id| {
+            !crate::modules::proxy_db::is_synthetic_tool_id(id) && row.tool_ids.contains(id)
+        });
+        if strong && !exact {
+            matched.clear();
+            exact = true;
+        }
+        if strong || !exact {
+            matched.push(idx);
+        }
+    }
+    if !saw {
+        return ToolMatch::Missing;
+    }
+    select_contextual_text_record(records, &matched, signature)
+        .map_or(ToolMatch::Conflict, ToolMatch::Found)
+}
+
+fn legacy_text_signatures_compatible(old: &ThinkingRecord, new: &ThinkingRecord) -> bool {
+    text_record_signatures_compatible(
+        &old.fingerprint,
+        old.signature.as_deref(),
+        new.signature.as_deref(),
+    )
+}
+
+/// Hash the semantic visible prefix, excluding recovered thought/signatures and
+/// transport metadata. Adjacent text blocks concatenate just as streamed deltas
+/// do; tool ids are excluded because adapters may normalize or synthesize them.
+/// Tool response roles normalize here because Gemini finalization changes them
+/// from user to model after hydration.
+fn hash_visible_turn(hasher: &mut Sha256, content: &Value) {
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return;
+    };
+    let mut projected = Vec::new();
+    let mut text = String::new();
+    let mut has_response = false;
+    for part in parts {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(value) = part.get("text").and_then(Value::as_str) {
+            text.push_str(value);
+            continue;
+        }
+        let value = if let Some(call) = part.get("functionCall") {
+            Some(json!({"functionCall": {"name": call.get("name"), "args": call.get("args")}}))
+        } else if let Some(response) = part.get("functionResponse") {
+            has_response = true;
+            Some(
+                json!({"functionResponse": {"name": response.get("name"), "response": response.get("response")}}),
+            )
+        } else if let Some(data) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+            Some(json!({"inlineData": data}))
+        } else if let Some(data) = part.get("fileData").or_else(|| part.get("file_data")) {
+            Some(json!({"fileData": data}))
+        } else if let Some(code) = part.get("executableCode") {
+            Some(json!({"executableCode": code}))
+        } else {
+            part.get("codeExecutionResult")
+                .map(|result| json!({"codeExecutionResult": result}))
+        };
+        if let Some(value) = value {
+            if !text.is_empty() {
+                projected.push(json!({"text": std::mem::take(&mut text)}));
+            }
+            projected.push(value);
+        }
+    }
+    if !text.is_empty() {
+        projected.push(json!({"text": text}));
+    }
+    let role = if has_response {
+        "tool"
+    } else {
+        match content.get("role").and_then(Value::as_str).unwrap_or("") {
+            "assistant" => "model",
+            role => role,
+        }
+    };
+    let mut bytes = Vec::new();
+    write_canonical_json(&json!({"role": role, "parts": projected}), &mut bytes);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn text_anchor(hasher: &Sha256) -> String {
+    format!("{:x}", hasher.clone().finalize())[..32].to_string()
+}
+
+fn compute_text_turn_anchors(contents: &[Value]) -> Vec<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"thinking-text-context-v2");
+    contents
+        .iter()
+        .map(|content| {
+            let anchor = text_anchor(&hasher);
+            hash_visible_turn(&mut hasher, content);
+            anchor
+        })
+        .collect()
+}
+
+/// Capture this from the final request contents, before starting the response
+/// stream. It is owned by that request, so concurrent requests cannot overwrite it.
+pub fn compute_response_text_anchor(contents: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"thinking-text-context-v2");
+    for content in contents {
+        hash_visible_turn(&mut hasher, content);
+    }
+    text_anchor(&hasher)
+}
+
 fn is_stronger_record(new: &ThinkingRecord, old: &ThinkingRecord) -> bool {
     new.thought.len() > old.thought.len()
         || new.signature.as_ref().map(|s| s.len()).unwrap_or(0)
             > old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+}
+
+fn has_ambiguous_replay_match(
+    rec: &ThinkingRecord,
+    existing: &[Arc<ThinkingRecord>],
+    matched: usize,
+) -> bool {
+    existing.iter().enumerate().any(|(idx, other)| {
+        if idx == matched {
+            return false;
+        }
+        // Consider used siblings too: consuming a different turn earlier in
+        // the request is not proof that an unsigned replay belonged to this one.
+        replay_fallback_matches(rec, other)
+    })
+}
+
+fn replay_fallback_matches(rec: &ThinkingRecord, other: &ThinkingRecord) -> bool {
+    if !text_record_signatures_compatible(
+        &rec.fingerprint,
+        rec.signature.as_deref(),
+        other.signature.as_deref(),
+    ) {
+        return false;
+    }
+    if !tool_ids_compatible(&rec.tool_ids, &other.tool_ids) {
+        return false;
+    }
+    if rec.tool_ids.iter().any(|id| other.tool_ids.contains(id)) {
+        return true;
+    }
+    let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
+    let other_has_tools = !other.tool_ids.is_empty() || !other.tool_names.is_empty();
+    if rec_has_tools != other_has_tools {
+        return false;
+    }
+    rec.fingerprint == other.fingerprint
+        || (!rec_has_tools
+            && text_fingerprint_context(&other.fingerprint).is_none()
+            && other.fingerprint == base_fingerprint(&rec.fingerprint))
 }
 
 fn match_existing_record(
@@ -3177,40 +4394,32 @@ fn match_existing_record(
 ) -> Option<usize> {
     if let Some(ref sig) = rec.signature.as_ref().filter(|s| is_real_signature(s)) {
         for (i, ex) in existing.iter().enumerate() {
-            if used[i] {
+            if used[i] || ex.fingerprint.starts_with(CALL_SIGNATURE_PREFIX) {
                 continue;
             }
             if let Some(ref ex_sig) = ex.signature {
-                if signatures_match(sig, ex_sig) {
+                if signatures_match(sig, ex_sig) && tool_ids_compatible(&rec.tool_ids, &ex.tool_ids)
+                {
                     return Some(i);
                 }
             }
         }
     }
     if !rec.tool_ids.is_empty() {
-        for (i, ex) in existing.iter().enumerate() {
-            if used[i] {
-                continue;
-            }
-            if rec
-                .tool_ids
-                .iter()
-                .any(|id| ex.tool_ids.iter().any(|x| x == id))
-            {
-                return Some(i);
-            }
-        }
+        return match select_tool_generation(
+            &rec.tool_ids,
+            rec.signature.as_deref(),
+            existing,
+            (0..existing.len()).filter(|&i| {
+                !used[i] && !existing[i].fingerprint.starts_with(CALL_SIGNATURE_PREFIX)
+            }),
+        ) {
+            ToolMatch::Found(i) => Some(i),
+            _ => None,
+        };
     }
-    let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
     for (i, ex) in existing.iter().enumerate() {
-        if used[i] {
-            continue;
-        }
-        if ex.fingerprint != rec.fingerprint {
-            continue;
-        }
-        let ex_has_tools = !ex.tool_ids.is_empty() || !ex.tool_names.is_empty();
-        if rec_has_tools == ex_has_tools {
+        if !used[i] && replay_fallback_matches(rec, ex) {
             return Some(i);
         }
     }
@@ -3476,6 +4685,2843 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
 }
 
 #[cfg(test)]
+mod l2_text_candidate_tests {
+    use super::*;
+    use crate::proxy::SignatureCache;
+    use base64::Engine;
+
+    fn key(name: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "l2-candidates-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+    fn signature(claude: bool, seed: u8) -> String {
+        let mut raw = if claude {
+            vec![0x08, 0x04, 0x12]
+        } else {
+            vec![0x12]
+        };
+        raw.extend(std::iter::repeat_n(seed, 48));
+        let sig = base64::engine::general_purpose::STANDARD.encode(raw);
+        if claude {
+            ensure_google_claude_thought_signature(&sig)
+        } else {
+            sig
+        }
+    }
+    fn user(text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":text}]})
+    }
+    fn answer() -> Value {
+        json!({"role":"model","parts":[{"text":"Done."}]})
+    }
+    fn captured(prefix: &[Value], thought: &str, sig: &str) -> ThinkingRecord {
+        let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(prefix.last()))
+            .with_text_context_anchor(compute_response_text_anchor(prefix));
+        acc.ingest_part(&json!({"text":thought,"thought":true}));
+        acc.ingest_part(&json!({"text":"Done.","thoughtSignature":sig}));
+        acc.into_record()
+    }
+    // Exercise different warm windows without depending on the user's configured
+    // memory limit. The first test separately exercises actual record() eviction.
+    fn warm_window(store: &ThinkingStore, sid: &str, resident_signature: Option<&str>) {
+        store.sessions.remove(sid);
+        let mut turns = store.load_turns(sid);
+        turns.retain(|rec| {
+            resident_signature.is_some_and(|sig| {
+                rec.signature
+                    .as_deref()
+                    .is_some_and(|stored| signatures_match(sig, stored))
+            })
+        });
+        // Keep a nonempty unrelated turn so load_turns uses the warm window.
+        turns.push(Arc::new(captured(
+            &[user("Unrelated")],
+            "Unrelated thought",
+            &signature(false, b'Z'),
+        )));
+        let mut entry = store.sessions.get_mut(sid).unwrap();
+        entry.bytes = turns.iter().map(|rec| record_bytes(rec)).sum();
+        entry.turns = turns;
+        entry.l2_has_evicted_turns = true;
+    }
+    fn cleanup(sid: &str) {
+        SignatureCache::global().invalidate_session(sid);
+        crate::modules::proxy_db::delete_thinking_records_for_session(sid).unwrap();
+    }
+    fn assert_restored(turn: &Value, thought: &str, sig: &str) {
+        assert_eq!(turn["parts"][0], json!({"text":thought,"thought":true}));
+        assert_eq!(
+            turn["parts"][1],
+            json!({"text":"Done.","thoughtSignature":sig})
+        );
+    }
+
+    #[test]
+    fn evicted_exact_generations_remain_ambiguous_after_warm_or_cold_load() {
+        let sid = key("actual-eviction");
+        let store = ThinkingStore::new();
+        let prefix = vec![user("Task")];
+        for (thought, seed) in [
+            ("First private thought", b'A'),
+            ("Second private thought", b'B'),
+        ] {
+            store.record(&sid, captured(&prefix, thought, &signature(false, seed)));
+        }
+        let fp = captured(&prefix, "Unused", &signature(false, b'A')).fingerprint;
+        let matches = crate::modules::proxy_db::load_thinking_by_fingerprints(
+            &sid,
+            &[fp.clone(), "missing".into()],
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 2, "SQLite must return every generation");
+        assert_eq!(matches[0].thought, "First private thought");
+        assert_eq!(matches[1].thought, "Second private thought");
+        for idx in 0..=max_turns_per_session() {
+            store.record(
+                &sid,
+                captured(
+                    &[user(&format!("Filler {idx}"))],
+                    "Filler thought",
+                    &signature(false, b'F'),
+                ),
+            );
+        }
+        assert!(store.sessions.get(&sid).unwrap().l2_has_evicted_turns);
+        assert!(!store
+            .load_turns(&sid)
+            .iter()
+            .any(|rec| rec.fingerprint == fp));
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&sid);
+            }
+            let mut history = vec![user("Task"), answer(), user("Continue")];
+            let before = history.clone();
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut history,
+                    Some("gemini-3.8-flash")
+                ),
+                0
+            );
+            assert_eq!(
+                history, before,
+                "ambiguous generations cannot be chosen by database order"
+            );
+        }
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn partially_resident_exact_generations_do_not_bypass_l2_ambiguity() {
+        let sid = key("partial-window");
+        let store = ThinkingStore::new();
+        let a = signature(false, b'A');
+        let b = signature(false, b'B');
+        store.record(&sid, captured(&[user("Task")], "First thought", &a));
+        store.record(&sid, captured(&[user("Task")], "Second thought", &b));
+        for resident in [Some(a.as_str()), Some(b.as_str()), None] {
+            warm_window(&store, &sid, resident);
+            for _ in 0..2 {
+                let mut history = vec![user("Task"), answer(), user("Continue")];
+                assert_eq!(
+                    store.restore_gemini_contents_with_model(
+                        &sid,
+                        &mut history,
+                        Some("gemini-3.8-flash")
+                    ),
+                    0
+                );
+                assert_eq!(history[1], answer());
+            }
+        }
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn l2_text_candidates_respect_family_and_authoritative_signatures() {
+        for mixed_family in [false, true] {
+            let sid = key("authority");
+            let store = ThinkingStore::new();
+            let a = signature(false, b'A');
+            let b = signature(mixed_family, b'B');
+            store.record(&sid, captured(&[user("Task")], "First thought", &a));
+            store.record(&sid, captured(&[user("Task")], "Second thought", &b));
+            for window in 0..3 {
+                if window == 2 {
+                    store.sessions.remove(&sid);
+                } else {
+                    warm_window(&store, &sid, (window == 1).then_some(b.as_str()));
+                }
+                SignatureCache::global().invalidate_session(&sid);
+                SignatureCache::global().cache_session_signature(&sid, b.clone(), 1);
+                let mut history = vec![user("Task"), answer(), user("Continue")];
+                let model = if mixed_family {
+                    "claude-sonnet-4-6"
+                } else {
+                    "gemini-3.8-flash"
+                };
+                assert_eq!(
+                    store.restore_gemini_contents_with_model(&sid, &mut history, Some(model)),
+                    1
+                );
+                assert_restored(&history[1], "Second thought", &b);
+                let mut explicit = vec![user("Task"), answer(), user("Continue")];
+                explicit[1]["parts"][0]["thoughtSignature"] = json!(a);
+                assert_eq!(
+                    store.restore_gemini_contents_with_model(
+                        &sid,
+                        &mut explicit,
+                        Some("gemini-3.8-flash")
+                    ),
+                    1
+                );
+                assert_restored(&explicit[1], "First thought", &a);
+                if !mixed_family {
+                    SignatureCache::global().invalidate_session(&sid);
+                    SignatureCache::global().cache_session_signature(
+                        &sid,
+                        signature(false, b'C'),
+                        1,
+                    );
+                    let mut unrelated_hint = vec![user("Task"), answer(), user("Continue")];
+                    assert_eq!(
+                        store.restore_gemini_contents_with_model(
+                            &sid,
+                            &mut unrelated_hint,
+                            Some(model)
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        unrelated_hint[1],
+                        answer(),
+                        "an unrelated latest signature cannot resolve this candidate set"
+                    );
+                }
+            }
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn l2_latest_hint_does_not_select_an_earlier_ambiguous_turn() {
+        let sid = key("latest-scope");
+        let store = ThinkingStore::new();
+        let a = signature(false, b'A');
+        let b = signature(false, b'B');
+        for (thought, sig) in [("First thought", &a), ("Second thought", &b)] {
+            store.record(&sid, captured(&[user("Task")], thought, sig));
+        }
+        SignatureCache::global().cache_session_signature(&sid, b, 1);
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&sid);
+            } else {
+                warm_window(&store, &sid, None);
+            }
+            let mut history = vec![
+                user("Task"),
+                answer(),
+                user("Continue"),
+                answer(),
+                user("Next"),
+            ];
+            let before = history.clone();
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut history,
+                    Some("gemini-3.8-flash")
+                ),
+                0
+            );
+            assert_eq!(history, before);
+        }
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn l2_legacy_candidates_are_consumed_once_in_capture_order() {
+        let sid = key("legacy-consumption");
+        let store = ThinkingStore::new();
+        let a = signature(false, b'A');
+        let b = signature(false, b'B');
+        for (thought, sig) in [("First thought", &a), ("Second thought", &b)] {
+            let mut rec = captured(&[user("Old")], thought, sig);
+            rec.fingerprint = fingerprint("Done.", &[], &[]);
+            store.record(&sid, rec);
+        }
+        for window in 0..3 {
+            if window == 2 {
+                store.sessions.remove(&sid);
+            } else {
+                warm_window(&store, &sid, (window == 1).then_some(b.as_str()));
+            }
+            let mut history = vec![
+                user("First"),
+                answer(),
+                user("Second"),
+                answer(),
+                user("Third"),
+                answer(),
+            ];
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut history,
+                    Some("gemini-3.8-flash")
+                ),
+                2
+            );
+            assert_restored(&history[1], "First thought", &a);
+            assert_restored(&history[3], "Second thought", &b);
+            assert_eq!(
+                history[5],
+                answer(),
+                "L2 must not replay an already consumed generation"
+            );
+        }
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn l2_signature_point_lookup_rejects_foreign_family_and_consumed_rows() {
+        let sid = key("signature-lookup");
+        let store = ThinkingStore::new();
+        let a = signature(false, b'A');
+        store.record(&sid, captured(&[user("Task")], "First thought", &a));
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&sid);
+            } else {
+                warm_window(&store, &sid, None);
+            }
+            let mut foreign = vec![user("Task"), answer()];
+            foreign[1]["parts"][0]["thoughtSignature"] = json!(a);
+            let before = foreign.clone();
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut foreign,
+                    Some("claude-sonnet-4-6")
+                ),
+                0
+            );
+            assert_eq!(
+                foreign, before,
+                "an explicit foreign signature must not restore foreign thought text"
+            );
+            let mut repeated = vec![
+                user("Task"),
+                answer(),
+                user("Different"),
+                json!({"role":"model","parts":[{"text":"Truncated","thoughtSignature":a}]}),
+            ];
+            repeated[1]["parts"][0]["thoughtSignature"] = json!(a);
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut repeated,
+                    Some("gemini-3.8-flash")
+                ),
+                1
+            );
+            assert_restored(&repeated[1], "First thought", &a);
+            assert_eq!(repeated[3]["parts"].as_array().unwrap().len(), 1);
+        }
+        cleanup(&sid);
+    }
+}
+
+#[cfg(test)]
+mod l2_pruning_regression_tests {
+    use super::*;
+    use crate::modules::proxy_db;
+    use crate::proxy::{
+        mappers::prompt_sanitizer::PromptSanitizer, pipeline::inbound::InboundThinkingPipeline,
+        SignatureCache,
+    };
+    use base64::Engine;
+
+    fn key(name: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "l2-prune-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+    fn signature(seed: u64) -> String {
+        let mut raw = vec![0x12];
+        for _ in 0..6 {
+            raw.extend(seed.to_le_bytes());
+        }
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+    fn user(text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":text}]})
+    }
+    fn history() -> Vec<Value> {
+        vec![
+            user("Task"),
+            json!({"role":"model","parts":[{"text":"Done."}]}),
+            user("Continue"),
+        ]
+    }
+    fn capture_answer(sid: &str, sig: &str) {
+        capture_gemini_contents(
+            sid,
+            &[
+                user("Task"),
+                json!({"role":"model","parts":[{"thought":true,"text":"Private reasoning"},{"text":"Done.","thoughtSignature":sig}]}),
+            ],
+        );
+    }
+    fn capture_branches(sid: &str) {
+        let prefix = history();
+        let anchor = compute_response_text_anchor(&prefix);
+        let causal = compute_causal_anchor(prefix.last());
+        // Alternatives all share one unchanged prefix, so this does not
+        // simulate compression or removal of the live Done turn.
+        for idx in 0..max_turns_per_session() + 5 {
+            capture_gemini_parts_with_context(
+                sid,
+                &[
+                    json!({"thought":true,"text":format!("Branch reasoning {idx}")}),
+                    json!({"functionCall":{"name":"lookup","args":{"branch":idx},"id":format!("call_branch_{idx}")},"thoughtSignature":signature(idx as u64+1000)}),
+                ],
+                &causal,
+                Some(&anchor),
+            );
+        }
+    }
+    fn finish(sid: &str, contents: &mut Vec<Value>, enabled: bool, retry: bool) {
+        let mut payload = json!({"contents":contents});
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        *contents = payload["contents"].as_array().unwrap().clone();
+        finalize_request_text_context(sid, contents, "gemini-3.8-flash", enabled, retry);
+    }
+    fn cleanup(sid: &str) {
+        ThinkingStore::global().sessions.remove(sid);
+        SignatureCache::global().invalidate_session(sid);
+        proxy_db::delete_thinking_records_for_session(sid).unwrap();
+    }
+    fn has_text(sid: &str) -> bool {
+        proxy_db::load_thinking_records(sid)
+            .unwrap()
+            .iter()
+            .any(|row| row.visible == "Done.")
+    }
+
+    #[test]
+    fn deferred_tool_stage_preserves_evicted_text_until_final_restore() {
+        for cold in [false, true] {
+            let sid = key("live-text");
+            let sig = signature(1);
+            capture_answer(&sid, &sig);
+            capture_branches(&sid);
+            assert!(!ThinkingStore::global()
+                .load_turns(&sid)
+                .iter()
+                .any(|r| r.visible == "Done."));
+            let before = proxy_db::load_thinking_records(&sid).unwrap().len();
+            if cold {
+                ThinkingStore::global().sessions.remove(&sid);
+            }
+            let mut contents = history();
+            InboundThinkingPipeline::process_contents_deferred_text(
+                &mut contents,
+                "gemini-3.8-flash",
+                true,
+                Some(&sid),
+                false,
+            );
+            assert!(
+                has_text(&sid),
+                "early tool hydration must not delete L2 text before it can be restored"
+            );
+            assert_eq!(proxy_db::load_thinking_records(&sid).unwrap().len(), before);
+            finish(&sid, &mut contents, true, false);
+            assert_eq!(
+                contents[1]["parts"],
+                json!([{"text":"Done.","thoughtSignature":sig}])
+            );
+            let rows = proxy_db::load_thinking_records(&sid).unwrap();
+            assert!(rows.iter().any(|r| r.visible == "Done."));
+            assert!(
+                rows.iter().filter(|r| !r.tool_ids.is_empty()).count() <= 2,
+                "orphan tools are still pruned after text restoration"
+            );
+            let once = contents.clone();
+            finish(&sid, &mut contents, true, false);
+            assert_eq!(contents, once);
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn final_prune_removes_compressed_text_and_tools_in_warm_and_cold_windows() {
+        for cold in [false, true] {
+            let sid = key("compressed");
+            capture_answer(&sid, &signature(1));
+            capture_branches(&sid);
+            if cold {
+                ThinkingStore::global().sessions.remove(&sid);
+            }
+            // Preserve the first-user identity while genuinely replacing the
+            // old model history with a user-provided summary.
+            let mut contents = vec![
+                user("Task"),
+                user("Summary of completed work; begin the next task."),
+            ];
+            InboundThinkingPipeline::process_contents_deferred_text(
+                &mut contents,
+                "gemini-3.8-flash",
+                true,
+                Some(&sid),
+                false,
+            );
+            assert!(
+                has_text(&sid),
+                "compaction pruning waits for the final prefix too"
+            );
+            finish(&sid, &mut contents, true, false);
+            let rows = proxy_db::load_thinking_records(&sid).unwrap();
+            assert!(!rows.iter().any(|r| r.visible == "Done."));
+            assert_eq!(
+                rows.len(),
+                2,
+                "only the two newest unused responses survive real compression"
+            );
+            assert!(rows.iter().all(|r| !r.tool_ids.is_empty()));
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn live_ambiguous_l2_text_survives_prune_and_later_explicit_disambiguation() {
+        let sid = key("ambiguous");
+        let a = signature(1);
+        let b = signature(2);
+        capture_answer(&sid, &a);
+        capture_answer(&sid, &b);
+        capture_branches(&sid);
+        let mut contents = history();
+        InboundThinkingPipeline::process_contents_deferred_text(
+            &mut contents,
+            "gemini-3.8-flash",
+            true,
+            Some(&sid),
+            false,
+        );
+        finish(&sid, &mut contents, true, false);
+        assert_eq!(contents[1]["parts"], json!([{"text":"Done."}]));
+        let rows = proxy_db::load_thinking_records(&sid).unwrap();
+        let live: Vec<_> = rows.iter().filter(|r| r.visible == "Done.").collect();
+        assert_eq!(
+            live.len(),
+            2,
+            "an ambiguous live generation is not an orphan merely because it stays outside RAM"
+        );
+        assert!(live
+            .iter()
+            .any(|r| r.signature.as_deref() == Some(a.as_str())));
+        assert!(live
+            .iter()
+            .any(|r| r.signature.as_deref() == Some(b.as_str())));
+        contents[1]["parts"][0]["thoughtSignature"] = json!(a);
+        InboundThinkingPipeline::process_contents_deferred_text(
+            &mut contents,
+            "gemini-3.8-flash",
+            true,
+            Some(&sid),
+            false,
+        );
+        finish(&sid, &mut contents, true, false);
+        assert_eq!(
+            contents[1]["parts"],
+            json!([{"text":"Done.","thoughtSignature":a}])
+        );
+        assert!(has_text(&sid));
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn active_evicted_tools_survive_while_nonlive_text_and_tools_are_pruned() {
+        let sid = key("live-tool");
+        let tool_sig = signature(2);
+        capture_answer(&sid, &signature(1));
+        let call = json!({"functionCall":{"name":"lookup","args":{"active":true},"id":"call_active"},"thoughtSignature":tool_sig});
+        capture_gemini_contents(
+            &sid,
+            &[
+                user("Task"),
+                json!({"role":"model","parts":[{"thought":true,"text":"Active tool reasoning"},call]}),
+            ],
+        );
+        capture_branches(&sid);
+        let mut contents = vec![
+            user("Task"),
+            json!({"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"active":true},"id":"call_active"}}]}),
+            json!({"role":"user","parts":[{"functionResponse":{"name":"lookup","id":"call_active","response":{"output":"ok"}}}]}),
+            user("Continue"),
+        ];
+        InboundThinkingPipeline::process_contents_deferred_text(
+            &mut contents,
+            "gemini-3.8-flash",
+            true,
+            Some(&sid),
+            false,
+        );
+        finish(&sid, &mut contents, true, false);
+        assert!(contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("functionCall").is_some() && p["thoughtSignature"] == tool_sig));
+        let rows = proxy_db::load_thinking_records(&sid).unwrap();
+        assert!(rows
+            .iter()
+            .any(|r| r.tool_ids.iter().any(|id| id == "call_active")));
+        assert!(!rows.iter().any(|r| r.visible == "Done."));
+        assert!(
+            rows.len() <= 3,
+            "keep the active tool and at most two newest unused responses"
+        );
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn final_prune_keeps_live_tool_identity_even_when_its_record_is_only_in_l2() {
+        for legacy_fingerprint in [false, true] {
+            let sid = key("l2-tool-identity");
+            let store = ThinkingStore::new();
+            let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(Some(&user("Task"))));
+            acc.ingest_part(&json!({"thought":true,"text":"Active tool reasoning"}));
+            acc.ingest_part(&json!({"functionCall":{"name":"lookup","args":{"active":true},"id":"call_active"},"thoughtSignature":signature(1)}));
+            let mut record = acc.into_record();
+            if legacy_fingerprint {
+                record.fingerprint = "old-tool-fingerprint-format".into();
+            }
+            store.record(&sid, record);
+            for idx in 0..max_turns_per_session() + 5 {
+                store.record(
+                    &sid,
+                    ThinkingRecord {
+                        fingerprint: format!("unrelated-{idx}"),
+                        thought: format!("Unrelated reasoning {idx}"),
+                        signature: Some(signature(idx as u64 + 1000)),
+                        tool_ids: vec![],
+                        tool_names: vec![],
+                        visible: format!("Unrelated answer {idx}"),
+                    },
+                );
+            }
+            assert!(!store
+                .load_turns(&sid)
+                .iter()
+                .any(|r| r.tool_ids.iter().any(|id| id == "call_active")));
+            let contents = vec![
+                user("Task"),
+                json!({"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"active":true},"id":"call_active"}}]}),
+                user("Continue"),
+            ];
+            store.prune_orphaned_records(&sid, &contents);
+            let rows = proxy_db::load_thinking_records(&sid).unwrap();
+            assert!(
+                rows.iter()
+                    .any(|r| r.tool_ids.iter().any(|id| id == "call_active")),
+                "a live tool ID remains authoritative even when its stored fingerprint differs"
+            );
+            assert_eq!(
+                rows.len(),
+                3,
+                "retain the live L2 tool and the two newest responses"
+            );
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn disabled_or_retry_text_restore_keeps_history_for_the_next_enabled_request() {
+        for (enabled, retry) in [(false, false), (true, true)] {
+            let sid = key("deferred-cleanup");
+            let sig = signature(1);
+            capture_answer(&sid, &sig);
+            capture_branches(&sid);
+            let before = proxy_db::load_thinking_records(&sid).unwrap().len();
+            let mut contents = history();
+            contents.push(json!({"role":"model","parts":[{"functionCall":{"name":"lookup","args":{},"id":"call_new"}}]}));
+            InboundThinkingPipeline::process_contents_deferred_text(
+                &mut contents,
+                "gemini-3.8-flash",
+                enabled,
+                Some(&sid),
+                retry,
+            );
+            finish(&sid, &mut contents, enabled, retry);
+            assert!(has_text(&sid));
+            assert_eq!(proxy_db::load_thinking_records(&sid).unwrap().len(), before);
+            let mut next = history();
+            InboundThinkingPipeline::process_contents_deferred_text(
+                &mut next,
+                "gemini-3.8-flash",
+                true,
+                Some(&sid),
+                false,
+            );
+            finish(&sid, &mut next, true, false);
+            assert_eq!(
+                next[1]["parts"],
+                json!([{"text":"Done.","thoughtSignature":sig}])
+            );
+            cleanup(&sid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_candidate_regression_tests {
+    use super::*;
+    use crate::proxy::{
+        mappers::gemini::{collector, streaming::GeminiStreamHandler},
+        pipeline::stream_lifecycle::ProtocolStreamHandler,
+    };
+    use base64::Engine;
+    fn sig(seed: u8) -> String {
+        let mut raw = vec![0x12];
+        raw.extend([seed; 48]);
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+    fn candidate(index: usize) -> Value {
+        let (t, x, s) = if index == 0 {
+            ("Thought for option A.", "Option alpha.", sig(b'A'))
+        } else {
+            ("Thought for option B.", "Option beta.", sig(b'B'))
+        };
+        json!({"index":index,"content":{"role":"model","parts":[{"text":t,"thought":true},{"text":x,"thoughtSignature":s}]},"finishReason":"STOP"})
+    }
+    #[tokio::test]
+    async fn gemini_candidates_keep_separate_responses_and_signed_history() {
+        let user = json!({"role":"user","parts":[{"text":"Suggest two options"}]});
+        let model = "gemini-2.5-flash";
+        let ctx = compute_response_text_anchor(std::slice::from_ref(&user));
+        let causal = compute_causal_anchor(Some(&user));
+        for mode in ["stream", "buffer"] {
+            for shape in ["single", "together", "interleaved", "implicit-zero"] {
+                let sid = format!("r16-{mode}-{shape}");
+                let groups = match shape {
+                    "single" => vec![vec![candidate(0)]],
+                    "together" => vec![vec![candidate(0), candidate(1)]],
+                    "implicit-zero" => {
+                        let mut zero = candidate(0);
+                        zero.as_object_mut().unwrap().remove("index");
+                        vec![vec![candidate(1), zero]]
+                    }
+                    _ => vec![vec![candidate(1)], vec![candidate(0)]],
+                };
+                let mut returned = Vec::new();
+                let mut handler = GeminiStreamHandler::new_with_context(
+                    None,
+                    sid.clone(),
+                    model.into(),
+                    1,
+                    causal.clone(),
+                    false,
+                    None,
+                    String::new(),
+                    String::new(),
+                    Some(ctx.clone()),
+                )
+                .with_candidate_request(if shape == "single" { 1 } else { 2 }, mode == "buffer");
+                let mut frames = Vec::new();
+                for group in groups {
+                    let f = format!("data: {}", json!({"candidates":group}));
+                    for b in handler.process_line(&f) {
+                        let line = String::from_utf8(b.to_vec()).unwrap();
+                        let payload: Value =
+                            serde_json::from_str(line.strip_prefix("data: ").unwrap().trim())
+                                .unwrap();
+                        returned.extend(payload["candidates"].as_array().unwrap().clone());
+                        frames.push(Ok::<_, String>(b));
+                    }
+                }
+                assert!(handler.emit_finalize().is_empty());
+                handler.on_finish();
+                if mode == "buffer" {
+                    let v = collector::collect_stream_to_json_with_context(
+                        futures::stream::iter(frames),
+                        &sid,
+                        Some(&causal),
+                        1,
+                        Some(ctx.clone()),
+                    )
+                    .await
+                    .unwrap();
+                    returned = v["candidates"].as_array().unwrap().clone();
+                }
+                let rows = crate::modules::proxy_db::load_thinking_records(&sid).unwrap();
+                let texts: Vec<_> = returned
+                    .iter()
+                    .map(|v| {
+                        v["content"]["parts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|p| p["thought"] != true)
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<String>()
+                    })
+                    .collect();
+                let mut history = vec![
+                    user.clone(),
+                    json!({"role":"model","parts":[{"text":"Option beta."}]}),
+                    json!({"role":"user","parts":[{"text":"Expand that one."}]}),
+                ];
+                if shape == "single" {
+                    history[1]["parts"][0]["text"] = json!("Option alpha.");
+                }
+                finalize_request_text_context(&sid, &mut history, model, true, false);
+                let signed = history[1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|p| p["thoughtSignature"].as_str());
+                let got = if signed == Some(sig(b'A').as_str()) {
+                    "A"
+                } else if signed == Some(sig(b'B').as_str()) {
+                    "B"
+                } else {
+                    "missing"
+                };
+                let expected = if shape == "single" { 1 } else { 2 };
+                assert_eq!(returned.len(), expected, "{mode} {shape} candidates");
+                for i in 0..expected {
+                    let wanted = if i == 0 {
+                        "Option alpha."
+                    } else {
+                        "Option beta."
+                    };
+                    assert!(returned.iter().any(|v| v
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        == i as u64
+                        && v["content"]["parts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|p| p["text"] == wanted)));
+                    assert!(rows
+                        .iter()
+                        .any(|r| r.visible == wanted && r.signature == Some(sig(b'A' + i as u8))));
+                }
+                assert_eq!(rows.len(), expected, "{mode} {shape} SQLite rows");
+                assert_eq!(
+                    got,
+                    if expected == 1 { "A" } else { "B" },
+                    "{mode} {shape} {texts:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn only_an_upstream_terminal_can_publish_a_signed_stream_candidate() {
+        let key = format!("stream-publish-before-yield-{}", std::process::id());
+        let make = || {
+            GeminiStreamHandler::new(
+                None,
+                key.clone(),
+                "gemini-2.5-flash".into(),
+                1,
+                "root".into(),
+                false,
+                None,
+                String::new(),
+                String::new(),
+            )
+        };
+        let mut failed = make();
+        let partial = json!({"candidates":[{"content":{"parts":[{"text":"Done.","thoughtSignature":sig(b'A')}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]});
+        failed.process_line(&format!("data: {partial}"));
+        // Stream cleanup after an error, timeout or EOF is not a model terminal.
+        failed.on_finish();
+        assert!(crate::modules::proxy_db::load_thinking_records(&key)
+            .unwrap()
+            .is_empty());
+        let mut success = make();
+        let complete = json!({"candidates":[{"content":{"parts":[{"text":"Done.","thoughtSignature":sig(b'B')}]},"finishReason":"STOP"}]});
+        let line = format!("data: {complete}");
+        success.process_line(&line);
+        // Before on_finish, trailer, or a second upstream poll.
+        let rows = crate::modules::proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signature, Some(sig(b'B')));
+        success.process_line(&line);
+        success.on_finish();
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&key)
+                .unwrap()
+                .len(),
+            1
+        );
+        ThinkingStore::global().end_session(&key);
+    }
+
+    #[tokio::test]
+    async fn duplicate_or_invalid_indices_are_not_published_as_signed_candidates() {
+        for index in [json!(null), json!(-1), json!(0)] {
+            let mut a = candidate(0);
+            let mut b = candidate(1);
+            a.as_object_mut().unwrap().remove("index");
+            if index == Value::Null {
+                b.as_object_mut().unwrap().remove("index");
+            } else {
+                b["index"] = index.clone();
+            }
+            let key = format!("invalid-index-{index}");
+            let mut h = GeminiStreamHandler::new(
+                None,
+                key.clone(),
+                "gemini-2.5-flash".into(),
+                1,
+                "root".into(),
+                false,
+                None,
+                String::new(),
+                String::new(),
+            )
+            .with_candidate_request(2, false);
+            let line = format!("data: {}", json!({"candidates":[a,b]}));
+            let direct: Value = serde_json::from_str(line.strip_prefix("data: ").unwrap()).unwrap();
+            capture_gemini_response_with_context(&key, &direct, None, None);
+            let frames = h.process_line(&line);
+            h.on_finish();
+            assert!(std::str::from_utf8(&frames[0])
+                .unwrap()
+                .contains("Invalid or duplicate"));
+            let result = collector::collect_stream_to_json(
+                futures::stream::iter([Ok::<_, String>(bytes::Bytes::from(format!("{line}\n\n")))]),
+                &key,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["error"]["code"], 502);
+            assert!(crate::modules::proxy_db::load_thinking_records(&key)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_visible_candidates_do_not_use_a_stale_session_signature() {
+        for buffered in [false, true] {
+            let key = format!("ambiguous-candidates-{buffered}");
+            let user = json!({"role":"user","parts":[{"text":"choose"}]});
+            let a = sig(b'A');
+            let b = sig(b'B');
+            crate::proxy::SignatureCache::global().cache_session_signature(&key, a.clone(), 1);
+            let ctx = compute_response_text_anchor(std::slice::from_ref(&user));
+            let anchor = compute_causal_anchor(Some(&user));
+            let mut h = GeminiStreamHandler::new_with_context(
+                None,
+                key.clone(),
+                "gemini-2.5-flash".into(),
+                1,
+                anchor.clone(),
+                false,
+                None,
+                String::new(),
+                String::new(),
+                Some(ctx.clone()),
+            )
+            .with_candidate_request(2, buffered);
+            let mut c0 = candidate(0);
+            let mut c1 = candidate(1);
+            c0["content"]["parts"][1]["text"] = json!("same");
+            c1["content"]["parts"][1]["text"] = json!("same");
+            let frames = h.process_line(&format!("data: {}", json!({"candidates":[c0,c1]})));
+            h.on_finish();
+            if buffered {
+                collector::collect_stream_to_json_with_context(
+                    futures::stream::iter(frames.into_iter().map(Ok::<_, String>)),
+                    &key,
+                    Some(&anchor),
+                    1,
+                    Some(ctx),
+                )
+                .await
+                .unwrap();
+            }
+            // One candidate's late signature at the same depth is still not evidence of a user choice.
+            crate::proxy::SignatureCache::global().cache_session_signature(&key, b.clone(), 1);
+            assert!(crate::proxy::SignatureCache::global()
+                .get_session_signature(&key)
+                .is_none());
+            let plain = vec![
+                user.clone(),
+                json!({"role":"model","parts":[{"text":"same"}]}),
+                json!({"role":"user","parts":[{"text":"continue"}]}),
+            ];
+            let mut unsigned = plain.clone();
+            finalize_request_text_context(&key, &mut unsigned, "gemini-2.5-flash", true, false);
+            assert_eq!(unsigned, plain);
+            let mut signed = plain;
+            signed[1]["parts"][0]["thoughtSignature"] = json!(b);
+            finalize_request_text_context(&key, &mut signed, "gemini-2.5-flash", true, false);
+            assert!(signed[1]["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["thoughtSignature"] == b));
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_multi_candidate_stream_does_not_invent_a_success_for_missing_index() {
+        let mut h = GeminiStreamHandler::new(
+            None,
+            "missing-branch".into(),
+            "gemini-2.5-flash".into(),
+            1,
+            "root".into(),
+            false,
+            None,
+            String::new(),
+            String::new(),
+        )
+        .with_candidate_request(2, true);
+        let mut data = h.process_line(&format!("data: {}", json!({"candidates":[candidate(0)]})));
+        data.extend(h.emit_finalize());
+        h.on_finish();
+        let response = collector::collect_stream_to_json(
+            futures::stream::iter(data.into_iter().map(Ok::<_, String>)),
+            "missing-branch",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], 502);
+        assert!(response.get("candidates").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tool_generation_regression_tests {
+    use super::*;
+    use crate::modules::proxy_db;
+    use crate::proxy::{pipeline::InboundThinkingPipeline, SignatureCache};
+    use base64::Engine;
+
+    fn sig(seed: u8) -> String {
+        let mut raw = vec![0x12];
+        raw.extend([seed; 48]);
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+    fn prompt() -> Value {
+        json!({"role":"user","parts":[{"text":"Read the status."}]})
+    }
+    fn call(id: Option<&str>) -> Value {
+        let mut p = json!({"functionCall":{"name":"get_status","args":{"k":"v"}}});
+        if let Some(id) = id {
+            p["functionCall"]["id"] = json!(id);
+        }
+        p
+    }
+    fn capture(key: &str, id: Option<&str>, signature: &str) {
+        let mut part = call(id);
+        part["thoughtSignature"] = json!(signature);
+        capture_gemini_response_with_context(
+            key,
+            &json!({"candidates":[{"content":{"role":"model","parts":[
+            {"thought":true,"text":"Tool reasoning."},part]},"finishReason":"STOP"}]}),
+            Some(&prompt()),
+            None,
+        );
+    }
+    fn replay(key: &str, id: Option<&str>, authority: Option<&str>) -> Option<String> {
+        let mut p = call(id);
+        if let Some(sig) = authority {
+            p["thoughtSignature"] = json!(sig);
+        }
+        let mut history = vec![
+            prompt(),
+            json!({"role":"model","parts":[p]}),
+            json!({"role":"user","parts":[{"functionResponse":{"name":"get_status","response":{"output":"OK"}}}]}),
+        ];
+        InboundThinkingPipeline::process_contents_deferred_text(
+            &mut history,
+            "gemini-3.8-flash",
+            true,
+            Some(key),
+            false,
+        );
+        history[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|p| {
+                p.get("thoughtSignature")
+                    .and_then(Value::as_str)
+                    .filter(|s| is_real_signature(s))
+                    .map(str::to_owned)
+            })
+    }
+    #[test]
+    fn parallel_calls_recover_only_their_own_signed_generations() {
+        let model = "gemini-2.5-flash";
+        let user = prompt();
+        let capture_pair = |sid: &str,
+                            names: [&str; 2],
+                            ids: [Option<&str>; 2],
+                            sigs: [&str; 2]| {
+            let mut parts = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                let mut part =
+                    json!({"functionCall":{"name":name,"args":{"x":i}},"thoughtSignature":sigs[i]});
+                if let Some(id) = ids[i] {
+                    part["functionCall"]["id"] = json!(id);
+                }
+                parts.push(part);
+            }
+            capture_gemini_response_with_context(
+                sid,
+                &json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}),
+                Some(&user),
+                None,
+            );
+            parts
+        };
+        let restore = |sid: &str, parts: Vec<Value>| {
+            let mut body = vec![user.clone(), json!({"role":"model","parts":parts})];
+            finalize_gemini_contents_thinking_with_session(&mut body, true, Some(model), Some(sid));
+            body[1]["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["thoughtSignature"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let a = sig(b'A');
+        let b = sig(b'B');
+        let c = sig(b'C');
+        for explicit in [true, false] {
+            for mask in 0..4 {
+                let sid = format!("parallel-by-id-{explicit}-{mask}-{}", std::process::id());
+                let ids = if explicit {
+                    [Some("call_A"), Some("call_B")]
+                } else {
+                    [None, None]
+                };
+                let mut parts = capture_pair(&sid, ["read", "read"], ids, [&a, &b]);
+                for (i, p) in parts.iter_mut().enumerate() {
+                    if !explicit {
+                        p["functionCall"]["id"] = json!(format!("call_client_{i}"));
+                    }
+                    if mask & (1 << i) != 0 {
+                        p.as_object_mut().unwrap().remove("thoughtSignature");
+                    }
+                }
+                ThinkingStore::global().sessions.remove(&sid);
+                assert_eq!(restore(&sid, parts), vec![Some(a.clone()), Some(b.clone())]);
+                ThinkingStore::global().end_session(&sid);
+            }
+        }
+        // Two candidates have the same causal call at index 0 but different
+        // signatures; the uniquely signed sibling at index 1 is still usable.
+        let sid = format!("parallel-conflict-{}", std::process::id());
+        capture_pair(&sid, ["read", "read"], [None, None], [&a, &b]);
+        let mut parts = capture_pair(&sid, ["read", "read"], [None, None], [&c, &b]);
+        for p in &mut parts {
+            p.as_object_mut().unwrap().remove("thoughtSignature");
+        }
+        ThinkingStore::global().sessions.remove(&sid);
+        assert_eq!(
+            restore(&sid, parts),
+            vec![Some(SENTINEL_SIGNATURE.into()), Some(b)]
+        );
+        ThinkingStore::global().end_session(&sid);
+    }
+
+    #[test]
+    fn regenerated_tools_replay_by_real_id_before_and_after_ram_eviction() {
+        let key = format!("tool-regeneration-{}", std::process::id());
+        let store = ThinkingStore::global();
+        let a = sig(b'A');
+        let b = sig(b'B');
+        let a_id = "call_original_client_A";
+        let b_id = "call_original_client_B";
+        assert!(!proxy_db::is_synthetic_tool_id(a_id));
+        capture(&key, Some(a_id), &a);
+        capture(&key, Some(b_id), &b);
+        assert_eq!(proxy_db::load_thinking_records(&key).unwrap().len(), 2);
+        for window in ["warm", "partial", "cold"] {
+            if window == "partial" {
+                let mut entry = store.sessions.get_mut(&key).unwrap();
+                entry.turns.remove(0);
+                entry.l2_has_evicted_turns = true;
+            }
+            if window == "cold" {
+                store.sessions.remove(&key);
+            }
+            // Weaker synthetic and session hints must not choose between siblings.
+            let synthetic = synthesize_tool_id(
+                "get_status",
+                Some(&json!({"k":"v"})),
+                &compute_causal_anchor(Some(&prompt())),
+                0,
+            );
+            SignatureCache::global().cache_tool_signature(&key, &synthetic, b.clone());
+            SignatureCache::global().cache_session_signature(&key, b.clone(), 2);
+            assert_eq!(
+                replay(&key, Some(a_id), None),
+                Some(a.clone()),
+                "{window} A"
+            );
+            assert_eq!(
+                replay(&key, Some(b_id), None),
+                Some(b.clone()),
+                "{window} B"
+            );
+            assert!(
+                replay(&key, None, None).is_none(),
+                "{window} ambiguous alias"
+            );
+            assert!(
+                replay(&key, Some("call_unrelated"), None).is_none(),
+                "{window} unrelated real ID"
+            );
+            assert_eq!(
+                replay(&key, None, Some(&a)),
+                Some(a.clone()),
+                "{window} signed"
+            );
+        }
+        store.sessions.remove(&key);
+        proxy_db::delete_thinking_records_for_session(&key).unwrap();
+        SignatureCache::global().invalidate_session(&key);
+    }
+    #[test]
+    fn concurrent_signed_captures_keep_separate_sqlite_generations() {
+        let key = format!("tool-parallel-generations-{}", std::process::id());
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for (id, seed) in [("call_a", b'A'), ("call_b", b'B')] {
+                let key = &key;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    capture(key, Some(id), &sig(seed));
+                });
+            }
+            barrier.wait();
+        });
+        let rows = proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (id, seed) in [("call_a", b'A'), ("call_b", b'B')] {
+            assert!(rows.iter().any(
+                |row| row.tool_ids.iter().any(|s| s == id) && row.signature == Some(sig(seed))
+            ));
+        }
+        ThinkingStore::global().sessions.remove(&key);
+        proxy_db::delete_thinking_records_for_session(&key).unwrap();
+    }
+
+    #[test]
+    fn tool_without_real_id_remains_recoverable_unless_signed_generations_conflict() {
+        let key = format!("tool-idless-generation-{}", std::process::id());
+        let a = sig(b'A');
+        let b = sig(b'B');
+        let store = ThinkingStore::global();
+        capture(&key, None, &a);
+        assert_eq!(replay(&key, Some("client-assigned"), None), Some(a.clone()));
+        store.sessions.remove(&key);
+        assert_eq!(replay(&key, None, None), Some(a.clone()));
+        capture(&key, None, &b);
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&key);
+            }
+            assert!(replay(&key, None, None).is_none());
+            assert_eq!(replay(&key, None, Some(&a)), Some(a.clone()));
+            assert_eq!(replay(&key, None, Some(&b)), Some(b.clone()));
+        }
+        store.sessions.remove(&key);
+        proxy_db::delete_thinking_records_for_session(&key).unwrap();
+        SignatureCache::global().invalidate_session(&key);
+    }
+}
+
+#[cfg(test)]
+mod pruned_candidate_completeness_tests {
+    use super::*;
+    use crate::modules::proxy_db;
+    use crate::proxy::{session_manager::SessionManager, SignatureCache};
+    use base64::Engine;
+
+    fn session(name: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "pruned-candidates-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+    fn signature(seed: u8) -> String {
+        let mut raw = vec![0x12];
+        raw.extend(std::iter::repeat_n(seed, 48));
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+    fn user(text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":text}]})
+    }
+    fn answer() -> Value {
+        json!({"role":"model","parts":[{"text":"Done."}]})
+    }
+    fn scope(session: &str, prefix: &[Value]) -> SessionScope {
+        let body = json!({"session_id":session,"contents":prefix});
+        SessionScope::from_headers_and_body(
+            &HeaderMap::new(),
+            Some(&body),
+            SessionManager::gemini_content_anchor(&body),
+        )
+    }
+    fn capture(session: &str, prefix: &[Value], thought: &str, signed_part: Value) -> String {
+        let key = scope(session, prefix).store_key;
+        let response = json!({"candidates":[{"content":{"role":"model","parts":[
+            {"text":thought,"thought":true}, signed_part
+        ]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10}});
+        capture_gemini_response_with_context(
+            &key,
+            &response,
+            prefix.last(),
+            Some(&compute_response_text_anchor(prefix)),
+        );
+        key
+    }
+    fn capture_text(session: &str, prefix: &[Value], thought: &str, signature: &str) -> String {
+        capture(
+            session,
+            prefix,
+            thought,
+            json!({"text":"Done.","thoughtSignature":signature}),
+        )
+    }
+    fn seed_omitted_branches(session: &str) {
+        for idx in 0..5 {
+            capture_text(
+                session,
+                &[user("Task"), answer(), user(&format!("Old branch {idx}"))],
+                "Old complete reasoning",
+                &signature(b'D' + idx),
+            );
+        }
+    }
+    fn cleanup(key: &str) {
+        ThinkingStore::global().sessions.remove(key);
+        SignatureCache::global().invalidate_session(key);
+        proxy_db::delete_thinking_records_for_session(key).unwrap();
+    }
+    fn assert_restored(turn: &Value, thought: &str, signature: &str) {
+        let parts = turn["parts"].as_array().unwrap();
+        assert!(parts
+            .iter()
+            .any(|part| part["thought"] == true && part["text"] == thought));
+        assert!(parts
+            .iter()
+            .any(|part| part["thoughtSignature"] == signature));
+    }
+
+    #[test]
+    fn cold_read_error_keeps_memory_captures_without_claiming_a_complete_window() {
+        let session = session("cold-read-error");
+        let prefix = vec![user("Task")];
+        let history = vec![user("Task"), answer(), user("Continue")];
+        let (a, b, c) = (signature(b'A'), signature(b'B'), signature(b'C'));
+        let key = capture_text(&session, &prefix, "First complete reasoning", &a);
+        let store = ThinkingStore::global();
+        store.sessions.remove(&key);
+        let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(prefix.last()))
+            .with_text_context_anchor(compute_response_text_anchor(&prefix));
+        acc.ingest_part(&json!({"thought":true,"text":"Second complete reasoning"}));
+        acc.ingest_part(&json!({"text":"Done.","thoughtSignature":b}));
+        // Only the cold read fails. The ordinary record() write still succeeds.
+        store.record_with_loader(
+            &key,
+            acc.into_record(),
+            |_| Err("database is locked".into()),
+        );
+        assert!(!store.sessions.get(&key).unwrap().l2_loaded);
+        let recovered = store.load_turns(&key);
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered
+            .iter()
+            .any(|r| r.signature.as_deref() == Some(a.as_str())));
+        capture_text(&session, &history, "Third branch reasoning", &c);
+        SignatureCache::global().cache_session_signature(&key, c, 3);
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&key);
+            }
+            let mut unsigned = history.clone();
+            finalize_request_text_context(&key, &mut unsigned, "gemini-3.8-flash", true, false);
+            assert_eq!(unsigned, history);
+            let mut signed = history.clone();
+            signed[1]["parts"][0]["thoughtSignature"] = json!(a);
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &key,
+                    &mut signed,
+                    Some("gemini-3.8-flash")
+                ),
+                1
+            );
+            assert_restored(&signed[1], "First complete reasoning", &a);
+        }
+        cleanup(&key);
+    }
+
+    #[test]
+    fn every_historical_upgrade_survives_restart_without_touching_a_sibling_generation() {
+        let session = session("historical-upgrades");
+        let store = ThinkingStore::global();
+        let claude = |seed| {
+            let mut bytes = vec![0x08, 0x04, 0x12];
+            bytes.extend(std::iter::repeat_n(seed, 48));
+            ensure_google_claude_thought_signature(
+                &base64::engine::general_purpose::STANDARD.encode(bytes),
+            )
+        };
+        let (a, b, c, d) = (claude(b'A'), claude(b'B'), claude(b'C'), claude(b'D'));
+        let signed = |sig: &str, thought: Option<&str>| {
+            let mut parts = Vec::new();
+            if let Some(thought) = thought {
+                parts.push(json!({"thought":true,"text":thought}));
+            }
+            parts.push(json!({"text":"Done.","thoughtSignature":sig}));
+            json!({"role":"model","parts":parts})
+        };
+        let model = "claude-sonnet-4-6";
+        let key = scope(&session, &[user("Task")]).store_key;
+        let mut first = vec![user("Task"), signed(&a, None), user("More")];
+        finalize_request_text_context(&key, &mut first, model, true, false);
+        capture_text(&session, &[user("Task")], "Sibling untouched", &b);
+        let mut second = vec![
+            user("Task"),
+            signed(&a, None),
+            user("More"),
+            signed(&c, None),
+            user("Continue"),
+        ];
+        finalize_request_text_context(&key, &mut second, model, true, false);
+        capture_text(&session, &second, "Last row untouched", &d);
+        let mut richer = second.clone();
+        richer[1] = signed(&a, Some("Original A reasoning"));
+        richer[3] = signed(&c, Some("Original C reasoning"));
+        finalize_request_text_context(&key, &mut richer, model, true, false);
+        let rows = proxy_db::load_thinking_records(&key).unwrap();
+        for (sig, thought) in [
+            (&a, "Original A reasoning"),
+            (&b, "Sibling untouched"),
+            (&c, "Original C reasoning"),
+            (&d, "Last row untouched"),
+        ] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.signature.as_ref() == Some(sig))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .find(|r| r.signature.as_ref() == Some(sig))
+                    .unwrap()
+                    .thought,
+                thought
+            );
+        }
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&key);
+            }
+            let mut restored = second.clone();
+            restored[1] = signed(&a, None);
+            restored[3] = signed(&c, None);
+            finalize_request_text_context(&key, &mut restored, model, true, false);
+            assert_restored(&restored[1], "Original A reasoning", &a);
+            assert_restored(&restored[3], "Original C reasoning", &c);
+        }
+        cleanup(&key);
+    }
+
+    #[test]
+    fn historical_snapshot_cannot_overwrite_a_recaptured_or_removed_row() {
+        let session = session("historical-cas");
+        let store = ThinkingStore::global();
+        let a = signature(b'A');
+        let prefix = vec![user("Task")];
+        let key = capture_text(&session, &prefix, "Original reasoning", &a);
+        let old = store.load_turns(&key)[0].clone();
+        let mut upgrade = (*old).clone();
+        upgrade.thought = "Late stale upgrade".into();
+        let db_snapshot = proxy_db::snapshot_thinking_upgrade(&key, &old)
+            .unwrap()
+            .unwrap();
+        capture_text(&session, &prefix, "Current much longer reasoning", &a);
+        assert!(!proxy_db::apply_thinking_upgrade(&db_snapshot, &upgrade).unwrap());
+        store.upgrade_record(&key, &old, upgrade.clone());
+        assert_eq!(
+            store.load_turns(&key)[0].thought,
+            "Current much longer reasoning"
+        );
+        let current = store.load_turns(&key)[0].clone();
+        let snap = proxy_db::snapshot_thinking_upgrade(&key, &current)
+            .unwrap()
+            .unwrap();
+        store.sessions.remove(&key);
+        proxy_db::delete_thinking_records_for_session(&key).unwrap();
+        capture_text(&session, &prefix, "Replacement reasoning", &a);
+        assert!(!proxy_db::apply_thinking_upgrade(&snap, &upgrade).unwrap());
+        store.upgrade_record(&key, &current, upgrade);
+        assert_eq!(
+            proxy_db::load_thinking_records(&key).unwrap()[0].thought,
+            "Replacement reasoning"
+        );
+        cleanup(&key);
+    }
+
+    #[test]
+    fn healing_raw_gemini_signature_does_not_create_another_generation_on_cold_recovery() {
+        let session = session("raw-heal");
+        let store = ThinkingStore::global();
+        let key = scope(&session, &[user("Task")]).store_key;
+        let raw = format!("\u{12}{}", "a".repeat(48));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        let mut record = TurnAccumulator::with_anchor("root");
+        record.ingest_part(&json!({"text":"Done.","thoughtSignature":raw}));
+        store.record_with_loader(&key, record.into_record(), |_| {
+            Err("database is locked".into())
+        });
+        let disk = proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].signature.as_deref(), Some(encoded.as_str()));
+        let recovered = store.load_turns(&key);
+        assert_eq!(recovered.len(), 1);
+        assert!(signatures_match(
+            recovered[0].signature.as_deref().unwrap(),
+            &encoded
+        ));
+        cleanup(&key);
+    }
+
+    #[test]
+    fn unsigned_richer_replay_cannot_upgrade_the_first_signed_sibling() {
+        let session = session("unsigned-upgrade");
+        let prefix = vec![user("Task")];
+        let a = signature(b'A');
+        let b = signature(b'B');
+        let store = ThinkingStore::global();
+        let key = capture_text(&session, &prefix, "A reasoning", &a);
+        capture_text(&session, &prefix, "B reasoning", &b);
+        let mut unsigned = (*store.load_turns(&key)[0]).clone();
+        unsigned.signature = None;
+        unsigned.thought = "Unattributable much longer client reasoning".into();
+        store.ingest_records(&key, vec![unsigned]);
+        let rows = proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thought, "A reasoning");
+        assert_eq!(rows[1].thought, "B reasoning");
+        let ram = store.load_turns(&key);
+        assert_eq!(ram[0].thought, rows[0].thought);
+        assert_eq!(ram[1].thought, rows[1].thought);
+        cleanup(&key);
+    }
+
+    #[test]
+    fn delayed_cold_read_does_not_reintroduce_a_cleared_session() {
+        let session = session("late-read");
+        let key = capture_text(&session, &[user("Task")], "Old reasoning", &signature(b'A'));
+        let store = ThinkingStore::global();
+        store.sessions.remove(&key);
+        let loaded = store.load_turns_with(&key, |k| {
+            let snapshot = proxy_db::load_thinking_records(k)?;
+            assert_eq!(snapshot.len(), 1);
+            store.clear_session_for_compaction(k);
+            Ok(snapshot)
+        });
+        assert!(loaded.is_empty());
+        assert!(store.load_turns(&key).is_empty());
+        cleanup(&key);
+    }
+
+    #[test]
+    fn historical_upgrade_after_prune_tracks_the_original_generation_not_its_index() {
+        let session = session("shifted-index");
+        let store = ThinkingStore::global();
+        let prefix = vec![user("Task")];
+        let key = capture_text(&session, &prefix, "Early A reasoning", &signature(b'A'));
+        capture_text(
+            &session,
+            &[user("Task"), answer(), user("Other")],
+            "Later B reasoning",
+            &signature(b'B'),
+        );
+        capture_text(
+            &session,
+            &[user("Task"), answer(), user("Third")],
+            "Latest C reasoning",
+            &signature(b'C'),
+        );
+        let old = store.load_turns(&key);
+        assert_eq!(old.len(), 3);
+        store.prune_orphaned_records(&key, &[]);
+        assert_eq!(store.load_turns(&key).len(), 2);
+        for idx in 0..2 {
+            let mut richer = (*old[idx]).clone();
+            richer.thought = format!("Richer reasoning for {idx}");
+            store.upgrade_record(&key, &old[idx], richer);
+        }
+        let disk = proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(disk.len(), 2);
+        assert_eq!(disk[0].thought, "Richer reasoning for 1");
+        assert_eq!(disk[1].thought, "Latest C reasoning");
+        assert_eq!(store.load_turns(&key)[0].thought, disk[0].thought);
+        cleanup(&key);
+    }
+
+    #[test]
+    fn missing_historical_generation_does_not_rewrite_its_persisted_sibling() {
+        let session = session("missing-upgrade");
+        let store = ThinkingStore::global();
+        let prefix = vec![user("Task")];
+        let key = capture_text(&session, &prefix, "Disk A reasoning", &signature(b'A'));
+        let persisted = store.load_turns(&key)[0].clone();
+        let mut b = (*persisted).clone();
+        b.signature = Some(signature(b'B'));
+        b.thought = "Memory B reasoning".into();
+        let b = Arc::new(b);
+        store.sessions.get_mut(&key).unwrap().turns.push(b.clone());
+        let mut richer = (*b).clone();
+        richer.thought = "Memory B richer reasoning".into();
+        store.upgrade_record(&key, &b, richer);
+        let turns = store.load_turns(&key);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].thought, "Memory B richer reasoning");
+        let sql = proxy_db::load_thinking_records(&key).unwrap();
+        assert_eq!(sql.len(), 1);
+        assert_eq!(sql[0].thought, "Disk A reasoning");
+        cleanup(&key);
+    }
+
+    #[test]
+    fn pruned_duplicate_text_generations_remain_ambiguous_warm_and_cold() {
+        let session = session("ambiguous");
+        let prefix = vec![user("Task")];
+        let store = ThinkingStore::global();
+        let a = signature(b'A');
+        let b = signature(b'B');
+        let c = signature(b'C');
+        seed_omitted_branches(&session);
+        let key = capture_text(&session, &prefix, "First complete reasoning", &a);
+        let history = vec![user("Task"), answer(), user("Continue")];
+        let mut established = history.clone();
+        assert_eq!(
+            store.restore_gemini_contents_with_model(
+                &key,
+                &mut established,
+                Some("gemini-3.8-flash")
+            ),
+            1
+        );
+        assert_restored(&established[1], "First complete reasoning", &a);
+
+        // Both are complete responses to the same legal prompt; their distinct
+        // signed generations share visible text, not an invented fingerprint.
+        assert_eq!(
+            capture_text(&session, &prefix, "Second complete reasoning", &b),
+            key
+        );
+        assert_eq!(
+            capture_text(
+                &session,
+                &[user("Task"), answer(), user("Other task")],
+                "Third complete reasoning",
+                &c
+            ),
+            key
+        );
+        SignatureCache::global().cache_session_signature(&key, c, 3);
+        let mut retry_prefix = prefix.clone();
+        assert_eq!(scope(&session, &retry_prefix).store_key, key);
+        finalize_request_text_context(&key, &mut retry_prefix, "gemini-3.8-flash", true, false);
+        assert_eq!(store.session_stats(&key).unwrap().0, 2);
+        let rows = proxy_db::load_thinking_records(&key).unwrap();
+        let fingerprint = &rows
+            .iter()
+            .find(|rec| rec.signature.as_deref() == Some(a.as_str()))
+            .unwrap()
+            .fingerprint;
+        assert_eq!(
+            rows.iter()
+                .filter(|rec| &rec.fingerprint == fingerprint)
+                .count(),
+            2,
+            "SQLite retains both generations of the surviving tail fingerprint"
+        );
+
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&key);
+            }
+            let mut restored = history.clone();
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &key,
+                    &mut restored,
+                    Some("gemini-3.8-flash")
+                ),
+                0,
+                "cold={cold}"
+            );
+            assert_eq!(
+                restored, history,
+                "an incomplete RAM window cannot select B over A"
+            );
+            for _ in 0..2 {
+                finalize_request_text_context(&key, &mut restored, "gemini-3.8-flash", true, false);
+                assert_eq!(
+                    restored, history,
+                    "later finalization must not reintroduce B"
+                );
+            }
+            let mut explicit = history.clone();
+            explicit[1]["parts"][0]["thoughtSignature"] = json!(a);
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &key,
+                    &mut explicit,
+                    Some("gemini-3.8-flash")
+                ),
+                1
+            );
+            assert_restored(&explicit[1], "First complete reasoning", &a);
+        }
+        cleanup(&key);
+    }
+
+    #[test]
+    fn pruned_single_text_generation_and_tool_turn_still_restore() {
+        let session = session("unambiguous");
+        let store = ThinkingStore::global();
+        let a = signature(b'A');
+        let tool_sig = signature(b'T');
+        seed_omitted_branches(&session);
+        let key = capture_text(&session, &[user("Task")], "Unique complete reasoning", &a);
+        let call = json!({"functionCall":{"name":"lookup","args":{},"id":"call_tail"}});
+        let mut signed_call = call.clone();
+        signed_call["thoughtSignature"] = json!(tool_sig);
+        assert_eq!(
+            capture(
+                &session,
+                &[user("Task"), answer(), user("Look it up")],
+                "Complete tool reasoning",
+                signed_call
+            ),
+            key
+        );
+        let mut retry_prefix = vec![user("Task")];
+        finalize_request_text_context(&key, &mut retry_prefix, "gemini-3.8-flash", true, false);
+        assert_eq!(store.session_stats(&key).unwrap().0, 2);
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&key);
+            }
+            let mut history = vec![
+                user("Task"),
+                answer(),
+                user("Look it up"),
+                json!({"role":"model","parts":[call]}),
+                json!({"role":"user","parts":[{"functionResponse":{
+                    "name":"lookup","id":"call_tail","response":{"result":"ok"}
+                }}]}),
+            ];
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &key,
+                    &mut history,
+                    Some("gemini-3.8-flash")
+                ),
+                2,
+                "cold={cold}"
+            );
+            assert_restored(&history[1], "Unique complete reasoning", &a);
+            assert_restored(&history[3], "Complete tool reasoning", &tool_sig);
+        }
+        cleanup(&key);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_pruning_tests {
+    use super::*;
+    use crate::modules::proxy_db;
+    use crate::proxy::SignatureCache;
+    use base64::Engine;
+
+    fn key(name: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "concurrent-prune-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+    fn signature(seed: u8) -> String {
+        let mut raw = vec![0x12];
+        raw.extend(std::iter::repeat_n(seed, 48));
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+    fn user(text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":text}]})
+    }
+    fn captured(task: &str, thought: &str, sig: Option<&str>) -> ThinkingRecord {
+        let prefix = vec![user(task)];
+        let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(prefix.last()))
+            .with_text_context_anchor(compute_response_text_anchor(&prefix));
+        acc.ingest_part(&json!({"text":thought,"thought":true}));
+        acc.ingest_part(&json!({"text":"Done.","thoughtSignature":sig}));
+        acc.into_record()
+    }
+    fn persist(sid: &str, rec: &ThinkingRecord) {
+        proxy_db::save_thinking_record(
+            sid,
+            &rec.fingerprint,
+            &rec.thought,
+            rec.signature.as_deref(),
+            &rec.tool_ids,
+            &rec.tool_names,
+            &rec.visible,
+        )
+        .unwrap();
+    }
+    fn assert_warm_and_cold_restore(store: &ThinkingStore, sid: &str, thought: &str, sig: &str) {
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(sid);
+            }
+            SignatureCache::global().invalidate_session(sid);
+            let mut contents = vec![
+                user("Task"),
+                json!({"role":"model","parts":[{"text":"Done."}]}),
+                user("Continue"),
+            ];
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    sid,
+                    &mut contents,
+                    Some("gemini-3.8-flash")
+                ),
+                1,
+                "cold={cold}"
+            );
+            assert_eq!(
+                contents[1]["parts"],
+                json!([
+                    {"text":thought,"thought":true},
+                    {"text":"Done.","thoughtSignature":sig}
+                ])
+            );
+        }
+    }
+    fn cleanup(sid: &str) {
+        SignatureCache::global().invalidate_session(sid);
+        proxy_db::delete_thinking_records_for_session(sid).unwrap();
+    }
+
+    #[test]
+    fn response_captured_after_ram_prune_survives_sql_prune_and_restart() {
+        let sid = key("capture");
+        let store = Arc::new(ThinkingStore::new());
+        for idx in 0..6 {
+            store.record(
+                &sid,
+                captured(
+                    &format!("Old task {idx}"),
+                    "Old reasoning",
+                    Some(&signature(b'A' + idx)),
+                ),
+            );
+        }
+        // Pause at the real two-phase boundary, with both database and RAM
+        // locks released. The other request must be able to finish capture.
+        let plan = store
+            .prepare_orphaned_records_prune(&sid, &[user("Task")])
+            .unwrap();
+        assert_eq!(store.session_stats(&sid).unwrap().0, 2);
+        let sig = signature(b'Z');
+        let fresh = captured("Task", "Fresh private reasoning", Some(&sig));
+        let fp = fresh.fingerprint.clone();
+        let worker_store = store.clone();
+        let worker_sid = sid.clone();
+        std::thread::spawn(move || worker_store.record(&worker_sid, fresh))
+            .join()
+            .unwrap();
+        assert_eq!(proxy_db::load_thinking_records(&sid).unwrap().len(), 7);
+        plan.persist();
+        let rows = proxy_db::load_thinking_records(&sid).unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "prune the four old orphans, retain two tail turns plus capture"
+        );
+        assert!(rows.iter().any(|r| r.fingerprint == fp));
+        assert_warm_and_cold_restore(&store, &sid, "Fresh private reasoning", &sig);
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn same_fingerprint_updates_after_snapshot_survive_without_timestamp_precision() {
+        for signature_only in [false, true] {
+            let sid = key(if signature_only {
+                "signature-only"
+            } else {
+                "thought-upgrade"
+            });
+            let sig = signature(b'Z');
+            let old = captured(
+                "Task",
+                "Original reasoning",
+                if signature_only { None } else { Some(&sig) },
+            );
+            persist(&sid, &old);
+            let snapshot = proxy_db::snapshot_thinking_records_for_prune(&sid).unwrap();
+            let fresh = captured(
+                "Task",
+                if signature_only {
+                    "..."
+                } else {
+                    "Longer replacement private reasoning"
+                },
+                Some(&sig),
+            );
+            // Both saves intentionally occur without sleeping. A millisecond
+            // cutoff cannot protect this in-place update reliably.
+            persist(&sid, &fresh);
+            let rows = proxy_db::load_thinking_records(&sid).unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "this is an UPDATE, not a new generation INSERT"
+            );
+            assert_eq!(rows[0].fingerprint, old.fingerprint);
+            assert_eq!(
+                proxy_db::delete_thinking_records_except_fingerprints(
+                    &snapshot,
+                    &["unrelated-keep".into()],
+                    &[],
+                    &[]
+                )
+                .unwrap(),
+                0
+            );
+            let thought = if signature_only {
+                "Original reasoning"
+            } else {
+                "Longer replacement private reasoning"
+            };
+            assert_warm_and_cold_restore(&ThinkingStore::new(), &sid, thought, &sig);
+            // The protected record is eligible for a later, fresh prune. We do
+            // not permanently exempt recaptured or upgraded rows from cleanup.
+            let next = proxy_db::snapshot_thinking_records_for_prune(&sid).unwrap();
+            assert_eq!(
+                proxy_db::delete_thinking_records_except_fingerprints(
+                    &next,
+                    &["unrelated-keep".into()],
+                    &[],
+                    &[]
+                )
+                .unwrap(),
+                1
+            );
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn signature_only_tool_recapture_refreshes_an_unchanged_sqlite_payload() {
+        let sid = key("unchanged-tool-payload");
+        let store = ThinkingStore::new();
+        let sig = signature(b'Z');
+        let prefix = user("Task");
+        let make_record = |visible: &str, thought: Option<&str>| {
+            let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(Some(&prefix)));
+            if let Some(thought) = thought {
+                acc.ingest_part(&json!({"thought":true,"text":thought}));
+            }
+            acc.ingest_part(&json!({"text":visible}));
+            acc.ingest_part(&json!({"functionCall":{"name":"lookup","args":{},"id":"call_tool"},"thoughtSignature":sig}));
+            acc.into_record()
+        };
+        let old = make_record("First call", Some("Original tool reasoning"));
+        let fresh = make_record("Retried call", None);
+        assert_ne!(old.fingerprint, fresh.fingerprint);
+        assert_eq!(old.tool_ids, fresh.tool_ids);
+        store.record(&sid, old);
+        let snapshot = proxy_db::snapshot_thinking_records_for_prune(&sid).unwrap();
+        store.record(&sid, fresh);
+        assert_eq!(
+            store.session_stats(&sid).unwrap().0,
+            2,
+            "RAM appends the new fingerprint"
+        );
+        let rows = proxy_db::load_thinking_records(&sid).unwrap();
+        assert_eq!(rows.len(), 1, "SQLite merges by the same causal tool ID");
+        assert_eq!(rows[0].thought, "Original tool reasoning");
+        assert_eq!(
+            proxy_db::delete_thinking_records_except_fingerprints(
+                &snapshot,
+                &["unrelated-keep".into()],
+                &[],
+                &[]
+            )
+            .unwrap(),
+            0
+        );
+        store.sessions.remove(&sid);
+        SignatureCache::global().invalidate_session(&sid);
+        let mut contents = vec![
+            prefix,
+            json!({"role":"model","parts":[{"text":"Retried call"},{"functionCall":{"name":"lookup","args":{},"id":"call_tool"}}]}),
+            json!({"role":"user","parts":[{"functionResponse":{"name":"lookup","id":"call_tool","response":{"result":"ok"}}}]}),
+        ];
+        assert_eq!(
+            store.restore_gemini_contents_with_model(&sid, &mut contents, Some("gemini-3.8-flash")),
+            1
+        );
+        assert!(contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["thoughtSignature"] == sig));
+        assert!(contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["thought"] == true && p["text"] == "Original tool reasoning"));
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn empty_snapshot_cannot_delete_a_later_capture() {
+        let sid = key("initial-capture");
+        let snapshot = proxy_db::snapshot_thinking_records_for_prune(&sid).unwrap();
+        let sig = signature(b'Z');
+        persist(
+            &sid,
+            &captured("Task", "First private reasoning", Some(&sig)),
+        );
+        assert_eq!(
+            proxy_db::delete_thinking_records_except_fingerprints(
+                &snapshot,
+                &["unrelated-keep".into()],
+                &[],
+                &[]
+            )
+            .unwrap(),
+            0
+        );
+        assert_warm_and_cold_restore(&ThinkingStore::new(), &sid, "First private reasoning", &sig);
+        cleanup(&sid);
+    }
+}
+
+#[cfg(test)]
+mod text_context_tests {
+    use super::*;
+
+    pub(super) fn key(name: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "text-context-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    fn signature(seed: u8) -> String {
+        use base64::Engine;
+        let mut raw = vec![0x12];
+        raw.extend(std::iter::repeat_n(seed, 48));
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    fn user(text: &str) -> Value {
+        json!({"role":"user", "parts":[{"text":text}]})
+    }
+
+    fn answer() -> Value {
+        json!({"role":"model", "parts":[{"text":"Done."}]})
+    }
+
+    fn captured(prefix: &[Value], thought: &str, sig: &str) -> ThinkingRecord {
+        let mut acc = TurnAccumulator::with_anchor(compute_causal_anchor(prefix.last()))
+            .with_text_context_anchor(compute_response_text_anchor(prefix));
+        acc.ingest_part(&json!({"text":thought,"thought":true}));
+        acc.ingest_part(&json!({"text":"Done.","thoughtSignature":sig}));
+        acc.into_record()
+    }
+
+    fn assert_thought(turn: &Value, thought: &str, sig: &str) {
+        let parts = turn["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], thought);
+        assert_eq!(parts[1]["text"], "Done.");
+        assert_eq!(parts[1]["thoughtSignature"], sig);
+    }
+
+    #[test]
+    fn repeated_continue_done_preserves_each_turn_and_sqlite_restart() {
+        let sid = key("repeated");
+        let store = ThinkingStore::new();
+        let first_sig = signature(b'A');
+        let second_sig = signature(b'B');
+        let first_prefix = vec![user("Continue.")];
+        let second_prefix = vec![user("Continue."), answer(), user("Continue.")];
+        let first = captured(&first_prefix, "First reason", &first_sig);
+        let second = captured(&second_prefix, "Second longer reason", &second_sig);
+        assert_ne!(first.fingerprint, second.fingerprint);
+        store.record(&sid, first);
+        store.record(&sid, second);
+        assert_eq!(store.session_stats(&sid).unwrap().0, 2);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            2
+        );
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&sid);
+            }
+            let mut contents = second_prefix.clone();
+            contents.push(answer());
+            contents.push(user("Next task"));
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &sid,
+                    &mut contents,
+                    Some("gemini-3.8-flash")
+                ),
+                2
+            );
+            assert_thought(&contents[1], "First reason", &first_sig);
+            assert_thought(&contents[3], "Second longer reason", &second_sig);
+            // Restored thought/signature and text block boundaries do not change
+            // the next capture's identity or create extra records on ingest.
+            assert_eq!(
+                compute_response_text_anchor(&contents[..3]),
+                compute_response_text_anchor(&second_prefix)
+            );
+            store.ingest_from_contents(&sid, &contents);
+            assert_eq!(store.session_stats(&sid).unwrap().0, 2);
+        }
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn same_text_turn_increment_is_idempotent_in_memory_and_sqlite() {
+        let sid = key("increment");
+        let store = ThinkingStore::new();
+        let prefix = vec![user("Task")];
+        let sig = signature(b'C');
+        let first = captured(&prefix, "Reason", &sig);
+        let extended = captured(&prefix, "Reason with additional detail", &sig);
+        store.record(&sid, first);
+        store.record(&sid, extended.clone());
+        let bytes = store.session_stats(&sid).unwrap().1;
+        store.record(&sid, extended);
+        assert_eq!(store.session_stats(&sid).unwrap().0, 1);
+        assert_eq!(store.session_stats(&sid).unwrap().1, bytes);
+        let rows = crate::modules::proxy_db::load_thinking_records(&sid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thought, "Reason with additional detail");
+        assert_eq!(rows[0].visible, "Done.");
+        assert_eq!(
+            rows[0].fingerprint,
+            contextual_fingerprint(
+                "Done.",
+                &[],
+                &[],
+                Some(&compute_response_text_anchor(&prefix))
+            )
+        );
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn same_context_regenerations_with_different_answers_or_signatures_stay_separate() {
+        let sid = key("regeneration");
+        let store = ThinkingStore::new();
+        let prefix = vec![user("Choose")];
+        let mut first = captured(&prefix, "Reason A", &signature(b'P'));
+        first.visible = "Alpha".into();
+        first.fingerprint = contextual_fingerprint(
+            "Alpha",
+            &[],
+            &[],
+            Some(&compute_response_text_anchor(&prefix)),
+        );
+        let mut second = first.clone();
+        second.visible = "Beta".into();
+        second.fingerprint = contextual_fingerprint(
+            "Beta",
+            &[],
+            &[],
+            Some(&compute_response_text_anchor(&prefix)),
+        );
+        let mut third = second.clone();
+        third.signature = Some(signature(b'Q'));
+        for rec in [first, second, third] {
+            store.record(&sid, rec);
+        }
+        assert_eq!(store.session_stats(&sid).unwrap().0, 3);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            3
+        );
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn scoped_text_never_falls_back_to_an_unrelated_prefix_in_memory_or_l2() {
+        let sid = key("no-fallback");
+        let store = ThinkingStore::new();
+        store.record(
+            &sid,
+            captured(&[user("Old task")], "Old private reason", &signature(b'D')),
+        );
+        for cold in [false, true] {
+            if cold {
+                store.sessions.remove(&sid);
+            }
+            let mut unrelated = vec![user("Different task"), answer()];
+            let before = unrelated.clone();
+            assert_eq!(store.restore_gemini_contents(&sid, &mut unrelated), 0);
+            assert_eq!(
+                unrelated, before,
+                "Phase 2/3/3.5/4 must all respect text context"
+            );
+        }
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn legacy_records_remain_readable_without_merging_distinct_real_signatures() {
+        let sid = key("legacy");
+        let store = ThinkingStore::new();
+        let a = signature(b'E');
+        let b = signature(b'F');
+        for (thought, sig) in [("Legacy first", &a), ("Legacy second", &b)] {
+            let mut rec = captured(&[user("ignored old context")], thought, sig);
+            rec.fingerprint = fingerprint("Done.", &[], &[]);
+            store.record(&sid, rec);
+        }
+        assert_eq!(store.session_stats(&sid).unwrap().0, 2);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            2
+        );
+        store.sessions.remove(&sid);
+        let mut contents = vec![user("old first"), answer(), user("old second"), answer()];
+        store.restore_gemini_contents(&sid, &mut contents);
+        assert_thought(&contents[1], "Legacy first", &a);
+        assert_thought(&contents[3], "Legacy second", &b);
+        store.ingest_from_contents(&sid, &contents);
+        assert_eq!(store.session_stats(&sid).unwrap().0, 2);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            2
+        );
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn text_context_ignores_rehydration_text_splits_tool_ids_and_response_role() {
+        let sent = vec![
+            user("Run"),
+            json!({"role":"model","parts":[
+                {"text":"private","thought":true},
+                {"text":"Before"},
+                {"functionCall":{"name":"lookup","args":{"a":1,"b":2},"id":"call_original"},"thoughtSignature":signature(b'G')},
+                {"text":"After"}
+            ]}),
+            json!({"role":"model","parts":[{"functionResponse":{"name":"lookup","id":"call_original","response":{"output":"ok"}}}]}),
+            user("Continue."),
+        ];
+        let replay = vec![
+            user("Run"),
+            json!({"role":"assistant","parts":[
+                {"text":"Be"},{"text":"fore"},
+                {"functionCall":{"name":"lookup","args":{"b":2,"a":1},"id":"call_normalized"}},
+                {"text":"After"}
+            ]}),
+            json!({"role":"user","parts":[{"functionResponse":{"name":"lookup","id":"call_normalized","response":{"output":"ok"}}}]}),
+            user("Continue."),
+        ];
+        assert_eq!(
+            compute_response_text_anchor(&sent),
+            compute_response_text_anchor(&replay)
+        );
+        let mut first = TurnAccumulator::with_anchor("unchanged-tool-anchor");
+        let mut second = first.clone().with_text_context_anchor("new-text-only-key");
+        let part = json!({"functionCall":{"name":"lookup","args":{"x":1}},"thoughtSignature":signature(b'H')});
+        first.ingest_part(&part);
+        second.ingest_part(&part);
+        assert_eq!(
+            first.into_record().fingerprint,
+            second.into_record().fingerprint
+        );
+    }
+
+    #[test]
+    fn staged_hydration_preserves_text_until_final_sanitized_prefix_and_prunes_exactly() {
+        let sid = key("stages");
+        let store = ThinkingStore::global();
+        let sig = signature(b'I');
+        store.record(
+            &sid,
+            captured(&[user("clean")], "Original warm reason", &sig),
+        );
+        for n in 0..5 {
+            store.record(
+                &sid,
+                captured(
+                    &[user(&format!("unrelated {n}"))],
+                    &format!("Unrelated reason {n}"),
+                    &signature(b'J' + n),
+                ),
+            );
+        }
+        let mut raw = vec![user("transient metadata clean"), answer(), user("next")];
+        hydrate_gemini_tool_contents_with_model(&sid, &mut raw, Some("gemini-3.8-flash"));
+        assert_eq!(store.session_stats(&sid).unwrap().0, 6);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            6
+        );
+        // Simulate the handler's already-authorized canonical sanitizer changing
+        // the visible prefix between the early tool phase and final text phase.
+        raw[0] = user("clean");
+        finalize_request_text_context(&sid, &mut raw, "gemini-3.8-flash", true, false);
+        assert_eq!(
+            raw[1]["parts"],
+            json!([{"text":"Done.","thoughtSignature":sig}])
+        );
+        assert_eq!(store.load_turns(&sid)[0].thought, "Original warm reason");
+        assert_eq!(
+            store.session_stats(&sid).unwrap().0,
+            3,
+            "exact live context plus two newest records"
+        );
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            3
+        );
+        let once = raw.clone();
+        finalize_request_text_context(&sid, &mut raw, "gemini-3.8-flash", true, false);
+        assert_eq!(raw, once);
+        store.sessions.remove(&sid);
+        crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+    }
+
+    #[test]
+    fn pending_signature_only_crosses_adjacent_model_fragments() {
+        let sig = signature(b'R');
+        let thought = json!({"role":"model","parts":[{
+            "text":"Private reason","thought":true,"thoughtSignature":sig
+        }]});
+        let mut adjacent = vec![thought.clone(), answer()];
+        finalize_gemini_contents_with_stage(
+            &mut adjacent,
+            true,
+            Some("gemini-3.8-flash"),
+            None,
+            false,
+            None,
+            false,
+        );
+        assert_eq!(adjacent[1]["parts"][0]["thoughtSignature"], sig);
+
+        for boundary in [
+            user("Different task"),
+            json!({"role":"model","parts":[{
+                "functionResponse":{"name":"run","response":{"output":"ok"}},
+                "thoughtSignature":sig
+            }]}),
+        ] {
+            let mut contents = vec![thought.clone(), boundary, answer()];
+            finalize_gemini_contents_with_stage(
+                &mut contents,
+                true,
+                Some("gemini-3.8-flash"),
+                None,
+                false,
+                None,
+                false,
+            );
+            assert!(contents[1]["parts"][0].get("thoughtSignature").is_none());
+            assert_eq!(
+                contents[2],
+                answer(),
+                "pending signatures cannot cross user/tool-result boundaries"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod text_context_pipeline_tests {
+    use super::text_context_tests::key;
+    use super::*;
+    use crate::proxy::{
+        mappers::prompt_sanitizer::PromptSanitizer, pipeline::inbound::InboundThinkingPipeline,
+        SignatureCache,
+    };
+    use base64::Engine;
+    use serde_json::{json, Value};
+
+    fn signature(model: &str, seed: u8) -> String {
+        let mut raw = if model.contains("claude") {
+            vec![0x08, 0x04, 0x12]
+        } else {
+            vec![0x12]
+        };
+        raw.extend(std::iter::repeat_n(seed, 48));
+        let sig = base64::engine::general_purpose::STANDARD.encode(raw);
+        if model.contains("claude") {
+            ensure_google_claude_thought_signature(&sig)
+        } else {
+            sig
+        }
+    }
+    fn user(seed: &str, text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":format!("x-anthropic-billing-header: cc_version={seed}; cch={seed}\n{text}")}]})
+    }
+    fn answer() -> Value {
+        json!({"role":"model","parts":[{"text":"Done."}]})
+    }
+    fn final_request(sid: &str, model: &str, contents: Vec<Value>) -> (Vec<Value>, String) {
+        let mut body = json!({"request":{"contents":contents}});
+        let history = body["request"]["contents"].as_array_mut().unwrap();
+        let before = history.clone();
+        InboundThinkingPipeline::process_contents_deferred_text(
+            history,
+            model,
+            true,
+            Some(sid),
+            false,
+        );
+        assert_eq!(
+            *history, before,
+            "early tool stage must not inject latest session signature into text history"
+        );
+        PromptSanitizer::sanitize_gemini_payload(&mut body);
+        assert!(
+            !body.to_string().contains("cc_version"),
+            "real sanitizer must remove dynamic billing metadata"
+        );
+        let history = body["request"]["contents"].as_array_mut().unwrap();
+        let anchor = finalize_request_text_context(sid, history, model, true, false);
+        (history.clone(), anchor)
+    }
+    fn capture(sid: &str, anchor: &str, thought: &str, sig: &str, count: usize) {
+        capture_gemini_parts_with_context(
+            sid,
+            &[
+                json!({"thought":true,"text":thought}),
+                json!({"text":"Done.","thoughtSignature":sig}),
+            ],
+            "root",
+            Some(anchor),
+        );
+        SignatureCache::global().cache_session_signature(sid, sig.into(), count);
+    }
+    fn check_turn(turn: &Value, model: &str, thought: &str, sig: &str) {
+        let parts = turn["parts"].as_array().unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part.get("thoughtSignature").is_some())
+                .count(),
+            1,
+            "{turn}"
+        );
+        let visible = parts.iter().find(|part| part["text"] == "Done.").unwrap();
+        assert_eq!(visible["thoughtSignature"], sig, "{turn}");
+        let thoughts = parts
+            .iter()
+            .filter(|part| part["thought"] == true)
+            .collect::<Vec<_>>();
+        if model.contains("claude") {
+            assert_eq!(thoughts.len(), 1, "{turn}");
+            assert_eq!(thoughts[0]["text"], thought);
+            assert!(thoughts[0].get("thoughtSignature").is_none());
+        } else {
+            assert!(
+                thoughts.is_empty(),
+                "Gemini history should retain signature without thought text: {turn}"
+            );
+            assert_eq!(parts.len(), 1, "{turn}");
+        }
+    }
+
+    #[test]
+    fn real_sanitizer_two_identical_done_turns_restore_distinct_contexts_and_family_shapes() {
+        for model in ["gemini-3.8-flash", "claude-sonnet-4-6"] {
+            let sid = key(&format!("sanitizer-context-{model}"));
+            let first_sig = signature(model, b'A');
+            let second_sig = signature(model, b'B');
+            let (first, first_anchor) =
+                final_request(&sid, model, vec![user("first", "Continue.")]);
+            assert_eq!(first[0]["parts"][0]["text"], "Continue.");
+            capture(&sid, &first_anchor, "First private reason", &first_sig, 1);
+
+            let (second, second_anchor) = final_request(
+                &sid,
+                model,
+                vec![
+                    user("mutated-first", "Continue."),
+                    answer(),
+                    user("second", "Continue."),
+                ],
+            );
+            check_turn(&second[1], model, "First private reason", &first_sig);
+            assert_ne!(first_anchor, second_anchor);
+            capture(
+                &sid,
+                &second_anchor,
+                "Second private reason",
+                &second_sig,
+                3,
+            );
+            assert_eq!(
+                crate::modules::proxy_db::load_thinking_records(&sid)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                SignatureCache::global()
+                    .get_session_signature(&sid)
+                    .as_deref(),
+                Some(second_sig.as_str())
+            );
+
+            for cold in [false, true] {
+                if cold {
+                    ThinkingStore::global().sessions.remove(&sid);
+                }
+                let (history, _) = final_request(
+                    &sid,
+                    model,
+                    vec![
+                        user("third-first", "Continue."),
+                        answer(),
+                        user("third-second", "Continue."),
+                        answer(),
+                        user("third", "Next task"),
+                    ],
+                );
+                check_turn(&history[1], model, "First private reason", &first_sig);
+                check_turn(&history[3], model, "Second private reason", &second_sig);
+                assert_eq!(
+                    crate::modules::proxy_db::load_thinking_records(&sid)
+                        .unwrap()
+                        .len(),
+                    2,
+                    "restore must not create cross-context duplicates"
+                );
+                let mut repeated = history.clone();
+                let old = repeated.clone();
+                finalize_request_text_context(&sid, &mut repeated, model, true, false);
+                assert_eq!(repeated, old, "second finalization must be idempotent");
+            }
+            let (unrelated, _) = final_request(
+                &sid,
+                model,
+                vec![
+                    user("foreign", "Different task"),
+                    answer(),
+                    user("foreign-next", "Next task"),
+                ],
+            );
+            assert_eq!(
+                unrelated[1],
+                answer(),
+                "latest session signature must not fill unrelated text context"
+            );
+            ThinkingStore::global().sessions.remove(&sid);
+            crate::modules::proxy_db::delete_thinking_records_for_session(&sid).unwrap();
+            SignatureCache::global().invalidate_session(&sid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod finalized_context_regression_tests {
+    use super::text_context_tests::key;
+    use super::*;
+    use crate::proxy::{pipeline::inbound::InboundThinkingPipeline, SignatureCache};
+    use base64::Engine;
+
+    fn signature(claude: bool, seed: u8, len: usize) -> String {
+        let mut bytes = if claude {
+            vec![0x08, 0x04, 0x12]
+        } else {
+            vec![0x12]
+        };
+        bytes.extend(std::iter::repeat_n(seed, len));
+        let raw = base64::engine::general_purpose::STANDARD.encode(bytes);
+        if claude {
+            ensure_google_claude_thought_signature(&raw)
+        } else {
+            raw
+        }
+    }
+    fn user(text: &str) -> Value {
+        json!({"role":"user","parts":[{"text":text}]})
+    }
+    fn answer(text: &str) -> Value {
+        json!({"role":"model","parts":[{"text":text}]})
+    }
+    fn capture(sid: &str, prefix: &[Value], thought: &str, text: &str, sig: Option<&str>) {
+        let mut parts = vec![json!({"thought":true,"text":thought}), json!({"text":text})];
+        if let Some(sig) = sig {
+            parts[1]["thoughtSignature"] = json!(sig);
+        }
+        capture_gemini_parts_with_context(
+            sid,
+            &parts,
+            "root",
+            Some(&compute_response_text_anchor(prefix)),
+        );
+    }
+    fn finalize(sid: &str, contents: &mut Vec<Value>, model: &str) -> String {
+        InboundThinkingPipeline::process_contents_deferred_text(
+            contents,
+            model,
+            true,
+            Some(sid),
+            false,
+        );
+        finalize_request_text_context(sid, contents, model, true, false)
+    }
+    fn cleanup(sid: &str) {
+        ThinkingStore::global().sessions.remove(sid);
+        SignatureCache::global().invalidate_session(sid);
+        crate::modules::proxy_db::delete_thinking_records_for_session(sid).unwrap();
+    }
+
+    #[test]
+    fn chained_degraded_thoughts_restore_in_one_request_before_pruning() {
+        let sid = key("chained-elevation");
+        let mut canonical = vec![user("Initial task")];
+        let mut degraded = canonical.clone();
+        for idx in 0..8 {
+            let text = format!("Answer number {idx}.");
+            let thought = format!("Private reasoning for turn {idx}.");
+            let sig = signature(false, b'A' + idx, 48);
+            capture(&sid, &canonical, &thought, &text, Some(&sig));
+            canonical.push(answer(&text));
+            canonical.push(user("Continue."));
+            degraded.push(json!({"role":"model","parts":[{"text":thought},{"text":text}]}));
+            degraded.push(user("Continue."));
+        }
+        // Exercise pruning only after every surviving prefix has settled.
+        for idx in 0..4 {
+            capture(
+                &sid,
+                &[user(&format!("Unrelated {idx}"))],
+                "Unrelated private thought",
+                "Unrelated",
+                Some(&signature(false, b'P' + idx, 48)),
+            );
+        }
+        ThinkingStore::global().sessions.remove(&sid);
+        let anchor = finalize(&sid, &mut degraded, "gemini-3.8-flash");
+        for idx in 0..8 {
+            assert_eq!(
+                degraded[idx * 2 + 1]["parts"],
+                json!([{
+                    "text":format!("Answer number {idx}."),
+                    "thoughtSignature":signature(false,b'A'+idx as u8,48)
+                }])
+            );
+        }
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(&sid)
+                .unwrap()
+                .len(),
+            10,
+            "all eight live records and two newest records survive; no provisional aliases"
+        );
+        let once = degraded.clone();
+        assert_eq!(finalize(&sid, &mut degraded, "gemini-3.8-flash"), anchor);
+        assert_eq!(degraded, once);
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn unsigned_thought_finalization_and_disabled_retry_preserve_context_contract() {
+        let sid = key("unsigned-finalization");
+        let prefix = vec![user("Task")];
+        capture(
+            &sid,
+            &prefix,
+            "First private analysis with enough detail.",
+            "First answer",
+            None,
+        );
+        let mut second = vec![user("Task"), answer("First answer"), user("Continue")];
+        finalize(&sid, &mut second, "gemini-3.8-flash");
+        let sig = signature(false, b'B', 48);
+        capture(
+            &sid,
+            &second,
+            "Second private analysis",
+            "Second answer",
+            Some(&sig),
+        );
+        let raw = vec![
+            user("Task"),
+            answer("First answer"),
+            user("Continue"),
+            answer("Second answer"),
+            user("Next"),
+        ];
+        let mut third = raw.clone();
+        finalize(&sid, &mut third, "gemini-3.8-flash");
+        assert_eq!(third[3]["parts"][0]["thoughtSignature"], sig);
+        let once = third.clone();
+        finalize(&sid, &mut third, "gemini-3.8-flash");
+        assert_eq!(third, once);
+        for (enabled, retry) in [(false, false), (true, true)] {
+            let mut skipped = raw.clone();
+            finalize_request_text_context(&sid, &mut skipped, "gemini-3.8-flash", enabled, retry);
+            assert_eq!(
+                skipped, raw,
+                "disabled/retry must not hydrate historical thoughts or signatures"
+            );
+        }
+        cleanup(&sid);
+    }
+
+    #[test]
+    fn exact_generations_use_available_evidence_and_never_cross_contexts() {
+        let prefix = vec![user("Run task")];
+        let raw = vec![user("Run task"), answer("Done."), user("Continue")];
+        for family_choice in [false, true] {
+            let sid = key("exact-candidates");
+            let a = signature(false, b'A', 48);
+            let b = signature(family_choice, b'B', 80);
+            capture(&sid, &prefix, "First attempt thought", "Done.", Some(&a));
+            capture(&sid, &prefix, "Selected second thought", "Done.", Some(&b));
+            let model = if family_choice {
+                "claude-sonnet-4-6"
+            } else {
+                "gemini-3.8-flash"
+            };
+            if !family_choice {
+                SignatureCache::global().cache_session_signature(&sid, b.clone(), 1);
+            }
+            for cold in [false, true] {
+                if cold {
+                    ThinkingStore::global().sessions.remove(&sid);
+                }
+                let mut next = raw.clone();
+                finalize(&sid, &mut next, model);
+                assert!(next[1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["thoughtSignature"] == b));
+            }
+            let mut unrelated = vec![user("Other task"), answer("Done."), user("Continue")];
+            finalize(&sid, &mut unrelated, model);
+            assert_eq!(unrelated[1], answer("Done."));
+            if !family_choice {
+                let mut explicit = raw.clone();
+                explicit[1]["parts"][0]["thoughtSignature"] = json!(a);
+                finalize(&sid, &mut explicit, model);
+                assert_eq!(
+                    explicit[1]["parts"][0]["thoughtSignature"], a,
+                    "client-owned signature overrides latest B"
+                );
+                SignatureCache::global().invalidate_session(&sid);
+                let mut ambiguous = raw.clone();
+                finalize(&sid, &mut ambiguous, model);
+                assert_eq!(ambiguous[1],answer("Done."),"without authoritative evidence, weaker fallbacks must not choose a signed generation");
+            }
+            cleanup(&sid);
+        }
+    }
+
+    #[test]
+    fn new_client_thought_survives_additional_finalization_passes() {
+        for signed in [false, true] {
+            let sid = key("new-client-thought");
+            let prefix = vec![user("Task")];
+            let a = signature(false, b'A', 48);
+            capture(
+                &sid,
+                &prefix,
+                "Old private reasoning",
+                "First answer",
+                Some(&a),
+            );
+            let b = signature(false, b'B', 48);
+            let mut fresh = answer("New answer");
+            fresh["parts"].as_array_mut().unwrap().insert(0,json!({
+                "thought":true,"text":"New client reasoning must survive all finalization passes"
+            }));
+            if signed {
+                fresh["parts"][1]["thoughtSignature"] = json!(b);
+            }
+            let mut history = vec![
+                user("Task"),
+                json!({"role":"model","parts":[
+                    {"text":"Old private reasoning"},{"text":"First answer"}
+                ]}),
+                user("Continue"),
+                fresh,
+                user("Next"),
+            ];
+            finalize(&sid, &mut history, "gemini-3.8-flash");
+            let rows = crate::modules::proxy_db::load_thinking_records(&sid).unwrap();
+            assert!(rows.iter().any(|row| row.visible == "New answer"
+                && row.thought == "New client reasoning must survive all finalization passes"));
+            assert_eq!(rows.len(), 2, "only finalized captures are persisted");
+            cleanup(&sid);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3626,8 +7672,11 @@ mod tests {
     fn same_fingerprint_updates_in_place() {
         let store = ThinkingStore::new();
         let key = format!("t:s1-{}", uuid::Uuid::new_v4());
-        store.record(&key, rec("short", "same", None));
-        store.record(&key, rec("much longer thought", "same", None));
+        let first = rec("short", "same", None);
+        let mut extended = rec("much longer thought", "same", None);
+        extended.signature = first.signature.clone();
+        store.record(&key, first);
+        store.record(&key, extended);
         let stats = store.session_stats(&key).unwrap();
         assert_eq!(stats.0, 1);
         let mut contents = vec![json!({"role":"model","parts":[{"text":"same"}]})];
@@ -3739,12 +7788,10 @@ mod tests {
         assert_eq!(parts[1]["text"], "I will read both files in parallel");
         assert!(parts[1].get("thoughtSignature").is_none());
 
-        // Index 2: 锚点为首个 functionCall (call_batch_1) 携带签名
+        // Older aggregate records carry no proof of which parallel call owned
+        // their only signature. Keep the thought, but never lend that signature.
         assert_eq!(parts[2]["functionCall"]["id"], "call_batch_1");
-        assert_eq!(
-            parts[2]["thoughtSignature"], real_sig,
-            "Real signature must be restored onto the functionCall anchor"
-        );
+        assert_eq!(parts[2]["thoughtSignature"], SENTINEL_SIGNATURE);
         assert_eq!(parts[3]["functionCall"]["id"], "call_batch_2");
         assert!(parts[3].get("thoughtSignature").is_none());
     }
@@ -3925,6 +7972,44 @@ mod tests {
     }
 
     #[test]
+    fn affinity_header_is_a_fallback_without_collapsing_branch_sessions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-affinity", "flow-root".parse().unwrap());
+        headers.insert("x-conversation-id", "legacy-alias".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root")
+        );
+
+        headers.insert("x-session-id", "flow-root:step:1".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root:step:1")
+        );
+        headers.insert("x-opencode-session-id", "flow-root:step:2".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("flow-root:step:2")
+        );
+        headers.insert(
+            "x-claude-code-session-id",
+            "product-session".parse().unwrap(),
+        );
+        assert_eq!(
+            stable_session_winner(&headers, None, None).as_deref(),
+            Some("product-session")
+        );
+
+        let mut blank = HeaderMap::new();
+        blank.insert("x-session-affinity", "  ".parse().unwrap());
+        blank.insert("x-conversation-id", "legacy-alias".parse().unwrap());
+        assert_eq!(
+            stable_session_winner(&blank, None, None).as_deref(),
+            Some("legacy-alias")
+        );
+    }
+
+    #[test]
     fn product_session_headers_win_over_generic_x_session_id() {
         let mut jeik = HeaderMap::new();
         jeik.insert("x-session-id", "generic-session".parse().unwrap());
@@ -4080,13 +8165,28 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_legacy_text_generations_are_not_selected_by_order() {
+        let store = ThinkingStore::new();
+        let key = format!("legacy-conflict-{}", uuid::Uuid::new_v4());
+        store.record(&key, rec("think-turn1", "same answer", None));
+        store.record(&key, rec("think-turn2", "same answer", None));
+        let mut contents = vec![
+            json!({"role":"model","parts":[{"text":"another generation","thought":true,"thoughtSignature":"s".repeat(60)},{"text":"same answer"}]}),
+            json!({"role":"model","parts":[{"text":"same answer"}]}),
+        ];
+        let original = contents.clone();
+        assert_eq!(store.restore_gemini_contents(&key, &mut contents), 0);
+        assert_eq!(contents, original);
+    }
+
+    #[test]
     fn tail_first_match_uses_latest_record_for_latest_incomplete_turn() {
         let store = ThinkingStore::new();
         let key = "t:tail-hello";
-        store.record(key, rec("think-turn1", "你好", None));
+        let first = rec("think-turn1", "你好", None);
+        let sig = first.signature.clone().unwrap();
+        store.record(key, first);
         store.record(key, rec("think-turn2", "你好", None));
-
-        let sig = "s".repeat(60);
         let mut contents = vec![
             json!({
                 "role": "model",

@@ -144,7 +144,23 @@ fn connect_db() -> Result<Connection, String> {
 }
 
 pub fn is_synthetic_tool_id(id: &str) -> bool {
-    id.starts_with("call_") && id.chars().filter(|&c| c == '_').count() >= 3
+    // Match the format emitted by synthesize_tool_id, not arbitrary client
+    // identifiers such as call_my_real_id that happen to contain underscores.
+    let Some(id) = id.strip_prefix("call_") else {
+        return false;
+    };
+    let mut fields = id.rsplitn(4, '_');
+    let (Some(ordinal), Some(args), Some(anchor), Some(name)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let hex = |s: &str| s.len() == 12 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    !name.is_empty()
+        && !ordinal.is_empty()
+        && ordinal.bytes().all(|b| b.is_ascii_digit())
+        && hex(args)
+        && (anchor == "root" || hex(anchor))
 }
 
 fn init_thinking_schema(conn: &Connection) -> Result<(), String> {
@@ -159,11 +175,19 @@ fn init_thinking_schema(conn: &Connection) -> Result<(), String> {
             tool_names TEXT NOT NULL,
             visible TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            last_accessed INTEGER
+            last_accessed INTEGER,
+            write_revision INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // Existing caches remain readable; revisions distinguish in-place captures
+    // from the version observed by an already-running orphan prune.
+    let _ = conn.execute(
+        "ALTER TABLE thinking_records ADD COLUMN write_revision INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     // 动态升级：增加 primary_tool_id 列用于旧版兼容点查
     let _ = conn.execute(
@@ -1007,9 +1031,10 @@ pub fn save_thinking_record(
         String,
         Option<String>,
         Option<String>,
+        String,
     )> = conn
         .query_row(
-            "SELECT id, length(thought), signature, fingerprint, primary_tool_id, causal_tool_id
+            "SELECT id, length(thought), signature, fingerprint, primary_tool_id, causal_tool_id, tool_ids
              FROM thinking_records
              WHERE session_key = ?1
              ORDER BY id DESC LIMIT 1",
@@ -1022,13 +1047,14 @@ pub fn save_thinking_record(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )
         .ok();
 
     let existing_id: Option<(i64, usize, Option<String>)> = match latest_row {
-        Some((id, len, sig, ref last_fp, ref last_tool_id, ref last_causal_id)) => {
+        Some((id, len, sig, ref last_fp, ref last_tool_id, ref last_causal_id, last_ids)) => {
             let is_match = if let Some(c_id) = causal_tool_id {
                 last_causal_id.as_deref() == Some(c_id)
                     || last_tool_id.as_deref() == Some(c_id)
@@ -1050,9 +1076,28 @@ pub fn save_thinking_record(
                         .as_deref()
                         == Some(p_id)
             } else {
-                last_fp == fingerprint && last_tool_id.is_none() && last_causal_id.is_none()
+                last_fp == fingerprint
+                    && last_tool_id.is_none()
+                    && last_causal_id.is_none()
+                    && crate::proxy::thinking_store::text_record_signatures_compatible(
+                        fingerprint,
+                        sig.as_deref(),
+                        signature.as_deref(),
+                    )
             };
-            if is_match {
+            let same_generation = if is_match && !normalized_tool_ids.is_empty() {
+                let old_ids: Vec<String> =
+                    serde_json::from_str(&last_ids).map_err(|e| e.to_string())?;
+                crate::proxy::thinking_store::tool_ids_compatible(&old_ids, &normalized_tool_ids)
+                    && crate::proxy::thinking_store::text_record_signatures_compatible(
+                        fingerprint,
+                        sig.as_deref(),
+                        signature.as_deref(),
+                    )
+            } else {
+                is_match
+            };
+            if same_generation {
                 Some((id, len, sig))
             } else {
                 None
@@ -1076,7 +1121,7 @@ pub fn save_thinking_record(
             let mut stmt = conn
                 .prepare_cached(
                     "UPDATE thinking_records
-                     SET thought = ?1, signature = ?2, tool_ids = ?3, visible = ?4, created_at = ?5, primary_tool_id = ?6, causal_tool_id = ?7
+                     SET thought = ?1, signature = ?2, tool_ids = ?3, visible = ?4, created_at = ?5, primary_tool_id = ?6, causal_tool_id = ?7, write_revision = write_revision + 1
                      WHERE id = ?8",
                 )
                 .map_err(|e| e.to_string())?;
@@ -1098,12 +1143,22 @@ pub fn save_thinking_record(
             let mut stmt = conn
                 .prepare_cached(
                     "UPDATE thinking_records
-                     SET signature = ?1, created_at = ?2
+                     SET signature = ?1, created_at = ?2, write_revision = write_revision + 1
                      WHERE id = ?3",
                 )
                 .map_err(|e| e.to_string())?;
             stmt.execute(params![effective_sig, now, id])
                 .map_err(|e| e.to_string())?;
+        } else {
+            // A signature-only capture can reuse the same causal tool ID while
+            // RAM appends a different visible/explicit-ID fingerprint. Even if
+            // the stored payload is already stronger, this is a fresh capture
+            // that an earlier orphan-prune snapshot must not delete.
+            conn.execute(
+                "UPDATE thinking_records SET write_revision = write_revision + 1 WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
         }
     } else {
         // 全新轮次：插入新记录（同时写入 primary_tool_id 与 causal_tool_id 列）
@@ -1136,6 +1191,96 @@ pub fn save_thinking_record(
     let _ = session_stmt.execute(params![session_key, now]);
 
     Ok(())
+}
+
+/// Identity observed before updating a historical generation. Never append or
+/// repurpose the newest row when the original generation is missing/stale.
+pub(crate) struct ThinkingUpgradeSnapshot {
+    database_path: Option<String>,
+    session_key: String,
+    id: i64,
+    revision: i64,
+}
+
+pub(crate) fn snapshot_thinking_upgrade(
+    session_key: &str,
+    previous: &crate::proxy::thinking_store::ThinkingRecord,
+) -> Result<Option<ThinkingUpgradeSnapshot>, String> {
+    let conn = thinking_db()?;
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, write_revision, thought, signature, tool_ids
+        FROM thinking_records WHERE session_key=?1 AND fingerprint=?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_key, &previous.fingerprint])
+        .map_err(|e| e.to_string())?;
+    let mut result = None;
+    let mut related_row = false;
+    let previous_sig = persist_signature(previous.signature.as_deref());
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let thought: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+        let sig: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+        let tool_ids: String = row.get(4).map_err(|e| e.to_string())?;
+        let disk_sig = persist_signature(sig.as_deref());
+        let same_signature = match (disk_sig.as_deref(), previous_sig.as_deref()) {
+            (Some(a), Some(b)) if !crate::proxy::thinking_store::signatures_match(a, b) => {
+                // A definitely different generation may coexist with a RAM-only capture.
+                continue;
+            }
+            (None, None) | (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        related_row = true;
+        let ids: Vec<String> = serde_json::from_str(&tool_ids).map_err(|e| e.to_string())?;
+        if !same_signature
+            || unpack_thought(&thought) != previous.thought
+            || ids.len() != previous.tool_ids.len()
+            || !ids.iter().zip(&previous.tool_ids).all(|(a, b)| {
+                crate::proxy::common::utils::normalize_tool_id(a)
+                    == crate::proxy::common::utils::normalize_tool_id(b)
+            })
+        {
+            continue;
+        }
+        if result.is_some() {
+            return Err("historical generation is ambiguous".into());
+        }
+        result = Some(ThinkingUpgradeSnapshot {
+            database_path: conn.path().map(str::to_owned),
+            session_key: session_key.to_owned(),
+            id: row.get(0).map_err(|e| e.to_string())?,
+            revision: row.get(1).map_err(|e| e.to_string())?,
+        });
+    }
+    if related_row && result.is_none() {
+        return Err("historical generation changed".into());
+    }
+    Ok(result)
+}
+
+pub(crate) fn apply_thinking_upgrade(
+    snapshot: &ThinkingUpgradeSnapshot,
+    upgraded: &crate::proxy::thinking_store::ThinkingRecord,
+) -> Result<bool, String> {
+    let conn = thinking_db()?;
+    if conn.path() != snapshot.database_path.as_deref() {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE thinking_records SET thought=?1, signature=?2, write_revision=write_revision+1
+        WHERE session_key=?3 AND id=?4 AND write_revision=?5",
+        params![
+            pack_thought(&upgraded.thought),
+            persist_signature(upgraded.signature.as_deref()),
+            &snapshot.session_key,
+            snapshot.id,
+            snapshot.revision
+        ],
+    )
+    .map(|changed| changed == 1)
+    .map_err(|e| e.to_string())
 }
 
 pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingRecord>, String> {
@@ -1173,18 +1318,18 @@ pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingR
 
     let mut result = Vec::new();
     for row in rows {
-        if let Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible)) = row {
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            result.push(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: persist_signature(signature.as_deref()),
-                tool_ids,
-                tool_names,
-                visible,
-            });
-        }
+        let (fp, thought_raw, signature, tool_ids_str, tool_names_str, visible) =
+            row.map_err(|e| e.to_string())?;
+        let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+        let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
+        result.push(PersistedThinkingRecord {
+            fingerprint: fp,
+            thought: unpack_thought(&thought_raw),
+            signature: persist_signature(signature.as_deref()),
+            tool_ids,
+            tool_names,
+            visible,
+        });
     }
     Ok(result)
 }
@@ -1237,7 +1382,7 @@ pub fn load_thinking_by_tool_id(
             if let Some(ref h_sig) = healed_sig {
                 if raw_signature.as_ref() != Some(h_sig) {
                     let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                         params![h_sig, rec_id],
                     );
                 }
@@ -1282,14 +1427,14 @@ pub fn load_thinking_by_tool_id(
             // 3. Track 3 (In-Place Self-Healing): 若当前请求使用的是因果伪哈希 ID，顺手静默修复老数据
             if is_synthetic_tool_id(candidate) {
                 let _ = conn.execute(
-                    "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
+                    "UPDATE thinking_records SET causal_tool_id = ?1, write_revision = write_revision + 1 WHERE id = ?2 AND causal_tool_id IS NULL",
                     params![candidate, rec_id],
                 );
             }
             if let Some(ref h_sig) = healed_sig {
                 if raw_signature.as_ref() != Some(h_sig) {
                     let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                         params![h_sig, rec_id],
                     );
                 }
@@ -1334,14 +1479,14 @@ pub fn load_thinking_by_tool_id(
 
             if is_synthetic_tool_id(candidate) {
                 let _ = conn.execute(
-                    "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
+                    "UPDATE thinking_records SET causal_tool_id = ?1, write_revision = write_revision + 1 WHERE id = ?2 AND causal_tool_id IS NULL",
                     params![candidate, rec_id],
                 );
             }
             if let Some(ref h_sig) = healed_sig {
                 if raw_signature.as_ref() != Some(h_sig) {
                     let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                         params![h_sig, rec_id],
                     );
                 }
@@ -1398,7 +1543,7 @@ pub fn load_thinking_by_signature(
         if let Some(ref h_sig) = healed_sig {
             if raw_signature.as_ref() != Some(h_sig) {
                 let _ = conn.execute(
-                    "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                    "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                     params![h_sig, rec_id],
                 );
             }
@@ -1438,7 +1583,7 @@ pub fn lookup_latest_thinking_signature(session_id: &str) -> Option<String> {
     if let Some(ref h) = healed {
         if h != &raw_sig {
             let _ = conn.execute(
-                "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                 rusqlite::params![h, id],
             );
         }
@@ -1479,7 +1624,7 @@ pub fn lookup_signature_by_thought_snippet(snippet: &str) -> Option<String> {
             if let Some(ref h) = healed {
                 if h != &raw_sig {
                     let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                         rusqlite::params![h, id],
                     );
                 }
@@ -1490,29 +1635,49 @@ pub fn lookup_signature_by_thought_snippet(snippet: &str) -> Option<String> {
     None
 }
 
-/// 根据 fingerprint 精准穿透点查纯文本历史思考（利用 idx_thinking_rec_fp 索引）
-pub fn load_thinking_by_fingerprint(
+/// Load every generation for the requested fingerprints in capture order.
+/// Selecting a single latest row here would hide ambiguity from ThinkingStore.
+pub fn load_thinking_by_fingerprints(
     session_key: &str,
-    fingerprint: &str,
-) -> Result<Option<PersistedThinkingRecord>, String> {
-    if session_key.is_empty() || fingerprint.is_empty() {
-        return Ok(None);
+    fingerprints: &[String],
+) -> Result<Vec<PersistedThinkingRecord>, String> {
+    load_thinking_candidates(session_key, fingerprints, false)
+}
+
+/// Only used for a partial RAM window: retain all generations sharing a
+/// causal ID, including siblings with different client IDs and signatures.
+pub(crate) fn load_thinking_by_tool_ids(
+    session_key: &str,
+    ids: &[String],
+) -> Result<Vec<PersistedThinkingRecord>, String> {
+    load_thinking_candidates(session_key, ids, true)
+}
+
+fn load_thinking_candidates(
+    session_key: &str,
+    keys: &[String],
+    by_tool: bool,
+) -> Result<Vec<PersistedThinkingRecord>, String> {
+    if session_key.is_empty() || keys.is_empty() {
+        return Ok(Vec::new());
     }
+    let fingerprints_json = serde_json::to_string(keys).map_err(|e| e.to_string())?;
     let conn = thinking_db()?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-             FROM thinking_records
-             WHERE session_key = ?1 AND fingerprint = ?2
-             ORDER BY id DESC LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
-
+    let sql = if by_tool {
+        "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records
+         WHERE session_key=?1 AND EXISTS (SELECT 1 FROM json_each(tool_ids) WHERE value IN (SELECT value FROM json_each(?2)))
+         ORDER BY id ASC"
+    } else {
+        "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records
+         WHERE session_key=?1 AND fingerprint IN (SELECT value FROM json_each(?2)) ORDER BY id ASC"
+    };
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_key, fingerprint])
+        .query(params![session_key, fingerprints_json])
         .map_err(|e| e.to_string())?;
 
-    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
         let fp: String = row.get(1).map_err(|e| e.to_string())?;
         let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
@@ -1527,23 +1692,33 @@ pub fn load_thinking_by_fingerprint(
         if let Some(ref h_sig) = healed_sig {
             if raw_signature.as_ref() != Some(h_sig) {
                 let _ = conn.execute(
-                    "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                    "UPDATE thinking_records SET signature = ?1, write_revision = write_revision + 1 WHERE id = ?2",
                     params![h_sig, rec_id],
                 );
             }
         }
 
-        Ok(Some(PersistedThinkingRecord {
+        records.push(PersistedThinkingRecord {
             fingerprint: fp,
             thought: unpack_thought(&thought_raw),
             signature: healed_sig,
             tool_ids,
             tool_names,
             visible,
-        }))
-    } else {
-        Ok(None)
+        });
     }
+    Ok(records)
+}
+
+/// Latest-row lookup retained for callers that do not arbitrate generations.
+pub fn load_thinking_by_fingerprint(
+    session_key: &str,
+    fingerprint: &str,
+) -> Result<Option<PersistedThinkingRecord>, String> {
+    if fingerprint.is_empty() {
+        return Ok(None);
+    }
+    Ok(load_thinking_by_fingerprints(session_key, &[fingerprint.to_owned()])?.pop())
 }
 
 pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
@@ -1562,20 +1737,78 @@ pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
     .map_err(|e| e.to_string())
 }
 
-pub fn delete_thinking_records_except_fingerprints(
+/// An orphan prune may delete only row versions observed before its RAM pass.
+/// Row IDs exclude later inserts; revisions also exclude in-place recaptures.
+/// No thought blobs are copied, and no SQLite guard escapes the snapshot read.
+pub struct ThinkingPruneSnapshot {
+    session_key: String,
+    database_path: Option<String>,
+    row_versions: Vec<(i64, i64)>,
+}
+
+pub fn snapshot_thinking_records_for_prune(
     session_key: &str,
+) -> Result<ThinkingPruneSnapshot, String> {
+    let conn = thinking_db()?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id, write_revision FROM thinking_records WHERE session_key = ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_key], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    let row_versions = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(ThinkingPruneSnapshot {
+        session_key: session_key.to_owned(),
+        database_path: conn.path().map(str::to_owned),
+        row_versions,
+    })
+}
+
+/// Keep live protocol identities as well as RAM survivor fingerprints. A row
+/// outside the memory window can still belong to the current request, and old
+/// tool fingerprints may differ while their causal tool ID remains unchanged.
+/// A capture or update after the snapshot survives even if absent from keep_fps.
+pub fn delete_thinking_records_except_fingerprints(
+    snapshot: &ThinkingPruneSnapshot,
     keep_fps: &[String],
+    live_tool_ids: &[String],
+    live_signatures: &[String],
 ) -> Result<usize, String> {
-    if session_key.is_empty() || keep_fps.is_empty() {
+    if snapshot.session_key.is_empty() || snapshot.row_versions.is_empty() || keep_fps.is_empty() {
         return Ok(0);
     }
     let conn = thinking_db()?;
-    let fps_json = serde_json::to_string(keep_fps).unwrap_or_else(|_| "[]".to_string());
+    // Configuration can switch the active data directory between both phases.
+    // A snapshot from another database cannot authorize deleting its row IDs.
+    if conn.path() != snapshot.database_path.as_deref() {
+        return Ok(0);
+    }
+    let fps_json = serde_json::to_string(keep_fps).map_err(|e| e.to_string())?;
+    let tools_json = serde_json::to_string(live_tool_ids).map_err(|e| e.to_string())?;
+    let signatures_json = serde_json::to_string(live_signatures).map_err(|e| e.to_string())?;
+    let versions_json = serde_json::to_string(&snapshot.row_versions).map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM thinking_records
          WHERE session_key = ?1
-         AND fingerprint NOT IN (SELECT value FROM json_each(?2))",
-        params![session_key, fps_json],
+         AND (id, write_revision) IN (
+             SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
+             FROM json_each(?5)
+         )
+         AND fingerprint NOT IN (SELECT value FROM json_each(?2))
+         AND NOT EXISTS (
+             SELECT 1 FROM json_each(thinking_records.tool_ids) AS stored_tool
+             JOIN json_each(?3) AS live_tool ON stored_tool.value = live_tool.value
+         )
+         AND (signature IS NULL OR signature NOT IN (SELECT value FROM json_each(?4)))",
+        params![
+            snapshot.session_key,
+            fps_json,
+            tools_json,
+            signatures_json,
+            versions_json
+        ],
     )
     .map_err(|e| e.to_string())
 }
@@ -1678,7 +1911,7 @@ pub fn purge_foreign_signatures_for_session_with_model(
     let mut total_updated = 0;
     if !ids_to_null.is_empty() {
         let mut update_stmt = conn
-            .prepare_cached("UPDATE thinking_records SET signature = NULL WHERE id = ?1")
+            .prepare_cached("UPDATE thinking_records SET signature = NULL, write_revision = write_revision + 1 WHERE id = ?1")
             .map_err(|e| e.to_string())?;
         for id in ids_to_null {
             if let Ok(n) = update_stmt.execute(params![id]) {
@@ -1703,7 +1936,7 @@ pub fn clear_thinking_signatures_for_session(session_key: &str) -> Result<usize,
     let conn = thinking_db()?;
     let updated = conn
         .execute(
-            "UPDATE thinking_records SET signature = NULL WHERE session_key = ?1 AND signature IS NOT NULL",
+            "UPDATE thinking_records SET signature = NULL, write_revision = write_revision + 1 WHERE session_key = ?1 AND signature IS NOT NULL",
             params![session_key],
         )
         .map_err(|e| e.to_string())?;
@@ -2196,6 +2429,43 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 
     stmt.query_row([log_id], map_request_log_row)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod thinking_prune_schema_tests {
+    use super::*;
+
+    #[test]
+    fn existing_cache_rows_gain_revision_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thinking_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            thought TEXT NOT NULL, signature TEXT, tool_ids TEXT NOT NULL,
+            tool_names TEXT NOT NULL, visible TEXT NOT NULL,
+            created_at INTEGER NOT NULL, last_accessed INTEGER
+        );
+        INSERT INTO thinking_records
+            (session_key,fingerprint,thought,signature,tool_ids,tool_names,visible,created_at)
+        VALUES ('legacy','fp','existing thought','existing signature','[]','[]','answer',1);",
+        )
+        .unwrap();
+        init_thinking_schema(&conn).unwrap();
+        init_thinking_schema(&conn).unwrap();
+        let row: (String, String, i64) = conn.query_row(
+            "SELECT thought, signature, write_revision FROM thinking_records WHERE session_key='legacy'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            row,
+            ("existing thought".into(), "existing signature".into(), 0)
+        );
+        let (_, default, not_null): (String, String, i64) = conn.query_row(
+            "SELECT name,dflt_value,\"notnull\" FROM pragma_table_info('thinking_records') WHERE name='write_revision'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(default, "0");
+        assert_eq!(not_null, 1);
+    }
 }
 
 #[cfg(test)]

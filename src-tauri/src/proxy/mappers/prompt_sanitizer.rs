@@ -56,6 +56,15 @@ use std::sync::{Arc, RwLock};
 static RE_CODE_BLOCK: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?ms)(```[\s\S]*?```|`[^`\r\n]+`)").unwrap());
 
+// Fingerprints ignore injected billing lines, but must preserve quoted/code
+// examples and ordinary prose mentioning billing. Keep this narrower than the
+// outbound WAF sanitizer and never match across a line boundary.
+static RE_BILLING_METADATA_LINE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+    r"(?im)^[ \t]*(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):[^\r\n]*(?:\r?\n)?"
+).unwrap()
+});
+
 /// 触发上游 Google WAF 拦截的高危客户端伪 Header 与特征声明正则（仅在非代码区域生效）：
 /// 1) 通用泛化匹配各类客户端注入的 `*-billing*` 伪 Header 行（如 `x-anthropic-billing-header:`, `x-billing:`, `x-client-billing:`, `anthropic-billing-header:` 等）
 /// 2) 匹配任何以 `x-` 开头且携带 Claude Code CLI 计费签名特征（`cc_version`, `cc_entrypoint`, `cch=`）的伪 Header
@@ -712,6 +721,60 @@ impl PromptSanitizer {
         let normalized = RE_MULTI_NEWLINE.replace_all(&restored, "\n\n");
 
         normalized.trim().to_string()
+    }
+
+    /// Canonical metadata projection shared by protocol-independent session
+    /// fingerprints. Only whole billing-header lines outside code are ignored.
+    pub fn strip_billing_header_lines(text: &str) -> String {
+        if !text.to_ascii_lowercase().contains("billing") {
+            return text.to_string();
+        }
+        let mut result = String::with_capacity(text.len());
+        let mut fence: Option<(char, usize)> = None;
+        let mut trailing_metadata = false;
+        for line in text.split_inclusive('\n') {
+            trailing_metadata = false;
+            let trimmed = line.trim();
+            if let Some((marker, width)) = fence {
+                let markers = trimmed.chars().take_while(|&c| c == marker).count();
+                if markers >= width
+                    && !line.starts_with("    ")
+                    && !line.starts_with('\t')
+                    && trimmed[markers..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                result.push_str(line);
+                continue;
+            }
+            // Markdown indented code is business content too. A fenced block
+            // remains protected to EOF when its closing fence is absent.
+            if line.starts_with("    ") || line.starts_with('\t') {
+                result.push_str(line);
+                continue;
+            }
+            if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+                let width = trimmed.chars().take_while(|&c| c == marker).count();
+                if width >= 3 {
+                    fence = Some((marker, width));
+                }
+            }
+            if fence.is_some() || !RE_BILLING_METADATA_LINE.is_match(line) {
+                result.push_str(line);
+            } else {
+                trailing_metadata = !line.ends_with('\n');
+            }
+        }
+        // A final injected header without a line ending borrowed the separator
+        // from the preceding text. Drop exactly that LF/CRLF; any earlier blank
+        // lines and a genuine terminal newline remain part of the fingerprint.
+        if trailing_metadata && result.ends_with('\n') {
+            result.pop();
+            if result.ends_with('\r') {
+                result.pop();
+            }
+        }
+        result
     }
 
     /// System 轨：把系统提示词全量文本中的「身份归属声明句」与已知客户端开场白归一化为官方 Antigravity 身份。

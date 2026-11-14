@@ -22,13 +22,28 @@ pub struct GeminiStreamHandler {
     image_success_manager: Option<Arc<crate::proxy::TokenManager>>,
     image_success_account: String,
     image_success_model: String,
-    thinking_acc: Option<TurnAccumulator>,
+    capture_template: TurnAccumulator,
+    tool_ids: super::wrapper::ResponseToolIds,
+    candidates: std::collections::BTreeMap<u64, CandidateState>,
+    expected_candidates: usize,
+    marked_multi_candidate: bool,
+    buffered: bool,
+    invalid_candidates: bool,
     saw_image_data: bool,
     saw_finish_reason: bool,
+    blocked_prompt: bool,
+    whole_prompt_blocked: bool,
     saw_function_call: bool,
     has_content: bool,
     has_thinking: bool,
     is_thinking_active: bool,
+}
+
+struct CandidateState {
+    thinking: Option<TurnAccumulator>,
+    finish: bool,
+    active_thought: bool,
+    has_content: bool,
 }
 
 impl GeminiStreamHandler {
@@ -44,6 +59,37 @@ impl GeminiStreamHandler {
         image_success_account: String,
         image_success_model: String,
     ) -> Self {
+        Self::new_with_context(
+            cloud_code_trace_id,
+            session_id,
+            model_name,
+            message_count,
+            causal_anchor,
+            track_image_success,
+            image_success_manager,
+            image_success_account,
+            image_success_model,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context(
+        cloud_code_trace_id: Option<String>,
+        session_id: String,
+        model_name: String,
+        message_count: usize,
+        causal_anchor: String,
+        track_image_success: bool,
+        image_success_manager: Option<Arc<crate::proxy::TokenManager>>,
+        image_success_account: String,
+        image_success_model: String,
+        text_context_anchor: Option<String>,
+    ) -> Self {
+        let mut thinking_acc = TurnAccumulator::with_anchor(causal_anchor);
+        if let Some(anchor) = text_context_anchor {
+            thinking_acc = thinking_acc.with_text_context_anchor(anchor);
+        }
         Self {
             cloud_code_trace_id,
             session_id,
@@ -53,18 +99,48 @@ impl GeminiStreamHandler {
             image_success_manager,
             image_success_account,
             image_success_model,
-            thinking_acc: Some(TurnAccumulator::with_anchor(causal_anchor)),
+            capture_template: thinking_acc,
+            tool_ids: Default::default(),
+            candidates: Default::default(),
+            expected_candidates: 1,
+            marked_multi_candidate: false,
+            buffered: false,
+            invalid_candidates: false,
             saw_image_data: false,
             saw_finish_reason: false,
+            blocked_prompt: false,
+            whole_prompt_blocked: false,
             saw_function_call: false,
             has_content: false,
             has_thinking: false,
             is_thinking_active: false,
         }
     }
+    /// Buffered responses are recorded by the collector once the complete body succeeds.
+    pub fn with_candidate_request(mut self, count: usize, buffered: bool) -> Self {
+        self.expected_candidates = count.max(1);
+        self.buffered = buffered;
+        self
+    }
+
+    fn incomplete_candidates(&self) -> bool {
+        !self.whole_prompt_blocked
+            && (self.candidates.len() < self.expected_candidates
+                || (self.expected_candidates > 1
+                    && (0..self.expected_candidates as u64)
+                        .any(|index| !self.candidates.contains_key(&index)))
+                || self.candidates.values().any(|c| !c.finish))
+    }
 }
 
 impl ProtocolStreamHandler for GeminiStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
+        vec![Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::json!({"usageMetadata":usage})
+        ))]
+    }
+
     fn initial_frames(&mut self) -> Vec<Bytes> {
         // 官方 Worker 会将 TraceID 作为 SSE 流的第 0 个数据包下发
         match &self.cloud_code_trace_id {
@@ -112,6 +188,12 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             self.saw_image_data = true;
         }
 
+        self.whole_prompt_blocked |=
+            crate::proxy::pipeline::stream_error::response_has_prompt_refusal(&json);
+        self.blocked_prompt |= crate::proxy::pipeline::stream_error::response_is_refusal(&json);
+
+        self.tool_ids.inject(&mut json, &self.model_name);
+
         // v1internal 响应可能包一层 "response"
         let parts_snapshot = json
             .get("response")
@@ -121,13 +203,29 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             .cloned()
             .unwrap_or_default();
 
-        let mut chunk_has_finish_reason = false;
-        for cand in &parts_snapshot {
-            if cand.get("finishReason").and_then(|v| v.as_str()).is_some()
-                || cand.get("finish_reason").and_then(|v| v.as_str()).is_some()
-            {
+        if self.invalid_candidates {
+            return Vec::new();
+        }
+        let Some(indices) = super::candidate_indices(&parts_snapshot) else {
+            self.invalid_candidates = true;
+            return vec![Bytes::from_static(b"data: {\"error\":{\"code\":502,\"status\":\"INTERNAL\",\"message\":\"Invalid or duplicate Gemini candidate index\"}}\n\n")];
+        };
+        let multiple = self.expected_candidates > 1
+            || indices.iter().any(|i| *i != 0)
+            || self.candidates.keys().any(|i| *i != 0);
+        for (index, cand) in indices.into_iter().zip(&parts_snapshot) {
+            let state = self
+                .candidates
+                .entry(index)
+                .or_insert_with(|| CandidateState {
+                    thinking: (!self.buffered).then(|| self.capture_template.clone()),
+                    finish: false,
+                    active_thought: false,
+                    has_content: false,
+                });
+            if super::has_candidate_finish(cand) {
                 self.saw_finish_reason = true;
-                chunk_has_finish_reason = true;
+                state.finish = true;
             }
             if let Some(parts) = cand
                 .get("content")
@@ -136,6 +234,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             {
                 for part in parts {
                     let is_thought = part.get("thought").and_then(|v| v.as_bool()) == Some(true);
+                    state.active_thought = is_thought;
                     if is_thought {
                         self.has_thinking = true;
                         self.is_thinking_active = true;
@@ -144,42 +243,45 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                     }
                     if part.get("functionCall").is_some() {
                         self.saw_function_call = true;
-                        self.has_content = true;
                         // 工具调用是明确的行动输出，必然意味着思考阶段已结束。
                         self.is_thinking_active = false;
-                    } else if (!is_thought && part.get("text").is_some())
-                        || part.get("inlineData").is_some()
-                        || part.get("inline_data").is_some()
-                    {
+                    }
+                    if super::has_visible_content(part) {
+                        state.has_content = true;
                         self.has_content = true;
                     }
-                    if let Some(acc) = self.thinking_acc.as_mut() {
-                        acc.ingest_part(part);
+                    if let Some(thinking) = &mut state.thinking {
+                        thinking.ingest_part(part);
                     }
-                    if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                        crate::proxy::SignatureCache::global().cache_session_signature(
-                            &self.session_id,
-                            sig.to_string(),
-                            self.message_count,
-                        );
-                        tracing::debug!(
-                            "[Gemini-SSE] Cached session signature (len: {}) for session: {} at count {}",
-                            sig.len(),
-                            self.session_id,
-                            self.message_count
-                        );
+                }
+            }
+            // Publish before yielding the terminal event: the client can start the
+            // next request immediately, without reading a usage trailer or EOF.
+            // Taking the accumulator also makes a repeated terminal idempotent.
+            if state.finish && state.has_content && super::has_successful_candidate_finish(cand) {
+                if let Some(thinking) = state.thinking.take() {
+                    if multiple && !self.marked_multi_candidate {
+                        crate::proxy::SignatureCache::global()
+                            .mark_multi_candidate_turn(&self.session_id, self.message_count);
+                        self.marked_multi_candidate = true;
+                    } else if !multiple {
+                        if let Some(sig) = thinking.observed_signature() {
+                            crate::proxy::SignatureCache::global().cache_session_signature(
+                                &self.session_id,
+                                sig.to_owned(),
+                                self.message_count,
+                            );
+                        }
                     }
+                    thinking.commit(&self.session_id);
                 }
             }
         }
 
-        // finishReason 表示生成已收尾，思考阶段不再活跃。
-        if chunk_has_finish_reason {
-            self.is_thinking_active = false;
-        }
-
-        // 注入工具调用 ID
-        crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &self.model_name);
+        self.is_thinking_active = self
+            .candidates
+            .values()
+            .any(|c| c.active_thought && !c.finish);
 
         // 解包 v1internal 信封
         if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
@@ -195,6 +297,16 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         }
     }
 
+    fn finalize_without_content(&self) -> bool {
+        self.blocked_prompt || self.invalid_candidates
+    }
+
+    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
+        // Only prompt refusal completes every candidate in the response.
+        (self.whole_prompt_blocked || self.invalid_candidates)
+            .then(|| std::time::Duration::from_millis(250))
+    }
+
     fn has_content(&self) -> bool {
         self.has_content
     }
@@ -208,6 +320,14 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
+        if self.invalid_candidates {
+            return Vec::new();
+        }
+        if (self.expected_candidates > 1 || self.candidates.len() > 1)
+            && self.incomplete_candidates()
+        {
+            return vec![Bytes::from_static(b"data: {\"error\":{\"code\":502,\"status\":\"INTERNAL\",\"message\":\"Stream ended before all Gemini candidates completed\"}}\n\n")];
+        }
         // 图片生成成功统计仅在优雅结束时提交（错误路径不会走到这里）
         if self.track_image_success && self.saw_image_data {
             if let Some(mgr) = &self.image_success_manager {
@@ -219,9 +339,12 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             }
         }
 
+        if self.expected_candidates > 1 || self.candidates.len() > 1 {
+            return Vec::new();
+        }
         // [Fixes #3813] 情形 B 异常收尾：上游输出了正文但未下发任何 finishReason 即遭遇未预期 EOF
         // 必须提供明确的合成终态与 finishMessage 诊断，标明流在正常完成前被提前截断，杜绝下游误判为正常结束
-        if self.has_content && !self.saw_finish_reason {
+        if self.has_content && !self.saw_finish_reason && !self.blocked_prompt {
             self.saw_finish_reason = true;
             let finish_reason = if self.saw_function_call {
                 "STOP"
@@ -252,6 +375,11 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         let mut chunks = Vec::new();
 
         // 终态与内容防护：若上游已下发 finishReason 或从未产生任何正文/工具调用，绝不可伪造收尾
+        if (self.expected_candidates > 1 || self.candidates.len() > 1)
+            && self.incomplete_candidates()
+        {
+            return self.emit_initial_error(error_report);
+        }
         if !self.has_content || self.saw_finish_reason {
             return chunks;
         }
@@ -297,9 +425,14 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
     fn emit_initial_error(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
         let error_json = serde_json::json!({
             "error": {
-                "code": 503,
+                "code": error_report.upstream_status.unwrap_or(503),
                 "message": error_report.client_message(),
-                "status": "UNAVAILABLE",
+                "status": match error_report.upstream_status.unwrap_or(503) {
+                    400 => "INVALID_ARGUMENT", 401 => "UNAUTHENTICATED",
+                    403 => "PERMISSION_DENIED", 404 => "NOT_FOUND",
+                    429 => "RESOURCE_EXHAUSTED", 503 => "UNAVAILABLE",
+                    504 => "DEADLINE_EXCEEDED", _ => "INTERNAL",
+                },
                 "function": error_report.function,
                 "call_site": error_report.call_site(),
                 "params": error_report.params
@@ -312,13 +445,6 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             )),
             Bytes::from("data: [DONE]\n\n"),
         ]
-    }
-
-    fn on_finish(&mut self) {
-        // 与 Claude/OpenAI 一致：流结束（含优雅收尾）时提交思维链
-        if let Some(acc) = self.thinking_acc.take() {
-            acc.commit(&self.session_id);
-        }
     }
 }
 
@@ -339,6 +465,90 @@ mod tests {
             "acc@example.com".to_string(),
             "gemini-2.5-pro".to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn blocking_prompt_feedback_finishes_cleanly_and_retains_usage_trailers() {
+        for reason in [
+            "SAFETY",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "MODEL_ARMOR",
+            "FUTURE_BLOCK_REASON",
+        ] {
+            for ending in ["\n\n", ""] {
+                let blocked = serde_json::json!({"response": {
+                    "promptFeedback":{"blockReason":reason},
+                    "usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}
+                }});
+                let trailer = serde_json::json!({"usageMetadata":{"candidatesTokenCount":0}});
+                let wire = format!("data: {blocked}\n\ndata: {trailer}{ending}");
+                let source = futures::stream::iter(
+                    wire.as_bytes()
+                        .chunks(3)
+                        .map(|chunk| Ok::<_, String>(Bytes::copy_from_slice(chunk)))
+                        .collect::<Vec<_>>(),
+                );
+                let stream = crate::proxy::pipeline::run_stream_lifecycle(
+                    Box::pin(source),
+                    test_gemini_handler(),
+                    crate::proxy::pipeline::StreamLifecycleConfig::new(
+                        "gemini",
+                        "blocked_prompt",
+                        "test".into(),
+                    ),
+                );
+                let chunks = stream.collect::<Vec<_>>().await;
+                assert!(chunks.iter().all(Result::is_ok), "{reason}: {chunks:?}");
+                let output = chunks
+                    .into_iter()
+                    .flat_map(|chunk| chunk.unwrap().to_vec())
+                    .collect::<Vec<_>>();
+                let output = String::from_utf8(output).unwrap();
+                assert!(output.contains(reason));
+                assert!(output.contains("cachedContentTokenCount"));
+                assert!(output.contains("candidatesTokenCount"));
+                assert!(!output.contains("gatewayInterrupted"));
+            }
+        }
+    }
+
+    #[test]
+    fn default_prompt_feedback_does_not_complete_an_empty_response() {
+        for feedback in [
+            serde_json::json!({}),
+            serde_json::json!({"blockReason":null}),
+            serde_json::json!({"blockReason":""}),
+            serde_json::json!({"blockReason":"BLOCK_REASON_UNSPECIFIED"}),
+        ] {
+            let mut handler = test_gemini_handler();
+            handler.process_line(&format!(
+                "data: {}",
+                serde_json::json!({"promptFeedback":feedback})
+            ));
+            assert!(!handler.finalize_without_content());
+            assert!(handler.completion_tail_timeout().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_prompt_transport_close_does_not_revoke_refusal() {
+        let source = futures::stream::iter(vec![
+            Ok(Bytes::from(
+                "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n",
+            )),
+            Err("connection reset after refusal".to_string()),
+        ]);
+        let stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(source),
+            test_gemini_handler(),
+            crate::proxy::pipeline::StreamLifecycleConfig::new(
+                "gemini",
+                "blocked_prompt",
+                "test".into(),
+            ),
+        );
+        assert!(stream.collect::<Vec<_>>().await.iter().all(Result::is_ok));
     }
 
     #[test]

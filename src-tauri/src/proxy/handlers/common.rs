@@ -396,6 +396,17 @@ pub fn build_token_error_response(
     account_email: Option<&str>,
     error_text: &str,
 ) -> axum::response::Response {
+    build_token_error_response_with_usage(protocol, mapped_model, account_email, error_text, None)
+}
+
+/// A retry-selection stop must preserve measurements from earlier attempts.
+pub fn build_token_error_response_with_usage(
+    protocol: &str,
+    mapped_model: &str,
+    account_email: Option<&str>,
+    error_text: &str,
+    usage: Option<&serde_json::Value>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     let status = resolve_token_error_status(error_text);
     let headers = build_token_error_headers_for_protocol(
@@ -404,7 +415,8 @@ pub fn build_token_error_response(
         account_email,
         error_text,
     );
-    let dual_err = build_dual_track_error(protocol, status.as_u16(), mapped_model, error_text);
+    let mut dual_err = build_dual_track_error(protocol, status.as_u16(), mapped_model, error_text);
+    crate::proxy::pipeline::stream_error::attach_error_usage(&mut dual_err, protocol, usage);
     (status, headers, axum::Json(dual_err)).into_response()
 }
 
@@ -1166,6 +1178,60 @@ mod retry_after_tests {
             resolve_token_error_status("No accounts available"),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn stale_retry_selection_returns_503_with_affinity_and_measured_usage() {
+        let usage = serde_json::json!({"promptTokenCount":100,"cachedContentTokenCount":80});
+        for protocol in ["claude", "gemini", "openai", "responses"] {
+            let error = crate::proxy::session_bindings::SESSION_BINDING_CHANGED;
+            let mut retry = crate::proxy::pipeline::rotation::RequestRetryState::default();
+            retry.preserve_token_error(error);
+            let response = retry.finish_error_response(build_token_error_response_with_usage(
+                protocol,
+                "gemini-flash",
+                None,
+                error,
+                Some(&usage),
+            ));
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-am-cache-affinity")
+                    .and_then(|v| v.to_str().ok()),
+                Some("preserve")
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["usageMetadata"], usage);
+            match protocol {
+                "claude" => {
+                    assert_eq!(body["usage"]["input_tokens"], 20);
+                    assert_eq!(body["usage"]["cache_read_input_tokens"], 80);
+                }
+                "openai" => {
+                    assert_eq!(body["usage"]["prompt_tokens"], 100);
+                    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 80);
+                }
+                "responses" => {
+                    assert_eq!(body["usage"]["input_tokens"], 100);
+                    assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 80);
+                }
+                _ => {}
+            }
+            if protocol == "gemini" {
+                assert_eq!(body["error"]["status"], "UNAVAILABLE");
+            } else {
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], "upstream_error");
+            }
+        }
     }
 
     #[test]
