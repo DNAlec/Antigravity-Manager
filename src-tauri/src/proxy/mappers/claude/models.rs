@@ -179,16 +179,24 @@ pub struct ImageSource {
     pub media_type: Option<String>,
     #[serde(default)]
     pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSource {
     #[serde(rename = "type", default = "default_base64_type")]
-    pub source_type: String, // "base64"
+    pub source_type: String, // "base64", "url", "text", or "content"
     #[serde(default)]
     pub media_type: Option<String>, // e.g. "application/pdf"
     #[serde(default)]
-    pub data: Option<String>, // base64 data
+    pub data: Option<String>, // base64 data or plain text
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
 }
 
 /// Tool - supports both client tools (with input_schema) and server tools (like web_search)
@@ -319,8 +327,26 @@ pub struct GeminiPart {
     pub function_response: Option<FunctionResponse>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "inlineData")]
+    #[serde(rename = "inlineData", alias = "inline_data")]
     pub inline_data: Option<InlineData>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "fileData", alias = "file_data")]
+    pub file_data: Option<FileData>,
+}
+
+impl GeminiPart {
+    pub(crate) fn render_media(
+        &self,
+    ) -> Option<crate::proxy::common::response_media::RenderedMedia> {
+        use crate::proxy::common::response_media::{render_file, render_inline};
+        if let Some(inline) = &self.inline_data {
+            return render_inline(Some(&inline.mime_type), &inline.data);
+        }
+        self.file_data
+            .as_ref()
+            .and_then(|file| render_file(file.mime_type.as_deref(), &file.file_uri))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,9 +368,21 @@ pub struct FunctionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineData {
-    #[serde(rename = "mimeType")]
+    #[serde(rename = "mimeType", alias = "mime_type", default)]
     pub mime_type: String,
     pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileData {
+    #[serde(
+        rename = "mimeType",
+        alias = "mime_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mime_type: Option<String>,
+    #[serde(rename = "fileUri", alias = "file_uri")]
+    pub file_uri: String,
 }
 
 /// Gemini 完整响应

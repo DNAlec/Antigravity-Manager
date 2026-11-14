@@ -883,6 +883,123 @@ fn build_system_instruction(
     }))
 }
 
+const MAX_MEDIA_CONTENT_DEPTH: usize = 32;
+
+/// Convert the same Claude source shapes in user messages and nested tool results.
+fn claude_media_source_parts(
+    source_type: &str,
+    media_type: Option<&str>,
+    data: Option<&str>,
+    url: Option<&str>,
+    content: Option<&Value>,
+    label: &str,
+    depth: usize,
+) -> Result<Vec<Value>, String> {
+    if depth > MAX_MEDIA_CONTENT_DEPTH {
+        return Err("Media content exceeds the maximum nesting depth".to_string());
+    }
+    match source_type {
+        "base64" => Ok(vec![
+            crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                media_type,
+                data.unwrap_or_default(),
+                label,
+            ),
+        ]),
+        "url" => {
+            let uri = url
+                .filter(|uri| !uri.trim().is_empty())
+                .ok_or_else(|| format!("{label} URL source is missing its URL"))?;
+            let default_mime = if label == "Image" {
+                "image/jpeg"
+            } else {
+                "application/pdf"
+            };
+            Ok(vec![
+                crate::proxy::mappers::common_utils::create_gemini_file_part(
+                    uri,
+                    media_type,
+                    default_mime,
+                )?,
+            ])
+        }
+        "text" => {
+            let text = data
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| format!("{label} text source is missing its data"))?;
+            Ok(vec![json!({"text": text})])
+        }
+        "content" => {
+            let content =
+                content.ok_or_else(|| format!("{label} content source is missing its content"))?;
+            let mut parts = Vec::new();
+            append_claude_content_parts(content, &mut parts, depth + 1)?;
+            if parts.is_empty() {
+                return Err(format!("{label} content source has no readable content"));
+            }
+            Ok(parts)
+        }
+        _ => Err(format!("Unsupported {label} source type: {source_type}")),
+    }
+}
+
+/// Keep readable content in order; unknown structured tool output stays readable JSON.
+fn append_claude_content_parts(
+    content: &Value,
+    parts: &mut Vec<Value>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_MEDIA_CONTENT_DEPTH {
+        return Err("Media content exceeds the maximum nesting depth".to_string());
+    }
+    match content {
+        Value::String(text) => {
+            if !text.is_empty() {
+                parts.push(json!({"text": text}));
+            }
+        }
+        Value::Array(blocks) => {
+            for block in blocks {
+                append_claude_content_parts(block, parts, depth + 1)?;
+            }
+        }
+        Value::Null => {}
+        Value::Object(block) => match block.get("type").and_then(Value::as_str) {
+            Some(kind @ ("image" | "document")) => {
+                let source = block
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("{kind} block is missing its source"))?;
+                let source_type = source
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("base64");
+                parts.extend(claude_media_source_parts(
+                    source_type,
+                    source.get("media_type").and_then(Value::as_str),
+                    source.get("data").and_then(Value::as_str),
+                    source.get("url").and_then(Value::as_str),
+                    source.get("content"),
+                    if kind == "image" { "Image" } else { "Document" },
+                    depth + 1,
+                )?);
+            }
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Text block is missing its text".to_string())?;
+                if !text.is_empty() {
+                    parts.push(json!({"text": text}));
+                }
+            }
+            _ => parts.push(json!({"text": content.to_string()})),
+        },
+        _ => parts.push(json!({"text": content.to_string()})),
+    }
+    Ok(())
+}
+
 /// 构建 Contents (Messages)
 fn build_contents(
     content: &MessageContent,
@@ -1150,28 +1267,28 @@ fn build_contents(
                         continue;
                     }
                     ContentBlock::Image { source, .. } => {
-                        if source.source_type == "base64" {
-                            let part =
-                                crate::proxy::mappers::common_utils::create_gemini_inline_part(
-                                    source.media_type.as_deref(),
-                                    source.data.as_deref().unwrap_or_default(),
-                                    "Image",
-                                );
-                            parts.push(part);
-                            saw_non_thinking = true;
-                        }
+                        parts.extend(claude_media_source_parts(
+                            &source.source_type,
+                            source.media_type.as_deref(),
+                            source.data.as_deref(),
+                            source.url.as_deref(),
+                            source.content.as_ref(),
+                            "Image",
+                            0,
+                        )?);
+                        saw_non_thinking = true;
                     }
                     ContentBlock::Document { source, .. } => {
-                        if source.source_type == "base64" {
-                            let part =
-                                crate::proxy::mappers::common_utils::create_gemini_inline_part(
-                                    source.media_type.as_deref(),
-                                    source.data.as_deref().unwrap_or_default(),
-                                    "Document",
-                                );
-                            parts.push(part);
-                            saw_non_thinking = true;
-                        }
+                        parts.extend(claude_media_source_parts(
+                            &source.source_type,
+                            source.media_type.as_deref(),
+                            source.data.as_deref(),
+                            source.url.as_deref(),
+                            source.content.as_ref(),
+                            "Document",
+                            0,
+                        )?);
+                        saw_non_thinking = true;
                     }
                     ContentBlock::ToolUse {
                         id,
@@ -1261,34 +1378,19 @@ fn build_contents(
                                     &mut extra_parts,
                                 )
                             }
-                            serde_json::Value::Array(arr) => {
+                            _ => {
+                                let mut converted = Vec::new();
+                                append_claude_content_parts(content, &mut converted, 0)?;
                                 let mut texts = Vec::new();
-                                for block in arr {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                for part in converted {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
                                         texts.push(text.to_string());
-                                    } else if block.get("source").is_some() {
-                                        if block.get("type").and_then(|v| v.as_str())
-                                            == Some("image")
-                                        {
-                                            let source = block.get("source").unwrap();
-                                            let media_type =
-                                                source.get("media_type").and_then(|v| v.as_str());
-                                            let data = source
-                                                .get("data")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default();
-                                            extra_parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
-                                                media_type,
-                                                data,
-                                                "Tool Result Image",
-                                            ));
-                                        }
+                                    } else {
+                                        extra_parts.push(part);
                                     }
                                 }
                                 texts.join("\n")
                             }
-                            serde_json::Value::Null => String::new(),
-                            _ => content.to_string(),
                         };
 
                         // FunctionResponsePart accepts media, not text. Keep validation
@@ -1819,6 +1921,335 @@ use crate::proxy::mappers::common_utils::is_model_compatible;
 
 #[cfg(test)]
 mod tests {
+    const MEDIA_TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const MEDIA_TEST_PDF: &str = "JVBERi0xLjQKJSVFT0Y=";
+
+    #[test]
+    fn r23_messages_media_remote_sources_survive_deserialization_and_mapping() {
+        let cases = [
+            (
+                "image",
+                "https://example.com/photo.PNG?sig=a%2Fb&expires=999",
+                None,
+                "image/png",
+            ),
+            (
+                "image",
+                "https://example.com/image?id=123",
+                None,
+                "image/jpeg",
+            ),
+            (
+                "image",
+                "https://example.com/image?id=456",
+                Some("image/webp"),
+                "image/webp",
+            ),
+            (
+                "document",
+                "https://example.com/report.pdf?sig=b%2Fc",
+                None,
+                "application/pdf",
+            ),
+            (
+                "document",
+                "https://example.com/report.txt",
+                None,
+                "text/plain",
+            ),
+        ];
+        for model in [
+            "claude-sonnet-4-6",
+            "gemini-2.5-flash",
+            "gemini-3.1-pro-high",
+        ] {
+            for (kind, uri, mime, expected_mime) in cases {
+                let request: ClaudeRequest = serde_json::from_value(json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "Read the attached source"},
+                        {"type": kind, "source": {"type": "url", "url": uri, "media_type": mime}}
+                    ]}]
+                }))
+                .unwrap();
+                let roundtrip = serde_json::to_value(&request).unwrap();
+                assert_eq!(roundtrip["messages"][0]["content"][1]["source"]["url"], uri);
+                let body = transform_claude_request_in(
+                    &request,
+                    "media-project",
+                    false,
+                    None,
+                    "media-url-session",
+                    None,
+                )
+                .unwrap();
+                let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
+                assert_eq!(parts.len(), 2, "{model}: {parts:?}");
+                assert_eq!(
+                    parts[1],
+                    json!({"fileData": {"fileUri": uri, "mimeType": expected_mime}})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r23_messages_media_plaintext_documents_keep_the_complete_body_and_base64_control() {
+        let document = format!(
+            "  Document begins\n{}\nDocument ends  ",
+            "完整正文 — full body\n".repeat(1024)
+        );
+        for model in [
+            "claude-sonnet-4-6",
+            "gemini-2.5-flash",
+            "gemini-3.1-pro-high",
+        ] {
+            let request: ClaudeRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": document}},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": MEDIA_TEST_PDF}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}}
+                ]}]
+            })).unwrap();
+            let body = transform_claude_request_in(
+                &request,
+                "media-project",
+                false,
+                None,
+                "media-text-session",
+                None,
+            )
+            .unwrap();
+            let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
+            assert_eq!(parts.len(), 3, "{model}: {parts:?}");
+            assert_eq!(parts[0]["text"], document);
+            assert_eq!(
+                parts[1],
+                json!({"inlineData": {"mimeType": "application/pdf", "data": MEDIA_TEST_PDF}})
+            );
+            assert_eq!(
+                parts[2],
+                json!({"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}})
+            );
+        }
+    }
+
+    #[test]
+    fn r23_messages_media_content_documents_keep_text_image_order() {
+        let uri = "https://example.com/nested.png?token=a%2Fb";
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "content", "content": "String document body"}},
+                {"type": "document", "source": {"type": "content", "content": [
+                    {"type": "text", "text": "Before image"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}},
+                    {"type": "text", "text": "Between images"},
+                    {"type": "image", "source": {"type": "url", "url": uri}},
+                    {"type": "text", "text": "After image"}
+                ]}}
+            ]}]
+        })).unwrap();
+        let body = transform_claude_request_in(
+            &request,
+            "media-project",
+            false,
+            None,
+            "media-content-session",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            body["request"]["contents"][0]["parts"],
+            json!([
+                {"text": "String document body"},
+                {"text": "Before image"},
+                {"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}},
+                {"text": "Between images"},
+                {"fileData": {"mimeType": "image/png", "fileUri": uri}},
+                {"text": "After image"}
+            ])
+        );
+    }
+
+    #[test]
+    fn r23_messages_media_tool_results_keep_documents_and_images_with_their_owner() {
+        let image_uri = "https://example.com/result.webp?sig=a%2Fb";
+        let document_uri = "https://example.com/result.pdf?sig=b%2Fc";
+        for model in [
+            "claude-sonnet-4-6",
+            "gemini-2.5-flash",
+            "gemini-3.1-pro-high",
+        ] {
+            let request: ClaudeRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": "Inspect both files"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "image-call", "name": "inspect_image", "input": {}},
+                        {"type": "tool_use", "id": "document-call", "name": "inspect_document", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "image-call", "content": [
+                            {"type": "text", "text": "Image result"},
+                            {"type": "image", "source": {"type": "url", "url": image_uri}}
+                        ]},
+                        {"type": "tool_result", "tool_use_id": "document-call", "is_error": true, "content": [
+                            {"type": "document", "source": {"type": "text", "data": "Full document body\nSecond line"}},
+                            {"type": "document", "source": {"type": "url", "url": document_uri}},
+                            {"type": "document", "source": {"type": "content", "content": [
+                                {"type": "text", "text": "Partial document output"},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}},
+                                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": MEDIA_TEST_PDF}}
+                            ]}},
+                            {"type": "custom_result", "value": "Readable structured result"}
+                        ]}
+                    ]}
+                ]
+            })).unwrap();
+            let body = transform_claude_request_in(
+                &request,
+                "media-project",
+                false,
+                None,
+                "media-tool-session",
+                None,
+            )
+            .unwrap();
+            let parts: Vec<_> = body["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|content| content["parts"].as_array().unwrap())
+                .collect();
+            let responses: Vec<_> = parts
+                .iter()
+                .filter_map(|part| part.get("functionResponse"))
+                .collect();
+            assert_eq!(responses.len(), 2, "{model}: {responses:?}");
+            let image = responses
+                .iter()
+                .find(|response| response["id"] == "image-call")
+                .unwrap();
+            assert_eq!(image["name"], "inspect_image");
+            assert_eq!(image["response"]["output"], "Image result");
+            let document = responses
+                .iter()
+                .find(|response| response["id"] == "document-call")
+                .unwrap();
+            assert_eq!(document["name"], "inspect_document");
+            assert!(document["response"].get("output").is_none());
+            assert_eq!(
+                document["response"]["error"],
+                format!(
+                    "Full document body\nSecond line\nPartial document output\n{}",
+                    json!({"type": "custom_result", "value": "Readable structured result"})
+                )
+            );
+            let image_media =
+                json!([{"fileData": {"mimeType": "image/webp", "fileUri": image_uri}}]);
+            let document_media = json!([
+                    {"fileData": {"mimeType": "application/pdf", "fileUri": document_uri}},
+                    {"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}},
+                    {"inlineData": {"mimeType": "application/pdf", "data": MEDIA_TEST_PDF}}
+            ]);
+            if model == "gemini-3.1-pro-high" {
+                assert_eq!(image["parts"], image_media);
+                assert_eq!(document["parts"], document_media);
+                assert!(
+                    parts
+                        .iter()
+                        .all(|part| part.get("fileData").is_none()
+                            && part.get("inlineData").is_none())
+                );
+            } else {
+                // Legacy targets place media after results and retain explicit owner positions.
+                assert!(image.get("parts").is_none());
+                assert!(document.get("parts").is_none());
+                assert_eq!(image["response"]["attached_media_positions"], json!([1]));
+                assert_eq!(
+                    document["response"]["attached_media_positions"],
+                    json!([2, 3, 4])
+                );
+                let media: Vec<_> = parts
+                    .iter()
+                    .filter(|part| {
+                        part.get("fileData").is_some() || part.get("inlineData").is_some()
+                    })
+                    .copied()
+                    .collect();
+                assert_eq!(
+                    media,
+                    image_media
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .chain(document_media.as_array().unwrap())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r23_messages_media_missing_content_fails_explicitly() {
+        for source in [
+            json!({"type": "url"}),
+            json!({"type": "url", "url": ""}),
+            json!({"type": "text"}),
+            json!({"type": "content", "content": []}),
+            json!({"type": "content", "content": ""}),
+            json!({"type": "content", "content": [{"type": "image"}]}),
+            json!({"type": "file", "file_id": "unavailable-file"}),
+        ] {
+            let request: ClaudeRequest = serde_json::from_value(json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Read this document"},
+                    {"type": "document", "source": source}
+                ]}]
+            }))
+            .unwrap();
+            assert!(
+                transform_claude_request_in(
+                    &request,
+                    "media-project",
+                    false,
+                    None,
+                    "media-missing-session",
+                    None,
+                )
+                .is_err(),
+                "missing source was accepted: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn r23_messages_media_recursive_content_is_bounded() {
+        let mut content = json!({"type": "text", "text": "Nested body"});
+        for _ in 0..MAX_MEDIA_CONTENT_DEPTH {
+            content =
+                json!({"type": "document", "source": {"type": "content", "content": content}});
+        }
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": [content]}]
+        }))
+        .unwrap();
+        let error = transform_claude_request_in(
+            &request,
+            "media-project",
+            false,
+            None,
+            "media-depth-session",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("maximum nesting depth"), "{error}");
+    }
+
     #[test]
     fn r19_cache_hints_do_not_erase_tool_business_fields() {
         for color in ["red", "blue"] {
@@ -2240,6 +2671,8 @@ mod tests {
                     role: "user".to_string(),
                     content: MessageContent::Array(vec![ContentBlock::Image {
                         source: ImageSource {
+                            url: None,
+                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some("iVBORw0KGgo=".to_string()),
@@ -3492,6 +3925,8 @@ mod tests {
                     // Corrupt image block 1 (empty data)
                     ContentBlock::Image {
                         source: ImageSource {
+                            url: None,
+                            content: None,
                             source_type: "base64".to_string(),
                             media_type: None,
                             data: None,
@@ -3501,6 +3936,8 @@ mod tests {
                     // Corrupt image block 2 (invalid short base64 +A==)
                     ContentBlock::Image {
                         source: ImageSource {
+                            url: None,
+                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some("+A==".to_string()),
@@ -3510,6 +3947,8 @@ mod tests {
                     // Valid image block
                     ContentBlock::Image {
                         source: ImageSource {
+                            url: None,
+                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some(valid_png_b64.to_string()),

@@ -1179,6 +1179,94 @@ mod responses_conversion_terminal_tests {
     }
 
     #[tokio::test]
+    async fn responses_media_survives_stream_buffering_and_direct_json() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let media_cases = [
+            (
+                json!({"inlineData":{"mimeType":"image/png","data":PNG}}),
+                PNG,
+            ),
+            (
+                json!({"fileData":{"mimeType":"image/png","fileUri":"https://files.example/answer.png"}}),
+                "https://files.example/answer.png",
+            ),
+            (
+                json!({"fileData":{"mimeType":"application/pdf","fileUri":"https://files.example/report.pdf"}}),
+                "https://files.example/report.pdf",
+            ),
+        ];
+        for (media, expected) in media_cases {
+            for with_text in [false, true] {
+                let mut parts = Vec::new();
+                if with_text {
+                    parts.push(json!({"text":"The generated result follows."}));
+                }
+                parts.push(media.clone());
+                let response = json!({
+                    "candidates":[{"index":0,"content":{"role":"model","parts":parts},"finishReason":"STOP"}],
+                    "usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":7,"totalTokenCount":107}
+                });
+                let direct_chat =
+                    crate::proxy::mappers::openai::response::transform_openai_response(
+                        &response, None, 1, None,
+                    );
+                let buffered_chat =
+                    crate::proxy::mappers::openai::collector::collect_stream_to_json(
+                        streaming::create_openai_sse_stream(
+                            source(vec![response.clone()]),
+                            "gemini-pro".into(),
+                            "media-parity-buffered".into(),
+                            1,
+                            None,
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let mut responses_stream = streaming::create_codex_sse_stream(
+                    source(vec![response]),
+                    "gemini-pro".into(),
+                    "media-parity-stream".into(),
+                    1,
+                    1,
+                    "resp_media_parity".into(),
+                    None,
+                    false,
+                );
+                let mut terminal = None;
+                while let Some(chunk) = responses_stream.next().await {
+                    for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                        let Some(data) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        let Ok(event) = serde_json::from_str::<Value>(data) else {
+                            continue;
+                        };
+                        assert_ne!(event["type"], "error", "{event}");
+                        if event["type"] == "response.completed" {
+                            terminal = Some(event["response"].clone());
+                        }
+                    }
+                }
+                for result in [
+                    convert_chat_response_to_responses(&direct_chat, false),
+                    convert_chat_response_to_responses(&buffered_chat, false),
+                    terminal.expect("media response must complete"),
+                ] {
+                    assert_eq!(result["status"], "completed", "{result}");
+                    let output = result["output"].to_string();
+                    assert!(output.contains(expected), "missing media: {output}");
+                    if with_text {
+                        assert!(output.contains("The generated result follows."), "{output}");
+                    }
+                    assert_eq!(result["usage"]["input_tokens"], 100);
+                    assert_eq!(result["usage"]["output_tokens"], 7);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn responses_json_matches_stream_for_text_tool_refusal_and_usage_tail() {
         let tool = json!({"functionCall":{"name":"lookup","args":{"key":1},"id":"call_test"}});
         let cases = [

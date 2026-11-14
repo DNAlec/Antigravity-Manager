@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::pin::Pin;
 use uuid::Uuid;
 
+use crate::proxy::common::response_media::{render_part, MediaTracker};
 use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
@@ -92,6 +93,7 @@ where
 
 /// OpenAI Chat 协议流渲染器（实现 ProtocolStreamHandler Trait）
 pub struct OpenAIChatStreamHandler {
+    media: MediaTracker,
     pub stream_id: String,
     pub created_ts: i64,
     pub model: String,
@@ -147,11 +149,14 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             }
             self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
             self.refused |= response_is_refusal(&actual_data);
+            self.media.begin_frame();
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
+                let candidate_ids = crate::proxy::mappers::gemini::candidate_indices(candidates);
                 if !candidates.is_empty() {
                     tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
                 }
                 for (idx, candidate) in candidates.iter().enumerate() {
+                    let candidate_id = candidate_ids.as_ref().map(|ids| ids[idx]);
                     let parts = candidate
                         .get("content")
                         .and_then(|c| c.get("parts"))
@@ -178,18 +183,10 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                     content_out.push_str(text);
                                 }
                             }
-                            if let Some(img) = part.get("inlineData") {
-                                let mime_type = img
-                                    .get("mimeType")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("image/png");
-                                let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                                if !data.is_empty() {
-                                    content_out.push_str(&format!(
-                                        "![image](data:{};base64,{})",
-                                        mime_type, data
-                                    ));
-                                }
+                            if let Some(text) = render_part(part)
+                                .and_then(|media| self.media.render(candidate_id, media))
+                            {
+                                content_out.push_str(&text);
                             }
                             if let Some(func_call) = part.get("functionCall") {
                                 let call_key = serde_json::to_string(func_call).unwrap_or_default();
@@ -666,6 +663,7 @@ where
     );
 
     let handler = OpenAIChatStreamHandler {
+        media: MediaTracker::default(),
         stream_id,
         created_ts,
         model,
@@ -1101,6 +1099,7 @@ fn codex_sse_frame(event: &Value) -> Bytes {
 /// 此处仅保留 Gemini SSE → Responses API 事件流（reasoning / message / tool /
 /// grounding / 终态）的协议差异。
 pub struct CodexResponsesStreamHandler {
+    media: MediaTracker,
     model: String,
     session_id: String,
     message_count: usize,
@@ -1154,6 +1153,7 @@ impl CodexResponsesStreamHandler {
             .unwrap_or_default()
             .as_secs();
         Self {
+            media: MediaTracker::default(),
             model,
             session_id,
             message_count,
@@ -1288,15 +1288,16 @@ impl CodexResponsesStreamHandler {
         self.push_event(frames, content_part_added);
     }
 
-    fn handle_part(&mut self, part: &Value, frames: &mut Vec<Bytes>) {
+    fn handle_part(&mut self, part: &Value, candidate_id: Option<u64>, frames: &mut Vec<Bytes>) {
         self.thinking_acc.ingest_part(part);
+        let media_text = render_part(part).and_then(|media| self.media.render(candidate_id, media));
         let is_thought = part
             .get("thought")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let is_text_or_tool = part.get("text").is_some()
             || part.get("functionCall").is_some()
-            || part.get("inlineData").is_some();
+            || media_text.is_some();
 
         // 正文或工具项开始前先关闭 reasoning，避免输出项生命周期重叠。
         if is_text_or_tool && !is_thought {
@@ -1378,6 +1379,22 @@ impl CodexResponsesStreamHandler {
                     self.push_event(frames, delta_ev);
                 }
             }
+        }
+
+        if let Some(text) = media_text {
+            self.close_reasoning(frames);
+            self.open_message(frames);
+            self.accumulated_text.push_str(&text);
+            self.push_event(
+                frames,
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": &self.message_item_id,
+                    "output_index": self.message_output_index,
+                    "content_index": 0,
+                    "delta": text
+                }),
+            );
         }
 
         if let Some(func_call) = part.get("functionCall") {
@@ -1833,7 +1850,10 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             self.final_finish_reason = Some("SAFETY".into());
         }
 
+        self.media.begin_frame();
         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
+            let candidate_id = crate::proxy::mappers::gemini::candidate_indices(candidates)
+                .and_then(|ids| ids.first().copied());
             if !candidates.is_empty() {
                 tracing::debug!("[Codex-Stream-Debug] Raw Candidate: {:?}", candidates[0]);
             }
@@ -1853,7 +1873,7 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
                     .and_then(|p| p.as_array())
                 {
                     for part in parts {
-                        self.handle_part(part, &mut frames);
+                        self.handle_part(part, candidate_id, &mut frames);
                     }
                 }
 

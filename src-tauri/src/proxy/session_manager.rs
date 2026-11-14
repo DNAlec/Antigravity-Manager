@@ -1000,6 +1000,8 @@ mod tests {
                 role: "user".to_string(),
                 content: MessageContent::Array(vec![ContentBlock::Image {
                     source: ImageSource {
+                        url: None,
+                        content: None,
                         source_type: "base64".to_string(),
                         media_type: Some("image/png".to_string()),
                         data: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string()),
