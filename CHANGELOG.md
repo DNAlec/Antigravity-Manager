@@ -3,6 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.5 (2026-11-14)**:
+        -   **[跨协议缓存连续性与历史恢复] (PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
+            -   仅在成功终态且存在可交付内容时提交思考历史与签名；失败重试、连接中断和仅思考输出不污染下一轮，多候选分别判断，并在客户端收到终态前发布有效历史。
+            -   累计媒体按候选及帧内次数去重，保留文件输出、终帧载体元数据、独立签名思考块和稳定工具 ID。与 sub2api 联验的三种分帧均交付并结算两张图。
+            -   修复 Responses HTTP/WS 的工具媒体完整回放、父历史引用、文件输入、token 别名覆盖和空闲 TTL；无法表示的外部加密状态与文件 ID 明确拒绝。
+            -   保留业务参数、可表达的 Schema 组合及约束；先裁剪媒体窗口再生成旧协议位置，确保图片和文件属于正确的工具回执。配套 [sub2api #6](https://github.com/DNAlec/sub2api/pull/6)。
+
     *   **v5.0.4 (2026-11-12)**:
         -   **[本仓库会话与冷却保护] (Ref [DNAlec/Antigravity-Manager#1](https://github.com/DNAlec/Antigravity-Manager/pull/1), [#2](https://github.com/DNAlec/Antigravity-Manager/pull/2), [#3](https://github.com/DNAlec/Antigravity-Manager/pull/3), [#4](https://github.com/DNAlec/Antigravity-Manager/pull/4), Thanks to @DNAlec)**:
             -   集成上游 `v5.0.4-beta.0` 至 `beta.7`，保留会话租约代际校验、原始 usage 诊断、实例级 QoS 配置和单次尝试控制。

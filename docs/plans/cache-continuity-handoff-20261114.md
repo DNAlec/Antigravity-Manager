@@ -1,6 +1,6 @@
 # AM / sub2api 缓存连续性开发交接（2026-11-14）
 
-两个 fork 的开发分支均为 `codex/cache-continuity-fixes`。**R19 修复及后续交叉复审已完成，本地定向回归通过；发布仍以对应提交的远端 CI 和项目发布流程为准。** 尚未合并生产分支、打标签或替换运行实例。
+两个 fork 的开发分支均为 `codex/cache-continuity-fixes`。**R19 修复、独立复审、本地回归及两仓最终 CI 均通过。** PR #5 / sub2api PR #6 已按维护者指令合并至 main，进入 v5.0.5 / v0.2.20-nekocloud.5 发布流程；镜像发布不等同于运行实例已升级。
 
 当前入口是 [sub2api 的修复与复审记录](https://github.com/DNAlec/sub2api/blob/codex/cache-continuity-fixes/docs/cache-continuity/r19-fixes.md)，它逐项对应 [R19 原始清单](https://github.com/DNAlec/sub2api/blob/codex/cache-continuity-fixes/docs/cache-continuity/r19-review.md) 的 #1–23 和异常候选 P3。R18 原始 18 项使用另一组编号；原始报告及观测日志保留为修前证据。
 

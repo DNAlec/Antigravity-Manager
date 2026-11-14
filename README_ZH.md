@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.4)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.5)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.4-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.5-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.4**（2026-11-12）：集成上游 beta.0–beta.7，保留本仓库的会话租约、QoS 配置与单次尝试控制。CacheFirst 不再提前解除隔离或清除并发更新的冷却记录，明确的冷却等待与 15 秒选号工作看门狗分开计时。上传采用进展驱动软预算，连接重试和流尾部刷新保护会话缓存与完整响应。同步提示词清理规则、请求级 429 处理、账号／配额恢复、模型族优先级、账号操作界面、ACP 集成及 Termux 支持。关联 Issue、贡献者署名和详细变化见[完整更新日志](CHANGELOG.md)。
+> 最新版本 **v5.0.5**（2026-11-14）：修复失败重试、流式终态与 Responses 回放中的缓存连续性，保留成功历史签名、文件输出、工具身份和媒体归属，修复累计图片重复及 Schema 约束丢失。已与 sub2api 联验实际交付和图片计费（PR #5，Thanks to @DNAlec）。详见[完整更新日志](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

@@ -3,6 +3,13 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.5 (2026-11-14)**:
+        -   **[Cross-protocol cache continuity and history recovery] (PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
+            -   Publish reasoning history and signatures only for successful, deliverable candidates. Failed retries, interrupted streams and thought-only failures cannot contaminate the next turn; candidates qualify independently and valid history is available before the client sees completion.
+            -   Deduplicate cumulative media by candidate and in-frame multiplicity while preserving file output, final carrier metadata, independent signed thought blocks and stable tool IDs. Three framing variants deliver and bill the same two images through sub2api.
+            -   Repair Responses HTTP/WS tool-media replay, parent references, file inputs, token-alias overrides and idle TTL. Unrepresentable external encrypted state and file IDs are explicitly rejected.
+            -   Preserve business arguments and representable Schema combinations/constraints; trim media before projecting legacy positions so images and files remain attached to their owning tool result. Pair with [sub2api #6](https://github.com/DNAlec/sub2api/pull/6).
+
     *   **v5.0.4 (2026-11-12)**:
         -   **[Fork session and cooldown protection] (Ref [DNAlec/Antigravity-Manager#1](https://github.com/DNAlec/Antigravity-Manager/pull/1), [#2](https://github.com/DNAlec/Antigravity-Manager/pull/2), [#3](https://github.com/DNAlec/Antigravity-Manager/pull/3), [#4](https://github.com/DNAlec/Antigravity-Manager/pull/4), Thanks to @DNAlec)**:
             -   Integrates upstream `v5.0.4-beta.0` through `beta.7`, preserving generation-checked session leases, raw usage diagnostics, per-instance QoS settings, and single-attempt controls.
