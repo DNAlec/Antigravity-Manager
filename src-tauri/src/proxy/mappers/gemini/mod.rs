@@ -78,14 +78,7 @@ pub(crate) fn has_visible_content(part: &serde_json::Value) -> bool {
         && part.get("text").is_some())
         || part.get("functionCall").is_some()
         || has_media(part)
-        || part
-            .pointer("/executableCode/code")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|code| !code.is_empty())
-        || part
-            .pointer("/codeExecutionResult/output")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|output| !output.is_empty())
+        || crate::proxy::pipeline::stream_error::has_code_execution_output(part)
 }
 
 /// Error/refusal terminals finish transport, but cannot authorize replaying

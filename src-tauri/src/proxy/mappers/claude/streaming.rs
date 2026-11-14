@@ -59,6 +59,7 @@ impl SignatureManager {
 /// 流式状态机
 pub struct StreamingState {
     pub(super) media: crate::proxy::common::response_media::MediaTracker,
+    pub(super) tool_calls: crate::proxy::common::response_tools::ToolCallTracker,
     pub(super) media_candidate: Option<u64>,
     block_type: BlockType,
     pub block_index: usize,
@@ -110,6 +111,7 @@ impl StreamingState {
     pub fn new() -> Self {
         Self {
             media: Default::default(),
+            tool_calls: Default::default(),
             media_candidate: None,
             block_type: BlockType::None,
             block_index: 0,

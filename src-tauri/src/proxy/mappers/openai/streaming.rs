@@ -1828,7 +1828,12 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
         }
 
-        if self.whole_prompt_blocked {
+        if self.whole_prompt_blocked
+            || matches!(
+                self.final_finish_reason.as_deref(),
+                Some("STOP" | "MAX_TOKENS")
+            )
+        {
             return frames;
         }
         self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
@@ -1893,8 +1898,12 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
     }
 
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        self.whole_prompt_blocked
-            .then(|| std::time::Duration::from_millis(250))
+        (self.whole_prompt_blocked
+            || matches!(
+                self.final_finish_reason.as_deref(),
+                Some("STOP" | "MAX_TOKENS")
+            ))
+        .then(|| std::time::Duration::from_millis(250))
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
@@ -2009,6 +2018,102 @@ mod tests {
     use super::*;
     use futures::stream;
     use serde_json::json;
+
+    async fn r26_responses_events(items: Vec<Result<Bytes, String>>) -> Vec<Value> {
+        let mut output = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-2.5-flash".into(),
+            format!("r26-{}", uuid::Uuid::new_v4()),
+            1,
+            1,
+            "resp_r26".into(),
+            None,
+            false,
+        );
+        let mut events = Vec::new();
+        while let Some(chunk) = output.next().await {
+            for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn r26_responses_finished_transport_close_preserves_terminal_and_trailing_usage() {
+        for (reason, status) in [("STOP", "completed"), ("MAX_TOKENS", "incomplete")] {
+            let first = json!({"response":{
+                "candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":reason}],
+                "usageMetadata":{"promptTokenCount":100}
+            }});
+            let trailer = json!({"response":{
+                "candidates":[{"content":{"parts":[{"text":"must not append"}]}}],
+                "usageMetadata":{"candidatesTokenCount":7,"totalTokenCount":107}
+            }});
+            let events = r26_responses_events(vec![
+                Ok(Bytes::from(format!("data: {first}\n\n"))),
+                Ok(Bytes::from(format!("data: {trailer}\n\n"))),
+                Err("connection reset by peer".into()),
+            ])
+            .await;
+            assert!(!events.iter().any(|event| event["type"] == "error"));
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal["type"], format!("response.{status}"));
+            assert_eq!(terminal["response"]["status"], status);
+            assert_eq!(
+                terminal["response"]["output"][0]["content"][0]["text"],
+                "answer"
+            );
+            assert_eq!(terminal["response"]["usage"]["input_tokens"], 100);
+            assert_eq!(terminal["response"]["usage"]["output_tokens"], 7);
+            if reason == "MAX_TOKENS" {
+                assert_eq!(
+                    terminal["response"]["incomplete_details"]["reason"],
+                    "max_output_tokens"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r26_responses_real_interruptions_and_structured_tail_errors_remain_failed() {
+        for (reason, structured) in [
+            (None, false),
+            (Some("FINISH_REASON_UNSPECIFIED"), false),
+            (Some("STOP"), true),
+            (Some("MAX_TOKENS"), true),
+        ] {
+            let mut candidate = json!({"content":{"parts":[{"text":"answer"}]}});
+            if let Some(reason) = reason {
+                candidate["finishReason"] = json!(reason);
+            }
+            let first = json!({"response":{"candidates":[candidate]}});
+            let failure = if structured {
+                Ok(Bytes::from("data: {\"response\":{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"overloaded\"}}}\n\n"))
+            } else {
+                Err("connection reset by peer".into())
+            };
+            let events =
+                r26_responses_events(vec![Ok(Bytes::from(format!("data: {first}\n\n"))), failure])
+                    .await;
+            assert!(events.iter().any(|event| event["type"] == "error"));
+            assert_eq!(events.last().unwrap()["type"], "response.failed");
+            assert!(!events
+                .iter()
+                .any(|event| event["type"] == "response.completed"
+                    || event["type"] == "response.incomplete"));
+            if structured {
+                assert_eq!(
+                    events.last().unwrap()["response"]["error"]["upstream_status"],
+                    503
+                );
+            }
+        }
+    }
 
     fn sparse_usage_chunks(explicit_zero: bool) -> Vec<Value> {
         let mut final_usage = json!({"candidatesTokenCount": 5, "totalTokenCount": 105});

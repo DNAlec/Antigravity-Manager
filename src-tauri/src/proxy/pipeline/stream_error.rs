@@ -395,6 +395,22 @@ fn error_status(error: &Value) -> Option<u16> {
     }
 }
 
+/// Code and execution results are generated output even without a text part.
+pub(crate) fn has_code_execution_output(part: &Value) -> bool {
+    [
+        ("executableCode", "executable_code", "code"),
+        ("codeExecutionResult", "code_execution_result", "output"),
+    ]
+    .iter()
+    .any(|(camel, snake, field)| {
+        part.get(*camel)
+            .or_else(|| part.get(*snake))
+            .and_then(|value| value.get(*field))
+            .and_then(Value::as_str)
+            .is_some_and(|output| !output.is_empty())
+    })
+}
+
 fn has_substantive_output(value: &Value) -> bool {
     value
         .get("candidates")
@@ -407,9 +423,11 @@ fn has_substantive_output(value: &Value) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|parts| {
                         parts.iter().any(|part| {
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
+                            has_code_execution_output(part)
+                                || part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
                                 || part
                                     .get("functionCall")
                                     .or_else(|| part.get("function_call"))
@@ -578,6 +596,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn r26_code_output_blocks_error_replay_before_usage_arrives() {
+        for (part, has_output) in [
+            (
+                json!({"executableCode":{"language":"PYTHON","code":"print(42)"}}),
+                true,
+            ),
+            (
+                json!({"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"42"}}),
+                true,
+            ),
+            (json!({"executable_code":{"code":"print(42)"}}), true),
+            (json!({"code_execution_result":{"output":"42"}}), true),
+            (json!({"thought":true,"text":"computing"}), true),
+            (json!({"codeExecutionResult":{"output":""}}), false),
+        ] {
+            let observer = UpstreamStreamErrorObserver::default();
+            let frames = [
+                json!({"response":{"candidates":[{"content":{"parts":[part]}}]}}),
+                json!({"response":{"error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"}}}),
+            ];
+            let source = futures::stream::iter(
+                frames
+                    .into_iter()
+                    .map(|value| Ok::<_, String>(Bytes::from(format!("data: {value}\n\n")))),
+            );
+            let _: Vec<_> = observe_response_errors(source, observer.clone(), true)
+                .collect()
+                .await;
+            let failure = observer.failure().expect("structured failure must survive");
+            assert_eq!(failure.status, 503);
+            assert_eq!(failure.after_output, has_output);
+            assert_eq!(failure.replay_safe(), !has_output);
+            assert!(failure.usage.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn collected_large_events_keep_authoritative_failure_usage() {
