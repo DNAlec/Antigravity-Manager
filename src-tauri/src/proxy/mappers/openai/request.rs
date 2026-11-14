@@ -141,6 +141,23 @@ pub struct ResponsesToolKinds {
 }
 
 impl ResponsesToolKinds {
+    pub(crate) fn qualified_names_in_namespace(&self, namespace: &str) -> Vec<&str> {
+        let prefix = if namespace.ends_with("__") {
+            namespace.to_owned()
+        } else {
+            format!("{namespace}__")
+        };
+        self.declarations
+            .iter()
+            .filter_map(|(qualified, (_, declared_namespace, _))| {
+                declared_namespace
+                    .as_deref()
+                    .filter(|declared| *declared == namespace || declared.starts_with(&prefix))
+                    .map(|_| qualified.as_str())
+            })
+            .collect()
+    }
+
     pub fn from_tools(tools: Option<&[Value]>) -> Self {
         fn collect(tools: &[Value], namespaces: &mut Vec<String>, result: &mut ResponsesToolKinds) {
             for tool in tools {
@@ -1337,18 +1354,22 @@ pub fn transform_openai_request_with_session(
 
     // Removed auto-inject since we handle it above now if Codex passes it.
 
-    if !function_declarations.is_empty() {
-        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
-    }
-
     // [tool_choice] 客户端有就传，没有就不传：
     // 若客户端显式指定了 tool_choice，将其规范化映射为标准的 Gemini toolConfig
     if let Some(tool_choice) = &request.tool_choice {
         if let Some(gemini_tc) =
-            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(tool_choice)
+            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(
+                tool_choice,
+                &mut function_declarations,
+                request.tools.as_deref().unwrap_or_default(),
+            )?
         {
             inner_request["toolConfig"] = gemini_tc;
         }
+    }
+
+    if !function_declarations.is_empty() {
+        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
@@ -3761,5 +3782,175 @@ mod responses_reasoning_replay_tests {
             serde_json::to_value(&msg).unwrap()["content"],
             "Visible answer"
         );
+    }
+}
+
+#[cfg(test)]
+mod r24_tool_choice_tests {
+    use super::*;
+
+    fn request(choice: Value) -> OpenAIRequest {
+        serde_json::from_value(json!({
+            "model":"gemini-2.5-flash", "messages":[{"role":"user","content":"Look up the answer"}],
+            "tools":[
+                {"type":"namespace","name":"fs","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}},
+                    {"type":"custom","name":"edit"}
+                ]},
+                {"type":"function","function":{"name":"delete","parameters":{"type":"object"}}}
+            ], "tool_choice":choice
+        }))
+        .unwrap()
+    }
+
+    fn mapped(choice: Value) -> Value {
+        transform_openai_request(&request(choice), "project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0["request"]
+            .clone()
+    }
+
+    #[test]
+    fn r24_namespace_forced_choice_matches_final_declaration() {
+        for kind in ["function", "custom"] {
+            let name = if kind == "function" { "lookup" } else { "edit" };
+            let body = mapped(json!({"type":kind,"namespace":"fs","name":name}));
+            assert_eq!(
+                body["toolConfig"]["functionCallingConfig"],
+                json!({"mode":"ANY","allowedFunctionNames":[format!("fs__{name}")]})
+            );
+            let names: Vec<_> = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["functionDeclarations"][0]["name"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&format!("fs__{name}").as_str()));
+        }
+    }
+
+    #[test]
+    fn r24_allowed_tools_keep_required_auto_and_scope_on_cached_declarations() {
+        // Reuse the same tools to cover both cold and cached declaration paths.
+        for (mode, nested) in [("required", false), ("auto", true), ("required", true)] {
+            let policy =
+                json!({"mode":mode,"tools":[{"type":"function","namespace":"fs","name":"lookup"}]});
+            let choice = if nested {
+                json!({"type":"allowed_tools","allowed_tools":policy})
+            } else {
+                let mut choice = policy;
+                choice["type"] = json!("allowed_tools");
+                choice
+            };
+            let body = mapped(choice);
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["name"],
+                "fs__lookup"
+            );
+            let config = &body["toolConfig"]["functionCallingConfig"];
+            assert_eq!(
+                config["mode"],
+                if mode == "required" { "ANY" } else { "AUTO" }
+            );
+            if mode == "required" {
+                assert_eq!(config["allowedFunctionNames"], json!(["fs__lookup"]));
+            } else {
+                assert!(config.get("allowedFunctionNames").is_none());
+            }
+        }
+        let body = mapped(json!("auto"));
+        assert_eq!(
+            body["tools"].as_array().unwrap().len(),
+            3,
+            "filtering must not poison cached tools"
+        );
+    }
+
+    #[test]
+    fn r24_invalid_selectors_never_generate_dangling_names() {
+        for choice in [
+            json!({"type":"function","namespace":"missing","name":"lookup"}),
+            json!({"type":"function","name":"lookup"}),
+            json!({"type":"allowed_tools","mode":"required","tools":[]}),
+            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"delete"},{"type":"function","name":"missing"}]}),
+            json!({"type":"unsupported_client_tool","name":"delete"}),
+        ] {
+            assert!(transform_openai_request(
+                &request(choice),
+                "project",
+                "gemini-2.5-flash",
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn r24_namespace_membership_keeps_mcp_names_and_excludes_prefixed_top_level_tools() {
+        let mut request = request(json!("auto"));
+        request.tools = Some(vec![
+            json!({"type":"namespace","name":"fs","tools":[{"type":"function","name":"mcp__read","parameters":{"type":"object"}}]}),
+            json!({"type":"function","name":"fs__delete","parameters":{"type":"object"}}),
+        ]);
+        for selector in [
+            json!({"type":"namespace","name":"fs"}),
+            json!({"type":"function","namespace":"fs","name":"mcp__read"}),
+        ] {
+            request.tool_choice =
+                Some(json!({"type":"allowed_tools","mode":"required","tools":[selector]}));
+            let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
+                .unwrap()
+                .0;
+            assert_eq!(body["request"]["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body["request"]["tools"][0]["functionDeclarations"][0]["name"],
+                "mcp__read"
+            );
+            assert_eq!(
+                body["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+                json!(["mcp__read"])
+            );
+        }
+        request.tool_choice = Some(json!({"type":"function","namespace":"fs","name":"delete"}));
+        assert!(transform_openai_request(&request, "project", "gemini-2.5-flash", None).is_err());
+    }
+
+    #[test]
+    fn r24_builtin_selector_keeps_existing_usable_fallback() {
+        let mut request = request(json!({"type":"web_search_preview"}));
+        request.tools = Some(vec![json!({"type":"web_search_preview"})]);
+        let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0;
+        assert!(!body["request"]["contents"].as_array().unwrap().is_empty());
+        assert!(body["request"].get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn r24_boolean_union_is_normalized_in_actual_tool_and_output_schemas() {
+        let schema = json!({"type":"object","properties":{"value":{"anyOf":[true,false,{"type":"integer"}]}}});
+        for field in [
+            json!({"tools":[{"type":"function","function":{"name":"accept","parameters":schema}}]}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}}),
+        ] {
+            let mut input =
+                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Answer"}]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let typed = serde_json::from_value(input).unwrap();
+            let body = transform_openai_request(&typed, "project", "gemini-2.5-flash", None)
+                .unwrap()
+                .0;
+            let schema = body
+                .pointer("/request/tools/0/functionDeclarations/0/parameters")
+                .or_else(|| body.pointer("/request/generationConfig/responseSchema"))
+                .unwrap();
+            let branches = schema["properties"]["value"]["anyOf"].as_array().unwrap();
+            assert_eq!(branches.len(), 2);
+            assert!(branches.iter().all(Value::is_object));
+        }
     }
 }

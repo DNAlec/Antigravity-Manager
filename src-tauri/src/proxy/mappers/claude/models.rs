@@ -161,6 +161,24 @@ pub enum ContentBlock {
         #[serde(default)]
         content: serde_json::Value,
     },
+
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
+
+    #[serde(
+        rename = "code_execution_tool_result",
+        alias = "bash_code_execution_tool_result",
+        alias = "text_editor_code_execution_tool_result"
+    )]
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
 }
 
 fn default_empty_object() -> serde_json::Value {

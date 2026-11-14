@@ -1000,6 +1000,53 @@ fn append_claude_content_parts(
     Ok(())
 }
 
+/// Server tools already ran in the historical provider session. Keep their
+/// readable results without manufacturing a client function call to replay.
+fn append_server_tool_result_parts(
+    content: &Value,
+    parts: &mut Vec<Value>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_MEDIA_CONTENT_DEPTH {
+        return Err("Server tool result exceeds the maximum nesting depth".into());
+    }
+    if let Some(items) = content.as_array() {
+        for item in items {
+            append_server_tool_result_parts(item, parts, depth + 1)?;
+        }
+        return Ok(());
+    }
+    match content.get("type").and_then(Value::as_str) {
+        Some("web_fetch_result") => {
+            if let Some(url) = content.get("url").and_then(Value::as_str) {
+                parts.push(json!({"text": format!("Fetched URL: {url}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        Some("code_execution_result" | "bash_code_execution_result") => {
+            for key in ["stdout", "stderr"] {
+                if let Some(text) = content
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    parts.push(json!({"text": format!("{key}:\n{text}")}));
+                }
+            }
+            if let Some(code) = content.get("return_code") {
+                parts.push(json!({"text": format!("Exit code: {code}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        _ => append_claude_content_parts(content, parts, depth + 1)?,
+    }
+    Ok(())
+}
+
 /// 构建 Contents (Messages)
 fn build_contents(
     content: &MessageContent,
@@ -1434,6 +1481,11 @@ fn build_contents(
 
                         // 标记状态，用于下一条 User 消息的去重判断
                         *previous_was_tool_result = true;
+                    }
+                    ContentBlock::WebFetchToolResult { content, .. }
+                    | ContentBlock::CodeExecutionToolResult { content, .. } => {
+                        append_server_tool_result_parts(content, &mut parts, 0)?;
+                        saw_non_thinking = true;
                     }
                     // ContentBlock::RedactedThinking handled above at line 583
                     ContentBlock::ServerToolUse { .. }
@@ -4334,5 +4386,100 @@ mod tests {
             }),
             "Raw tool_use_id must never leak as functionResponse name"
         );
+    }
+}
+
+#[cfg(test)]
+mod r24_server_history_tests {
+    use super::*;
+
+    fn mapped(block: Value) -> Value {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-5", "max_tokens":100,
+            "messages":[
+                {"role":"user","content":"Find the answer"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Before the result"},
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_fetch","input":{}},
+                    block,
+                    {"type":"text","text":"After the result"}
+                ]},
+                {"role":"user","content":"Explain that answer"}
+            ]
+        }))
+        .unwrap();
+        transform_claude_request_in(&request, "project", false, None, "r24-history", None).unwrap()
+    }
+
+    fn visible_text(body: &Value) -> String {
+        body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn r24_web_fetch_history_keeps_document_body_and_message_order() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_result","url":"https://example.com/report",
+            "content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Full document body\nSecond line"}}}}),
+        );
+        let text = visible_text(&body);
+        let ordered = [
+            "Before the result",
+            "https://example.com/report",
+            "Full document body\nSecond line",
+            "After the result",
+            "Explain that answer",
+        ];
+        let mut offset = 0;
+        for fragment in ordered {
+            offset += text[offset..].find(fragment).expect(fragment) + fragment.len();
+        }
+        assert!(!body.to_string().contains("functionCall"));
+    }
+
+    #[test]
+    fn r24_code_execution_history_keeps_stdout_stderr_and_nested_text() {
+        for kind in [
+            "code_execution_tool_result",
+            "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result",
+        ] {
+            let body = mapped(json!({"type":kind,"tool_use_id":"srvtoolu_1","content":{
+                "type":"code_execution_result","stdout":"42\nline two\n","stderr":"Warning: example\n",
+                "return_code":1,"content":[{"type":"text","text":"Readable tool summary"},
+                {"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document"}]}}]
+            }}));
+            let text = visible_text(&body);
+            for expected in [
+                "42\nline two\n",
+                "Warning: example\n",
+                "Exit code: 1",
+                "Readable tool summary",
+                "Nested document",
+                "After the result",
+            ] {
+                assert!(text.contains(expected), "missing {expected} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn r24_server_errors_stay_readable_and_unknown_client_blocks_are_rejected() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_tool_result_error","error_code":"unavailable","message":"Fetch failed"}}),
+        );
+        assert!(visible_text(&body).contains("Fetch failed"));
+        let unknown = json!({"model":"claude-sonnet-4-5","messages":[{"role":"assistant","content":[
+            {"type":"unknown_client_tool_call","name":"execute","input":{"cmd":"keep me explicit"}}
+        ]}]});
+        assert!(serde_json::from_value::<ClaudeRequest>(unknown).is_err());
     }
 }
