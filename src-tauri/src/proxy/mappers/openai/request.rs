@@ -250,7 +250,7 @@ pub fn transform_openai_request(
     project_id: &str,
     mapped_model: &str,
     token: Option<&ProxyToken>,
-) -> (Value, String, usize, String) {
+) -> Result<(Value, String, usize, String), String> {
     let session_id =
         crate::proxy::session_manager::SessionManager::extract_openai_session_id(request);
     transform_openai_request_with_session(
@@ -299,7 +299,7 @@ pub fn transform_openai_request_with_session(
     signature_read_key: Option<&str>,
     is_responses_api: bool,
     is_retry: bool,
-) -> (Value, String, usize, String) {
+) -> Result<(Value, String, usize, String), String> {
     let remember_cwd =
         |text: &str| crate::proxy::adapters::apply_patch_preflight::remember_cwd_from_text(text);
     let found_cwd = request.instructions.as_deref().is_some_and(remember_cwd);
@@ -1142,7 +1142,7 @@ pub fn transform_openai_request_with_session(
             gen_config["responseMimeType"] = json!("application/json");
             if let Some(js) = &fmt.json_schema {
                 if let Some(mut schema) = js.schema.clone() {
-                    crate::proxy::common::json_schema::clean_response_schema(&mut schema);
+                    crate::proxy::common::json_schema::clean_response_schema(&mut schema)?;
                     gen_config["responseSchema"] = schema;
                 }
             }
@@ -1277,7 +1277,7 @@ pub fn transform_openai_request_with_session(
 
                 if let Some(params) = gemini_func.get_mut("parameters") {
                     // [DEEP FIX] 统一调用公共库清洗：展开 $ref 并剔除所有层级的 format/definitions
-                    crate::proxy::common::json_schema::clean_json_schema(params);
+                    crate::proxy::common::json_schema::clean_json_schema(params)?;
 
                     // Gemini v1internal 要求：
                     // 1. type 必须是大写 (OBJECT, STRING 等)
@@ -1399,7 +1399,7 @@ pub fn transform_openai_request_with_session(
         &mut inner_request,
         &config.final_model,
         None,
-    );
+    )?;
     let reordered_request = inner_request;
 
     // requestId：官方 5 段形态，三适配器共用（含 unixMs → 幂等隔离）。
@@ -1441,7 +1441,7 @@ pub fn transform_openai_request_with_session(
         final_body["requestType"] = json!("agent");
     }
 
-    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut final_body);
+    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut final_body)?;
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -1477,7 +1477,7 @@ pub fn transform_openai_request_with_session(
         crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
     }
 
-    (final_body, session_id, message_count, prefix_hash)
+    Ok((final_body, session_id, message_count, prefix_hash))
 }
 
 pub fn enforce_uppercase_types(value: &mut Value) {
@@ -1529,7 +1529,7 @@ mod tests {
                 }
                 let req: OpenAIRequest =
                     serde_json::from_value(json!({"model":model,"messages":messages})).unwrap();
-                let (body, _, _, _) = transform_openai_request(&req, "p", model, None);
+                let (body, _, _, _) = transform_openai_request(&req, "p", model, None).unwrap();
                 let parts: Vec<_> = body["request"]["contents"]
                     .as_array()
                     .unwrap()
@@ -1576,7 +1576,8 @@ mod tests {
             None,
             true,
             false,
-        );
+        )
+        .unwrap();
         let tools = body
             .pointer("/request/tools/0/functionDeclarations")
             .expect("actual Gemini declarations");
@@ -1661,7 +1662,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (body, _, _, _) = transform_openai_request(&req2, "test-p", "gemini-3.7-flash", None);
+        let (body, _, _, _) =
+            transform_openai_request(&req2, "test-p", "gemini-3.7-flash", None).unwrap();
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
@@ -1699,7 +1701,7 @@ mod tests {
 
             // 适配层收尾已跑过清洗节点；这里再显式跑一次，同时覆盖多次清洗幂等
             let (mut body, _, _, _) =
-                transform_openai_request(&req, "test-project", &req.model, None);
+                transform_openai_request(&req, "test-project", &req.model, None).unwrap();
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
             );
@@ -1734,7 +1736,9 @@ mod tests {
             raw["reasoning"] = json!({ "effort": effort });
         }
         let request: OpenAIRequest = serde_json::from_value(raw).unwrap();
-        transform_openai_request(&request, "test-project", model, None).0
+        transform_openai_request(&request, "test-project", model, None)
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -1793,7 +1797,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_high, "test-p", "gemini-3.7-flash-high", None);
+            transform_openai_request(&req_high, "test-p", "gemini-3.7-flash-high", None).unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             -1
@@ -1807,7 +1811,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_high, "test-p", "gemini-3-flash", None);
+            transform_openai_request(&req_flash_high, "test-p", "gemini-3-flash", None).unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1823,7 +1827,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_low, "test-p", "gemini-3-flash", None);
+            transform_openai_request(&req_flash_low, "test-p", "gemini-3-flash", None).unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "LOW"
@@ -1836,7 +1840,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None);
+            transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None).unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1849,7 +1853,8 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
+            transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None)
+                .unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
             false
@@ -1867,7 +1872,8 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None);
+            transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None)
+                .unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1888,7 +1894,8 @@ mod tests {
             "test-p",
             "gemini-3-flash",
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1904,9 +1911,9 @@ mod tests {
         .unwrap();
 
         let (first, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
         let (second, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
         let first_id = first["requestId"].as_str().unwrap();
         let second_id = second["requestId"].as_str().unwrap();
 
@@ -1938,7 +1945,8 @@ mod tests {
             None,
             true,
             false,
-        );
+        )
+        .unwrap();
         let system_instruction = body["request"].get("systemInstruction");
 
         assert_eq!(session_id, "resp-routing-root");
@@ -1969,7 +1977,7 @@ mod tests {
         .unwrap();
 
         let (body, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
         let parts = body["request"]["systemInstruction"]["parts"]
             .as_array()
             .expect("systemInstruction.parts");
@@ -2028,7 +2036,8 @@ mod tests {
             Some(&previous_response_id),
             true,
             false,
-        );
+        )
+        .unwrap();
         let contents = body["request"]["contents"].as_array().unwrap();
         let model_msg = contents
             .iter()
@@ -2066,7 +2075,7 @@ mod tests {
 
         // Auto mode (default) should map gemini-3-pro thinking budget to 49152 per model_specs
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-3-pro", None);
+            transform_openai_request(&req, "test-v", "gemini-3-pro", None).unwrap();
         // 新规则：gemini-3-pro 交由服务端默认预算，不再显式下发 thinkingBudget
         let tc = &result["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], true);
@@ -2123,7 +2132,7 @@ mod tests {
 
         // 验证针对 Gemini 模型在 Custom 模式下注入自定义预算
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
+            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None).unwrap();
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
@@ -2132,7 +2141,7 @@ mod tests {
         // 验证非 Gemini 模型（如 Claude 原生路径，假设映射后名不含 gemini）则不应截断
         // 注意：这里的 transform_openai_request 第三个参数是 mapped_model
         let (result_claude, _, _, _) =
-            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None);
+            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None).unwrap();
         let _budget_claude = result_claude["request"]["generationConfig"]["thinkingConfig"]
             ["thinkingBudget"]
             .as_i64();
@@ -2173,7 +2182,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-1.5-flash", None);
+            transform_openai_request(&req, "test-v", "gemini-1.5-flash", None).unwrap();
         let parts = &result["request"]["contents"][0]["parts"];
         assert_eq!(parts.as_array().unwrap().len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "What is in this image?");
@@ -2207,7 +2216,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-2.5-flash", None);
+            transform_openai_request(&req, "test-v", "gemini-2.5-flash", None).unwrap();
         let parts = &result["request"]["contents"][0]["parts"];
         assert_eq!(parts.as_array().unwrap().len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "Describe this video");
@@ -2267,7 +2276,7 @@ mod tests {
 
         // Pass explicit gemini-3-pro-preview which doesn't have "-thinking" suffix
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None);
+            transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None).unwrap();
         let gen_config = &result["request"]["generationConfig"];
 
         // Assert thinkingConfig is present (fix verification)
@@ -2296,7 +2305,7 @@ mod tests {
 
         // Pass gemini-3-pro-image which matches "gemini-3-pro" substring
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3-pro-image", None);
+            transform_openai_request(&req, "test-p", "gemini-3-pro-image", None).unwrap();
         let gen_config = &result["request"]["generationConfig"];
 
         // Assert thinkingConfig IS present (based on latest user feedback)
@@ -2339,7 +2348,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3.1-pro-high", None);
+            transform_openai_request(&req, "test-p", "gemini-3.1-pro-high", None).unwrap();
         let gen_config = &result["request"]["generationConfig"];
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
         // 官方物理硬顶 safe_limit = 65535
@@ -2390,7 +2399,8 @@ mod tests {
 
         // Test with Flash model
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None);
+            transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None)
+                .unwrap();
         let gen_config = &result["request"]["generationConfig"];
 
         // 默认自适应模式下，未收录的 exp 模型不显式下发固定 thinkingBudget
@@ -2426,7 +2436,7 @@ mod tests {
         let mapped_model = "projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash-thinking-exp";
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", mapped_model, None);
+            transform_openai_request(&req, "test-v", mapped_model, None).unwrap();
 
         // Extract the tool call part from contents (under request.contents)
         let contents = result["request"]["contents"].as_array().unwrap();
@@ -2472,7 +2482,7 @@ mod tests {
             };
 
             let (result, _sid, _msg_count, _) =
-                transform_openai_request(&req, "test-proj", model, None);
+                transform_openai_request(&req, "test-proj", model, None).unwrap();
 
             let contents = result["request"]["contents"]
                 .as_array()
@@ -2529,7 +2539,7 @@ mod tests {
 
         // 2. Transform request
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None);
+            transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None).unwrap();
 
         // 3. Verify thinkingConfig has includeThoughts: false
         let gen_config = result["request"]["generationConfig"]
@@ -2566,7 +2576,8 @@ mod tests {
         };
 
         // 使用 gemini-2.0-flash 模型执行转换
-        let (result, _, _, _) = transform_openai_request(&req, "proj", "gemini-2.0-flash", None);
+        let (result, _, _, _) =
+            transform_openai_request(&req, "proj", "gemini-2.0-flash", None).unwrap();
 
         let tools = result["request"]["tools"]
             .as_array()
@@ -2626,7 +2637,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _sid, _msg_count, _) =
-            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
+            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None).unwrap();
         let gen_config = &res_val["request"]["generationConfig"];
         assert_eq!(gen_config["responseMimeType"], "application/json");
         assert!(gen_config.get("responseSchema").is_some());
@@ -2668,7 +2679,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "claude-sonnet-4-6", None);
+            transform_openai_request(&req, "test-proj", "claude-sonnet-4-6", None).unwrap();
 
         let gen_config = &result["request"]["generationConfig"];
         assert!(
@@ -2746,7 +2757,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
 
         let thinking = &result["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(
@@ -2794,7 +2805,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gpt-4o", None);
+            transform_openai_request(&req, "test-proj", "gpt-4o", None).unwrap();
         let gen_config = &result["request"]["generationConfig"];
         assert!(
             gen_config.get("thinkingConfig").is_none(),
@@ -2839,7 +2850,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None).unwrap();
 
         let gen_config = result["request"]["generationConfig"]
             .as_object()
@@ -2882,7 +2893,8 @@ mod tests {
             ..Default::default()
         };
         let (res1, _, _, _) =
-            transform_openai_request(&req_default, "test-proj", "gemini-3.8-flash-tiered", None);
+            transform_openai_request(&req_default, "test-proj", "gemini-3.8-flash-tiered", None)
+                .unwrap();
         let tc1 = res1["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for default thinking");
@@ -2902,7 +2914,8 @@ mod tests {
             ..Default::default()
         };
         let (res2, _, _, _) =
-            transform_openai_request(&req_level, "test-proj", "gemini-3.8-flash-tiered", None);
+            transform_openai_request(&req_level, "test-proj", "gemini-3.8-flash-tiered", None)
+                .unwrap();
         let tc2 = res2["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for level");
@@ -2926,7 +2939,8 @@ mod tests {
             ..Default::default()
         };
         let (res3, _, _, _) =
-            transform_openai_request(&req_budget, "test-proj", "gemini-3.8-flash-tiered", None);
+            transform_openai_request(&req_budget, "test-proj", "gemini-3.8-flash-tiered", None)
+                .unwrap();
         let tc3 = res3["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for budget");
@@ -2975,7 +2989,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None).unwrap();
 
         let gen_config = result["request"]["generationConfig"]
             .as_object()
@@ -3024,7 +3038,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _sid, _msg_count, _) =
-            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None);
+            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None).unwrap();
         let contents = res_val["request"]["contents"]
             .as_array()
             .expect("contents must be an array");
@@ -3069,7 +3083,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _, _, _) =
-            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
+            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None).unwrap();
         assert!(
             res_val.get("requestType").is_none(),
             "Plain text request should not have requestType: 'agent'"
@@ -3115,7 +3129,8 @@ mod tests {
             None,
             true,
             false,
-        );
+        )
+        .unwrap();
         let (chat_result, _, _, _) = transform_openai_request_with_session(
             &req,
             "test-proj",
@@ -3125,7 +3140,8 @@ mod tests {
             None,
             false,
             false,
-        );
+        )
+        .unwrap();
         let model_parts = |body: &serde_json::Value| {
             let contents = body["request"]["contents"].as_array().unwrap();
             let model_msg = contents.iter().find(|m| m["role"] == "model").unwrap();
@@ -3187,7 +3203,8 @@ mod tests {
             None,
             false,
             false,
-        );
+        )
+        .unwrap();
 
         let tools = result["request"]["tools"].as_array().unwrap();
         let func_decls = tools[0]["functionDeclarations"].as_array().unwrap();
@@ -3312,7 +3329,8 @@ mod tests {
             Some(&prev_resp_id),
             true, // is_responses_api
             false,
-        );
+        )
+        .unwrap();
 
         let contents = result["request"]["contents"].as_array().unwrap();
 
@@ -3380,7 +3398,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 验证 assistant 的 functionCall.args 中的 command 绝对未被剔除
@@ -3460,7 +3478,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 验证第 1 轮工具响应的名字为 edit_file，绝不能被后续同 ID 的 run_command 覆盖
@@ -3522,7 +3540,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None).unwrap();
         let contents = result["request"]["contents"].as_array().unwrap();
         let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
 
@@ -3568,7 +3586,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None).unwrap();
         let tools = result["request"]["tools"].as_array().unwrap();
         let func_decls = tools[0]["functionDeclarations"].as_array().unwrap();
         let decl = &func_decls[0];
@@ -3628,7 +3646,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-tiered", None);
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-tiered", None).unwrap();
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 查找 model 轮次中的 functionCall 部件

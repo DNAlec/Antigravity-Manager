@@ -33,7 +33,7 @@ mod tests {
             }
         });
 
-        InboundThinkingPipeline::align_official_envelope(&mut body);
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
 
         // 1. Envelope keys: project -> requestId -> request -> model -> userAgent -> requestType
         let keys: Vec<&str> = body
@@ -115,7 +115,8 @@ mod tests {
             &mut inner_req,
             "gemini-2.5-flash",
             None,
-        );
+        )
+        .unwrap();
 
         // 验证客户端显式指定的 toolConfig 得到完整保留，且键序严格位于 tools 之后、labels 之前
         let tc = inner_req
@@ -170,7 +171,7 @@ mod tests {
             }
         });
 
-        InboundThinkingPipeline::align_official_envelope(&mut body);
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
 
         let req = body.get("request").unwrap();
 
@@ -221,7 +222,7 @@ mod tests {
             }
         });
 
-        InboundThinkingPipeline::align_official_envelope(&mut body);
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
 
         let req = body.get("request").unwrap();
         let labels = req.get("labels").unwrap();
@@ -640,7 +641,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let wrapped_gc = &wrapped["request"]["generationConfig"];
         let wrapped_max = wrapped_gc["maxOutputTokens"].as_u64().unwrap();
         let wrapped_budget = wrapped_gc["thinkingConfig"]["thinkingBudget"]
@@ -714,7 +716,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let wrapped_gc = &wrapped["request"]["generationConfig"];
         let wrapped_max = wrapped_gc["maxOutputTokens"].as_u64().unwrap();
         let wrapped_budget = wrapped_gc["thinkingConfig"]["thinkingBudget"]
@@ -801,7 +804,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let wrapped_gc = &wrapped["request"]["generationConfig"];
         let wrapped_max = wrapped_gc["maxOutputTokens"].as_u64().unwrap();
         assert_eq!(wrapped_max, 1024);

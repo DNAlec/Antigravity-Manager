@@ -192,6 +192,13 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             crate::proxy::pipeline::stream_error::response_has_prompt_refusal(&json);
         self.blocked_prompt |= crate::proxy::pipeline::stream_error::response_is_refusal(&json);
 
+        if self.invalid_candidates {
+            return Vec::new();
+        }
+        let Some(indices) = super::normalize_candidate_indices(&mut json) else {
+            self.invalid_candidates = true;
+            return vec![Bytes::from_static(b"data: {\"error\":{\"code\":502,\"status\":\"INTERNAL\",\"message\":\"Invalid or duplicate Gemini candidate index\"}}\n\n")];
+        };
         self.tool_ids.inject(&mut json, &self.model_name);
 
         // v1internal 响应可能包一层 "response"
@@ -203,13 +210,6 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             .cloned()
             .unwrap_or_default();
 
-        if self.invalid_candidates {
-            return Vec::new();
-        }
-        let Some(indices) = super::candidate_indices(&parts_snapshot) else {
-            self.invalid_candidates = true;
-            return vec![Bytes::from_static(b"data: {\"error\":{\"code\":502,\"status\":\"INTERNAL\",\"message\":\"Invalid or duplicate Gemini candidate index\"}}\n\n")];
-        };
         let multiple = self.expected_candidates > 1
             || indices.iter().any(|i| *i != 0)
             || self.candidates.keys().any(|i| *i != 0);
@@ -465,6 +465,36 @@ mod tests {
             "acc@example.com".to_string(),
             "gemini-2.5-pro".to_string(),
         )
+    }
+
+    #[test]
+    fn numeric_string_indices_keep_candidate_tool_ids_across_frames() {
+        let mut handler = test_gemini_handler().with_candidate_request(2, false);
+        handler.model_name = "claude-sonnet-4-6".to_owned();
+        let first = handler.process_line(r#"data: {"response":{"candidates":[{"index":"1","content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]}},{"index":"0","content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]}}]}}"#);
+        let read = |frames: &[Bytes]| -> Value {
+            let frame = std::str::from_utf8(&frames[0]).unwrap();
+            serde_json::from_str(frame.trim().strip_prefix("data: ").unwrap()).unwrap()
+        };
+        let first = read(&first);
+        assert_eq!(first["candidates"][0]["index"], 1);
+        assert_eq!(first["candidates"][1]["index"], 0);
+        let first_id = &first["candidates"][0]["content"]["parts"][0]["functionCall"]["id"];
+        let second_id = &first["candidates"][1]["content"]["parts"][0]["functionCall"]["id"];
+        assert!(first_id.is_string());
+        assert_ne!(first_id, second_id);
+
+        let last = handler.process_line(r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"},{"index":1,"content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]},"finishReason":"STOP"}]}"#);
+        let last = read(&last);
+        assert_eq!(
+            &last["candidates"][0]["content"]["parts"][0]["functionCall"]["id"],
+            second_id
+        );
+        assert_eq!(
+            &last["candidates"][1]["content"]["parts"][0]["functionCall"]["id"],
+            first_id
+        );
+        assert!(handler.emit_finalize().is_empty());
     }
 
     #[tokio::test]

@@ -1592,7 +1592,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
         let request: OpenAIRequest =
             serde_json::from_value(converted).expect("converted Chat request");
         let (upstream, _, _, _) =
-            transform_openai_request(&request, "test-project", "gemini-2.5-pro", None);
+            transform_openai_request(&request, "test-project", "gemini-2.5-pro", None).unwrap();
         let roles = upstream["request"]["contents"]
             .as_array()
             .expect("Gemini contents")
@@ -1650,7 +1650,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             serde_json::from_value(converted).expect("valid OpenAI request");
 
         let (upstream, _, _, _) =
-            transform_openai_request(&request, "project", "gemini-3.7-flash-high", None);
+            transform_openai_request(&request, "project", "gemini-3.7-flash-high", None).unwrap();
         let parts = upstream["request"]["contents"]
             .as_array()
             .expect("contents")
@@ -2102,7 +2102,8 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             Some("sess-test"),
             true,
             false,
-        );
+        )
+        .unwrap();
 
         let inner_req = &mut gemini_payload["request"];
 
@@ -2126,7 +2127,8 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             inner_req,
             "gemini-3.8-flash-high",
             None,
-        );
+        )
+        .unwrap();
         assert!(
             inner_req.get("tools").is_none(),
             "tools must be suppressed by pipeline when responseSchema is active"
@@ -2550,7 +2552,7 @@ pub async fn handle_chat_completions(
         && (body.get("instructions").is_some() || body.get("input").is_some());
 
     if is_responses_format {
-        validate_responses_continuation(&body)
+        normalize_responses_plaintext(&mut body)
             .map_err(|(_, _, message)| (StatusCode::BAD_REQUEST, message.to_owned()))?;
         debug!("Detected Responses API format, converting with structured role preservation");
         body = convert_codex_to_openai_request(body);
@@ -2968,7 +2970,8 @@ pub async fn handle_chat_completions(
                 None,
                 false,
                 retried_without_thinking,
-            );
+            )
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
         heal_flags.reapply(&mut gemini_body);
         let session_id = store_key.clone();
         // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
@@ -4331,6 +4334,89 @@ fn validate_openai_tool_schemas(tools: Option<&[Value]>) -> Result<(), String> {
     Ok(())
 }
 
+// Foreign reasoning may carry both readable context and provider-encrypted
+// state. Prefer the readable representation when adapting it to Gemini.
+fn responses_plaintext_summary(item: &Value) -> Option<String> {
+    for key in ["summary", "text", "thought", "content"] {
+        let value = &item[key];
+        let text = if let Some(text) = value.as_str() {
+            text.to_owned()
+        } else if let Some(parts) = value.as_array() {
+            parts
+                .iter()
+                .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            continue;
+        };
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn responses_reasoning_message(item: &Value) -> Value {
+    let text = responses_plaintext_summary(item).unwrap_or_default();
+    let signature = item
+        .get("thoughtSignature")
+        .or_else(|| item.get("thought_signature"))
+        .or_else(|| item.get("signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| {
+            crate::proxy::thinking_store::is_real_signature(signature)
+                && (crate::proxy::thinking_store::is_likely_gemini_signature(signature)
+                    || crate::proxy::thinking_store::is_claude_signature(signature))
+        });
+    if let Some(signature) = signature {
+        json!({"role":"assistant", "content":"", "reasoning_content":text, "thoughtSignature":signature})
+    } else {
+        // An external summary is readable history, not a signed Gemini thought.
+        // Plain content survives non-thinking targets and is injected only once.
+        json!({"role":"assistant", "content":text})
+    }
+}
+
+fn normalize_responses_plaintext(
+    body: &mut Value,
+) -> Result<(), (&'static str, &'static str, &'static str)> {
+    // Validate before changing input: failed requests must not consume history.
+    validate_responses_continuation(body)?;
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut normalized = Vec::with_capacity(items.len());
+    for mut item in std::mem::take(items) {
+        match item["type"].as_str() {
+            Some("reasoning") if responses_plaintext_summary(&item).is_some() => {
+                if let Some(fields) = item.as_object_mut() {
+                    fields.remove("encrypted_content");
+                }
+                normalized.push(item);
+            }
+            Some("compaction_summary") => {
+                let text = responses_plaintext_summary(&item);
+                let mut marker = json!({"type": "compaction_summary"});
+                if let Some(id) = item.get("id") {
+                    marker["id"] = id.clone();
+                }
+                // Keep the existing reset signal until history is merged. The
+                // readable summary must be a separate item because reset
+                // markers themselves are intentionally removed by the store.
+                normalized.push(marker);
+                if let Some(text) = text {
+                    normalized.push(json!({"role":"user", "content":text}));
+                }
+            }
+            _ => normalized.push(item),
+        }
+    }
+    *items = normalized;
+    Ok(())
+}
+
 fn validate_responses_continuation(
     body: &Value,
 ) -> Result<(), (&'static str, &'static str, &'static str)> {
@@ -4348,9 +4434,17 @@ fn validate_responses_continuation(
         items.iter().any(|item| {
             item["type"] == "compaction"
                 || (item["type"] == "compaction_summary"
-                    && item
-                        .as_object()
-                        .is_some_and(|m| m.keys().any(|key| key != "type" && key != "id")))
+                    && responses_plaintext_summary(item).is_none()
+                    && ["encrypted_content", "summary", "text", "thought", "content"]
+                        .iter()
+                        .filter_map(|key| item.get(key))
+                        .any(|value| match value {
+                            Value::Null => false,
+                            Value::String(text) => !text.trim().is_empty(),
+                            Value::Array(parts) => !parts.is_empty(),
+                            Value::Object(fields) => !fields.is_empty(),
+                            _ => true,
+                        }))
         })
     }) {
         return Err(("unsupported_compaction", "input", "Cannot restore a Responses compaction payload; send the compacted plaintext transcript instead"));
@@ -4385,6 +4479,7 @@ fn validate_responses_continuation(
                 && item
                     .get("encrypted_content")
                     .is_some_and(|v| !v.is_null() && v != "")
+                && responses_plaintext_summary(item).is_none()
             {
                 return Err((
                     "unsupported_reasoning",
@@ -4449,7 +4544,7 @@ fn validate_responses_continuation(
         return Err((
             "unsupported_tool_schema",
             "tools",
-            "Tool schema contains a union that cannot be represented without changing its contract",
+            "Tool schema is unsupported or exceeds the schema resource budget",
         ));
     }
     Ok(())
@@ -4492,7 +4587,7 @@ pub async fn handle_completions(
         || body.get("instructions").is_some()
         || (is_responses_api && body.get("previous_response_id").is_some());
     if is_responses_api {
-        if let Err((code, param, message)) = validate_responses_continuation(&body) {
+        if let Err((code, param, message)) = normalize_responses_plaintext(&mut body) {
             return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","code":code,"param":param,"message":message}}))).into_response();
         }
     }
@@ -4739,39 +4834,7 @@ pub async fn handle_completions(
                         messages.push(message);
                     }
                     "reasoning" => {
-                        let mut thought_text = String::new();
-                        if let Some(summary_arr) = item.get("summary").and_then(Value::as_array) {
-                            for s in summary_arr {
-                                if let Some(t) = s.get("text").and_then(Value::as_str) {
-                                    thought_text.push_str(t);
-                                }
-                            }
-                        }
-                        if thought_text.is_empty() {
-                            if let Some(t) = item
-                                .get("text")
-                                .or_else(|| item.get("thought"))
-                                .and_then(Value::as_str)
-                            {
-                                thought_text.push_str(t);
-                            }
-                        }
-                        let sig = item
-                            .get("thoughtSignature")
-                            .or_else(|| item.get("thought_signature"))
-                            .or_else(|| item.get("signature"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-
-                        let mut msg_obj = json!({
-                            "role": "assistant",
-                            "content": "",
-                            "reasoning_content": thought_text,
-                        });
-                        if let Some(s) = sig {
-                            msg_obj["thoughtSignature"] = json!(s);
-                        }
-                        messages.push(msg_obj);
+                        messages.push(responses_reasoning_message(&item));
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call"
                     | "web_search_call" => {
@@ -5441,29 +5504,41 @@ pub async fn handle_completions(
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
         let tf_start = std::time::Instant::now();
-        let (mut gemini_body, _routed_session, message_count, _prefix_hash) = if is_responses_api {
-            transform_openai_request_with_session(
-                &openai_req,
-                &project_id,
-                &mapped_model,
-                proxy_token.as_ref(),
-                &affinity_key,
-                signature_read_key.as_deref(),
-                true, // is_responses_api
-                retried_without_thinking,
-            )
-        } else {
-            transform_openai_request_with_session(
-                &openai_req,
-                &project_id,
-                &mapped_model,
-                proxy_token.as_ref(),
-                &affinity_key,
-                None,
-                false,
-                retried_without_thinking,
-            )
-        };
+        let (mut gemini_body, _routed_session, message_count, _prefix_hash) =
+            match if is_responses_api {
+                transform_openai_request_with_session(
+                    &openai_req,
+                    &project_id,
+                    &mapped_model,
+                    proxy_token.as_ref(),
+                    &affinity_key,
+                    signature_read_key.as_deref(),
+                    true, // is_responses_api
+                    retried_without_thinking,
+                )
+            } else {
+                transform_openai_request_with_session(
+                    &openai_req,
+                    &project_id,
+                    &mapped_model,
+                    proxy_token.as_ref(),
+                    &affinity_key,
+                    None,
+                    false,
+                    retried_without_thinking,
+                )
+            } {
+                Ok(mapped) => mapped,
+                Err(message) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {"type": "invalid_request_error", "message": message}
+                        })),
+                    )
+                        .into_response()
+                }
+            };
         heal_flags.reapply(&mut gemini_body);
         let session_id = session_id_str.clone();
         // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
@@ -8758,6 +8833,7 @@ async fn prepare_websocket_prewarm(
     }
     validate_responses_input_image_limits_with_mode(payload.get("input"), false)?;
     let mut validated = payload.clone();
+    normalize_responses_plaintext(&mut validated).map_err(|(_, _, msg)| msg.to_owned())?;
     if payload["previous_response_id"]
         .as_str()
         .is_none_or(str::is_empty)
@@ -8875,7 +8951,7 @@ fn normalize_responses_websocket_request(
     mut payload: Value,
     state: &mut WebsocketSessionState,
 ) -> Result<Value, String> {
-    validate_responses_continuation(&payload).map_err(|(_, _, msg)| msg.to_owned())?;
+    normalize_responses_plaintext(&mut payload).map_err(|(_, _, msg)| msg.to_owned())?;
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -9230,6 +9306,9 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
 
                     messages.push(json!({"role":role,"content":content}));
                 }
+                "reasoning" => {
+                    messages.push(responses_reasoning_message(&item));
+                }
                 "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
                     let mut name =
                         responses_item_tool_name(&item).unwrap_or_else(|| "unknown".to_string());
@@ -9544,7 +9623,7 @@ async fn call_openai_gemini_sync(
     let token_obj = token_manager.get_token_by_id(&account_id);
     let session_id = format!("bg_sid_{}", chrono::Utc::now().timestamp_subsec_millis());
     let (gemini_body, _, _, _) =
-        transform_openai_request(request, &project_id, &session_id, token_obj.as_ref());
+        transform_openai_request(request, &project_id, &session_id, token_obj.as_ref())?;
 
     debug!(
         "[{}] [OpenAI-BG] Calling {} via cloudcode v1internal for summary",
@@ -11066,8 +11145,18 @@ mod r19_responses_regressions {
     }
 
     #[test]
-    fn ambiguous_tool_schema_fails_for_chat_and_responses_namespaces() {
+    fn lossy_tool_schema_is_accepted_but_resource_limits_remain_enforced() {
         let schema = json!({"oneOf":[{"type":"string"},{"type":"string","minLength":2}]});
+        for tools in [
+            json!([{"type":"function","function":{"name":"check","parameters":schema}}]),
+            json!([{"type":"namespace","name":"repo","tools":[{"type":"function","name":"check","parameters":schema}]}]),
+        ] {
+            assert!(validate_openai_tool_schemas(tools.as_array().map(Vec::as_slice)).is_ok());
+            let body = json!({"type":"response.create","model":"g","input":"hi","tools":tools});
+            assert!(validate_responses_continuation(&body).is_ok());
+            assert!(normalize_responses_websocket_request(body, &mut state()).is_ok());
+        }
+        let schema = json!({"type":"object", "description":"x".repeat(crate::proxy::common::json_schema::MAX_SCHEMA_BYTES + 1)});
         for tools in [
             json!([{"type":"function","function":{"name":"check","parameters":schema}}]),
             json!([{"type":"namespace","name":"repo","tools":[{"type":"function","name":"check","parameters":schema}]}]),
@@ -11099,7 +11188,7 @@ mod r19_responses_regressions {
     }
 
     #[test]
-    fn files_and_external_encrypted_reasoning_fail_before_history_is_consumed() {
+    fn unresolved_files_and_reasoning_without_plaintext_fail_before_history_is_consumed() {
         for part in [
             json!({"type":"input_file","file_data":"data:application/pdf;base64,not-base64"}),
             json!({"type":"input_file","file_id":"file-one"}),
@@ -11182,7 +11271,8 @@ mod r19_responses_regressions {
                     Some("session"),
                     true,
                     false,
-                );
+                )
+                .unwrap();
             let part = &mapped["request"]["contents"][0]["parts"][0];
             if let Some(uri) = file["file_url"].as_str() {
                 assert_eq!(
@@ -11220,5 +11310,305 @@ mod r19_responses_regressions {
         )
         .is_err());
         assert_eq!(s.last_request, before);
+    }
+}
+
+#[cfg(test)]
+mod responses_plaintext_compatibility_tests {
+    use super::*;
+    use crate::proxy::http_session_store::{
+        prepare_session_input_with_storage, save_session_delta,
+    };
+
+    fn state() -> WebsocketSessionState {
+        WebsocketSessionState {
+            last_request: None,
+            last_response_output: json!([]),
+            last_response_id: String::new(),
+            tool_call_cache: Default::default(),
+        }
+    }
+
+    fn assert_nonthinking_model_keeps_summary(body: Value) {
+        let request: OpenAIRequest = serde_json::from_value(body).unwrap();
+        let (mapped, _, _, _) =
+            crate::proxy::mappers::openai::request::transform_openai_request_with_session(
+                &request,
+                "project",
+                "gemini-2.5-flash",
+                None,
+                "plaintext-test",
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        let matches: Vec<_> = mapped["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter(|part| {
+                part["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Readable context"))
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "summary must be sent once: {mapped}");
+        assert_eq!(
+            mapped["request"]["contents"]
+                .to_string()
+                .matches("Readable context")
+                .count(),
+            1
+        );
+        assert_ne!(matches[0]["thought"], true);
+        assert!(matches[0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn plaintext_reasoning_survives_foreign_encryption_and_chat_conversion() {
+        for (key, value) in [
+            (
+                "summary",
+                json!([{"type":"summary_text","text":"Readable context"}]),
+            ),
+            ("text", json!("Readable context")),
+            (
+                "content",
+                json!([{"type":"reasoning_text","text":"Readable context"}]),
+            ),
+        ] {
+            let mut reasoning =
+                json!({"type":"reasoning","id":"rs-one","encrypted_content":"foreign-ciphertext"});
+            reasoning[key] = value;
+            let mut request = json!({"model":"g","input":[{"role":"user","content":"First question"},reasoning,{"role":"assistant","content":"First answer"},{"role":"user","content":"Followup"}]});
+            normalize_responses_plaintext(&mut request).unwrap();
+            assert!(request["input"][1].get("encrypted_content").is_none());
+            // HTTP and Chat's Responses compatibility adapter share this mapping.
+            let expected = responses_reasoning_message(&request["input"][1]);
+            let mapped = convert_codex_to_openai_request(request);
+            assert_eq!(mapped["messages"][1], expected);
+            assert_eq!(expected["content"], "Readable context");
+            assert!(expected.get("reasoning_content").is_none());
+            assert_eq!(mapped["messages"][3]["content"], "Followup");
+            assert_nonthinking_model_keeps_summary(mapped);
+        }
+    }
+
+    #[test]
+    fn plaintext_summary_precedes_text_and_business_fields_are_untouched() {
+        let mut body = json!({"input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"preferred"}],"text":"fallback","encrypted_content":"opaque"},{"type":"function_call","name":"business","arguments":{"type":"compaction_summary","text":"business","encrypted_content":"business cipher"}}]});
+        let business = body["input"][1].clone();
+        normalize_responses_plaintext(&mut body).unwrap();
+        assert_eq!(
+            responses_reasoning_message(&body["input"][0])["content"],
+            "preferred"
+        );
+        assert_eq!(body["input"][1], business);
+    }
+
+    #[tokio::test]
+    async fn plaintext_reasoning_survives_websocket_prewarm_and_generation() {
+        let input = json!([
+            {"role":"user","content":"First question"},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"Readable context"}],"encrypted_content":"foreign-ciphertext"},
+            {"role":"assistant","content":"First answer"}
+        ]);
+        let mut socket = state();
+        let initial = normalize_responses_websocket_request(
+            json!({"type":"response.create","model":"g","input":input}),
+            &mut socket,
+        )
+        .unwrap();
+        assert!(initial["input"][1].get("encrypted_content").is_none());
+
+        let mut socket = state();
+        let (_, completed) = prepare_websocket_prewarm(
+            &json!({"type":"response.create","model":"g","generate":false,"store":false,"input":input}),
+            &mut socket, &HeaderMap::new(), "connection",
+        ).await.unwrap();
+        assert!(!socket
+            .last_request
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("foreign-ciphertext"));
+        let next = normalize_responses_websocket_request(
+            json!({"type":"response.create","previous_response_id":completed["response"]["id"],"input":"Followup"}),
+            &mut socket,
+        ).unwrap();
+        let converted = convert_codex_to_openai_request(next);
+        assert_eq!(converted["messages"][1]["content"], "Readable context");
+        assert_eq!(converted["messages"][3]["content"], "Followup");
+        assert_nonthinking_model_keeps_summary(converted);
+    }
+
+    #[test]
+    fn native_signed_reasoning_keeps_its_existing_thought_path() {
+        use base64::Engine;
+        let signature = base64::engine::general_purpose::STANDARD.encode([0x12; 48]);
+        let item = json!({"type":"reasoning","summary":[{"type":"summary_text","text":"Native thought"}],"thoughtSignature":signature});
+        let message = responses_reasoning_message(&item);
+        assert_eq!(message["reasoning_content"], "Native thought");
+        assert_eq!(message["thoughtSignature"], signature);
+        assert_eq!(message["content"], "");
+        for signature in [
+            "external-token",
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+        ] {
+            let mut foreign = item.clone();
+            foreign["thoughtSignature"] = json!(signature);
+            let message = responses_reasoning_message(&foreign);
+            assert_eq!(message["content"], "Native thought");
+            assert!(message.get("reasoning_content").is_none());
+            assert!(message.get("thoughtSignature").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_compaction_resets_http_history_and_reaches_model_input() {
+        for summary in [
+            json!({"text":"Compacted context"}),
+            json!({"summary":[{"type":"summary_text","text":"Compacted context"}]}),
+            json!({"content":[{"type":"input_text","text":"Compacted context"}],"encrypted_content":"optional-opaque-backup"}),
+        ] {
+            let id = Uuid::new_v4().to_string();
+            save_session_delta(
+                id.clone(),
+                None,
+                vec![json!({"role":"user","content":"stale history"})],
+                vec![],
+                String::new(),
+                "g".into(),
+                "route".into(),
+            )
+            .await;
+            let mut marker = summary;
+            marker["type"] = json!("compaction_summary");
+            marker["status"] = json!("completed");
+            let mut body = json!({"model":"gemini-3.7-flash-high","previous_response_id":id,"input":[marker,{"role":"user","content":"Next question"}]});
+            normalize_responses_plaintext(&mut body).unwrap();
+            let once = body.clone();
+            normalize_responses_plaintext(&mut body).unwrap();
+            assert_eq!(
+                body, once,
+                "HTTP must accept already normalized WS input without repeating the summary"
+            );
+            let (parent, _) = load_responses_parent(Some(&id), true)
+                .await
+                .unwrap()
+                .unwrap();
+            let prepared = prepare_session_input_with_storage(
+                parent.input_items,
+                take_responses_input_items(&mut body),
+                &Default::default(),
+                true,
+            );
+            assert!(prepared.reset_parent);
+            assert_eq!(
+                prepared.merged,
+                vec![
+                    json!({"role":"user","content":"Compacted context"}),
+                    json!({"role":"user","content":"Next question"})
+                ]
+            );
+            body["input"] = json!(prepared.merged);
+            let request: OpenAIRequest =
+                serde_json::from_value(convert_codex_to_openai_request(body)).unwrap();
+            let (mapped, _, _, _) =
+                crate::proxy::mappers::openai::request::transform_openai_request_with_session(
+                    &request,
+                    "project",
+                    "gemini-3.7-flash-high",
+                    None,
+                    "session",
+                    Some("session"),
+                    true,
+                    false,
+                )
+                .unwrap();
+            let content = mapped["request"]["contents"].to_string();
+            assert!(content.contains("Compacted context"));
+            assert!(content.contains("Next question"));
+            assert!(!content.contains("stale history"));
+            assert!(!content.contains("optional-opaque-backup"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_compaction_replaces_socket_history_and_survives_prewarm() {
+        let input = json!([{"type":"compaction_summary","status":"completed","text":"Compacted context"},{"role":"user","content":"Current question"}]);
+        let mut socket = state();
+        normalize_responses_websocket_request(
+            json!({"type":"response.create","model":"g","input":"stale history"}),
+            &mut socket,
+        )
+        .unwrap();
+        socket.last_response_id = "local-parent".into();
+        socket.last_response_output = json!([{"role":"assistant","content":"stale answer"}]);
+        let body = normalize_responses_websocket_request(
+            json!({"type":"response.append","previous_response_id":"local-parent","input":input}),
+            &mut socket,
+        )
+        .unwrap();
+        assert_eq!(
+            body["input"],
+            json!([{"role":"user","content":"Compacted context"},{"role":"user","content":"Current question"}])
+        );
+
+        let parent = Uuid::new_v4().to_string();
+        save_session_delta(
+            parent.clone(),
+            None,
+            vec![json!({"role":"user","content":"stale HTTP history"})],
+            vec![],
+            String::new(),
+            "g".into(),
+            "route".into(),
+        )
+        .await;
+        let mut socket = state();
+        let prewarm = json!({"type":"response.create","model":"g","generate":false,"store":false,"previous_response_id":parent,"input":input});
+        let (_, completed) =
+            prepare_websocket_prewarm(&prewarm, &mut socket, &HeaderMap::new(), "connection")
+                .await
+                .unwrap();
+        assert_eq!(
+            socket.last_request.as_ref().unwrap()["input"],
+            body["input"]
+        );
+        let next = normalize_responses_websocket_request(json!({"type":"response.create","previous_response_id":completed["response"]["id"],"input":"Followup"}), &mut socket).unwrap();
+        assert_eq!(next["input"].as_array().unwrap().len(), 3);
+        assert_eq!(next["input"][0]["content"], "Compacted context");
+        assert!(!next.to_string().contains("stale HTTP history"));
+    }
+
+    #[tokio::test]
+    async fn opaque_context_rejection_preserves_pending_socket_history() {
+        for item in [
+            json!({"type":"reasoning","summary":[],"encrypted_content":"opaque"}),
+            json!({"type":"reasoning","summary":[{"type":"summary_text","text":"  "}],"encrypted_content":"opaque"}),
+            json!({"type":"compaction_summary","encrypted_content":"opaque","status":"completed"}),
+            json!({"type":"compaction_summary","content":{"encrypted_content":"opaque"}}),
+            json!({"type":"compaction","encrypted_content":"opaque"}),
+        ] {
+            let body = json!({"type":"response.create","model":"g","input":[item,{"role":"user","content":"Continue"}]});
+            let mut normalized = body.clone();
+            assert!(normalize_responses_plaintext(&mut normalized).is_err());
+            assert_eq!(normalized, body);
+            let mut socket = state();
+            assert!(
+                prepare_websocket_prewarm(&body, &mut socket, &HeaderMap::new(), "connection")
+                    .await
+                    .is_err()
+            );
+            assert!(socket.last_request.is_none());
+            assert!(normalize_responses_websocket_request(body, &mut socket).is_err());
+            assert!(socket.last_request.is_none());
+        }
+        let mut marker = json!({"input":[{"type":"compaction_summary","status":"completed","metadata":{"tokens":100}},{"role":"user","content":"Complete replacement transcript"}]});
+        normalize_responses_plaintext(&mut marker).unwrap();
+        assert_eq!(marker["input"][0], json!({"type":"compaction_summary"}));
     }
 }

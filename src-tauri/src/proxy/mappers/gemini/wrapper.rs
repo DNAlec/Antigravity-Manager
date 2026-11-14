@@ -15,7 +15,7 @@ pub fn wrap_request_v2(
     _upstream: Option<&std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>>,
     upstream_session_id: Option<&str>,
     is_retry: bool,
-) -> Value {
+) -> Result<Value, String> {
     // 优先使用传入的 mapped_model，其次尝试从 body 获取
     let original_model = body
         .get("model")
@@ -486,14 +486,14 @@ pub fn wrap_request_v2(
                                     let mut params = params_json_schema;
                                     crate::proxy::common::json_schema::clean_json_schema(
                                         &mut params,
-                                    );
+                                    )?;
                                     crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                         &mut params,
                                     );
                                     decl_obj.insert("parameters".to_string(), params);
                                 } else if let Some(params) = decl_obj.get_mut("parameters") {
                                     // 标准 parameters 字段
-                                    crate::proxy::common::json_schema::clean_json_schema(params);
+                                    crate::proxy::common::json_schema::clean_json_schema(params)?;
                                     crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                         params,
                                     );
@@ -716,7 +716,7 @@ pub fn wrap_request_v2(
         &mut inner_request,
         &config.final_model,
         Some(&official_request_id),
-    );
+    )?;
     let reordered_inner = inner_request;
 
     let mut final_request_obj = json!({
@@ -735,9 +735,9 @@ pub fn wrap_request_v2(
 
     crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(
         &mut final_request_obj,
-    );
+    )?;
 
-    final_request_obj
+    Ok(final_request_obj)
 }
 
 #[cfg(test)]
@@ -768,7 +768,8 @@ mod test_fixes {
             }]
         });
 
-        let result = wrap_request(&body, "proj", "gemini-pro", None, Some(session_id), None);
+        let result =
+            wrap_request(&body, "proj", "gemini-pro", None, Some(session_id), None).unwrap();
         let injected_sig = result["request"]["contents"][0]["parts"][0]["thoughtSignature"]
             .as_str()
             .unwrap();
@@ -794,7 +795,7 @@ mod test_fixes {
             }]
         });
 
-        let result = wrap_request(&body, "proj", "gemini-pro", None, None, None);
+        let result = wrap_request(&body, "proj", "gemini-pro", None, None, None).unwrap();
         let part = &result["request"]["contents"][0]["parts"][0];
         assert_eq!(
             part["thoughtSignature"].as_str(),
@@ -1009,7 +1010,7 @@ async fn try_compress_gemini_with_summary(
         Some(account_id),
         Some(session_id_str),
         token_obj.as_ref(),
-    );
+    )?;
 
     // 走共享的辅助调用通道：复用主请求路径的客户端（含按账号代理池）、
     // 端点顺序（Daily → Sandbox → Prod）、URL 形状与回退判定。
@@ -1114,7 +1115,7 @@ pub fn wrap_request(
     account_id: Option<&str>,
     session_id: Option<&str>,
     token: Option<&crate::proxy::token_manager::ProxyToken>,
-) -> Value {
+) -> Result<Value, String> {
     wrap_request_v2(
         body,
         project_id,
@@ -1142,7 +1143,8 @@ mod tests {
             "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
         });
 
-        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let result =
+            wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None).unwrap();
         assert_eq!(result["project"], "test-project");
         assert_eq!(result["model"], "gemini-2.5-flash");
         assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
@@ -1168,7 +1170,7 @@ mod tests {
             "messages": []
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
 
         // 验证没有多余注入的 systemInstruction
         assert!(result
@@ -1208,7 +1210,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1235,7 +1238,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         // 新规则：Pro 模型不再显式下发 thinkingBudget（交服务端默认）
         assert!(
             result_pro["request"]["generationConfig"]["thinkingConfig"]
@@ -1277,7 +1281,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1296,7 +1301,7 @@ mod tests {
             }
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
         let sys = result
             .get("request")
             .unwrap()
@@ -1321,7 +1326,7 @@ mod tests {
             }
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
         let sys = result
             .get("request")
             .unwrap()
@@ -1353,7 +1358,8 @@ mod tests {
             "contents": [{"parts": parts}]
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-3-pro-image", None, None, None);
+        let result =
+            wrap_request(&body, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
 
         let request = result.get("request").unwrap();
         let contents = request.get("contents").unwrap().as_array().unwrap();
@@ -1399,7 +1405,8 @@ mod tests {
         });
 
         // Test with Pro model
-        let result = wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None);
+        let result =
+            wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None).unwrap();
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1444,7 +1451,8 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             });
 
-            let result = wrap_request(&body, "proj", "claude-sonnet-4-6", None, None, None);
+            let result =
+                wrap_request(&body, "proj", "claude-sonnet-4-6", None, None, None).unwrap();
             let req = result.get("request").unwrap();
 
             // 1. 确保根目录没有 thinking
@@ -1494,7 +1502,8 @@ mod tests {
                 None,
                 None,
                 None,
-            );
+            )
+            .unwrap();
             let req = result.get("request").unwrap();
             let gen_config = req.get("generationConfig").unwrap();
             let thinking_config = gen_config.get("thinkingConfig").unwrap();
@@ -1531,7 +1540,8 @@ mod tests {
         });
 
         // Test with Pro-preview model (should NOT auto-inject to avoid 400)
-        let result = wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None);
+        let result =
+            wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None).unwrap();
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1546,7 +1556,8 @@ mod tests {
             "model": "gemini-3-pro",
             "generationConfig": {}
         });
-        let result_std = wrap_request(&body_std, "test-proj", "gemini-3-pro", None, None, None);
+        let result_std =
+            wrap_request(&body_std, "test-proj", "gemini-3-pro", None, None, None).unwrap();
         let gen_config_std = result_std
             .get("request")
             .unwrap()
@@ -1569,7 +1580,8 @@ mod tests {
             "prompt": "Test"
         });
 
-        let result_1 = wrap_request(&body_1, "test-proj", "gemini-3-pro-image", None, None, None);
+        let result_1 =
+            wrap_request(&body_1, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
         let req_1 = result_1.get("request").unwrap();
         let gen_config_1 = req_1.get("generationConfig").unwrap();
         let image_config_1 = gen_config_1.get("imageConfig").unwrap();
@@ -1585,7 +1597,8 @@ mod tests {
              "prompt": "Test"
         });
 
-        let result_2 = wrap_request(&body_2, "test-proj", "gemini-3-pro-image", None, None, None);
+        let result_2 =
+            wrap_request(&body_2, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
         let req_2 = result_2.get("request").unwrap();
         let image_config_2 = req_2["generationConfig"]["imageConfig"]
             .as_object()
@@ -1669,7 +1682,8 @@ mod tests {
             }
         });
 
-        let mut wrapped = wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None);
+        let mut wrapped =
+            wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None).unwrap();
         crate::proxy::thinking_store::finalize_request_text_context(
             "",
             wrapped["request"]["contents"].as_array_mut().unwrap(),
@@ -1718,7 +1732,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
@@ -1737,7 +1752,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1748,7 +1764,8 @@ mod tests {
                 "thinkingConfig": { "thinkingLevel": "LOW" }
             }
         });
-        let wrapped = wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None);
+        let wrapped =
+            wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None).unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "LOW");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1767,7 +1784,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], false);
         assert_eq!(tc["thinkingBudget"], 0);
@@ -1783,7 +1801,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1802,7 +1821,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1820,7 +1840,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());

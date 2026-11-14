@@ -146,7 +146,7 @@ fn compute_schema_hash(schema: &Value) -> String {
 ///
 /// # Returns
 /// 清洗后的 Schema
-pub fn clean_json_schema_cached(schema: &mut Value, tool_name: &str) {
+pub fn clean_json_schema_cached(schema: &mut Value, tool_name: &str) -> Result<(), String> {
     // 1. 计算原始 Schema 的缓存键
     let hash = compute_schema_hash(schema);
     let cache_key = format!("{}:{}", tool_name, hash);
@@ -156,18 +156,19 @@ pub fn clean_json_schema_cached(schema: &mut Value, tool_name: &str) {
         if let Ok(mut cache) = SCHEMA_CACHE.write() {
             if let Some(cached) = cache.get(&cache_key) {
                 *schema = cached;
-                return;
+                return Ok(());
             }
         }
     }
 
     // 3. 缓存未命中,执行清洗
-    super::json_schema::clean_json_schema_for_tool(schema, tool_name);
+    super::json_schema::clean_json_schema_for_tool(schema, tool_name)?;
 
     // 4. 写入缓存 (使用原始哈希作为键)
     if let Ok(mut cache) = SCHEMA_CACHE.write() {
         cache.insert(cache_key, schema.clone());
     }
+    Ok(())
 }
 
 /// 获取缓存统计信息
@@ -214,11 +215,11 @@ mod tests {
         let tool_name = "test_tool";
 
         // 第一次调用 - 缓存未命中
-        clean_json_schema_cached(&mut schema, tool_name);
+        clean_json_schema_cached(&mut schema, tool_name).unwrap();
 
         // 第二次调用相同的 Schema - 应该缓存命中
         let mut schema2 = json!({"type": "string", "minLength": 5});
-        clean_json_schema_cached(&mut schema2, tool_name);
+        clean_json_schema_cached(&mut schema2, tool_name).unwrap();
 
         let stats = get_cache_stats();
         // 验证有缓存命中
@@ -238,7 +239,7 @@ mod tests {
         for i in 0..1100 {
             let mut schema = json!({"type": "string", "index": i});
             let tool_name = format!("tool_{}", i);
-            clean_json_schema_cached(&mut schema, &tool_name);
+            clean_json_schema_cached(&mut schema, &tool_name).unwrap();
         }
 
         // 验证缓存大小被限制
