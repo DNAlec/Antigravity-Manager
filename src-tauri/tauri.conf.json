@@ -69,15 +69,6 @@
     }
   },
   "plugins": {
-    "updater": {
-      "active": true,
-      "endpoints": [
-        "https://github.com/lbjlaq/Antigravity-Manager/releases/latest/download/updater.json",
-        "https://github.com/lbjlaq/Antigravity-Manager/releases/download/preview/updater.json"
-      ],
-      "dialog": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJFRjVDRjdCREE1Rjg2NkYKUldSdmhsL2FlOC8xdnJuTzBtaTRhZkk1VWJ1cW5QWGU3ZWEwU20yZHRlZStxMnRWcUIzc3FwT2IK"
-    },
     "process": null,
     "fs": null,
     "dialog": null,
