@@ -204,10 +204,16 @@ jobs:
           # 进入产物目录
           cd src-tauri/target/*/release/bundle/macos/
           
-          # 重命名 .app.tar.gz 和 .sig
+          # Unsigned builds disable updater artifacts, but still need a downloadable app bundle.
+          if [ ! -f "Antigravity Tools.app.tar.gz" ] && [ -d "Antigravity Tools.app" ]; then
+            tar -czf "Antigravity Tools.app.tar.gz" "Antigravity Tools.app"
+          fi
+          # 重命名 .app.tar.gz 和可选的 .sig
           if [ -f "Antigravity Tools.app.tar.gz" ]; then
             mv "Antigravity Tools.app.tar.gz" "Antigravity Tools_${ARCH}.app.tar.gz"
-            mv "Antigravity Tools.app.tar.gz.sig" "Antigravity Tools_${ARCH}.app.tar.gz.sig"
+            if [ -f "Antigravity Tools.app.tar.gz.sig" ]; then
+              mv "Antigravity Tools.app.tar.gz.sig" "Antigravity Tools_${ARCH}.app.tar.gz.sig"
+            fi
             echo "Renamed assets to append Arch: $ARCH"
           fi
           
@@ -421,7 +427,7 @@ jobs:
                   signature: $linux_a64_sig
                 }
               }
-            }' > updater.json
+            } | .platforms |= with_entries(select(.value.signature != ""))' > updater.json
 
           echo "Generated updater.json:"
           cat updater.json
@@ -449,6 +455,11 @@ jobs:
           done
           cd ..
           find release-files -maxdepth 1 -type f -print
+
+          # Do not publish updater entries that point at a missing artifact.
+          while IFS= read -r filename; do
+            test -s "release-files/$filename" || { echo "Missing updater artifact: $filename" >&2; exit 1; }
+          done < <(jq -r '.platforms[].url | split("/") | last' updater.json)
 
       # 使用 ncipollo/release-action 进行统一发布，支持稳健覆盖
       - name: Create or Update GitHub Release
