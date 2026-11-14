@@ -1708,9 +1708,7 @@ impl PromptSanitizer {
     pub fn sanitize_gemini_payload(body: &mut Value) -> usize {
         let mut total_cleaned = 0;
 
-        // 0. 深度清理 "[undefined]" 占位串（Cherry Studio 等客户端常见注入）
-        //    统一在此执行，不分协议 —— 任何客户端注入的脏数据都必须清洗。
-        crate::proxy::mappers::common_utils::deep_clean_undefined(body, 0);
+        crate::proxy::mappers::common_utils::clean_undefined_control_fields(body);
 
         // 兼容处理：若存在包装层 "request"，清洗包装内部
         if let Some(inner) = body.get_mut("request").and_then(Value::as_object_mut) {
@@ -2020,7 +2018,7 @@ mod tests {
                 { "text": "x-anthropic-billing-header: cc_version=2.1.270.ffc;" },
                 { "text": "You are an expert coder." }
             ]},
-            "generationConfig": { "foo": "[undefined]" }
+            "generationConfig": { "temperature": "[undefined]" }
         });
         PromptSanitizer::sanitize_gemini_payload(&mut payload);
 
@@ -2028,7 +2026,7 @@ mod tests {
         assert_eq!(parts.len(), 1, "计费元数据 part 必须被剔除: {payload}");
         assert_eq!(parts[0]["text"], "You are an expert coder.");
         assert!(
-            payload["generationConfig"].get("foo").is_none(),
+            payload["generationConfig"].get("temperature").is_none(),
             "[undefined] 占位串必须被清理: {payload}"
         );
     }
@@ -4058,5 +4056,59 @@ mod tests {
             .unwrap_or_else(|| billing_raw.to_string());
         assert!(!rewritten_billing.contains("x-anthropic-billing-header"));
         assert!(rewritten_billing.contains("System prompt."));
+    }
+}
+
+#[cfg(test)]
+mod r26_undefined_scope_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn r26_placeholder_cleanup_is_confined_to_protocol_controls() {
+        let business = json!({"needle":"[undefined]","temperature":"[undefined]","generationConfig":{"maxOutputTokens":"[undefined]"}});
+        let schema = json!({"type":"object","properties":{"needle":{"type":"string","description":"[undefined]","default":"[undefined]","enum":["[undefined]"]}}});
+        for wrapped in [false, true] {
+            let request = json!({
+                "contents":[{"role":"user","parts":[{"text":"[undefined]"},{"functionResponse":{"id":"call_literal","name":"lookup","response":business}}]},
+                    {"role":"model","parts":[{"functionCall":{"id":"call_literal","name":"lookup","args":business}}]}],
+                "tools":[{"functionDeclarations":[{"name":"lookup","parameters":schema}]}],
+                "generationConfig":{"temperature":"[undefined]","topP":0.7,"responseJsonSchema":schema,"stopSequences":["[undefined]"],"thinkingConfig":{"thinkingBudget":"[undefined]"}}
+            });
+            let mut payload = if wrapped {
+                json!({"request":request})
+            } else {
+                request
+            };
+            PromptSanitizer::sanitize_gemini_payload(&mut payload);
+            let body = if wrapped {
+                &payload["request"]
+            } else {
+                &payload
+            };
+            assert_eq!(body["contents"][0]["parts"][0]["text"], "[undefined]");
+            assert_eq!(
+                body["contents"][0]["parts"][1]["functionResponse"]["response"],
+                business
+            );
+            assert_eq!(
+                body["contents"][1]["parts"][0]["functionCall"]["args"],
+                business
+            );
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["parameters"],
+                schema
+            );
+            assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+            assert_eq!(
+                body["generationConfig"]["stopSequences"],
+                json!(["[undefined]"])
+            );
+            assert_eq!(body["generationConfig"]["topP"], 0.7);
+            assert!(body["generationConfig"].get("temperature").is_none());
+            assert!(body["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none());
+        }
     }
 }

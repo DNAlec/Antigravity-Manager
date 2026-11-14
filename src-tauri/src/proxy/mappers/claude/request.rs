@@ -1487,6 +1487,36 @@ fn build_contents(
                         append_server_tool_result_parts(content, &mut parts, 0)?;
                         saw_non_thinking = true;
                     }
+                    ContentBlock::McpToolUse {
+                        id,
+                        name,
+                        server_name,
+                        input,
+                    } => {
+                        parts.push(json!({"text": format!(
+                            "MCP tool {server_name}/{name} (call {id})\nInput: {}", json!(input)
+                        )}));
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::McpToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let status = if *is_error { "error" } else { "result" };
+                        parts.push(
+                            json!({"text": format!("MCP tool {status} (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            McpToolResultContent::Text(text) => parts.push(json!({"text":text})),
+                            McpToolResultContent::Blocks(blocks) => {
+                                for McpTextBlock::Text { text } in blocks {
+                                    parts.push(json!({"text":text}));
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
                     // ContentBlock::RedactedThinking handled above at line 583
                     ContentBlock::ServerToolUse { .. }
                     | ContentBlock::WebSearchToolResult { .. } => {
@@ -4481,5 +4511,97 @@ mod r24_server_history_tests {
             {"type":"unknown_client_tool_call","name":"execute","input":{"cmd":"keep me explicit"}}
         ]}]});
         assert!(serde_json::from_value::<ClaudeRequest>(unknown).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r26_mcp_history_tests {
+    use super::*;
+
+    fn request(blocks: Value) -> Result<ClaudeRequest, serde_json::Error> {
+        serde_json::from_value(
+            json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
+                {"role":"user","content":"Fetch the report"},
+                {"role":"assistant","content":blocks},
+                {"role":"user","content":"Explain that result"}
+            ]}),
+        )
+    }
+    fn mapped_text(request: &ClaudeRequest) -> (Value, String) {
+        let mapped =
+            transform_claude_request_in(request, "r26-project", false, None, "r26-mcp", None)
+                .unwrap();
+        let text = mapped["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (mapped, text)
+    }
+
+    #[test]
+    fn r26_mcp_history_degrades_to_readable_context_in_order() {
+        let request = request(json!([
+            {"type":"text","text":"BEFORE_MCP"},
+            {"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":{"needle":"[undefined]"}},
+            {"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":false,"content":[{"type":"text","text":"REPORT_42\nSecond line"}]},
+            {"type":"text","text":"AFTER_MCP"}
+        ])).unwrap();
+        let (mapped, text) = mapped_text(&request);
+        let mut position = 0;
+        for fragment in [
+            "BEFORE_MCP",
+            "docs/lookup",
+            "[undefined]",
+            "REPORT_42\nSecond line",
+            "AFTER_MCP",
+            "Explain that result",
+        ] {
+            position += text[position..]
+                .find(fragment)
+                .unwrap_or_else(|| panic!("Missing {fragment} in {text}"))
+                + fragment.len();
+        }
+        assert!(!mapped.to_string().contains("functionCall"));
+        assert!(!mapped.to_string().contains("functionResponse"));
+    }
+
+    #[test]
+    fn r26_mcp_results_without_adjacent_text_keep_strings_and_errors() {
+        for (error, content) in [
+            (false, json!("SERVER_BODY")),
+            (true, json!([{"type":"text","text":"SERVER_BODY"}])),
+        ] {
+            let request = request(json!([{"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":error,"content":content}])).unwrap();
+            let (_, text) = mapped_text(&request);
+            assert!(text.contains("SERVER_BODY"));
+            assert!(text.contains(if error {
+                "MCP tool error"
+            } else {
+                "MCP tool result"
+            }));
+        }
+        let control = request(json!([{"type":"text","text":"SERVER_BODY"}])).unwrap();
+        assert!(mapped_text(&control).1.contains("SERVER_BODY"));
+    }
+
+    #[test]
+    fn r26_mcp_degradation_keeps_malformed_and_local_tool_envelopes_strict() {
+        for invalid in [
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs"}),
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":[]}),
+            json!({"type":"mcp_tool_result","content":"result"}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"text"}]}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"unknown_local_tool","input":{}}]}),
+            json!({"type":"tool_use","id":"toolu_42","input":{}}),
+            json!({"type":"unknown_client_tool_call","name":"execute","input":{}}),
+        ] {
+            assert!(
+                request(json!([{"type":"text","text":"valid adjacent text"},invalid])).is_err()
+            );
+        }
     }
 }

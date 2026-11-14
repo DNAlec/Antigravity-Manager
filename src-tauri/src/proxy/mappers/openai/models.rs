@@ -1,9 +1,10 @@
 // OpenAI 数据模型
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct OpenAIRequest {
     pub model: String,
     #[serde(default)]
@@ -77,6 +78,168 @@ pub struct OpenAIRequest {
     // Responses API Structured Outputs / text config (e.g. text.format)
     #[serde(default)]
     pub text: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for OpenAIRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = Value::deserialize(deserializer)?;
+        normalize_chat_request(&mut value).map_err(serde::de::Error::custom)?;
+        // The remote derive retains the ordinary typed validation after normalization.
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for OpenAIRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+fn normalize_chat_request(value: &mut Value) -> Result<(), String> {
+    let Some(body) = value.as_object_mut() else {
+        return Err("Chat request must be an object".into());
+    };
+    if body.get("stream").is_some_and(Value::is_null) {
+        body.remove("stream");
+    }
+    let mut token_limit = None;
+    for key in [
+        "max_tokens",
+        "max_completion_tokens",
+        "maxCompletionTokens",
+        "maxTokens",
+        "max_output_tokens",
+        "maxOutputTokens",
+    ] {
+        if let Some(value) = body.remove(key).filter(|value| !value.is_null()) {
+            if token_limit
+                .as_ref()
+                .is_some_and(|previous| previous != &value)
+            {
+                return Err("Conflicting non-null maximum token limits".into());
+            }
+            token_limit = Some(value);
+        }
+    }
+    if let Some(limit) = token_limit {
+        body.insert("max_tokens".into(), limit);
+    }
+
+    if let Some(functions) = body.remove("functions").filter(|v| !v.is_null()) {
+        let functions = functions.as_array().ok_or("functions must be an array")?;
+        let mut tools = Vec::with_capacity(functions.len());
+        for function in functions {
+            required_function_name(function)?;
+            if let Some(schema) = function.get("parameters") {
+                crate::proxy::common::json_schema::validate_tool_schema(schema)?;
+            }
+            tools.push(json!({"type":"function", "function":function}));
+        }
+        if body
+            .get("tools")
+            .is_some_and(|value| !value.is_null() && value != &json!([]))
+        {
+            return Err("Specify either functions or tools, not both".into());
+        }
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(choice) = body.remove("function_call").filter(|v| !v.is_null()) {
+        let choice = match choice.as_str() {
+            Some("auto" | "none") => choice,
+            Some(_) => {
+                return Err("function_call must be auto, none, or an object with a name".into())
+            }
+            None => {
+                json!({"type":"function", "function":{"name":required_function_name(&choice)?}})
+            }
+        };
+        if body
+            .get("tool_choice")
+            .is_some_and(|v| !v.is_null() && v != &choice)
+        {
+            return Err("Conflicting function_call and tool_choice".into());
+        }
+        body.insert("tool_choice".into(), choice);
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut used_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for (index, message) in messages.iter_mut().enumerate() {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        if let Some(function) = message.remove("function_call").filter(|v| !v.is_null()) {
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Err("Historical function_call requires an assistant message".into());
+            }
+            let parsed: ToolFunction =
+                serde_json::from_value(function.clone()).map_err(|e| e.to_string())?;
+            required_function_name(&function)?;
+            let arguments: Value = serde_json::from_str(&parsed.arguments)
+                .map_err(|e| format!("Invalid function_call arguments: {e}"))?;
+            if !arguments.is_object() {
+                return Err("function_call arguments must encode an object".into());
+            }
+            if message
+                .get("tool_calls")
+                .is_some_and(|v| !v.is_null() && v != &json!([]))
+            {
+                return Err(
+                    "Assistant message cannot contain both function_call and tool_calls".into(),
+                );
+            }
+            let mut id = format!("call_legacy_{index}");
+            while !used_ids.insert(id.clone()) {
+                id.push('_');
+            }
+            pending.push((parsed.name, id.clone()));
+            message.insert(
+                "tool_calls".into(),
+                json!([{"id":id, "type":"function", "function":function}]),
+            );
+        }
+        if message.get("role").and_then(Value::as_str) == Some("function") {
+            let name = message
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("Function result is missing its name")?;
+            let Some(position) = pending
+                .iter()
+                .rposition(|(pending_name, _)| pending_name == name)
+            else {
+                // A trimmed history can start with a result. Preserve the existing
+                // orphan-result handling instead of inventing a call association.
+                continue;
+            };
+            let (_, id) = pending.remove(position);
+            if message
+                .get("tool_call_id")
+                .is_some_and(|value| !value.is_null() && value.as_str() != Some(id.as_str()))
+            {
+                return Err("Function result has a conflicting tool_call_id".into());
+            }
+            message.insert("role".into(), json!("tool"));
+            message.insert("tool_call_id".into(), json!(id));
+        }
+    }
+    Ok(())
+}
+
+fn required_function_name(function: &Value) -> Result<&str, String> {
+    function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "Function is missing a non-empty name".into())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -451,5 +614,129 @@ impl From<&crate::proxy::pipeline::CanonicalUsage> for OpenAIUsage {
             total_tool_use_tokens: None,
             gemini_total_tokens: Some(c.total_tokens),
         }
+    }
+}
+
+#[cfg(test)]
+mod r26_request_boundary_tests {
+    use super::*;
+
+    fn request(extra: Value) -> Result<OpenAIRequest, serde_json::Error> {
+        let mut body =
+            json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body)
+    }
+
+    #[test]
+    fn r26_nullable_stream_preserves_boolean_semantics_and_rejects_bad_types() {
+        for (extra, expected) in [
+            (json!({}), false),
+            (json!({"stream":null}), false),
+            (json!({"stream":false}), false),
+            (json!({"stream":true}), true),
+        ] {
+            let parsed = request(extra).unwrap();
+            assert_eq!(parsed.stream, expected);
+            let roundtrip: OpenAIRequest =
+                serde_json::from_value(serde_json::to_value(parsed).unwrap()).unwrap();
+            assert_eq!(roundtrip.stream, expected);
+        }
+        for invalid in [json!("false"), json!(0), json!({}), json!([])] {
+            assert!(request(json!({"stream":invalid})).is_err());
+        }
+    }
+
+    #[test]
+    fn r26_token_aliases_accept_null_with_one_effective_limit_and_reject_conflicts() {
+        let aliases = [
+            "max_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "maxTokens",
+            "max_output_tokens",
+            "maxOutputTokens",
+        ];
+        for active in aliases {
+            let mut controls = serde_json::Map::new();
+            for alias in aliases {
+                controls.insert(alias.into(), Value::Null);
+            }
+            controls.insert(active.into(), json!(16));
+            assert_eq!(
+                request(Value::Object(controls)).unwrap().max_tokens,
+                Some(16)
+            );
+        }
+        assert_eq!(
+            request(json!({"max_tokens":16,"max_completion_tokens":16}))
+                .unwrap()
+                .max_tokens,
+            Some(16)
+        );
+        assert_eq!(
+            request(json!({"max_tokens":null,"max_completion_tokens":null}))
+                .unwrap()
+                .max_tokens,
+            None
+        );
+        for invalid in [
+            json!({"max_tokens":16,"max_completion_tokens":32}),
+            json!({"max_tokens":null,"max_completion_tokens":"16"}),
+            json!({"max_completion_tokens":-1}),
+        ] {
+            assert!(request(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn r26_legacy_normalization_does_not_accept_incomplete_calls_or_conflicting_envelopes() {
+        for invalid in [
+            json!({"functions":"lookup"}),
+            json!({"functions":[{"parameters":{}}]}),
+            json!({"function_call":{"wrong_name":"lookup"}}),
+            json!({"function_call":"required"}),
+            json!({"functions":[{"name":"lookup"}],"tools":[{"type":"function","function":{"name":"other"}}]}),
+            json!({"function_call":"none","tool_choice":"auto"}),
+            json!({"messages":[{"role":"assistant","function_call":{"name":"lookup"}}]}),
+            json!({"messages":[{"role":"assistant","function_call":{"name":"lookup","arguments":"broken"}}]}),
+            json!({"messages":[{"role":"assistant","function_call":{"name":"lookup","arguments":"[]"}}]}),
+            json!({"messages":[{"role":"user","function_call":{"name":"lookup","arguments":"{}"}}]}),
+            json!({"messages":[{"role":"assistant","tool_calls":[{"id":"call_local","type":"function","function":{"name":"lookup"}}]}]}),
+        ] {
+            assert!(
+                request(invalid.clone()).is_err(),
+                "accepted invalid request: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn r26_legacy_ids_are_stable_and_do_not_collide_with_modern_ids() {
+        let input = json!({"messages":[
+            {"role":"user","content":"Run both"},
+            {"role":"assistant","function_call":{"name":"lookup","arguments":"{}"}},
+            {"role":"function","name":"lookup","content":"first"},
+            {"role":"assistant","tool_calls":[{"id":"call_legacy_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"call_legacy_1","content":"second"}
+        ]});
+        let parsed = request(input.clone()).unwrap();
+        let repeated = request(input).unwrap();
+        let legacy_id = &parsed.messages[1].tool_calls.as_ref().unwrap()[0].id;
+        assert_ne!(legacy_id, "call_legacy_1");
+        assert_eq!(
+            parsed.messages[2].tool_call_id.as_deref(),
+            Some(legacy_id.as_str())
+        );
+        assert_eq!(
+            &repeated.messages[1].tool_calls.as_ref().unwrap()[0].id,
+            legacy_id
+        );
+        assert_eq!(
+            parsed.messages[4].tool_call_id.as_deref(),
+            Some("call_legacy_1")
+        );
     }
 }

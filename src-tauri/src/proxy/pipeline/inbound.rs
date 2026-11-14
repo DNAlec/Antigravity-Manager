@@ -1062,13 +1062,20 @@ impl InboundThinkingPipeline {
     ///
     /// 返回被规范化的 ID 数量。
     pub fn normalize_tool_call_ids(contents: &mut [Value]) -> usize {
+        let normalizer = crate::proxy::common::utils::ToolIdNormalizer::new(
+            contents
+                .iter()
+                .filter_map(|content| content["parts"].as_array())
+                .flatten()
+                .filter_map(|part| part["functionCall"]["id"].as_str()),
+        );
         let mut normalized_count = 0usize;
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts.iter_mut() {
                     if let Some(fc) = part.get_mut("functionCall") {
                         if let Some(id_val) = fc.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fc["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;
@@ -1077,7 +1084,7 @@ impl InboundThinkingPipeline {
                     }
                     if let Some(fr) = part.get_mut("functionResponse") {
                         if let Some(id_val) = fr.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fr["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;

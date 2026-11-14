@@ -52,9 +52,6 @@ pub fn wrap_request_v2(
         (body.clone(), None)
     };
 
-    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
-    crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
-
     // [PIPELINE] 统一清洗提示词与风控伪 Header（兼容第三方聚合器如 New API 以 Gemini 原生协议转入时的特征残留）
     crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
         &mut inner_request,
@@ -1845,5 +1842,52 @@ mod tests {
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
+    }
+}
+
+#[cfg(test)]
+mod r26_tool_identity_tests {
+    use super::*;
+
+    #[test]
+    fn r26_native_pipeline_preserves_colliding_original_ids_and_normalizes_other_aliases() {
+        let body = wrap_request(&json!({"contents":[
+            {"role":"user","parts":[{"text":"Run all three"}]},
+            {"role":"model","parts":[
+                {"functionCall":{"id":"call12","name":"read","args":{}}},
+                {"functionCall":{"id":"call_12","name":"write","args":{}}},
+                {"functionCall":{"id":"call34","name":"list","args":{}}}
+            ]},
+            {"role":"user","parts":[
+                {"functionResponse":{"id":"call12","name":"read","response":{"output":"READ"}}},
+                {"functionResponse":{"id":"call_12","name":"write","response":{"output":"WRITE"}}},
+                {"functionResponse":{"id":"call_34","name":"list","response":{"output":"LIST"}}}
+            ]}
+        ]}),"r26-project","gemini-2.5-flash",None,None,None).unwrap();
+        let parts: Vec<_> = body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .collect();
+        let calls: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.get("functionCall"))
+            .collect();
+        let results: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.get("functionResponse"))
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(results.len(), 3);
+        for (index, id, name) in [
+            (0, "call12", "read"),
+            (1, "call_12", "write"),
+            (2, "call_34", "list"),
+        ] {
+            assert_eq!(calls[index]["id"], id);
+            assert_eq!(results[index]["id"], id);
+            assert_eq!(results[index]["name"], name);
+        }
     }
 }

@@ -482,6 +482,14 @@ pub fn transform_openai_request_with_session(
         !key.is_empty() && seen_system_instruction_keys.insert(key.to_string())
     });
 
+    let tool_ids = crate::proxy::common::utils::ToolIdNormalizer::new(
+        request
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+            .map(|call| call.id.as_str()),
+    );
     // Pre-scan to map tool_call_id to function name (for Codex)
     let mut tool_id_to_name = std::collections::HashMap::new();
     for msg in &request.messages {
@@ -500,7 +508,7 @@ pub fn transform_openai_request_with_session(
                     &name
                 };
                 tool_id_to_name.insert(call.id.clone(), final_name.to_string());
-                let norm_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
+                let norm_id = tool_ids.normalize(&call.id);
                 if norm_id.as_ref() != call.id {
                     tool_id_to_name.insert(norm_id.into_owned(), final_name.to_string());
                 }
@@ -794,15 +802,16 @@ pub fn transform_openai_request_with_session(
                 let name = msg.name.as_deref().unwrap_or("");
                 // 优先从前置 assistant 消息中查找匹配该 tool_call_id 的工具名称 (精准杜绝长会话 ID 碰撞时全局 Map 覆盖错误)
                 let matched_preceding_name = if let Some(ref target_id) = msg.tool_call_id {
-                    let norm_target_id = crate::proxy::common::utils::normalize_tool_id(target_id);
+                    let norm_target_id = tool_ids.normalize(target_id);
                     let mut found = None;
                     for prev_idx in (0..msg_index).rev() {
                         if let Some(prev_msg) = request.messages.get(prev_idx) {
                             if prev_msg.role == "assistant" {
                                 if let Some(ref calls) = prev_msg.tool_calls {
-                                    for call in calls {
-                                        let norm_call_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
-                                        if call.id == *target_id || norm_call_id.as_ref() == norm_target_id.as_ref() {
+                                    // Exact IDs always win over compatibility aliases.
+                                    let matched = calls.iter().find(|call| call.id == *target_id)
+                                        .or_else(|| calls.iter().find(|call| tool_ids.normalize(&call.id) == norm_target_id));
+                                    if let Some(call) = matched {
                                             found = if let Some(ref func) = call.function {
                                                 Some(if func.name == "local_shell_call" { "shell".to_string() } else { func.name.clone() })
                                             } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
@@ -810,8 +819,6 @@ pub fn transform_openai_request_with_session(
                                             } else {
                                                 None
                                             };
-                                            break;
-                                        }
                                     }
                                 }
                                 if found.is_some() {
@@ -835,7 +842,7 @@ pub fn transform_openai_request_with_session(
                 } else if name == "local_shell_call" {
                     "shell"
                 } else if let Some(id) = &msg.tool_call_id {
-                    let norm_id = crate::proxy::common::utils::normalize_tool_id(id);
+                    let norm_id = tool_ids.normalize(id);
                     tool_id_to_name
                         .get(id)
                         .or_else(|| tool_id_to_name.get(norm_id.as_ref()))
@@ -3951,6 +3958,168 @@ mod r24_tool_choice_tests {
             let branches = schema["properties"]["value"]["anyOf"].as_array().unwrap();
             assert_eq!(branches.len(), 2);
             assert!(branches.iter().all(Value::is_object));
+        }
+    }
+}
+
+#[cfg(test)]
+mod r26_request_compat_tests {
+    use super::*;
+    use crate::proxy::mappers::{claude, gemini};
+
+    fn mapped(input: Value) -> Value {
+        let request: OpenAIRequest = serde_json::from_value(input).unwrap();
+        transform_openai_request(&request, "r26-project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0
+    }
+    fn parts<'a>(body: &'a Value, key: &str) -> Vec<&'a Value> {
+        body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part.get(key))
+            .collect()
+    }
+    fn declaration(name: &str) -> Value {
+        json!({"type":"function","function":{"name":name,"parameters":{"type":"object","properties":{"needle":{"type":"string"}},"required":["needle"]}}})
+    }
+
+    #[test]
+    fn r26_distinct_tool_ids_and_result_names_survive_the_complete_pipeline() {
+        for (first, second, expected_first) in [
+            ("call12", "call_12", "call12"),
+            ("call12", "call_13", "call_12"),
+            ("call_12", "call12", "call_12"),
+        ] {
+            let body = mapped(
+                json!({"model":"gemini-2.5-flash","tools":[declaration("read"),declaration("write")],"messages":[
+                    {"role":"user","content":"Perform both operations"},
+                    {"role":"assistant","tool_calls":[{"id":first,"type":"function","function":{"name":"read","arguments":"{\"needle\":\"READ_PATH\"}"}},{"id":second,"type":"function","function":{"name":"write","arguments":"{\"needle\":\"WRITE_PATH\"}"}}]},
+                    {"role":"tool","tool_call_id":first,"content":"READ_OUTPUT"},
+                    {"role":"tool","tool_call_id":second,"content":"WRITE_OUTPUT"},
+                    {"role":"user","content":"Summarize each operation"}
+                ]}),
+            );
+            let calls = parts(&body, "functionCall");
+            let results = parts(&body, "functionResponse");
+            assert_eq!(calls.len(), 2);
+            assert_eq!(results.len(), 2);
+            assert_eq!(calls[0]["id"], expected_first);
+            assert_ne!(calls[0]["id"], calls[1]["id"]);
+            for (index, name, output) in [(0, "read", "READ_OUTPUT"), (1, "write", "WRITE_OUTPUT")]
+            {
+                assert_eq!(results[index]["id"], calls[index]["id"]);
+                assert_eq!(results[index]["name"], name);
+                assert_eq!(results[index]["response"]["output"], output);
+            }
+        }
+    }
+
+    #[test]
+    fn r26_unambiguous_client_id_alias_still_pairs_its_result() {
+        let body = mapped(
+            json!({"model":"gemini-2.5-flash","tools":[declaration("read")],"messages":[
+                {"role":"user","content":"Read file"},
+                {"role":"assistant","tool_calls":[{"id":"call123","type":"function","function":{"name":"read","arguments":"{\"needle\":\"path\"}"}}]},
+                {"role":"tool","tool_call_id":"call_123","content":"OK"}
+            ]}),
+        );
+        assert_eq!(parts(&body, "functionCall")[0]["id"], "call_123");
+        assert_eq!(parts(&body, "functionResponse")[0]["id"], "call_123");
+        assert_eq!(parts(&body, "functionResponse")[0]["name"], "read");
+    }
+
+    #[test]
+    fn r26_literal_undefined_survives_all_request_adapters() {
+        for literal in ["[undefined]", "undefined"] {
+            let args = json!({"needle":literal});
+            let chat = mapped(
+                json!({"model":"gemini-2.5-flash","tools":[declaration("lookup")],"messages":[
+                    {"role":"user","content":literal},
+                    {"role":"assistant","tool_calls":[{"id":"call_literal","type":"function","function":{"name":"lookup","arguments":args.to_string()}}]},
+                    {"role":"tool","tool_call_id":"call_literal","content":literal}
+                ]}),
+            );
+            let native = gemini::wrapper::wrap_request(&json!({"contents":[
+                {"role":"user","parts":[{"text":literal}]},
+                {"role":"model","parts":[{"functionCall":{"id":"call_literal","name":"lookup","args":args}}]},
+                {"role":"user","parts":[{"functionResponse":{"id":"call_literal","name":"lookup","response":{"output":literal}}}]}
+            ]}), "r26-project", "gemini-2.5-flash", None, None, None).unwrap();
+            let claude_request: claude::models::ClaudeRequest = serde_json::from_value(json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
+                {"role":"user","content":literal},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_literal","name":"lookup","input":args}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_literal","content":literal}]}
+            ]})).unwrap();
+            let anthropic = claude::transform_claude_request_in(
+                &claude_request,
+                "r26-project",
+                false,
+                None,
+                "r26-undefined",
+                None,
+            )
+            .unwrap();
+            for (route, body) in [("chat", chat), ("native", native), ("claude", anthropic)] {
+                assert_eq!(
+                    parts(&body, "functionCall")[0]["args"]["needle"],
+                    literal,
+                    "{route}: {body}"
+                );
+                assert_eq!(
+                    parts(&body, "functionResponse")[0]["response"]["output"],
+                    literal,
+                    "{route}: {body}"
+                );
+                assert!(
+                    parts(&body, "text")
+                        .iter()
+                        .any(|text| text.as_str() == Some(literal)),
+                    "{route}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r26_legacy_declarations_choice_and_repeated_history_keep_the_tool_contract() {
+        let tool = declaration("lookup");
+        let legacy = mapped(
+            json!({"model":"gemini-2.5-flash","functions":[tool["function"]],"function_call":{"name":"lookup"},"messages":[
+                {"role":"user","content":"Look up both"},
+                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"FIRST_PATH\"}"}},
+                {"role":"function","name":"lookup","content":"FIRST_OUTPUT"},
+                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"SECOND_PATH\"}"}},
+                {"role":"function","name":"lookup","content":"SECOND_OUTPUT"},
+                {"role":"user","content":"What did you find?"}
+            ]}),
+        );
+        let modern = mapped(
+            json!({"model":"gemini-2.5-flash","tools":[tool],"tool_choice":{"type":"function","function":{"name":"lookup"}},"messages":[{"role":"user","content":"Look up both"}]}),
+        );
+        assert_eq!(legacy["request"]["tools"], modern["request"]["tools"]);
+        assert_eq!(
+            legacy["request"]["toolConfig"],
+            modern["request"]["toolConfig"]
+        );
+        assert_eq!(
+            legacy["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["lookup"])
+        );
+        let calls = parts(&legacy, "functionCall");
+        let results = parts(&legacy, "functionResponse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        for (index, needle, output) in [
+            (0, "FIRST_PATH", "FIRST_OUTPUT"),
+            (1, "SECOND_PATH", "SECOND_OUTPUT"),
+        ] {
+            assert_eq!(calls[index]["args"]["needle"], needle);
+            assert_eq!(results[index]["id"], calls[index]["id"]);
+            assert_eq!(results[index]["name"], "lookup");
+            assert_eq!(results[index]["response"]["output"], output);
         }
     }
 }

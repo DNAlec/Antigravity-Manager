@@ -547,32 +547,53 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
     }
 }
 
-/// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
-pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
-    if depth > 10 {
-        return;
-    }
-    match value {
-        Value::Object(map) => {
-            // 移除值为 "[undefined]" 的键
-            map.retain(|_, v| {
-                if let Some(s) = v.as_str() {
-                    s != "[undefined]"
-                } else {
-                    true
+/// Remove client placeholders only from known Gemini control fields.
+/// Text, tool arguments/results and schemas may legitimately contain this literal.
+pub fn clean_undefined_control_fields(body: &mut Value) {
+    fn clean_fields(value: &mut Value, fields: &[&str]) {
+        if let Some(object) = value.as_object_mut() {
+            for field in fields {
+                if object.get(*field).and_then(Value::as_str) == Some("[undefined]") {
+                    object.remove(*field);
                 }
-            });
-            // 递归处理嵌套
-            for v in map.values_mut() {
-                deep_clean_undefined(v, depth + 1);
             }
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                deep_clean_undefined(v, depth + 1);
-            }
+    }
+
+    let body = if body.get("request").is_some_and(Value::is_object) {
+        &mut body["request"]
+    } else {
+        body
+    };
+    if let Some(config) = body.get_mut("generationConfig") {
+        clean_fields(
+            config,
+            &[
+                "temperature",
+                "topP",
+                "topK",
+                "candidateCount",
+                "maxOutputTokens",
+                "presencePenalty",
+                "frequencyPenalty",
+                "seed",
+                "responseMimeType",
+                "responseLogprobs",
+                "logprobs",
+            ],
+        );
+        if let Some(thinking) = config.get_mut("thinkingConfig") {
+            clean_fields(
+                thinking,
+                &["thinkingBudget", "thinkingLevel", "includeThoughts"],
+            );
         }
-        _ => {}
+        if let Some(image) = config.get_mut("imageConfig") {
+            clean_fields(image, &["aspectRatio", "imageSize", "personGeneration"]);
+        }
+    }
+    if let Some(calling) = body.pointer_mut("/toolConfig/functionCallingConfig") {
+        clean_fields(calling, &["mode"]);
     }
 }
 
