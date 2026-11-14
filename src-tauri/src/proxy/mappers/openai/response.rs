@@ -165,17 +165,8 @@ pub fn transform_openai_response_with_context(
                         });
                     }
 
-                    // 图片处理 (响应中直接返回图片的情况)
-                    if let Some(img) = part.get("inlineData") {
-                        let mime_type = img
-                            .get("mimeType")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("image/png");
-                        let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                        if !data.is_empty() {
-                            content_out
-                                .push_str(&format!("![image](data:{};base64,{})", mime_type, data));
-                        }
+                    if let Some(media) = crate::proxy::common::response_media::render_part(part) {
+                        content_out.push_str(&media.text);
                     }
 
                     // 处理原生代码执行 (executableCode)

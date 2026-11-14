@@ -6,6 +6,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+use crate::proxy::common::response_media::media_identity;
 use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::SignatureCache; // Assuming this is available at crate root or re-exported
 
@@ -413,20 +414,6 @@ fn thinking_fragment_mergeable(part: &Value) -> bool {
             )
         })
     })
-}
-
-// Content identity is independent of JSON key order, protocol aliases, and
-// incidental signature/video metadata attached by a cumulative terminal frame.
-fn media_identity(part: &Value) -> (bool, [u8; 32]) {
-    use sha2::{Digest, Sha256};
-    let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
-    let file = part.get("fileData").or_else(|| part.get("file_data"));
-    let data = inline
-        .and_then(|value| value.get("data"))
-        .or_else(|| file.and_then(|value| value.get("fileUri").or_else(|| value.get("file_uri"))))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    (inline.is_none(), Sha256::digest(data.as_bytes()).into())
 }
 
 // Native signed parts must round-trip without moving their signature onto

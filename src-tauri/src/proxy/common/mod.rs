@@ -7,6 +7,9 @@ pub mod client_adapters;
 pub mod json_schema;
 pub mod model_gate;
 pub mod model_mapping;
+pub(crate) mod response_media;
+#[cfg(test)]
+mod response_media_tests;
 pub mod schema_cache;
 pub mod session;
 pub mod utils; // [ADDED v4.1.24] Tools for deriving stable session identifiers

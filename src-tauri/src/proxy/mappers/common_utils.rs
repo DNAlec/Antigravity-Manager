@@ -1919,6 +1919,41 @@ pub fn validate_and_sanitize_inline_data(
     Some((final_mime, clean_b64.to_string()))
 }
 
+/// Forward a remote media source for the upstream to read, keeping signed URLs intact.
+/// MIME hints are advisory; extensionless URLs use the caller's media default.
+pub fn create_gemini_file_part(
+    source_uri: &str,
+    mime_type: Option<&str>,
+    default_mime: &str,
+) -> Result<Value, String> {
+    let parsed = reqwest::Url::parse(source_uri)
+        .map_err(|_| "Media source URL must be an absolute HTTP(S) or gs URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "gs") || parsed.host_str().is_none() {
+        return Err("Media source URL must be an absolute HTTP(S) or gs URL".to_string());
+    }
+    let extension = parsed.path().rsplit('.').next().unwrap_or_default();
+    let inferred_mime = match extension.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" | "heif" => "image/heic",
+        "avif" => "image/avif",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        _ => default_mime,
+    };
+    let mime = mime_type
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())
+        .unwrap_or(inferred_mime);
+    Ok(json!({"fileData": {"fileUri": source_uri, "mimeType": mime}}))
+}
+
 /// Helper to create a Gemini inlineData part or fallback text if invalid
 pub fn create_gemini_inline_part(
     mime_type: Option<&str>,

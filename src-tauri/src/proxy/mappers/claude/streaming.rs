@@ -58,6 +58,8 @@ impl SignatureManager {
 
 /// 流式状态机
 pub struct StreamingState {
+    pub(super) media: crate::proxy::common::response_media::MediaTracker,
+    pub(super) media_candidate: Option<u64>,
     block_type: BlockType,
     pub block_index: usize,
     pub message_start_sent: bool,
@@ -107,6 +109,8 @@ pub struct StreamingState {
 impl StreamingState {
     pub fn new() -> Self {
         Self {
+            media: Default::default(),
+            media_candidate: None,
             block_type: BlockType::None,
             block_index: 0,
             message_start_sent: false,
@@ -631,14 +635,11 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // 3. InlineData (Image) 处理
-        if let Some(img) = &part.inline_data {
-            let mime_type = &img.mime_type;
-            let data = &img.data;
-            if !data.is_empty() {
-                let markdown_img = format!("![image](data:{};base64,{})", mime_type, data);
-                chunks.extend(self.process_text(&markdown_img, None));
-            }
+        if let Some(text) = part
+            .render_media()
+            .and_then(|media| self.state.media.render(self.state.media_candidate, media))
+        {
+            chunks.extend(self.process_text(&text, None));
         }
 
         chunks
@@ -1164,6 +1165,7 @@ mod tests {
             text: None,
             function_call: Some(fc),
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1208,6 +1210,7 @@ mod tests {
             text: None,
             function_call: Some(fc),
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1256,6 +1259,7 @@ mod tests {
             text: None,
             function_call: Some(fc),
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1310,6 +1314,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1345,6 +1350,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1370,6 +1376,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1394,6 +1401,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1419,6 +1427,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1447,6 +1456,7 @@ mod tests {
             text: Some(text.to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1495,6 +1505,7 @@ mod tests {
             text: None,
             function_call: Some(fc),
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,
@@ -1544,6 +1555,7 @@ mod tests {
             text: Some("Next turn text".to_string()),
             function_call: None,
             inline_data: None,
+            file_data: None,
             thought: None,
             thought_signature: None,
             function_response: None,

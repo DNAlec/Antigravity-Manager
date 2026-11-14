@@ -208,46 +208,38 @@ impl NonStreamingProcessor {
                     if signature.is_some() {
                         self.trailing_signature = signature;
                     }
-                    return;
-                }
+                } else {
+                    self.flush_thinking();
 
-                self.flush_thinking();
+                    // 处理之前的 trailingSignature
+                    if let Some(trailing_sig) = self.trailing_signature.take() {
+                        self.flush_text();
+                        self.content_blocks.push(ContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: Some(trailing_sig),
+                            cache_control: None,
+                        });
+                    }
 
-                // 处理之前的 trailingSignature
-                if let Some(trailing_sig) = self.trailing_signature.take() {
-                    self.flush_text();
-                    self.content_blocks.push(ContentBlock::Thinking {
-                        thinking: String::new(),
-                        signature: Some(trailing_sig),
-                        cache_control: None,
-                    });
-                }
+                    self.text_builder.push_str(text);
 
-                self.text_builder.push_str(text);
-
-                // 非空 text 带签名 - 立即刷新并输出空 thinking 块
-                if let Some(sig) = signature {
-                    self.flush_text();
-                    self.content_blocks.push(ContentBlock::Thinking {
-                        thinking: String::new(),
-                        signature: Some(sig),
-                        cache_control: None,
-                    });
+                    // 非空 text 带签名 - 立即刷新并输出空 thinking 块
+                    if let Some(sig) = signature {
+                        self.flush_text();
+                        self.content_blocks.push(ContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: Some(sig),
+                            cache_control: None,
+                        });
+                    }
                 }
             }
         }
 
-        // 3. InlineData (Image) 处理
-        if let Some(img) = &part.inline_data {
+        if let Some(media) = part.render_media() {
             self.flush_thinking();
-
-            let mime_type = &img.mime_type;
-            let data = &img.data;
-            if !data.is_empty() {
-                let markdown_img = format!("![image](data:{};base64,{})", mime_type, data);
-                self.text_builder.push_str(&markdown_img);
-                self.flush_text();
-            }
+            self.text_builder.push_str(&media.text);
+            self.flush_text();
         }
     }
 
@@ -544,6 +536,7 @@ mod tests {
                         function_call: None,
                         function_response: None,
                         inline_data: None,
+                        file_data: None,
                     }],
                 }),
                 finish_reason: Some("STOP".to_string()),
@@ -599,6 +592,7 @@ mod tests {
                             function_call: None,
                             function_response: None,
                             inline_data: None,
+                            file_data: None,
                         },
                         GeminiPart {
                             text: Some("The answer is 42".to_string()),
@@ -607,6 +601,7 @@ mod tests {
                             function_call: None,
                             function_response: None,
                             inline_data: None,
+                            file_data: None,
                         },
                     ],
                 }),

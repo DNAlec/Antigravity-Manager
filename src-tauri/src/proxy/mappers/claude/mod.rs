@@ -353,6 +353,12 @@ fn process_sse_line(
     }
 
     // 处理所有 parts
+    state.media.begin_frame();
+    state.media_candidate = raw_json
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| crate::proxy::mappers::gemini::candidate_indices(candidates))
+        .and_then(|ids| ids.first().copied());
     if let Some(parts) = raw_json
         .get("candidates")
         .and_then(|c| c.get(0))

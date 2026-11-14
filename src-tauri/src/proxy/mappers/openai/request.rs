@@ -558,6 +558,11 @@ pub fn transform_openai_request_with_session(
                 {
                     parts.push(part);
                 }
+                // A refusal is readable assistant history even when the Chat
+                // response has no ordinary content. Keep it in the next turn.
+                if let Some(refusal) = msg.refusal.as_deref().filter(|s| !s.trim().is_empty()) {
+                    parts.push(json!({"text": refusal}));
+                }
             }
 
             // Handle content (multimodal or text)
@@ -620,10 +625,11 @@ pub fn transform_openai_request_with_session(
                                         } else {
                                             parts.push(json!({"text": "[Image: invalid data URL omitted]"}));
                                         }
-                                    } else if image_url.url.starts_with("http") {
-                                        parts.push(json!({
-                                            "fileData": { "fileUri": &image_url.url, "mimeType": "image/jpeg" }
-                                        }));
+                                    } else if image_url.url.starts_with("http") || image_url.url.starts_with("gs://") {
+                                        let part = crate::proxy::mappers::common_utils::create_gemini_file_part(
+                                            &image_url.url, None, "image/jpeg",
+                                        ).unwrap_or_else(|_| json!({"text": format!("[Image: {}]", image_url.url)}));
+                                        parts.push(part);
                                     } else {
                                         // [NEW] 处理本地文件路径 (file:// 或 Windows/Unix 路径)
                                         let file_path = if image_url.url.starts_with("file://") {
@@ -870,7 +876,12 @@ pub fn transform_openai_request_with_session(
                                             ));
                                         }
                                     } else {
-                                        texts.push("[image link]".to_string());
+                                        match crate::proxy::mappers::common_utils::create_gemini_file_part(
+                                            &image_url.url, None, "image/jpeg",
+                                        ) {
+                                            Ok(part) => extra_parts.push(part),
+                                            Err(_) => texts.push(format!("[Image: {}]", image_url.url)),
+                                        }
                                     }
                                 }
                                 OpenAIContentBlock::File { file } => {
@@ -3671,6 +3682,67 @@ mod tests {
 #[cfg(test)]
 mod responses_reasoning_replay_tests {
     use super::*;
+    #[test]
+    fn remote_images_survive_user_and_tool_history_with_their_mime_type() {
+        const IMAGE_URL: &str = "https://images.example/result.PNG?download=1";
+        let image = json!({"type":"image_url", "image_url":{"url":IMAGE_URL}});
+        let histories = [
+            json!([{"role":"user", "content":[{"type":"text","text":"Describe the image."}, image]}]),
+            json!([
+                {"role":"user", "content":"Read the image."},
+                {"role":"assistant", "tool_calls":[{"id":"call-image", "type":"function", "function":{"name":"view_image","arguments":"{}"}}]},
+                {"role":"tool", "tool_call_id":"call-image", "content":[image]}
+            ]),
+        ];
+        for messages in histories {
+            let request: OpenAIRequest = serde_json::from_value(json!({
+                "model":"gemini-3.8-flash-tiered", "messages":messages,
+                "tools":[{"type":"function","function":{"name":"view_image","parameters":{"type":"object","properties":{}}}}]
+            })).unwrap();
+            let (body, _, _, _) =
+                transform_openai_request(&request, "test-project", "gemini-3.8-flash-tiered", None)
+                    .unwrap();
+            let wire = body["request"]["contents"].to_string();
+            assert_eq!(wire.matches(IMAGE_URL).count(), 1, "{wire}");
+            assert!(wire.contains("image/png"), "{wire}");
+        }
+    }
+
+    #[test]
+    fn assistant_refusal_survives_chat_history_conversion() {
+        for content in [Value::Null, json!("An alternative suggestion.")] {
+            let request: OpenAIRequest = serde_json::from_value(json!({
+                "model": "gemini-2.5-flash",
+                "messages": [
+                    {"role": "user", "content": "Previous request."},
+                    {"role": "assistant", "content": content,
+                     "refusal": "I cannot provide the requested private data."},
+                    {"role": "user", "content": "Explain that answer."}
+                ]
+            }))
+            .unwrap();
+            let (body, _, _, _) =
+                transform_openai_request(&request, "test-project", "gemini-2.5-flash", None)
+                    .unwrap();
+            let contents = body["request"]["contents"].as_array().unwrap();
+            let model_text: String = contents
+                .iter()
+                .filter(|message| message["role"] == "model")
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .filter_map(|part| part["text"].as_str())
+                .collect();
+            assert_eq!(
+                model_text
+                    .matches("I cannot provide the requested private data.")
+                    .count(),
+                1
+            );
+            if content.is_string() {
+                assert!(model_text.contains("An alternative suggestion."));
+            }
+        }
+    }
+
     #[test]
     fn separate_reasoning_is_never_downgraded_to_answer_text_on_responses() {
         let msg: OpenAIMessage = serde_json::from_value(json!({"role":"assistant","content":"Visible answer","reasoning_content":"Distinct summary","thoughtSignature":"distinct-signature"})).unwrap();
