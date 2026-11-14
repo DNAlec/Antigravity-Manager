@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.5)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.6)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.5-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.6-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.5**（2026-11-14）：修复失败重试、流式终态与 Responses 回放中的缓存连续性，保留成功历史签名、文件输出、工具身份和媒体归属，修复累计图片重复及 Schema 约束丢失。已与 sub2api 联验实际交付和图片计费（PR #5，Thanks to @DNAlec）。详见[完整更新日志](CHANGELOG.md)。
+> 最新版本 **v5.0.6**（2026-11-14）：改善工具 Schema 和本地引用兼容性并保留资源限制，支持 Responses 明文推理与压缩历史，兼容无歧义的 Gemini 候选索引表示。上游版本检查改为仅提示，未签名 macOS 构建仍提供应用归档（PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5)，Thanks to @DNAlec）。OpenCode `myt` 客户端能力配置问题尚未修复，不包含在本次发布中。详见[完整更新日志](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

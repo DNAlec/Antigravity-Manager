@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.5)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.6)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.5-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.6-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -528,7 +528,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.5** (2026-11-14): Preserves cache continuity across failed retries, streaming completion and Responses replay. Fixes cumulative image duplication, signed history, file output, tool identity, Schema constraints and media ownership. Validated together with sub2api for actual delivery and image billing (PR #5, Thanks to @DNAlec). See the [full release notes](CHANGELOG_EN.md).
+> Latest version **v5.0.6** (2026-11-14): Improves tool Schema and local-reference compatibility with resource limits, preserves readable Responses reasoning and compaction history, and accepts unambiguous Gemini candidate index variants. Upstream version checks are now notification-only, and unsigned macOS app archives remain available (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec). The OpenCode `myt` client capability configuration issue remains unresolved and is not included. See the [full release notes](CHANGELOG_EN.md).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 
