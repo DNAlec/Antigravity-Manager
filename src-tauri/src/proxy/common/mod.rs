@@ -10,6 +10,7 @@ pub mod model_mapping;
 pub(crate) mod response_media;
 #[cfg(test)]
 mod response_media_tests;
+pub(crate) mod response_tools;
 pub mod schema_cache;
 pub mod session;
 pub mod utils; // [ADDED v4.1.24] Tools for deriving stable session identifiers
