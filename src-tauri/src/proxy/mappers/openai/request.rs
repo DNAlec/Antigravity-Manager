@@ -696,6 +696,11 @@ pub fn transform_openai_request_with_session(
                                             parts.extend(crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text));
                                         }
                                     }
+                                OpenAIContentBlock::Refusal { refusal } => {
+                                    if !refusal.is_empty() {
+                                        parts.push(json!({"text":refusal}));
+                                    }
+                                }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(",") {
@@ -953,7 +958,8 @@ pub fn transform_openai_request_with_session(
                         let mut texts = Vec::new();
                         for block in blocks {
                             match block {
-                                OpenAIContentBlock::Text { text } => texts.push(text.clone()),
+                                OpenAIContentBlock::Text { text }
+                                | OpenAIContentBlock::Refusal { refusal: text } => texts.push(text.clone()),
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(',') {

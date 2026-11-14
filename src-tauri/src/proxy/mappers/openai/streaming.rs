@@ -12,6 +12,7 @@ use crate::proxy::common::response_tools::ToolCallTracker;
 use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
+use crate::proxy::pipeline::candidate_selection::CandidateSelection;
 use crate::proxy::pipeline::stream_error::{
     is_refusal_finish_reason, response_has_prompt_refusal, response_is_refusal,
 };
@@ -114,7 +115,7 @@ pub struct OpenAIChatStreamHandler {
     pub client_tool_names: std::collections::HashSet<String>,
     pub include_usage: bool,
     chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
-    first_candidate_only: bool,
+    candidate_selection: Option<CandidateSelection>,
     tool_calls: ToolCallTracker,
     candidates: std::collections::BTreeMap<u64, ChatCandidateState>,
     marked_multi_candidate: bool,
@@ -154,8 +155,8 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             } else {
                 json
             };
-            if self.first_candidate_only {
-                super::response::retain_first_candidate(&mut actual_data);
+            if let Some(selection) = &self.candidate_selection {
+                selection.project(&mut actual_data);
             }
             if let Some(u) = actual_data.get("usageMetadata") {
                 merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
@@ -665,6 +666,35 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_openai_sse_stream_for_responses_with_selection(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_for_responses_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    candidate_selection: CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     create_openai_sse_stream_with_options(
         gemini_stream,
         model,
@@ -675,7 +705,7 @@ where
         causal_anchor,
         text_context_anchor,
         None,
-        true,
+        Some(candidate_selection),
     )
 }
 
@@ -733,7 +763,7 @@ where
         causal_anchor,
         text_context_anchor,
         chat_tool_kinds,
-        false,
+        None,
     )
 }
 
@@ -748,7 +778,7 @@ fn create_openai_sse_stream_with_options<S, E>(
     causal_anchor: Option<String>,
     text_context_anchor: Option<String>,
     chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
-    first_candidate_only: bool,
+    candidate_selection: Option<CandidateSelection>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -782,7 +812,7 @@ where
         client_tool_names,
         include_usage,
         chat_tool_kinds,
-        first_candidate_only,
+        candidate_selection,
         tool_calls: ToolCallTracker::default(),
         candidates: Default::default(),
         marked_multi_candidate: false,
@@ -1211,6 +1241,7 @@ fn codex_sse_frame(event: &Value) -> Bytes {
 /// 此处仅保留 Gemini SSE → Responses API 事件流（reasoning / message / tool /
 /// grounding / 终态）的协议差异。
 pub struct CodexResponsesStreamHandler {
+    candidate_selection: CandidateSelection,
     media: MediaTracker,
     model: String,
     session_id: String,
@@ -1265,6 +1296,7 @@ impl CodexResponsesStreamHandler {
             .unwrap_or_default()
             .as_secs();
         Self {
+            candidate_selection: Default::default(),
             media: MediaTracker::default(),
             model,
             session_id,
@@ -1931,6 +1963,7 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             }
         };
 
+        self.candidate_selection.project(&mut json);
         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
             inner
         } else {
@@ -2106,6 +2139,41 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_codex_sse_stream_with_selection(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        _assistant_turn_index,
+        response_id,
+        completion_tx,
+        cache_tool_calls,
+        text_context_anchor,
+        tool_kinds,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_codex_sse_stream_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    _assistant_turn_index: usize,
+    response_id: String,
+    completion_tx: Option<
+        tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
+    >,
+    cache_tool_calls: bool,
+    text_context_anchor: Option<String>,
+    tool_kinds: super::request::ResponsesToolKinds,
+    candidate_selection: CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let trace_info = format!(
         "model={} session={} response_id={} messages={}",
         model, session_id, response_id, message_count
@@ -2119,6 +2187,7 @@ where
         cache_tool_calls,
     );
     handler.tool_kinds = tool_kinds;
+    handler.candidate_selection = candidate_selection;
     if let Some(anchor) = text_context_anchor {
         handler.thinking_acc = handler.thinking_acc.with_text_context_anchor(anchor);
     }
@@ -3724,3 +3793,7 @@ mod response_usability_tests;
 #[cfg(test)]
 #[path = "response_failures_tests.rs"]
 mod response_failures_tests;
+
+#[cfg(test)]
+#[path = "response_selection_tests.rs"]
+mod response_selection_tests;

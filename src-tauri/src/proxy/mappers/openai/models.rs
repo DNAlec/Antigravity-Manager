@@ -340,6 +340,8 @@ pub enum OpenAIContent {
 pub enum OpenAIContentBlock {
     #[serde(rename = "text", alias = "input_text")]
     Text { text: String },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: OpenAIImageUrl },
     #[serde(rename = "file")]

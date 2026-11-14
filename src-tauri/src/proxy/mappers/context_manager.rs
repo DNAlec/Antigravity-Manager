@@ -662,7 +662,8 @@ impl ContextManager {
                     crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
                         for block in blocks {
                             match block {
-                                crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } => {
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text }
+                                | crate::proxy::mappers::openai::models::OpenAIContentBlock::Refusal { refusal: text } => {
                                     total += estimate_tokens_from_str(text);
                                 }
                                 crate::proxy::mappers::openai::models::OpenAIContentBlock::ImageUrl { image_url } => {

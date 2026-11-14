@@ -187,6 +187,12 @@ pub enum ContentBlock {
         content: serde_json::Value,
     },
 
+    #[serde(rename = "tool_search_tool_result")]
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchResultContent,
+    },
+
     #[serde(rename = "mcp_tool_use")]
     McpToolUse {
         id: String,
@@ -203,6 +209,26 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolSearchResultContent {
+    #[serde(rename = "tool_search_tool_search_result")]
+    Found { tool_references: Vec<ToolReference> },
+    #[serde(rename = "tool_search_tool_result_error")]
+    Error {
+        error_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolReference {
+    #[serde(rename = "tool_reference")]
+    Tool { tool_name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

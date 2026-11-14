@@ -1062,8 +1062,6 @@ fn build_contents(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     _existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
@@ -1142,34 +1140,12 @@ fn build_contents(
                                 continue;
                             }
 
-                            // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
-                            // 检查该文本是否与上一轮任务描述完全一致。
-                            if !is_assistant && *previous_was_tool_result {
-                                if let Some(last_task) = last_user_task_text_normalized {
-                                    let current_normalized =
-                                        text.replace(|c: char| c.is_whitespace(), "");
-                                    if !current_normalized.is_empty()
-                                        && current_normalized == *last_task
-                                    {
-                                        tracing::info!("[Claude-Request] Dropping duplicated task text echo (len: {})", text.len());
-                                        continue;
-                                    }
-                                }
-                            }
-
                             parts.extend(
                                 crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
                                     text,
                                 ),
                             );
                             saw_non_thinking = true;
-
-                            // 记录最近一次 User 任务文本用于后续比对
-                            if !is_assistant {
-                                *last_user_task_text_normalized =
-                                    Some(text.replace(|c: char| c.is_whitespace(), ""));
-                            }
-                            *previous_was_tool_result = false;
                         }
                     }
                     ContentBlock::Thinking {
@@ -1478,13 +1454,39 @@ fn build_contents(
                             response["parts"] = Value::Array(extra_parts);
                         }
                         parts.push(json!({ "functionResponse": response }));
-
-                        // 标记状态，用于下一条 User 消息的去重判断
-                        *previous_was_tool_result = true;
                     }
                     ContentBlock::WebFetchToolResult { content, .. }
                     | ContentBlock::CodeExecutionToolResult { content, .. } => {
                         append_server_tool_result_parts(content, &mut parts, 0)?;
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::ToolSearchToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Tool search result (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            ToolSearchResultContent::Found { tool_references } => {
+                                for ToolReference::Tool { tool_name } in tool_references {
+                                    parts.push(
+                                        json!({"text":format!("Discovered tool: {tool_name}")}),
+                                    );
+                                }
+                            }
+                            ToolSearchResultContent::Error {
+                                error_code,
+                                error_message,
+                            } => {
+                                parts.push(
+                                    json!({"text":format!("Tool search failed: {error_code}")}),
+                                );
+                                if let Some(message) = error_message {
+                                    parts.push(json!({"text":message}));
+                                }
+                            }
+                        }
                         saw_non_thinking = true;
                     }
                     ContentBlock::SearchResult {
@@ -1616,8 +1618,6 @@ fn build_google_content(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Value, String> {
     let role = if msg.role == "assistant" {
@@ -1677,8 +1677,6 @@ fn build_google_content(
         mapped_model,
         last_thought_signature,
         pending_tool_use_ids,
-        last_user_task_text_normalized,
-        previous_was_tool_result,
         existing_tool_result_ids,
     )?;
 
@@ -1719,10 +1717,6 @@ fn build_google_contents(
     // Track pending tool_use IDs for recovery
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
 
-    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
-    let mut last_user_task_text_normalized: Option<String> = None;
-    let mut previous_was_tool_result = false;
-
     let _msg_count = messages.len();
 
     // [FIX #632] Pre-scan all messages to identify all tool_result IDs that ALREADY exist in the conversation.
@@ -1758,8 +1752,6 @@ fn build_google_contents(
             mapped_model,
             &mut last_thought_signature,
             &mut pending_tool_use_ids,
-            &mut last_user_task_text_normalized,
-            &mut previous_was_tool_result,
             &existing_tool_result_ids,
         )?;
 

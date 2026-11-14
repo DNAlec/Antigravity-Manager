@@ -226,7 +226,43 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_claude_sse_stream_with_selection(
+        gemini_stream,
+        trace_id,
+        email,
+        session_id,
+        scaling_enabled,
+        context_limit,
+        estimated_prompt_tokens,
+        message_count,
+        client_adapter,
+        registered_tool_names,
+        text_context_anchor,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_claude_sse_stream_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    trace_id: String,
+    email: String,
+    session_id: Option<String>, // [NEW v3.3.17] Session ID for signature caching
+    scaling_enabled: bool,      // [NEW] Flag for context usage scaling
+    context_limit: u32,
+    estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
+    message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
+    client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
+    registered_tool_names: Vec<String>,   // [FIX #MCP] Tool names for fuzzy matching
+    text_context_anchor: Option<String>,
+    candidate_selection: crate::proxy::pipeline::candidate_selection::CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let mut state = StreamingState::new();
+    state.candidate_selection = candidate_selection;
     if let Some(anchor) = text_context_anchor {
         state.thinking_acc = state.thinking_acc.with_text_context_anchor(anchor);
     }
@@ -296,12 +332,14 @@ fn process_sse_line(
     }
 
     // 解析 JSON
-    let json_value: serde_json::Value = match serde_json::from_str(data_str) {
+    let mut json_value: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
     let mut chunks = Vec::new();
+
+    state.candidate_selection.project(&mut json_value);
 
     // 解包 response 字段 (如果存在)
     let raw_json = json_value.get("response").unwrap_or(&json_value);

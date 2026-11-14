@@ -846,7 +846,8 @@ fn openai_content_text(content: &OpenAIContent) -> String {
         OpenAIContent::Array(parts) => parts
             .iter()
             .filter_map(|part| match part {
-                OpenAIContentBlock::Text { text } => Some(text.as_str()),
+                OpenAIContentBlock::Text { text }
+                | OpenAIContentBlock::Refusal { refusal: text } => Some(text.as_str()),
                 _ => None,
             })
             .collect(),
@@ -1385,10 +1386,9 @@ mod responses_conversion_terminal_tests {
     }
 }
 
-/// 仅识别客户端本地私有展示项（如本地渲染的思考块），绝不误杀伴随工具调用的真实过程进度说明。
-/// 只有明确以 `msg_thought_` 为 ID 前缀或历史遗留以 `**Thinking**` 开头的消息才被视为 transcript-only。
-/// 真实的 `phase="commentary"` 消息包含正文说明，必须作为上下文历史保留以保证模型少样本进度输出范式。
-fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool {
+/// Only explicitly marked local thought-message IDs are transcript-only.
+/// Ordinary assistant text, including Markdown headings, remains history.
+fn is_codex_transcript_only_assistant_message(item: &Value) -> bool {
     if responses_input_item_type(item) != "message"
         || item.get("role").and_then(Value::as_str) != Some("assistant")
     {
@@ -1398,7 +1398,6 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
     item.get("id")
         .and_then(Value::as_str)
         .is_some_and(|id| id.starts_with(CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX))
-        || text.trim_start().starts_with("**Thinking**")
 }
 
 #[cfg(test)]
@@ -2234,7 +2233,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             "phase": "commentary",
             "content": [{"type": "output_text", "text": "progress"}],
         });
-        let contaminated_final = json!({
+        let ordinary_heading = json!({
             "type": "message",
             "role": "assistant",
             "phase": "final_answer",
@@ -2247,21 +2246,14 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             "content": [{"type": "output_text", "text": "done"}],
         });
 
-        assert!(is_codex_transcript_only_assistant_message(
-            &thought, "thinking"
+        assert!(is_codex_transcript_only_assistant_message(&thought));
+        assert!(!is_codex_transcript_only_assistant_message(
+            &normal_commentary
         ));
         assert!(!is_codex_transcript_only_assistant_message(
-            &normal_commentary,
-            "progress"
+            &ordinary_heading
         ));
-        assert!(is_codex_transcript_only_assistant_message(
-            &contaminated_final,
-            "**Thinking**\n\nlegacy thought"
-        ));
-        assert!(!is_codex_transcript_only_assistant_message(
-            &clean_final,
-            "done"
-        ));
+        assert!(!is_codex_transcript_only_assistant_message(&clean_final));
     }
 
     #[test]
@@ -4900,7 +4892,7 @@ pub async fn handle_completions(
                             .to_string();
                         let (content, joined_text, has_media) =
                             responses_message_content(&mut item, step_marker);
-                        if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                        if is_codex_transcript_only_assistant_message(&item) {
                             continue;
                         }
 
@@ -6024,7 +6016,7 @@ pub async fn handle_completions(
                 if client_wants_stream {
                     let mut session_completion_rx = None;
                     let mut openai_stream = if is_codex_style {
-                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_context;
+                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_selection;
                         let completion_tx = if store_response {
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             session_completion_rx = Some(rx);
@@ -6032,7 +6024,7 @@ pub async fn handle_completions(
                         } else {
                             None
                         };
-                        create_codex_sse_stream_with_context(
+                        create_codex_sse_stream_with_selection(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id_str.clone(),
@@ -6043,6 +6035,7 @@ pub async fn handle_completions(
                             store_response,
                             response_text_context.clone(),
                             responses_tool_kinds.clone(),
+                            stream_errors.candidate_selection().unwrap_or_default(),
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_context;
@@ -6182,11 +6175,11 @@ pub async fn handle_completions(
                     // Forced Stream Internal -> Convert to Legacy JSON
                     // Use CHAT SSE Stream (so Collector can parse it)
                     use crate::proxy::mappers::openai::streaming::{
-                        create_openai_sse_stream_for_responses_with_context,
+                        create_openai_sse_stream_for_responses_with_selection,
                         create_openai_sse_stream_with_context,
                     };
                     let mut openai_stream = if is_responses_api {
-                        create_openai_sse_stream_for_responses_with_context(
+                        create_openai_sse_stream_for_responses_with_selection(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id_str.clone(),
@@ -6195,6 +6188,7 @@ pub async fn handle_completions(
                             true,
                             Some(causal_anchor),
                             response_text_context.clone(),
+                            stream_errors.candidate_selection().unwrap_or_default(),
                         )
                     } else {
                         create_openai_sse_stream_with_context(
@@ -9459,7 +9453,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         .to_string();
                     let (content, joined_text, has_media) =
                         responses_message_content(&mut item, step_marker);
-                    if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                    if is_codex_transcript_only_assistant_message(&item) {
                         continue;
                     }
 
@@ -11784,3 +11778,7 @@ mod responses_plaintext_compatibility_tests {
 #[cfg(test)]
 #[path = "openai_request_identity_tests.rs"]
 mod request_identity_tests;
+
+#[cfg(test)]
+#[path = "openai_request_text_tests.rs"]
+mod request_text_tests;

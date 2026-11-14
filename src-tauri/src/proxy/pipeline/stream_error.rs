@@ -51,6 +51,8 @@ impl UpstreamStreamError {
 #[derive(Default)]
 struct Observation {
     failure: Option<UpstreamStreamError>,
+    candidate_failures: std::collections::BTreeMap<u64, UpstreamStreamError>,
+    first_candidate_index: Option<u64>,
     has_output: bool,
     usage: Option<Value>,
 }
@@ -59,7 +61,7 @@ struct Observation {
 pub struct UpstreamStreamErrorObserver {
     state: Arc<Mutex<Observation>>,
     detect_model_failures: bool,
-    first_candidate_only: bool,
+    candidate_selection: Option<super::candidate_selection::CandidateSelection>,
 }
 
 impl Default for UpstreamStreamErrorObserver {
@@ -67,7 +69,7 @@ impl Default for UpstreamStreamErrorObserver {
         Self {
             state: Arc::default(),
             detect_model_failures: true,
-            first_candidate_only: false,
+            candidate_selection: None,
         }
     }
 }
@@ -76,17 +78,36 @@ impl UpstreamStreamErrorObserver {
     /// Claude and Responses project the first candidate; unselected candidates
     /// must not turn the selected answer into a failed response.
     pub fn with_selected_candidate(mut self) -> Self {
-        self.first_candidate_only = true;
+        self.candidate_selection = Some(Default::default());
         self
+    }
+
+    pub fn candidate_selection(&self) -> Option<super::candidate_selection::CandidateSelection> {
+        self.candidate_selection.clone()
+    }
+
+    fn selected_index(&self, state: &Observation) -> Option<u64> {
+        self.candidate_selection
+            .as_ref()
+            .and_then(|selection| selection.index())
+            .or(state.first_candidate_index)
     }
 
     pub fn failure(&self) -> Option<UpstreamStreamError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.failure.clone().map(|mut failure| {
-            failure.after_output |= state.has_output;
-            failure.usage = state.usage.clone();
-            failure
-        })
+        state
+            .failure
+            .as_ref()
+            .or_else(|| {
+                self.selected_index(&state)
+                    .and_then(|index| state.candidate_failures.get(&index))
+            })
+            .cloned()
+            .map(|mut failure| {
+                failure.after_output |= state.has_output;
+                failure.usage = state.usage.clone();
+                failure
+            })
     }
 
     /// Transport/EOF failures have no structured envelope. Preserve measured
@@ -121,11 +142,16 @@ impl UpstreamStreamErrorObserver {
 
     pub fn take(&self) -> Option<UpstreamStreamError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.failure.take().map(|mut failure| {
-            failure.after_output |= state.has_output;
-            failure.usage = state.usage.clone();
-            failure
-        })
+        let selected = self.selected_index(&state);
+        state
+            .failure
+            .take()
+            .or_else(|| selected.and_then(|index| state.candidate_failures.remove(&index)))
+            .map(|mut failure| {
+                failure.after_output |= state.has_output;
+                failure.usage = state.usage.clone();
+                failure
+            })
     }
 
     pub fn has_measured_usage(&self) -> bool {
@@ -160,7 +186,47 @@ impl UpstreamStreamErrorObserver {
         if state.failure.is_some() {
             return;
         }
-        if let Some(mut failure) = upstream_error_for_selection(value, self.first_candidate_only) {
+        let global_finish_failure = inner
+            .get("finishReason")
+            .or_else(|| inner.get("finish_reason"))
+            .and_then(Value::as_str)
+            .is_some_and(is_failure_finish_reason);
+        if self.candidate_selection.is_some()
+            && error_envelope(value).is_none()
+            && !global_finish_failure
+        {
+            if let Some(candidates) = inner.get("candidates").and_then(Value::as_array) {
+                if let Some(indices) = crate::proxy::mappers::gemini::candidate_indices(candidates)
+                {
+                    if state.first_candidate_index.is_none() {
+                        state.first_candidate_index = indices.first().copied();
+                    }
+                    for (candidate, index) in candidates.iter().zip(indices) {
+                        if !self.detect_model_failures
+                            || state.candidate_failures.contains_key(&index)
+                        {
+                            continue;
+                        }
+                        if !candidate
+                            .get("finishReason")
+                            .or_else(|| candidate.get("finish_reason"))
+                            .and_then(Value::as_str)
+                            .is_some_and(is_failure_finish_reason)
+                        {
+                            continue;
+                        }
+                        let mut selected = inner.clone();
+                        selected["candidates"] = json!([candidate]);
+                        if let Some(mut failure) = model_finish_failure(&selected, false) {
+                            failure.after_output = state.has_output;
+                            state.candidate_failures.insert(index, failure);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(mut failure) = upstream_error_from_event(value) {
             if !self.detect_model_failures && failure.is_model_failure() {
                 return;
             }

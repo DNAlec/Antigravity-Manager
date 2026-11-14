@@ -483,25 +483,6 @@ impl InboundThinkingPipeline {
                                     continue;
                                 }
 
-                                // 协议无关自愈：检查是否夹带旧版遗留思考前缀 (如 **Thinking**)
-                                if raw_text.trim_start().starts_with("**Thinking**") {
-                                    let clean_thought = Self::strip_thinking_prefix(raw_text);
-                                    if thinking_part.is_none() && is_thinking_enabled {
-                                        if crate::proxy::thinking_store::is_meaningful_thought(
-                                            &clean_thought,
-                                        ) {
-                                            // 铁律 I4：思考块绝不携带签名
-                                            let t_obj = json!({
-                                                "text": clean_thought,
-                                                "thought": true,
-                                            });
-                                            thinking_part = Some(t_obj);
-                                        }
-                                    }
-                                    // 若已有思考块，该遗留思考块作为陈旧副本剥离，防止二次污染正文
-                                    continue;
-                                }
-
                                 other_parts.push(part);
                             } else {
                                 other_parts.push(part);
@@ -3130,18 +3111,6 @@ impl InboundThinkingPipeline {
             obj.retain(|k, _| k == "request");
         }
     }
-
-    /// 剥离遗留思考块的前缀标记 (**Thinking**)
-    fn strip_thinking_prefix(text: &str) -> String {
-        let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("**Thinking**") {
-            let rest = rest.trim_start_matches(':');
-            rest.trim_start_matches(|c| c == '\r' || c == '\n' || c == ' ' || c == '\t')
-                .to_string()
-        } else {
-            text.to_string()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3453,34 +3422,42 @@ mod tests {
     }
 
     #[test]
-    fn test_heals_legacy_thinking_prefix_without_corrupting_prose() {
-        let mut contents = vec![json!({
-            "role": "model",
-            "parts": [
-                { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
-                { "text": "正在执行检查。" },
-                {
-                    "functionCall": {
-                        "name": "inspect",
-                        "args": {}
-                    }
-                }
-            ]
-        })];
+    fn r30_markdown_thinking_headings_remain_plain_text_for_every_target() {
+        for model in ["claude-sonnet-4-6", "gemini-2.5-pro"] {
+            for enabled in [false, true] {
+                let mut contents = vec![json!({
+                    "role": "model",
+                    "parts": [
+                        { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
+                        { "text": "正在执行检查。" },
+                        {
+                            "functionCall": {
+                                "name": "inspect",
+                                "args": {}
+                            }
+                        }
+                    ]
+                })];
 
-        InboundThinkingPipeline::process_contents(
-            &mut contents,
-            "claude-sonnet-4-6",
-            true,
-            None,
-            false,
-        );
+                InboundThinkingPipeline::process_contents(
+                    &mut contents,
+                    model,
+                    enabled,
+                    None,
+                    false,
+                );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：无签名思考块被丢弃，仅保留可见正文与工具调用
-        assert!(parts.iter().all(|p| p.get("thought").is_none()));
-        assert_eq!(parts[0]["text"], "正在执行检查。");
-        assert!(parts[1].get("functionCall").is_some());
+                let parts = contents[0]["parts"].as_array().expect("parts array");
+                assert!(parts.iter().all(|p| p.get("thought").is_none()));
+                assert_eq!(parts.len(), 3);
+                assert_eq!(
+                    parts[0]["text"],
+                    "**Thinking**\n\n分析了案例数据，准备调用工具。"
+                );
+                assert_eq!(parts[1]["text"], "正在执行检查。");
+                assert!(parts[2].get("functionCall").is_some());
+            }
+        }
     }
 
     #[test]
