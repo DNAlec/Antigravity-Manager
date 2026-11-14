@@ -46,6 +46,47 @@ pub fn resolve_shell_tool_name(
     model_tool_name.to_string()
 }
 
+pub(crate) fn chat_tool_call(
+    name: &str,
+    args: &Value,
+    id: String,
+    kinds: Option<&super::request::ResponsesToolKinds>,
+) -> ToolCall {
+    let identity = kinds.and_then(|kinds| kinds.wire_identity(name));
+    let wire_name = identity.as_ref().map_or(name, |(name, _, _)| name.as_str());
+    let custom = identity
+        .as_ref()
+        .filter(|(_, _, custom)| *custom)
+        .and_then(|_| {
+            args.as_object()
+                .filter(|args| args.len() == 1)
+                .and_then(|args| args.get("input"))
+                .and_then(Value::as_str)
+                .map(|input| ToolCustom {
+                    name: wire_name.to_owned(),
+                    input: input.to_owned(),
+                })
+        });
+    ToolCall {
+        id,
+        r#type: if custom.is_some() {
+            "custom"
+        } else {
+            "function"
+        }
+        .to_owned(),
+        function: custom.is_none().then(|| ToolFunction {
+            name: wire_name.to_owned(),
+            arguments: args.to_string(),
+        }),
+        custom,
+        signature: None,
+        status: None,
+        call_id: None,
+        operation: None,
+    }
+}
+
 pub fn transform_openai_response(
     gemini_response: &Value,
     session_id: Option<&str>,
@@ -61,7 +102,35 @@ pub fn transform_openai_response(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) fn retain_first_candidate(value: &mut Value) {
+    let raw = if value.get("response").is_some_and(Value::is_object) {
+        &mut value["response"]
+    } else {
+        value
+    };
+    if let Some(candidates) = raw.get_mut("candidates").and_then(Value::as_array_mut) {
+        candidates.truncate(1);
+    }
+}
+
+pub fn transform_openai_response_for_responses_with_context(
+    gemini_response: &Value,
+    session_id: Option<&str>,
+    message_count: usize,
+    client_tool_names: Option<&std::collections::HashSet<String>>,
+    text_context_anchor: Option<String>,
+) -> OpenAIResponse {
+    let mut selected = gemini_response.clone();
+    retain_first_candidate(&mut selected);
+    transform_openai_response_with_context(
+        &selected,
+        session_id,
+        message_count,
+        client_tool_names,
+        text_context_anchor,
+    )
+}
+
 pub fn transform_openai_response_with_context(
     gemini_response: &Value,
     session_id: Option<&str>,
@@ -69,11 +138,32 @@ pub fn transform_openai_response_with_context(
     client_tool_names: Option<&std::collections::HashSet<String>>,
     text_context_anchor: Option<String>,
 ) -> OpenAIResponse {
+    transform_openai_response_with_tool_kinds(
+        gemini_response,
+        session_id,
+        message_count,
+        client_tool_names,
+        text_context_anchor,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn transform_openai_response_with_tool_kinds(
+    gemini_response: &Value,
+    session_id: Option<&str>,
+    message_count: usize,
+    client_tool_names: Option<&std::collections::HashSet<String>>,
+    text_context_anchor: Option<String>,
+    tool_kinds: Option<&super::request::ResponsesToolKinds>,
+) -> OpenAIResponse {
     let empty_set = std::collections::HashSet::new();
     let client_tool_names = client_tool_names.unwrap_or(&empty_set);
 
     // 解包 response 字段
     let raw = gemini_response.get("response").unwrap_or(gemini_response);
+    let session_id = session_id
+        .filter(|_| crate::proxy::pipeline::stream_error::upstream_error_from_event(raw).is_none());
 
     let mut choices = Vec::new();
 
@@ -128,7 +218,6 @@ pub fn transform_openai_response_with_context(
                         // [FIX #1575 & #3430] 标准化并清洗 shell / PowerShell 等工具参数名称与必填字段
                         normalize_and_sanitize_tool_args(name, &mut args_json);
 
-                        let arguments_str = args_json.to_string();
                         let final_name = resolve_shell_tool_name(name, client_tool_names);
 
                         let id = fc
@@ -151,18 +240,7 @@ pub fn transform_openai_response_with_context(
                             }
                         }
 
-                        tool_calls.push(ToolCall {
-                            id,
-                            r#type: "function".to_string(),
-                            function: Some(ToolFunction {
-                                name: final_name.to_string(),
-                                arguments: arguments_str,
-                            }),
-                            signature: None,
-                            status: None,
-                            call_id: None,
-                            operation: None,
-                        });
+                        tool_calls.push(chat_tool_call(&final_name, &args_json, id, tool_kinds));
                     }
 
                     if let Some(media) = crate::proxy::common::response_media::render_part(part) {
@@ -276,7 +354,6 @@ pub fn transform_openai_response_with_context(
                         "STOP" => "stop",
                         "MAX_TOKENS" => "length",
                         "SAFETY" | "RECITATION" => "content_filter",
-                        "MALFORMED_FUNCTION_CALL" => "stop",
                         _ => "stop",
                     })
                     .unwrap_or("stop")
@@ -315,7 +392,9 @@ pub fn transform_openai_response_with_context(
                     name: None,
                     refusal: refusal_val,
                 },
-                finish_reason: Some(finish_reason.to_string()),
+                finish_reason: (!raw_finish_reason
+                    .is_some_and(crate::proxy::pipeline::stream_error::is_failure_finish_reason))
+                .then(|| finish_reason.to_string()),
             });
         }
     }
@@ -552,7 +631,7 @@ mod tests {
 
         let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
         assert_eq!(result.choices.len(), 1);
-        assert_eq!(result.choices[0].finish_reason, Some("stop".to_string()));
+        assert_eq!(result.choices[0].finish_reason, None);
         assert!(result.choices[0].message.content.is_none());
     }
 

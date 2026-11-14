@@ -637,6 +637,25 @@ pub fn build_dual_track_error_with_ua_and_lang(
     // [Fixes #3763] 剔除内部链路控制标记，避免大体积上传终态标记泄漏到客户端报文
     let sanitized_error_text = crate::proxy::upstream::client::strip_internal_markers(error_text);
     let error_text = sanitized_error_text.as_str();
+    // Model failures include generated partial output. Do not scan that output
+    // for transport/quota keywords or parse HTTP prefixes inside quoted text.
+    if let Ok(mut failure) = serde_json::from_str::<serde_json::Value>(error_text) {
+        if failure
+            .pointer("/error/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("upstream_finish_error")
+        {
+            if protocol == "claude" {
+                failure["type"] = serde_json::json!("error");
+                failure["error"]["type"] = serde_json::json!("api_error");
+            } else if protocol == "gemini" {
+                failure["error"]["code"] = serde_json::json!(status_code);
+                failure["error"]["status"] =
+                    serde_json::json!(map_status_code_to_gemini_status(status_code));
+            }
+            return failure;
+        }
+    }
     let lower = error_text.to_lowercase();
     let is_internal_limited =
         crate::proxy::pipeline::policy::UpstreamClassification::is_internal_gateway_exhaustion(

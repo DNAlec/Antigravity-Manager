@@ -25,7 +25,16 @@ pub struct UpstreamStreamError {
 impl UpstreamStreamError {
     /// A response may be replayed only before both output and measured work.
     pub fn replay_safe(&self) -> bool {
-        !self.after_output && !has_measured_usage(self.usage.as_ref())
+        !self.after_output && !has_measured_usage(self.usage.as_ref()) && !self.is_model_failure()
+    }
+
+    fn is_model_failure(&self) -> bool {
+        serde_json::from_str::<Value>(&self.body)
+            .ok()
+            .is_some_and(|value| {
+                value.pointer("/error/type").and_then(Value::as_str)
+                    == Some("upstream_finish_error")
+            })
     }
 
     /// The protocol collector has complete events; the bounded observer can miss
@@ -46,12 +55,31 @@ struct Observation {
     usage: Option<Value>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UpstreamStreamErrorObserver {
     state: Arc<Mutex<Observation>>,
+    detect_model_failures: bool,
+    first_candidate_only: bool,
+}
+
+impl Default for UpstreamStreamErrorObserver {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            detect_model_failures: true,
+            first_candidate_only: false,
+        }
+    }
 }
 
 impl UpstreamStreamErrorObserver {
+    /// Claude and Responses project the first candidate; unselected candidates
+    /// must not turn the selected answer into a failed response.
+    pub fn with_selected_candidate(mut self) -> Self {
+        self.first_candidate_only = true;
+        self
+    }
+
     pub fn failure(&self) -> Option<UpstreamStreamError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.failure.clone().map(|mut failure| {
@@ -64,7 +92,18 @@ impl UpstreamStreamErrorObserver {
     /// Transport/EOF failures have no structured envelope. Preserve measured
     /// work before adapters flatten them into a generic collection error.
     pub fn failure_or_incomplete(&self, incomplete: Option<&str>) -> Option<UpstreamStreamError> {
-        if let Some(failure) = self.failure() {
+        if let Some(mut failure) = self.failure() {
+            if failure.is_model_failure() {
+                if let Some(partial) = incomplete
+                    .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                    .and_then(|value| value.get("partial_response").cloned())
+                {
+                    if let Ok(mut body) = serde_json::from_str::<Value>(&failure.body) {
+                        body["partial_response"] = partial;
+                        failure.body = body.to_string();
+                    }
+                }
+            }
             return Some(failure);
         }
         let message = incomplete?;
@@ -121,7 +160,10 @@ impl UpstreamStreamErrorObserver {
         if state.failure.is_some() {
             return;
         }
-        if let Some(mut failure) = upstream_error_from_event(value) {
+        if let Some(mut failure) = upstream_error_for_selection(value, self.first_candidate_only) {
+            if !self.detect_model_failures && failure.is_model_failure() {
+                return;
+            }
             failure.after_output = state.has_output;
             state.failure = Some(failure);
         }
@@ -141,6 +183,59 @@ pub fn is_refusal_finish_reason(reason: &str) -> bool {
             | "IMAGE_PROHIBITED_CONTENT"
             | "MODEL_ARMOR"
     )
+}
+
+/// A provider finish outside the documented success, limit and refusal states
+/// is an execution failure. The default enum value is not a terminal state.
+pub fn is_failure_finish_reason(reason: &str) -> bool {
+    !matches!(
+        reason,
+        "" | "FINISH_REASON_UNSPECIFIED" | "STOP" | "MAX_TOKENS"
+    ) && !is_refusal_finish_reason(reason)
+}
+
+pub fn model_finish_error(reason: &str) -> Value {
+    json!({"type":"upstream_finish_error", "code":"upstream_finish_error",
+        "message":format!("Gemini generation ended with {reason}"), "finish_reason":reason})
+}
+
+/// Preserve the upstream partial payload for JSON errors. Stream collectors
+/// replace this last-frame snapshot with their complete protocol partial.
+fn model_finish_failure(value: &Value, first_candidate_only: bool) -> Option<UpstreamStreamError> {
+    let raw = value
+        .get("response")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
+    let reason = raw
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| {
+            candidates
+                .iter()
+                .take(if first_candidate_only { 1 } else { usize::MAX })
+                .filter_map(|candidate| {
+                    candidate
+                        .get("finishReason")
+                        .or_else(|| candidate.get("finish_reason"))
+                        .and_then(Value::as_str)
+                })
+                .find(|reason| is_failure_finish_reason(reason))
+        })
+        .or_else(|| {
+            raw.get("finishReason")
+                .or_else(|| raw.get("finish_reason"))
+                .and_then(Value::as_str)
+                .filter(|reason| is_failure_finish_reason(reason))
+        })?;
+    Some(UpstreamStreamError {
+        status: 502,
+        body: json!({"error":model_finish_error(reason), "partial_response":raw}).to_string(),
+        usage: raw
+            .get("usageMetadata")
+            .filter(|usage| usage.is_object())
+            .cloned(),
+        after_output: has_substantive_output(raw),
+    })
 }
 
 /// A blocked prompt terminates the entire response; a refused candidate may
@@ -191,7 +286,20 @@ pub fn error_envelope(value: &Value) -> Option<&Value> {
 }
 
 pub fn upstream_error_from_event(value: &Value) -> Option<UpstreamStreamError> {
-    let error = error_envelope(value)?;
+    upstream_error_for_selection(value, false)
+}
+
+pub fn upstream_error_from_selected_candidate(value: &Value) -> Option<UpstreamStreamError> {
+    upstream_error_for_selection(value, true)
+}
+
+fn upstream_error_for_selection(
+    value: &Value,
+    first_candidate_only: bool,
+) -> Option<UpstreamStreamError> {
+    let Some(error) = error_envelope(value) else {
+        return model_finish_failure(value, first_candidate_only);
+    };
     Some(UpstreamStreamError {
         status: error_status(error).unwrap_or(502),
         body: json!({"error": error}).to_string(),
@@ -332,7 +440,12 @@ impl Default for UpstreamSseErrorDetector {
                 capture_limit: None,
                 ..Default::default()
             },
-            observer: UpstreamStreamErrorObserver::default(),
+            // Adapters render model failures after delivering their frame's
+            // content. Only actual error envelopes preempt content processing.
+            observer: UpstreamStreamErrorObserver {
+                detect_model_failures: false,
+                ..Default::default()
+            },
         }
     }
 }

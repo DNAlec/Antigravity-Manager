@@ -57,9 +57,6 @@ pub fn wrap_request_v2(
         &mut inner_request,
     );
 
-    // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
-    let is_target_claude = final_model_name.to_lowercase().contains("claude");
-
     let lower_model = final_model_name.to_lowercase();
 
     let client_budget = inner_request
@@ -123,9 +120,6 @@ pub fn wrap_request_v2(
         for (_i, content) in contents.iter_mut().enumerate() {
             let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
             let is_assistant = role == "model" || role == "assistant";
-
-            let mut name_counters: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
 
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 // 1. 如果是 assistant/model 轮次，预先扫描提取 turn_signature (对齐 Anthropic)
@@ -253,21 +247,6 @@ pub fn wrap_request_v2(
                         if let Some(obj) = part.as_object_mut() {
                             // 1. 处理 functionCall (Assistant 请求调用工具)
                             if let Some(fc) = obj.get_mut("functionCall") {
-                                if fc.get("id").is_none() && is_target_claude {
-                                    let name = fc
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    let count = name_counters.entry(name.to_string()).or_insert(0);
-                                    let call_id = format!("call_{}_{}", name, count);
-                                    *count += 1;
-
-                                    fc.as_object_mut()
-                                        .unwrap()
-                                        .insert("id".to_string(), json!(call_id));
-                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
-                                }
-
                                 // 处理签名校验与兼容性 (对齐 Anthropic)
                                 let _call_id =
                                     fc.get("id").and_then(|v| v.as_str()).map(str::to_string);
@@ -288,22 +267,6 @@ pub fn wrap_request_v2(
                             if obj.contains_key("functionResponse") {
                                 obj.remove("thoughtSignature");
                                 obj.remove("thought_signature");
-                            }
-                            if let Some(fr) = obj.get_mut("functionResponse") {
-                                if fr.get("id").is_none() && is_target_claude {
-                                    let name = fr
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    let count = name_counters.entry(name.to_string()).or_insert(0);
-                                    let call_id = format!("call_{}_{}", name, count);
-                                    *count += 1;
-
-                                    fr.as_object_mut()
-                                        .unwrap()
-                                        .insert("id".to_string(), json!(call_id));
-                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
-                                }
                             }
                         }
                         saw_non_thinking = true;

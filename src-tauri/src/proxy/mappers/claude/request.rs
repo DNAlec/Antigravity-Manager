@@ -1487,6 +1487,19 @@ fn build_contents(
                         append_server_tool_result_parts(content, &mut parts, 0)?;
                         saw_non_thinking = true;
                     }
+                    ContentBlock::SearchResult {
+                        source,
+                        title,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Search result: {title}\nSource: {source}")}),
+                        );
+                        for McpTextBlock::Text { text } in content {
+                            parts.push(json!({"text":text}));
+                        }
+                        saw_non_thinking = true;
+                    }
                     ContentBlock::McpToolUse {
                         id,
                         name,

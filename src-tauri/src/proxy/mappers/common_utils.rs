@@ -821,7 +821,10 @@ pub fn map_openai_tool_choice_to_gemini(
 
     let resolve = |selector: &Value| -> Result<Vec<String>, String> {
         let kind = selector.get("type").and_then(Value::as_str).unwrap_or("");
-        let function = selector.get("function").unwrap_or(selector);
+        let function = selector
+            .get("function")
+            .or_else(|| selector.get("custom"))
+            .unwrap_or(selector);
         let name = function
             .get("name")
             .and_then(Value::as_str)
@@ -832,10 +835,7 @@ pub fn map_openai_tool_choice_to_gemini(
             .get("namespace")
             .or_else(|| function.get("namespace"))
             .and_then(Value::as_str);
-        let qualified = namespace.map_or_else(
-            || name.to_owned(),
-            |ns| crate::proxy::mappers::openai::request::qualify_namespace_tool_name(ns, name),
-        );
+        let qualified = tool_kinds.backend_name(name, namespace);
         let names: Vec<String> = match kind {
             "function" | "custom" => declarations
                 .iter()
@@ -851,7 +851,15 @@ pub fn map_openai_tool_choice_to_gemini(
                 .map(str::to_owned)
                 .collect(),
             "namespace" => {
-                let members = tool_kinds.qualified_names_in_namespace(&qualified);
+                let selected_namespace = namespace.map_or_else(
+                    || name.to_owned(),
+                    |ns| {
+                        crate::proxy::mappers::openai::request::qualify_namespace_tool_name(
+                            ns, name,
+                        )
+                    },
+                );
+                let members = tool_kinds.qualified_names_in_namespace(&selected_namespace);
                 declarations
                     .iter()
                     .filter_map(|decl| decl["name"].as_str())

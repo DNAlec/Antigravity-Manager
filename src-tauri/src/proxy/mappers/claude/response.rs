@@ -514,9 +514,29 @@ pub fn transform_response(
     message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     registered_tool_names: Vec<String>, // [FIX #3379] For call:default_api leakage recovery
 ) -> Result<ClaudeResponse, String> {
-    let mut processor = NonStreamingProcessor::new(session_id, model_name, message_count);
+    let failure_reason = gemini_response
+        .candidates
+        .as_ref()
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.finish_reason.as_deref())
+        .filter(|reason| crate::proxy::pipeline::stream_error::is_failure_finish_reason(reason));
+    let mut processor = NonStreamingProcessor::new(
+        session_id.filter(|_| failure_reason.is_none()),
+        model_name,
+        message_count,
+    );
     processor.set_registered_tool_names(registered_tool_names);
-    Ok(processor.process(gemini_response, scaling_enabled, context_limit))
+    let response = processor.process(gemini_response, scaling_enabled, context_limit);
+    if let Some(reason) = failure_reason {
+        let mut partial = serde_json::to_value(&response).unwrap_or_default();
+        partial["stop_reason"] = serde_json::Value::Null;
+        return Err(serde_json::json!({
+            "error":crate::proxy::pipeline::stream_error::model_finish_error(reason),
+            "partial_response":partial
+        })
+        .to_string());
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -2426,7 +2426,8 @@ pub async fn handle_messages(
                     );
                 // Preserve structured upstream errors before protocol conversion.
                 let stream_errors =
-                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
+                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default()
+                        .with_selected_candidate();
                 let gemini_stream = Box::pin(
                     crate::proxy::pipeline::stream_error::observe_response_errors(
                         gemini_stream,
@@ -2869,6 +2870,25 @@ pub async fn handle_messages(
 
                 if let Some(attempt) = usage_attempt {
                     attempt.finish_json(&gemini_resp);
+                }
+
+                if let Some(failure) =
+                    crate::proxy::pipeline::stream_error::upstream_error_from_selected_candidate(
+                        &gemini_resp,
+                    )
+                {
+                    retry_state.preserve_http_stop(
+                        failure.status,
+                        &failure.body,
+                        &token_manager.get_sticky_config().await,
+                        config.request_type != "image_gen",
+                    );
+                    failure_statuses.record(
+                        StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    );
+                    terminal_stream_usage = failure.usage;
+                    last_error = failure.body;
+                    break 'attempts;
                 }
 
                 if let Some(confirmation) = session_confirmation.as_mut() {

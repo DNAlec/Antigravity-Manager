@@ -83,9 +83,6 @@ pub struct StreamingState {
     pub scaling_enabled: bool,
     // [NEW] Context limit for smart threshold recovery (default to 1M)
     pub context_limit: u32,
-    // [NEW] MCP XML Bridge 缓冲区
-    pub mcp_xml_buffer: String,
-    pub in_mcp_xml: bool,
     // [FIX] Estimated prompt tokens for calibrator learning
     pub estimated_prompt_tokens: Option<u32>,
     // [FIX #859] Post-thinking interruption tracking
@@ -129,8 +126,6 @@ impl StreamingState {
             session_id: None,
             scaling_enabled: false,
             context_limit: 1_048_576, // Default to 1M
-            mcp_xml_buffer: String::new(),
-            in_mcp_xml: false,
             estimated_prompt_tokens: None,
             has_thinking: false,
             has_content: false,
@@ -407,6 +402,28 @@ impl StreamingState {
                 ));
                 self.block_index += 1;
             }
+        }
+
+        if let Some(reason) = finish_reason
+            .filter(|reason| crate::proxy::pipeline::stream_error::is_failure_finish_reason(reason))
+        {
+            let mut error = json!({
+                "type": "error",
+                "error": crate::proxy::pipeline::stream_error::model_finish_error(reason)
+            });
+            error["error"]["type"] = json!("api_error");
+            if let Some(usage) = usage_metadata.or(self.last_usage.as_ref()) {
+                error["usage"] = serde_json::to_value(to_claude_usage(
+                    usage,
+                    self.scaling_enabled,
+                    self.context_limit,
+                ))
+                .unwrap_or_default();
+            }
+            chunks.push(self.emit("error", error));
+            // This flag also prevents lifecycle finalization after the error.
+            self.message_stop_sent = true;
+            return chunks;
         }
 
         // 确定 stop_reason：若触发工具调用，必须严格优先保持 tool_use；若触发最大长度或截断异常收尾，标记 max_tokens
@@ -746,75 +763,6 @@ impl<'a> PartProcessor<'a> {
         }
 
         // Ordinary text (without signature)
-
-        // [NEW] MCP XML Bridge: Intercept and parse <mcp__...> tags
-        if text.contains("<mcp__") || self.state.in_mcp_xml {
-            self.state.in_mcp_xml = true;
-            self.state.mcp_xml_buffer.push_str(text);
-
-            // Check if we have a complete tag in the buffer
-            if self.state.mcp_xml_buffer.contains("</mcp__")
-                && self.state.mcp_xml_buffer.contains('>')
-            {
-                let buffer = self.state.mcp_xml_buffer.clone();
-                if let Some(start_idx) = buffer.find("<mcp__") {
-                    if let Some(tag_end_idx) = buffer[start_idx..].find('>') {
-                        let actual_tag_end = start_idx + tag_end_idx;
-                        let tool_name = &buffer[start_idx + 1..actual_tag_end];
-                        let end_tag = format!("</{}>", tool_name);
-
-                        if let Some(close_idx) = buffer.find(&end_tag) {
-                            let input_str = &buffer[actual_tag_end + 1..close_idx];
-                            let input_json: serde_json::Value =
-                                serde_json::from_str(input_str.trim())
-                                    .unwrap_or_else(|_| json!({ "input": input_str.trim() }));
-
-                            // 构造并发送 tool_use
-                            let fc = FunctionCall {
-                                name: tool_name.to_string(),
-                                args: Some(input_json),
-                                id: Some(format!("{}-xml", tool_name)),
-                            };
-
-                            let tool_chunks = self.process_function_call(&fc, None);
-
-                            // 清理缓冲区并重置状态
-                            self.state.mcp_xml_buffer.clear();
-                            self.state.in_mcp_xml = false;
-
-                            // 处理标签之前可能存在的非 XML 文本
-                            if start_idx > 0 {
-                                let prefix_text = &buffer[..start_idx];
-                                // 这里不能递归。直接 emit 之前的 text 块。
-                                if self.state.current_block_type() != BlockType::Text {
-                                    chunks.extend(self.state.start_block(
-                                        BlockType::Text,
-                                        json!({ "type": "text", "text": "" }),
-                                    ));
-                                }
-                                chunks.push(
-                                    self.state
-                                        .emit_delta("text_delta", json!({ "text": prefix_text })),
-                                );
-                            }
-
-                            chunks.extend(tool_chunks);
-
-                            // 处理标签之后可能存在的非 XML 文本
-                            let suffix = &buffer[close_idx + end_tag.len()..];
-                            if !suffix.is_empty() {
-                                // 递归处理后缀内容
-                                chunks.extend(self.process_text(suffix, None));
-                            }
-
-                            return chunks;
-                        }
-                    }
-                }
-            }
-            // While in XML, don't emit text deltas
-            return vec![];
-        }
 
         // [FIX #3379] call:default_api:* leakage recovery bridge
         // Attempt to recover leaked tool-call text as a proper tool_use block.

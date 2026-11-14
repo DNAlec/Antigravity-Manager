@@ -144,6 +144,9 @@ impl InboundThinkingPipeline {
         // 彻底解决不同客户端在 tool call ID 格式上不一致（如缺少下划线 `call573077` vs `call_573077`）的问题，
         // 将 `functionCall.id` 与 `functionResponse.id` 统一对齐为带 `_` 的标准形态 (`call_...`)。
         Self::normalize_tool_call_ids(contents);
+        if is_claude {
+            Self::pair_missing_tool_call_ids(contents);
+        }
 
         // 0.05 工具名称双向自愈与非法回执降级防护（Pipeline First 统一治理，Fixes #3679）：
         Self::repair_and_sanitize_tool_names(contents);
@@ -1054,6 +1057,98 @@ impl InboundThinkingPipeline {
         }
 
         pruned_count
+    }
+
+    /// Claude requires IDs even for native Gemini calls that omitted them.
+    /// Pair by pending occurrence across split result contents, reserving every
+    /// explicit ID before allocating any synthetic one.
+    fn pair_missing_tool_call_ids(contents: &mut [Value]) {
+        use std::collections::{HashMap, HashSet};
+        let mut used: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .flat_map(|part| {
+                [
+                    part["functionCall"]["id"].as_str(),
+                    part["functionResponse"]["id"].as_str(),
+                ]
+            })
+            .flatten()
+            .map(str::to_owned)
+            .collect();
+        let explicit_results: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .filter_map(|part| part["functionResponse"]["id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        let mut counters = HashMap::<String, usize>::new();
+        let mut pending = Vec::<(String, String)>::new();
+        let mut results_started = false;
+        for content in contents {
+            let is_model = matches!(content["role"].as_str(), Some("model" | "assistant"));
+            let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let has_calls = parts.iter().any(|part| part.get("functionCall").is_some());
+            let has_results = parts
+                .iter()
+                .any(|part| part.get("functionResponse").is_some());
+            if (is_model && results_started) || (!is_model && !has_calls && !has_results) {
+                pending.clear();
+                results_started = false;
+            }
+            for part in parts {
+                if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
+                    let Some(name) = call.get("name").and_then(Value::as_str).map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let id = if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        id.to_owned()
+                    } else {
+                        let counter = counters.entry(name.clone()).or_default();
+                        let id = loop {
+                            let candidate = format!("call_{name}_{counter}");
+                            *counter += 1;
+                            if used.insert(candidate.clone()) {
+                                break candidate;
+                            }
+                        };
+                        call.insert("id".into(), json!(id));
+                        id
+                    };
+                    pending.push((name, id));
+                } else if let Some(response) = part
+                    .get_mut("functionResponse")
+                    .and_then(Value::as_object_mut)
+                {
+                    results_started = true;
+                    let name = response
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    let explicit_id = response.get("id").and_then(Value::as_str);
+                    let position = match explicit_id {
+                        Some(id) => pending.iter().position(|(_, pending_id)| pending_id == id),
+                        None => pending.iter().position(|(pending_name, id)| {
+                            pending_name == &name && !explicit_results.contains(id)
+                        }),
+                    };
+                    if let Some(position) = position {
+                        let (_, id) = pending.remove(position);
+                        if explicit_id.is_none() {
+                            response.insert("id".into(), json!(id));
+                        }
+                    } else if explicit_id.is_none() {
+                        *part = json!({"text":format!("Tool result without matching call ({name}): {}", json!(response))});
+                    }
+                }
+            }
+        }
     }
 
     /// 工具调用 ID 统一规范化治理（Pipeline First）：
@@ -3674,17 +3769,23 @@ mod tests {
 
     #[test]
     fn test_inbound_pipeline_empty_tool_result_sanitizes_to_default_output() {
-        let mut contents = vec![json!({
-            "role": "user",
-            "parts": [{
-                "functionResponse": {
-                    "name": "edit_file",
-                    "response": {
-                        "output": "   "
+        let mut contents = vec![
+            json!({
+                "role":"model",
+                "parts":[{"functionCall":{"name":"edit_file","args":{}}}]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "edit_file",
+                        "response": {
+                            "output": "   "
+                        }
                     }
-                }
-            }]
-        })];
+                }]
+            }),
+        ];
 
         InboundThinkingPipeline::process_contents(
             &mut contents,
@@ -3694,10 +3795,12 @@ mod tests {
             false,
         );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        let output_text = parts[0]["functionResponse"]["response"]["output"]
-            .as_str()
-            .unwrap();
+        let output_text = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .find_map(|part| part["functionResponse"]["response"]["output"].as_str())
+            .expect("matched tool result output");
         assert_eq!(output_text, "Command executed successfully.");
     }
 

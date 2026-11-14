@@ -162,6 +162,22 @@ fn normalize_chat_request(value: &mut Value) -> Result<(), String> {
         body.insert("tool_choice".into(), choice);
     }
 
+    fn validate_custom_tools(tools: &[Value]) -> Result<(), String> {
+        for tool in tools {
+            if tool["type"] == "namespace" {
+                if let Some(children) = tool["tools"].as_array() {
+                    validate_custom_tools(children)?;
+                }
+            } else if tool["type"] == "custom" {
+                required_function_name(tool.get("custom").unwrap_or(tool))?;
+            }
+        }
+        Ok(())
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        validate_custom_tools(tools)?;
+    }
+
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(());
     };
@@ -177,6 +193,21 @@ fn normalize_chat_request(value: &mut Value) -> Result<(), String> {
         let Some(message) = message.as_object_mut() else {
             continue;
         };
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if call["type"] == "custom" {
+                    let custom = call
+                        .get("custom")
+                        .ok_or("Custom tool call is missing custom")?;
+                    required_function_name(custom)?;
+                    serde_json::from_value::<ToolCustom>(custom.clone())
+                        .map_err(|e| e.to_string())?;
+                    if call.get("function").is_some_and(|value| !value.is_null()) {
+                        return Err("Custom tool call cannot contain function arguments".into());
+                    }
+                }
+            }
+        }
         if let Some(function) = message.remove("function_call").filter(|v| !v.is_null()) {
             if message.get("role").and_then(Value::as_str) != Some("assistant") {
                 return Err("Historical function_call requires an assistant message".into());
@@ -477,6 +508,9 @@ pub struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<ToolFunction>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<ToolCustom>,
+
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "thoughtSignature",
@@ -498,6 +532,12 @@ pub struct ApplyPatchOperation {
     pub r#type: String,
     pub diff: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCustom {
+    pub name: String,
+    pub input: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

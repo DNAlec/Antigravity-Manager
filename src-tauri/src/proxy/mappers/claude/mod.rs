@@ -431,6 +431,7 @@ fn process_sse_line(
         if state.has_thinking
             && !state.has_content
             && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
+            && !crate::proxy::pipeline::stream_error::is_failure_finish_reason(finish_reason)
         {
             tracing::warn!(
                 "[{}] Upstream emitted finishReason '{}' after thinking without content. Suppressing message_stop to allow native client retry.",

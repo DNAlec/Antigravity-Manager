@@ -123,6 +123,13 @@ pub enum ContentBlock {
         cache_control: Option<serde_json::Value>,
     },
 
+    #[serde(rename = "search_result")]
+    SearchResult {
+        source: String,
+        title: String,
+        content: Vec<McpTextBlock>,
+    },
+
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
 

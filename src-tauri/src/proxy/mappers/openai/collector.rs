@@ -85,6 +85,15 @@ impl ChoiceAccumulator {
                         }
                     }
 
+                    if let Some(custom) = tc.get("custom") {
+                        if let Some(name) = custom.get("name").and_then(Value::as_str) {
+                            entry.2 = name.to_owned();
+                        }
+                        if let Some(input) = custom.get("input").and_then(Value::as_str) {
+                            entry.3.push(input.to_owned());
+                        }
+                    }
+
                     if let Some(func) = tc.get("function") {
                         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                             if !name.is_empty() {
@@ -127,15 +136,31 @@ impl ChoiceAccumulator {
             let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
                 .into_iter()
                 .map(|(index, (id, tc_type, name, args_parts))| {
+                    let payload = args_parts.join("");
+                    let (function, custom) = if tc_type == "custom" {
+                        (
+                            None,
+                            Some(ToolCustom {
+                                name,
+                                input: payload,
+                            }),
+                        )
+                    } else {
+                        (
+                            Some(ToolFunction {
+                                name,
+                                arguments: payload,
+                            }),
+                            None,
+                        )
+                    };
                     (
                         index,
                         ToolCall {
                             id,
                             r#type: tc_type,
-                            function: Some(ToolFunction {
-                                name,
-                                arguments: args_parts.join(""),
-                            }),
+                            function,
+                            custom,
                             signature: None,
                             status: None,
                             call_id: None,
@@ -226,6 +251,27 @@ where
                 if let Ok(json) = serde_json::from_str::<Value>(data_str) {
                     if let Some(error) = crate::proxy::pipeline::stream_error::error_envelope(&json)
                     {
+                        if error.get("code").and_then(Value::as_str)
+                            == Some("upstream_finish_error")
+                        {
+                            response.choices = choices_by_index
+                                .into_iter()
+                                .map(|(index, state)| {
+                                    let mut choice = state.finish(index);
+                                    choice.finish_reason = None;
+                                    choice
+                                })
+                                .collect();
+                            if let Some(usage) = json.get("usage") {
+                                response.usage = serde_json::from_value(usage.clone())
+                                    .ok()
+                                    .or(response.usage);
+                            }
+                            return Err(
+                                serde_json::json!({"error":error, "partial_response":response})
+                                    .to_string(),
+                            );
+                        }
                         return Err(error
                             .get("message")
                             .and_then(Value::as_str)

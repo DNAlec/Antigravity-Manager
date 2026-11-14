@@ -113,6 +113,8 @@ pub struct OpenAIChatStreamHandler {
     pub message_count: usize,
     pub client_tool_names: std::collections::HashSet<String>,
     pub include_usage: bool,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+    first_candidate_only: bool,
     tool_calls: ToolCallTracker,
     candidates: std::collections::BTreeMap<u64, ChatCandidateState>,
     marked_multi_candidate: bool,
@@ -145,12 +147,16 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         }
 
         let mut chunks = Vec::new();
+        let mut model_failure = None;
         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+            let mut actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
                 inner
             } else {
                 json
             };
+            if self.first_candidate_only {
+                super::response::retain_first_candidate(&mut actual_data);
+            }
             if let Some(u) = actual_data.get("usageMetadata") {
                 merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
             }
@@ -249,7 +255,14 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                         thinking.record_tool_id(name, &call_id);
                                     }
 
-                                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                    let call = super::response::chat_tool_call(
+                                        &final_name,
+                                        &args,
+                                        call_id,
+                                        self.chat_tool_kinds.as_ref(),
+                                    );
+                                    let mut call = serde_json::to_value(call).unwrap_or_default();
+                                    call["index"] = json!(state.tool_call_index);
                                     let tool_call_chunk = json!({
                                         "id": &self.stream_id,
                                         "object": "chat.completion.chunk",
@@ -259,12 +272,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                             "index": candidate_index,
                                             "delta": {
                                                 "role": "assistant",
-                                                "tool_calls": [{
-                                                    "index": state.tool_call_index,
-                                                    "id": call_id,
-                                                    "type": "function",
-                                                    "function": { "name": final_name, "arguments": args_str }
-                                                }]
+                                                "tool_calls": [call]
                                             },
                                             "finish_reason": serde_json::Value::Null
                                         }]
@@ -328,12 +336,19 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         .or_else(|| candidate.get("finish_reason"))
                         .and_then(|f| f.as_str());
 
-                    let gemini_finish_reason = raw_finish_reason.map(|f| match f {
-                        "STOP" => "stop",
-                        "MAX_TOKENS" => "length",
-                        reason if is_refusal_finish_reason(reason) => "content_filter",
-                        "MALFORMED_FUNCTION_CALL" => "stop",
-                        _ => "stop",
+                    let failed = raw_finish_reason.is_some_and(
+                        crate::proxy::pipeline::stream_error::is_failure_finish_reason,
+                    );
+                    if failed {
+                        state.finished = true;
+                        model_failure = raw_finish_reason
+                            .map(crate::proxy::pipeline::stream_error::model_finish_error);
+                    }
+                    let gemini_finish_reason = raw_finish_reason.and_then(|reason| match reason {
+                        "STOP" => Some("stop"),
+                        "MAX_TOKENS" => Some("length"),
+                        reason if is_refusal_finish_reason(reason) => Some("content_filter"),
+                        _ => None,
                     });
 
                     let finish_reason =
@@ -440,6 +455,13 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                     self.model, self.session_id, self.message_count
                 ),
             );
+        }
+
+        if let Some(error) = model_failure {
+            let frame = json!({"error":error, "usage":self.final_usage});
+            chunks.push(Bytes::from(format!("data: {frame}\n\n")));
+            chunks.push(Bytes::from("data: [DONE]\n\n"));
+            self.has_emitted_done = true;
         }
 
         self.is_thinking_active = self
@@ -629,6 +651,35 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_for_responses_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn create_openai_sse_stream_with_context<S, E>(
     gemini_stream: Pin<Box<S>>,
     model: String,
@@ -638,6 +689,66 @@ pub fn create_openai_sse_stream_with_context<S, E>(
     include_usage: bool,
     causal_anchor: Option<String>,
     text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_tool_kinds(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_with_tool_kinds<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        chat_tool_kinds,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_openai_sse_stream_with_options<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+    first_candidate_only: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -670,6 +781,8 @@ where
         message_count,
         client_tool_names,
         include_usage,
+        chat_tool_kinds,
+        first_candidate_only,
         tool_calls: ToolCallTracker::default(),
         candidates: Default::default(),
         marked_multi_candidate: false,
@@ -3251,6 +3364,7 @@ mod tests {
         );
 
         let mut all_content = String::new();
+        let mut saw_model_failure = false;
         let mut final_finish_reason: Option<String> = None;
 
         while let Some(result) = openai_stream.next().await {
@@ -3260,6 +3374,7 @@ mod tests {
                     if line.starts_with("data: ") && !line.contains("[DONE]") {
                         let json_str = line.trim_start_matches("data: ").trim();
                         if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                            saw_model_failure |= json["error"]["code"] == "upstream_finish_error";
                             if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                                 if let Some(choice) = choices.first() {
                                     if let Some(delta) = choice.get("delta") {
@@ -3288,7 +3403,8 @@ mod tests {
             "Expected empty content, got: {}",
             all_content
         );
-        assert_eq!(final_finish_reason, Some("stop".to_string()));
+        assert_eq!(final_finish_reason, None);
+        assert!(saw_model_failure);
     }
 
     #[tokio::test]
@@ -3604,3 +3720,7 @@ mod error_usage_snapshot_tests {
 #[cfg(test)]
 #[path = "response_usability_tests.rs"]
 mod response_usability_tests;
+
+#[cfg(test)]
+#[path = "response_failures_tests.rs"]
+mod response_failures_tests;
