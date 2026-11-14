@@ -528,7 +528,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.6** (2026-11-14): Improves tool Schema and local-reference compatibility with resource limits, preserves readable Responses reasoning and compaction history, and accepts unambiguous Gemini candidate index variants. Upstream version checks are now notification-only, and unsigned macOS app archives remain available (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec). The OpenCode `myt` client capability configuration issue remains unresolved and is not included. See the [full release notes](CHANGELOG_EN.md).
+> Latest version **v5.0.6** (2026-11-14): Improves tool Schema and local-reference compatibility with resource limits, preserves readable Responses reasoning and compaction history, and accepts unambiguous Gemini candidate index variants. Direct Chat/Responses/Claude outputs retain media and file references, while URL/plaintext/nested documents and tool-result attachments remain usable (PR [#9](https://github.com/DNAlec/Antigravity-Manager/pull/9)). Upstream version checks are now notification-only, and unsigned macOS app archives remain available (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec). The OpenCode `myt` client capability configuration issue remains unresolved and is not included. See the [full release notes](CHANGELOG_EN.md).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

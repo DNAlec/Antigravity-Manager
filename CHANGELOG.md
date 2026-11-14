@@ -14,6 +14,9 @@
         -   **[版本检查与发布附件] (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
             -   上游版本检查仅显示版本提示，移除下载、安装和更新重启入口，避免上游安装包覆盖本分支。
             -   未配置签名的 macOS 构建仍提供应用归档；更新清单仅包含有签名且附件存在的下载项。
+        -   **[媒体答案与附件输入可用性] (PR [#9](https://github.com/DNAlec/Antigravity-Manager/pull/9), Thanks to @DNAlec)**:
+            -   Chat、Responses、Claude 的流式与 JSON 输出统一保留内联图片及文件链接，避免纯媒体回答变成空结果或错误。重复累计帧去重，同帧独立媒体、用量和真实中断状态继续保留。
+            -   Messages 支持 URL 图片/文档、完整明文文档和嵌套内容文档；工具结果中的附件保留调用归属。Chat 工具结果传递实际图片 URL，拒绝历史作为可读助手上下文保留。
         -   本次未修复、未包含 OpenCode `myt` 的客户端能力配置问题；升级 AM 不会自动修复该配置。
 
     *   **v5.0.5 (2026-11-14)**:

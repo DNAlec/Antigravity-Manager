@@ -14,6 +14,9 @@
         -   **[Version checks and release downloads] (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
             -   Upstream version checks display notifications only. Download, installation and update-restart actions have been removed to prevent upstream packages from replacing this fork.
             -   Unsigned macOS builds still provide downloadable app archives. Update manifests include only signed entries whose release assets exist.
+        -   **[Usable media answers and attachment inputs] (PR [#9](https://github.com/DNAlec/Antigravity-Manager/pull/9), Thanks to @DNAlec)**:
+            -   Chat, Responses and Claude retain inline media and file references across streaming and JSON output, including media-only answers. Cumulative media is deduplicated while same-frame multiplicity, usage and real interruption states remain intact.
+            -   Messages accepts URL images/documents, complete plaintext documents and nested content documents, retaining attachment ownership in tool results. Chat tool results forward real image URLs and readable refusal history reaches subsequent turns.
         -   The OpenCode `myt` client capability configuration issue remains unresolved and is outside this release; upgrading AM does not repair that configuration.
 
     *   **v5.0.5 (2026-11-14)**:
