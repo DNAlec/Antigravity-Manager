@@ -2059,6 +2059,7 @@
         "cached": "緩"
     },
     "update_notification": {
+    "check_only": "繼續檢查上游版本。此版本已停用應用程式內下載和安裝更新。",
         "title": "發現新版本",
         "message": "新版本已準備就緒，包含諸多優化與改進。目前版本: v{{current}}",
         "ready": "更新準備就緒",

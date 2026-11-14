@@ -2162,6 +2162,7 @@
         }
     },
     "update_notification": {
+    "check_only": "Upstream version checks are enabled. In-app downloads and installation are disabled for this build.",
         "title": "Updating...",
         "message": "A new version is ready with optimizations and improvements. Current: v{{current}}",
         "ready": "Update Ready!",

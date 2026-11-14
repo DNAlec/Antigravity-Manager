@@ -15,7 +15,7 @@ import { ApiKeyFun } from './pages/ApiKeyFun';
 import { UpdateNotification } from './components/UpdateNotification';
 import SuggestionDeleteThinkingModal from './components/common/SuggestionDeleteThinkingModal';
 import DebugConsole from './components/debug/DebugConsole';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useConfigStore, normalizeLanguageCode } from './stores/useConfigStore';
 import { useAccountStore } from './stores/useAccountStore';
 import { useViewStore } from './stores/useViewStore';
@@ -177,14 +177,6 @@ function App() {
       })
     );
 
-    // 监听手动触发自动更新事件
-    unlistenPromises.push(
-      listen('app://trigger-update', () => {
-        console.log('[App] Received app://trigger-update event, showing updater...');
-        setShowUpdateNotification(true);
-      })
-    );
-
     // 监听后端全局配置更新事件
     unlistenPromises.push(
       listen('config://updated', async () => {
@@ -270,6 +262,7 @@ function App() {
 
   // Update notification state
   const [showUpdateNotification, setShowUpdateNotification] = useState(false);
+  const closeUpdateNotification = useCallback(() => setShowUpdateNotification(false), []);
 
   // Check for updates on startup
   useEffect(() => {
@@ -372,7 +365,7 @@ function App() {
       <DebugConsole />
       <SuggestionDeleteThinkingModal />
       {showUpdateNotification && (
-        <UpdateNotification onClose={() => setShowUpdateNotification(false)} />
+        <UpdateNotification onClose={closeUpdateNotification} />
       )}
       <RouterProvider router={router} />
     </AdminAuthGuard>
