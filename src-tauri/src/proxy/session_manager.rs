@@ -108,7 +108,10 @@ fn extract_openai_content_summary(content: &OpenAIContent) -> String {
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
-                    crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } => {
+                    crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text }
+                    | crate::proxy::mappers::openai::models::OpenAIContentBlock::Refusal {
+                        refusal: text,
+                    } => {
                         let text = PromptSanitizer::strip_billing_header_lines(text);
                         if !text.trim().is_empty() {
                             parts.push(text);

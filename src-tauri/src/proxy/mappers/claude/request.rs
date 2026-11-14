@@ -1000,6 +1000,53 @@ fn append_claude_content_parts(
     Ok(())
 }
 
+/// Server tools already ran in the historical provider session. Keep their
+/// readable results without manufacturing a client function call to replay.
+fn append_server_tool_result_parts(
+    content: &Value,
+    parts: &mut Vec<Value>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_MEDIA_CONTENT_DEPTH {
+        return Err("Server tool result exceeds the maximum nesting depth".into());
+    }
+    if let Some(items) = content.as_array() {
+        for item in items {
+            append_server_tool_result_parts(item, parts, depth + 1)?;
+        }
+        return Ok(());
+    }
+    match content.get("type").and_then(Value::as_str) {
+        Some("web_fetch_result") => {
+            if let Some(url) = content.get("url").and_then(Value::as_str) {
+                parts.push(json!({"text": format!("Fetched URL: {url}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        Some("code_execution_result" | "bash_code_execution_result") => {
+            for key in ["stdout", "stderr"] {
+                if let Some(text) = content
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    parts.push(json!({"text": format!("{key}:\n{text}")}));
+                }
+            }
+            if let Some(code) = content.get("return_code") {
+                parts.push(json!({"text": format!("Exit code: {code}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        _ => append_claude_content_parts(content, parts, depth + 1)?,
+    }
+    Ok(())
+}
+
 /// 构建 Contents (Messages)
 fn build_contents(
     content: &MessageContent,
@@ -1015,8 +1062,6 @@ fn build_contents(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     _existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
@@ -1095,34 +1140,12 @@ fn build_contents(
                                 continue;
                             }
 
-                            // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
-                            // 检查该文本是否与上一轮任务描述完全一致。
-                            if !is_assistant && *previous_was_tool_result {
-                                if let Some(last_task) = last_user_task_text_normalized {
-                                    let current_normalized =
-                                        text.replace(|c: char| c.is_whitespace(), "");
-                                    if !current_normalized.is_empty()
-                                        && current_normalized == *last_task
-                                    {
-                                        tracing::info!("[Claude-Request] Dropping duplicated task text echo (len: {})", text.len());
-                                        continue;
-                                    }
-                                }
-                            }
-
                             parts.extend(
                                 crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
                                     text,
                                 ),
                             );
                             saw_non_thinking = true;
-
-                            // 记录最近一次 User 任务文本用于后续比对
-                            if !is_assistant {
-                                *last_user_task_text_normalized =
-                                    Some(text.replace(|c: char| c.is_whitespace(), ""));
-                            }
-                            *previous_was_tool_result = false;
                         }
                     }
                     ContentBlock::Thinking {
@@ -1431,9 +1454,83 @@ fn build_contents(
                             response["parts"] = Value::Array(extra_parts);
                         }
                         parts.push(json!({ "functionResponse": response }));
-
-                        // 标记状态，用于下一条 User 消息的去重判断
-                        *previous_was_tool_result = true;
+                    }
+                    ContentBlock::WebFetchToolResult { content, .. }
+                    | ContentBlock::CodeExecutionToolResult { content, .. } => {
+                        append_server_tool_result_parts(content, &mut parts, 0)?;
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::ToolSearchToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Tool search result (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            ToolSearchResultContent::Found { tool_references } => {
+                                for ToolReference::Tool { tool_name } in tool_references {
+                                    parts.push(
+                                        json!({"text":format!("Discovered tool: {tool_name}")}),
+                                    );
+                                }
+                            }
+                            ToolSearchResultContent::Error {
+                                error_code,
+                                error_message,
+                            } => {
+                                parts.push(
+                                    json!({"text":format!("Tool search failed: {error_code}")}),
+                                );
+                                if let Some(message) = error_message {
+                                    parts.push(json!({"text":message}));
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::SearchResult {
+                        source,
+                        title,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Search result: {title}\nSource: {source}")}),
+                        );
+                        for McpTextBlock::Text { text } in content {
+                            parts.push(json!({"text":text}));
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::McpToolUse {
+                        id,
+                        name,
+                        server_name,
+                        input,
+                    } => {
+                        parts.push(json!({"text": format!(
+                            "MCP tool {server_name}/{name} (call {id})\nInput: {}", json!(input)
+                        )}));
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::McpToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let status = if *is_error { "error" } else { "result" };
+                        parts.push(
+                            json!({"text": format!("MCP tool {status} (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            McpToolResultContent::Text(text) => parts.push(json!({"text":text})),
+                            McpToolResultContent::Blocks(blocks) => {
+                                for McpTextBlock::Text { text } in blocks {
+                                    parts.push(json!({"text":text}));
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
                     }
                     // ContentBlock::RedactedThinking handled above at line 583
                     ContentBlock::ServerToolUse { .. }
@@ -1521,8 +1618,6 @@ fn build_google_content(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Value, String> {
     let role = if msg.role == "assistant" {
@@ -1582,8 +1677,6 @@ fn build_google_content(
         mapped_model,
         last_thought_signature,
         pending_tool_use_ids,
-        last_user_task_text_normalized,
-        previous_was_tool_result,
         existing_tool_result_ids,
     )?;
 
@@ -1624,10 +1717,6 @@ fn build_google_contents(
     // Track pending tool_use IDs for recovery
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
 
-    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
-    let mut last_user_task_text_normalized: Option<String> = None;
-    let mut previous_was_tool_result = false;
-
     let _msg_count = messages.len();
 
     // [FIX #632] Pre-scan all messages to identify all tool_result IDs that ALREADY exist in the conversation.
@@ -1663,8 +1752,6 @@ fn build_google_contents(
             mapped_model,
             &mut last_thought_signature,
             &mut pending_tool_use_ids,
-            &mut last_user_task_text_normalized,
-            &mut previous_was_tool_result,
             &existing_tool_result_ids,
         )?;
 
@@ -4334,5 +4421,192 @@ mod tests {
             }),
             "Raw tool_use_id must never leak as functionResponse name"
         );
+    }
+}
+
+#[cfg(test)]
+mod r24_server_history_tests {
+    use super::*;
+
+    fn mapped(block: Value) -> Value {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-5", "max_tokens":100,
+            "messages":[
+                {"role":"user","content":"Find the answer"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Before the result"},
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_fetch","input":{}},
+                    block,
+                    {"type":"text","text":"After the result"}
+                ]},
+                {"role":"user","content":"Explain that answer"}
+            ]
+        }))
+        .unwrap();
+        transform_claude_request_in(&request, "project", false, None, "r24-history", None).unwrap()
+    }
+
+    fn visible_text(body: &Value) -> String {
+        body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn r24_web_fetch_history_keeps_document_body_and_message_order() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_result","url":"https://example.com/report",
+            "content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Full document body\nSecond line"}}}}),
+        );
+        let text = visible_text(&body);
+        let ordered = [
+            "Before the result",
+            "https://example.com/report",
+            "Full document body\nSecond line",
+            "After the result",
+            "Explain that answer",
+        ];
+        let mut offset = 0;
+        for fragment in ordered {
+            offset += text[offset..].find(fragment).expect(fragment) + fragment.len();
+        }
+        assert!(!body.to_string().contains("functionCall"));
+    }
+
+    #[test]
+    fn r24_code_execution_history_keeps_stdout_stderr_and_nested_text() {
+        for kind in [
+            "code_execution_tool_result",
+            "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result",
+        ] {
+            let body = mapped(json!({"type":kind,"tool_use_id":"srvtoolu_1","content":{
+                "type":"code_execution_result","stdout":"42\nline two\n","stderr":"Warning: example\n",
+                "return_code":1,"content":[{"type":"text","text":"Readable tool summary"},
+                {"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document"}]}}]
+            }}));
+            let text = visible_text(&body);
+            for expected in [
+                "42\nline two\n",
+                "Warning: example\n",
+                "Exit code: 1",
+                "Readable tool summary",
+                "Nested document",
+                "After the result",
+            ] {
+                assert!(text.contains(expected), "missing {expected} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn r24_server_errors_stay_readable_and_unknown_client_blocks_are_rejected() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_tool_result_error","error_code":"unavailable","message":"Fetch failed"}}),
+        );
+        assert!(visible_text(&body).contains("Fetch failed"));
+        let unknown = json!({"model":"claude-sonnet-4-5","messages":[{"role":"assistant","content":[
+            {"type":"unknown_client_tool_call","name":"execute","input":{"cmd":"keep me explicit"}}
+        ]}]});
+        assert!(serde_json::from_value::<ClaudeRequest>(unknown).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r26_mcp_history_tests {
+    use super::*;
+
+    fn request(blocks: Value) -> Result<ClaudeRequest, serde_json::Error> {
+        serde_json::from_value(
+            json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
+                {"role":"user","content":"Fetch the report"},
+                {"role":"assistant","content":blocks},
+                {"role":"user","content":"Explain that result"}
+            ]}),
+        )
+    }
+    fn mapped_text(request: &ClaudeRequest) -> (Value, String) {
+        let mapped =
+            transform_claude_request_in(request, "r26-project", false, None, "r26-mcp", None)
+                .unwrap();
+        let text = mapped["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (mapped, text)
+    }
+
+    #[test]
+    fn r26_mcp_history_degrades_to_readable_context_in_order() {
+        let request = request(json!([
+            {"type":"text","text":"BEFORE_MCP"},
+            {"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":{"needle":"[undefined]"}},
+            {"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":false,"content":[{"type":"text","text":"REPORT_42\nSecond line"}]},
+            {"type":"text","text":"AFTER_MCP"}
+        ])).unwrap();
+        let (mapped, text) = mapped_text(&request);
+        let mut position = 0;
+        for fragment in [
+            "BEFORE_MCP",
+            "docs/lookup",
+            "[undefined]",
+            "REPORT_42\nSecond line",
+            "AFTER_MCP",
+            "Explain that result",
+        ] {
+            position += text[position..]
+                .find(fragment)
+                .unwrap_or_else(|| panic!("Missing {fragment} in {text}"))
+                + fragment.len();
+        }
+        assert!(!mapped.to_string().contains("functionCall"));
+        assert!(!mapped.to_string().contains("functionResponse"));
+    }
+
+    #[test]
+    fn r26_mcp_results_without_adjacent_text_keep_strings_and_errors() {
+        for (error, content) in [
+            (false, json!("SERVER_BODY")),
+            (true, json!([{"type":"text","text":"SERVER_BODY"}])),
+        ] {
+            let request = request(json!([{"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":error,"content":content}])).unwrap();
+            let (_, text) = mapped_text(&request);
+            assert!(text.contains("SERVER_BODY"));
+            assert!(text.contains(if error {
+                "MCP tool error"
+            } else {
+                "MCP tool result"
+            }));
+        }
+        let control = request(json!([{"type":"text","text":"SERVER_BODY"}])).unwrap();
+        assert!(mapped_text(&control).1.contains("SERVER_BODY"));
+    }
+
+    #[test]
+    fn r26_mcp_degradation_keeps_malformed_and_local_tool_envelopes_strict() {
+        for invalid in [
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs"}),
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":[]}),
+            json!({"type":"mcp_tool_result","content":"result"}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"text"}]}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"unknown_local_tool","input":{}}]}),
+            json!({"type":"tool_use","id":"toolu_42","input":{}}),
+            json!({"type":"unknown_client_tool_call","name":"execute","input":{}}),
+        ] {
+            assert!(
+                request(json!([{"type":"text","text":"valid adjacent text"},invalid])).is_err()
+            );
+        }
     }
 }

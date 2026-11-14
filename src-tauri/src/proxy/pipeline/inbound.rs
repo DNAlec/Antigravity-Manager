@@ -144,6 +144,9 @@ impl InboundThinkingPipeline {
         // 彻底解决不同客户端在 tool call ID 格式上不一致（如缺少下划线 `call573077` vs `call_573077`）的问题，
         // 将 `functionCall.id` 与 `functionResponse.id` 统一对齐为带 `_` 的标准形态 (`call_...`)。
         Self::normalize_tool_call_ids(contents);
+        if is_claude {
+            Self::pair_missing_tool_call_ids(contents);
+        }
 
         // 0.05 工具名称双向自愈与非法回执降级防护（Pipeline First 统一治理，Fixes #3679）：
         Self::repair_and_sanitize_tool_names(contents);
@@ -477,25 +480,6 @@ impl InboundThinkingPipeline {
                                     if !clean_visible.is_empty() {
                                         other_parts.push(json!({ "text": clean_visible }));
                                     }
-                                    continue;
-                                }
-
-                                // 协议无关自愈：检查是否夹带旧版遗留思考前缀 (如 **Thinking**)
-                                if raw_text.trim_start().starts_with("**Thinking**") {
-                                    let clean_thought = Self::strip_thinking_prefix(raw_text);
-                                    if thinking_part.is_none() && is_thinking_enabled {
-                                        if crate::proxy::thinking_store::is_meaningful_thought(
-                                            &clean_thought,
-                                        ) {
-                                            // 铁律 I4：思考块绝不携带签名
-                                            let t_obj = json!({
-                                                "text": clean_thought,
-                                                "thought": true,
-                                            });
-                                            thinking_part = Some(t_obj);
-                                        }
-                                    }
-                                    // 若已有思考块，该遗留思考块作为陈旧副本剥离，防止二次污染正文
                                     continue;
                                 }
 
@@ -1056,19 +1040,118 @@ impl InboundThinkingPipeline {
         pruned_count
     }
 
+    /// Claude requires IDs even for native Gemini calls that omitted them.
+    /// Pair by pending occurrence across split result contents, reserving every
+    /// explicit ID before allocating any synthetic one.
+    fn pair_missing_tool_call_ids(contents: &mut [Value]) {
+        use std::collections::{HashMap, HashSet};
+        let mut used: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .flat_map(|part| {
+                [
+                    part["functionCall"]["id"].as_str(),
+                    part["functionResponse"]["id"].as_str(),
+                ]
+            })
+            .flatten()
+            .map(str::to_owned)
+            .collect();
+        let explicit_results: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .filter_map(|part| part["functionResponse"]["id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        let mut counters = HashMap::<String, usize>::new();
+        let mut pending = Vec::<(String, String)>::new();
+        let mut results_started = false;
+        for content in contents {
+            let is_model = matches!(content["role"].as_str(), Some("model" | "assistant"));
+            let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let has_calls = parts.iter().any(|part| part.get("functionCall").is_some());
+            let has_results = parts
+                .iter()
+                .any(|part| part.get("functionResponse").is_some());
+            if (is_model && results_started) || (!is_model && !has_calls && !has_results) {
+                pending.clear();
+                results_started = false;
+            }
+            for part in parts {
+                if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
+                    let Some(name) = call.get("name").and_then(Value::as_str).map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let id = if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        id.to_owned()
+                    } else {
+                        let counter = counters.entry(name.clone()).or_default();
+                        let id = loop {
+                            let candidate = format!("call_{name}_{counter}");
+                            *counter += 1;
+                            if used.insert(candidate.clone()) {
+                                break candidate;
+                            }
+                        };
+                        call.insert("id".into(), json!(id));
+                        id
+                    };
+                    pending.push((name, id));
+                } else if let Some(response) = part
+                    .get_mut("functionResponse")
+                    .and_then(Value::as_object_mut)
+                {
+                    results_started = true;
+                    let name = response
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    let explicit_id = response.get("id").and_then(Value::as_str);
+                    let position = match explicit_id {
+                        Some(id) => pending.iter().position(|(_, pending_id)| pending_id == id),
+                        None => pending.iter().position(|(pending_name, id)| {
+                            pending_name == &name && !explicit_results.contains(id)
+                        }),
+                    };
+                    if let Some(position) = position {
+                        let (_, id) = pending.remove(position);
+                        if explicit_id.is_none() {
+                            response.insert("id".into(), json!(id));
+                        }
+                    } else if explicit_id.is_none() {
+                        *part = json!({"text":format!("Tool result without matching call ({name}): {}", json!(response))});
+                    }
+                }
+            }
+        }
+    }
+
     /// 工具调用 ID 统一规范化治理（Pipeline First）：
     /// 规范化 contents 中所有的 `functionCall` 与 `functionResponse` 的 `id`，
     /// 统一对齐为带下划线的标准形态 (`call_...`)，杜绝客户端格式漂移导致的签名与思考回填脱落。
     ///
     /// 返回被规范化的 ID 数量。
     pub fn normalize_tool_call_ids(contents: &mut [Value]) -> usize {
+        let normalizer = crate::proxy::common::utils::ToolIdNormalizer::new(
+            contents
+                .iter()
+                .filter_map(|content| content["parts"].as_array())
+                .flatten()
+                .filter_map(|part| part["functionCall"]["id"].as_str()),
+        );
         let mut normalized_count = 0usize;
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts.iter_mut() {
                     if let Some(fc) = part.get_mut("functionCall") {
                         if let Some(id_val) = fc.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fc["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;
@@ -1077,7 +1160,7 @@ impl InboundThinkingPipeline {
                     }
                     if let Some(fr) = part.get_mut("functionResponse") {
                         if let Some(id_val) = fr.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fr["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;
@@ -3028,18 +3111,6 @@ impl InboundThinkingPipeline {
             obj.retain(|k, _| k == "request");
         }
     }
-
-    /// 剥离遗留思考块的前缀标记 (**Thinking**)
-    fn strip_thinking_prefix(text: &str) -> String {
-        let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("**Thinking**") {
-            let rest = rest.trim_start_matches(':');
-            rest.trim_start_matches(|c| c == '\r' || c == '\n' || c == ' ' || c == '\t')
-                .to_string()
-        } else {
-            text.to_string()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3351,34 +3422,42 @@ mod tests {
     }
 
     #[test]
-    fn test_heals_legacy_thinking_prefix_without_corrupting_prose() {
-        let mut contents = vec![json!({
-            "role": "model",
-            "parts": [
-                { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
-                { "text": "正在执行检查。" },
-                {
-                    "functionCall": {
-                        "name": "inspect",
-                        "args": {}
-                    }
-                }
-            ]
-        })];
+    fn r30_markdown_thinking_headings_remain_plain_text_for_every_target() {
+        for model in ["claude-sonnet-4-6", "gemini-2.5-pro"] {
+            for enabled in [false, true] {
+                let mut contents = vec![json!({
+                    "role": "model",
+                    "parts": [
+                        { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
+                        { "text": "正在执行检查。" },
+                        {
+                            "functionCall": {
+                                "name": "inspect",
+                                "args": {}
+                            }
+                        }
+                    ]
+                })];
 
-        InboundThinkingPipeline::process_contents(
-            &mut contents,
-            "claude-sonnet-4-6",
-            true,
-            None,
-            false,
-        );
+                InboundThinkingPipeline::process_contents(
+                    &mut contents,
+                    model,
+                    enabled,
+                    None,
+                    false,
+                );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：无签名思考块被丢弃，仅保留可见正文与工具调用
-        assert!(parts.iter().all(|p| p.get("thought").is_none()));
-        assert_eq!(parts[0]["text"], "正在执行检查。");
-        assert!(parts[1].get("functionCall").is_some());
+                let parts = contents[0]["parts"].as_array().expect("parts array");
+                assert!(parts.iter().all(|p| p.get("thought").is_none()));
+                assert_eq!(parts.len(), 3);
+                assert_eq!(
+                    parts[0]["text"],
+                    "**Thinking**\n\n分析了案例数据，准备调用工具。"
+                );
+                assert_eq!(parts[1]["text"], "正在执行检查。");
+                assert!(parts[2].get("functionCall").is_some());
+            }
+        }
     }
 
     #[test]
@@ -3667,17 +3746,23 @@ mod tests {
 
     #[test]
     fn test_inbound_pipeline_empty_tool_result_sanitizes_to_default_output() {
-        let mut contents = vec![json!({
-            "role": "user",
-            "parts": [{
-                "functionResponse": {
-                    "name": "edit_file",
-                    "response": {
-                        "output": "   "
+        let mut contents = vec![
+            json!({
+                "role":"model",
+                "parts":[{"functionCall":{"name":"edit_file","args":{}}}]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "edit_file",
+                        "response": {
+                            "output": "   "
+                        }
                     }
-                }
-            }]
-        })];
+                }]
+            }),
+        ];
 
         InboundThinkingPipeline::process_contents(
             &mut contents,
@@ -3687,10 +3772,12 @@ mod tests {
             false,
         );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        let output_text = parts[0]["functionResponse"]["response"]["output"]
-            .as_str()
-            .unwrap();
+        let output_text = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .find_map(|part| part["functionResponse"]["response"]["output"].as_str())
+            .expect("matched tool result output");
         assert_eq!(output_text, "Command executed successfully.");
     }
 

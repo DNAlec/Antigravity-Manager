@@ -8,9 +8,11 @@ use std::pin::Pin;
 use uuid::Uuid;
 
 use crate::proxy::common::response_media::{render_part, MediaTracker};
+use crate::proxy::common::response_tools::ToolCallTracker;
 use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
+use crate::proxy::pipeline::candidate_selection::CandidateSelection;
 use crate::proxy::pipeline::stream_error::{
     is_refusal_finish_reason, response_has_prompt_refusal, response_is_refusal,
 };
@@ -91,6 +93,17 @@ where
     )
 }
 
+#[derive(Default)]
+struct ChatCandidateState {
+    thinking: Option<crate::proxy::thinking_store::TurnAccumulator>,
+    tool_call_index: usize,
+    has_content: bool,
+    has_thinking: bool,
+    thinking_active: bool,
+    finished: bool,
+    upstream_finished: bool,
+}
+
 /// OpenAI Chat 协议流渲染器（实现 ProtocolStreamHandler Trait）
 pub struct OpenAIChatStreamHandler {
     media: MediaTracker,
@@ -101,13 +114,15 @@ pub struct OpenAIChatStreamHandler {
     pub message_count: usize,
     pub client_tool_names: std::collections::HashSet<String>,
     pub include_usage: bool,
-    pub emitted_tool_calls: std::collections::HashSet<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+    candidate_selection: Option<CandidateSelection>,
+    tool_calls: ToolCallTracker,
+    candidates: std::collections::BTreeMap<u64, ChatCandidateState>,
+    marked_multi_candidate: bool,
     pub final_usage: Option<super::models::OpenAIUsage>,
     // Retain raw cumulative fields even after a translated usage frame is emitted.
     pub usage_metadata: Option<Value>,
-    pub tool_call_index: usize,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
-    upstream_finished: bool,
     pub has_content: bool,
     pub has_thinking: bool,
     pub is_thinking_active: bool,
@@ -133,12 +148,16 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         }
 
         let mut chunks = Vec::new();
+        let mut model_failure = None;
         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+            let mut actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
                 inner
             } else {
                 json
             };
+            if let Some(selection) = &self.candidate_selection {
+                selection.project(&mut actual_data);
+            }
             if let Some(u) = actual_data.get("usageMetadata") {
                 merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
             }
@@ -150,6 +169,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
             self.refused |= response_is_refusal(&actual_data);
             self.media.begin_frame();
+            self.tool_calls.begin_frame();
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                 let candidate_ids = crate::proxy::mappers::gemini::candidate_indices(candidates);
                 if !candidates.is_empty() {
@@ -157,6 +177,13 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 }
                 for (idx, candidate) in candidates.iter().enumerate() {
                     let candidate_id = candidate_ids.as_ref().map(|ids| ids[idx]);
+                    let candidate_index = candidate_id.unwrap_or(idx as u64);
+                    let state = self.candidates.entry(candidate_index).or_insert_with(|| {
+                        ChatCandidateState {
+                            thinking: Some(self.thinking_acc.clone()),
+                            ..Default::default()
+                        }
+                    });
                     let parts = candidate
                         .get("content")
                         .and_then(|c| c.get("parts"))
@@ -166,7 +193,14 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
 
                     if let Some(parts_list) = parts {
                         for part in parts_list {
-                            self.thinking_acc.ingest_part(part);
+                            let call_id = part
+                                .get("functionCall")
+                                .and_then(|call| self.tool_calls.observe(candidate_index, call));
+                            if part.get("functionCall").is_none() || call_id.is_some() {
+                                if let Some(thinking) = &mut state.thinking {
+                                    thinking.ingest_part(part);
+                                }
+                            }
                             let is_thought_part = part
                                 .get("thought")
                                 .and_then(|v| v.as_bool())
@@ -189,9 +223,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                 content_out.push_str(&text);
                             }
                             if let Some(func_call) = part.get("functionCall") {
-                                let call_key = serde_json::to_string(func_call).unwrap_or_default();
-                                if !self.emitted_tool_calls.contains(&call_key) {
-                                    self.emitted_tool_calls.insert(call_key);
+                                if let Some(call_id) = call_id {
                                     let name = func_call
                                         .get("name")
                                         .and_then(|v| v.as_str())
@@ -208,26 +240,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                         &self.client_tool_names,
                                     );
 
-                                    let call_id = func_call
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| {
-                                            let mut hasher =
-                                                std::collections::hash_map::DefaultHasher::new();
-                                            use std::hash::{Hash, Hasher};
-                                            serde_json::to_string(func_call)
-                                                .unwrap_or_default()
-                                                .hash(&mut hasher);
-                                            self.tool_call_index.hash(&mut hasher);
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_nanos()
-                                                .hash(&mut hasher);
-                                            format!("call_{:x}", hasher.finish())
-                                        });
-
                                     if let Some(sig) = part
                                         .get("thoughtSignature")
                                         .or(part.get("thought_signature"))
@@ -240,32 +252,37 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                                                 sig.to_string(),
                                             );
                                     }
-                                    self.thinking_acc.record_tool_id(name, &call_id);
+                                    if let Some(thinking) = &mut state.thinking {
+                                        thinking.record_tool_id(name, &call_id);
+                                    }
 
-                                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                    let call = super::response::chat_tool_call(
+                                        &final_name,
+                                        &args,
+                                        call_id,
+                                        self.chat_tool_kinds.as_ref(),
+                                    );
+                                    let mut call = serde_json::to_value(call).unwrap_or_default();
+                                    call["index"] = json!(state.tool_call_index);
                                     let tool_call_chunk = json!({
                                         "id": &self.stream_id,
                                         "object": "chat.completion.chunk",
                                         "created": self.created_ts,
                                         "model": &self.model,
                                         "choices": [{
-                                            "index": idx as u32,
+                                            "index": candidate_index,
                                             "delta": {
                                                 "role": "assistant",
-                                                "tool_calls": [{
-                                                    "index": self.tool_call_index,
-                                                    "id": call_id,
-                                                    "type": "function",
-                                                    "function": { "name": final_name, "arguments": args_str }
-                                                }]
+                                                "tool_calls": [call]
                                             },
                                             "finish_reason": serde_json::Value::Null
                                         }]
                                     });
 
-                                    self.tool_call_index += 1;
+                                    state.tool_call_index += 1;
                                     self.has_content = true;
-                                    self.is_thinking_active = false;
+                                    state.has_content = true;
+                                    state.thinking_active = false;
                                     let sse_out = format!(
                                         "data: {}\n\n",
                                         serde_json::to_string(&tool_call_chunk).unwrap_or_default()
@@ -313,39 +330,46 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         }
                     }
 
-                    self.upstream_finished |=
+                    state.upstream_finished |=
                         crate::proxy::mappers::gemini::has_successful_candidate_finish(candidate);
                     let raw_finish_reason = candidate
                         .get("finishReason")
                         .or_else(|| candidate.get("finish_reason"))
                         .and_then(|f| f.as_str());
 
-                    let gemini_finish_reason = raw_finish_reason.map(|f| match f {
-                        "STOP" => "stop",
-                        "MAX_TOKENS" => "length",
-                        reason if is_refusal_finish_reason(reason) => "content_filter",
-                        "MALFORMED_FUNCTION_CALL" => "stop",
-                        _ => "stop",
+                    let failed = raw_finish_reason.is_some_and(
+                        crate::proxy::pipeline::stream_error::is_failure_finish_reason,
+                    );
+                    if failed {
+                        state.finished = true;
+                        model_failure = raw_finish_reason
+                            .map(crate::proxy::pipeline::stream_error::model_finish_error);
+                    }
+                    let gemini_finish_reason = raw_finish_reason.and_then(|reason| match reason {
+                        "STOP" => Some("stop"),
+                        "MAX_TOKENS" => Some("length"),
+                        reason if is_refusal_finish_reason(reason) => Some("content_filter"),
+                        _ => None,
                     });
 
-                    let finish_reason = if !self.emitted_tool_calls.is_empty()
-                        && gemini_finish_reason == Some("stop")
-                    {
-                        Some("tool_calls")
-                    } else {
-                        gemini_finish_reason
-                    };
+                    let finish_reason =
+                        if state.tool_call_index > 0 && gemini_finish_reason == Some("stop") {
+                            Some("tool_calls")
+                        } else {
+                            gemini_finish_reason
+                        };
 
                     if !thought_out.is_empty() {
                         self.has_thinking = true;
-                        self.is_thinking_active = true;
+                        state.has_thinking = true;
+                        state.thinking_active = true;
                         let reasoning_chunk = json!({
                             "id": &self.stream_id,
                             "object": "chat.completion.chunk",
                             "created": self.created_ts,
                             "model": &self.model,
                             "choices": [{
-                                "index": idx as u32,
+                                "index": candidate_index,
                                 "delta": { "role": "assistant", "content": serde_json::Value::Null, "reasoning_content": thought_out },
                                 "finish_reason": serde_json::Value::Null
                             }]
@@ -358,12 +382,13 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                     }
 
                     if !content_out.is_empty() || finish_reason.is_some() {
-                        self.is_thinking_active = false;
+                        state.thinking_active = false;
                         if !content_out.is_empty() {
                             self.has_content = true;
+                            state.has_content = true;
                         }
                         if finish_reason.is_some() {
-                            self.has_emitted_finish_reason = true;
+                            state.finished = true;
                         }
                         let delta = if !content_out.is_empty() {
                             json!({ "content": content_out })
@@ -376,7 +401,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                             "created": self.created_ts,
                             "model": &self.model,
                             "choices": [{
-                                "index": idx as u32,
+                                "index": candidate_index,
                                 "delta": delta,
                                 "finish_reason": finish_reason
                             }]
@@ -398,14 +423,28 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             if self.whole_prompt_blocked && !self.has_emitted_finish_reason {
                 self.has_emitted_finish_reason = true;
                 self.is_thinking_active = false;
-                let mut chunk = json!({"id":self.stream_id,"object":"chat.completion.chunk","created":self.created_ts,
-                    "model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]});
-                if !self.include_usage {
-                    if let Some(usage) = self.final_usage.take() {
-                        chunk["usage"] = serde_json::to_value(usage).unwrap();
+                let indices: Vec<u64> = if self.candidates.is_empty() {
+                    vec![0]
+                } else {
+                    self.candidates
+                        .iter_mut()
+                        .filter_map(|(index, state)| {
+                            let unfinished = !state.finished;
+                            state.finished = true;
+                            unfinished.then_some(*index)
+                        })
+                        .collect()
+                };
+                for index in indices {
+                    let mut chunk = json!({"id":self.stream_id,"object":"chat.completion.chunk","created":self.created_ts,
+                        "model":self.model,"choices":[{"index":index,"delta":{},"finish_reason":"content_filter"}]});
+                    if !self.include_usage {
+                        if let Some(usage) = self.final_usage.take() {
+                            chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
+                        }
                     }
+                    chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
                 }
-                chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
             }
         } else {
             report_sse_json_parse(
@@ -419,11 +458,19 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
             );
         }
 
-        // Publish before exposing an upstream finish to a client that may stop
-        // consuming immediately, without polling the transport to EOF.
-        if self.upstream_finished {
-            self.on_finish();
+        if let Some(error) = model_failure {
+            let frame = json!({"error":error, "usage":self.final_usage});
+            chunks.push(Bytes::from(format!("data: {frame}\n\n")));
+            chunks.push(Bytes::from("data: [DONE]\n\n"));
+            self.has_emitted_done = true;
         }
+
+        self.is_thinking_active = self
+            .candidates
+            .values()
+            .any(|state| state.thinking_active && !state.finished);
+        // Publish each completed candidate separately before its terminal reaches the client.
+        self.on_finish();
         chunks
     }
 
@@ -455,40 +502,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     fn emit_finalize(&mut self) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // [收尾保底防御 Fixes #3716]
-        // 若流已产生正文或工具调用，但上游在未显式下发 finishReason 的情况下关闭了连接 (EOF) 或仅下发了 usageMetadata：
-        // 严格遵循 OpenAI 流式契约，在发射 [DONE] 之前补发带有终态 finish_reason ("stop" 或 "tool_calls") 的收尾块。
-        // 防止下游客户端（如 OpenCode、Cline）判定为 finish=unknown 并错误触发空 assistant 续步导致上游 400 报错。
-        if !self.has_emitted_finish_reason
-            && (self.has_content || !self.emitted_tool_calls.is_empty())
-        {
-            self.has_emitted_finish_reason = true;
-            let final_reason = if !self.emitted_tool_calls.is_empty() {
-                "tool_calls"
-            } else {
-                "stop"
-            };
-            let mut finish_chunk = json!({
-                "id": &self.stream_id,
-                "object": "chat.completion.chunk",
-                "created": self.created_ts,
-                "model": &self.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": final_reason
-                }]
-            });
-            if !self.include_usage {
-                if let Some(usage) = self.final_usage.take() {
-                    finish_chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
-                }
-            }
-            chunks.push(Bytes::from(format!(
-                "data: {}\n\n",
-                serde_json::to_string(&finish_chunk).unwrap_or_default()
-            )));
-        }
+        chunks.extend(self.finish_unfinished_candidates(false));
 
         // include_usage=false puts known usage on the finish chunk. A later
         // sparse trailer still needs one final snapshot, including zero corrections.
@@ -500,7 +514,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                     "created": self.created_ts,
                     "model": &self.model,
                     // Older clients index choices[0] unless include_usage was requested.
-                    "choices": if self.include_usage { json!([]) } else { json!([{"index":0,"delta":{},"finish_reason":null}]) },
+                    "choices": if self.include_usage { json!([]) } else { json!([{"index":self.candidates.keys().next().copied().unwrap_or(0),"delta":{},"finish_reason":null}]) },
                     "usage": usage
                 });
                 chunks.push(Bytes::from(format!(
@@ -518,42 +532,13 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         let mut chunks = Vec::new();
 
         // 终态与未产生内容防护：若已经发射 [DONE]，或从未产生任何正文/工具调用，绝不可伪造收尾
-        if self.has_emitted_done || (!self.has_content && self.emitted_tool_calls.is_empty()) {
+        if self.has_emitted_done || !self.has_content {
             return chunks;
         }
 
         self.is_thinking_active = false;
 
-        // 若流尚未发射 finish_reason，按异常收尾契约下发带有 "tool_calls" 或 "length" 的终态帧
-        if !self.has_emitted_finish_reason {
-            self.has_emitted_finish_reason = true;
-            let finish_reason = if !self.emitted_tool_calls.is_empty() {
-                "tool_calls"
-            } else {
-                "length"
-            };
-
-            let mut finish_chunk = json!({
-                "id": &self.stream_id,
-                "object": "chat.completion.chunk",
-                "created": self.created_ts,
-                "model": &self.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason
-                }]
-            });
-            if !self.include_usage {
-                if let Some(usage) = self.final_usage.take() {
-                    finish_chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
-                }
-            }
-            chunks.push(Bytes::from(format!(
-                "data: {}\n\n",
-                serde_json::to_string(&finish_chunk).unwrap_or_default()
-            )));
-        }
+        chunks.extend(self.finish_unfinished_candidates(true));
 
         if self.include_usage {
             if let Some(usage) = self.final_usage.take() {
@@ -591,16 +576,53 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     }
 
     fn on_finish(&mut self) {
-        // Reasoning-only Chat responses fail the lifecycle's content guard,
-        // even when the provider already emitted a successful finish reason.
-        if !self.upstream_finished || !self.has_content {
-            return;
+        let multiple = self.candidates.len() > 1 || self.candidates.keys().any(|index| *index != 0);
+        for state in self.candidates.values_mut() {
+            if !state.upstream_finished || !state.has_content {
+                continue;
+            }
+            if let Some(acc) = state.thinking.take() {
+                if multiple && !self.marked_multi_candidate {
+                    crate::proxy::SignatureCache::global()
+                        .mark_multi_candidate_turn(&self.session_id, self.message_count);
+                    self.marked_multi_candidate = true;
+                } else if !multiple {
+                    if let Some(sig) = acc.observed_signature() {
+                        store_thought_signature(sig, &self.session_id, self.message_count);
+                    }
+                }
+                acc.commit(&self.session_id);
+            }
         }
-        let acc = std::mem::take(&mut self.thinking_acc);
-        if let Some(sig) = acc.observed_signature() {
-            store_thought_signature(sig, &self.session_id, self.message_count);
+    }
+}
+
+impl OpenAIChatStreamHandler {
+    fn finish_unfinished_candidates(&mut self, interrupted: bool) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        for (index, state) in &mut self.candidates {
+            if state.finished || (!state.has_content && !state.has_thinking) {
+                continue;
+            }
+            state.finished = true;
+            let reason = if state.tool_call_index > 0 {
+                "tool_calls"
+            } else if interrupted || !state.has_content {
+                "length"
+            } else {
+                "stop"
+            };
+            let mut chunk = json!({"id":self.stream_id,"object":"chat.completion.chunk",
+                "created":self.created_ts,"model":self.model,
+                "choices":[{"index":index,"delta":{},"finish_reason":reason}]});
+            if !self.include_usage {
+                if let Some(usage) = self.final_usage.take() {
+                    chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
+                }
+            }
+            chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
         }
-        acc.commit(&self.session_id);
+        chunks
     }
 }
 
@@ -630,6 +652,64 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_for_responses_with_context<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_for_responses_with_selection(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_for_responses_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    candidate_selection: CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        None,
+        Some(candidate_selection),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn create_openai_sse_stream_with_context<S, E>(
     gemini_stream: Pin<Box<S>>,
     model: String,
@@ -639,6 +719,66 @@ pub fn create_openai_sse_stream_with_context<S, E>(
     include_usage: bool,
     causal_anchor: Option<String>,
     text_context_anchor: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_tool_kinds(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_with_tool_kinds<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        chat_tool_kinds,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_openai_sse_stream_with_options<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+    candidate_selection: Option<CandidateSelection>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -671,15 +811,17 @@ where
         message_count,
         client_tool_names,
         include_usage,
-        emitted_tool_calls: std::collections::HashSet::new(),
+        chat_tool_kinds,
+        candidate_selection,
+        tool_calls: ToolCallTracker::default(),
+        candidates: Default::default(),
+        marked_multi_candidate: false,
         final_usage: None,
         usage_metadata: None,
-        tool_call_index: 0,
         thinking_acc,
         has_content: false,
         has_thinking: false,
         is_thinking_active: false,
-        upstream_finished: false,
         has_emitted_finish_reason: false,
         has_emitted_done: false,
         refused: false,
@@ -1099,6 +1241,7 @@ fn codex_sse_frame(event: &Value) -> Bytes {
 /// 此处仅保留 Gemini SSE → Responses API 事件流（reasoning / message / tool /
 /// grounding / 终态）的协议差异。
 pub struct CodexResponsesStreamHandler {
+    candidate_selection: CandidateSelection,
     media: MediaTracker,
     model: String,
     session_id: String,
@@ -1118,7 +1261,7 @@ pub struct CodexResponsesStreamHandler {
     reasoning_open: bool,
     reasoning_item_seq: u32,
     active_reasoning_item_id: String,
-    emitted_tool_calls: std::collections::HashSet<String>,
+    tool_calls: ToolCallTracker,
     accumulated_text: String,
     accumulated_thinking: String,
     thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
@@ -1153,6 +1296,7 @@ impl CodexResponsesStreamHandler {
             .unwrap_or_default()
             .as_secs();
         Self {
+            candidate_selection: Default::default(),
             media: MediaTracker::default(),
             model,
             session_id,
@@ -1171,7 +1315,7 @@ impl CodexResponsesStreamHandler {
             reasoning_open: false,
             reasoning_item_seq: 0,
             active_reasoning_item_id: String::new(),
-            emitted_tool_calls: std::collections::HashSet::new(),
+            tool_calls: ToolCallTracker::default(),
             accumulated_text: String::new(),
             accumulated_thinking: String::new(),
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
@@ -1289,7 +1433,12 @@ impl CodexResponsesStreamHandler {
     }
 
     fn handle_part(&mut self, part: &Value, candidate_id: Option<u64>, frames: &mut Vec<Bytes>) {
-        self.thinking_acc.ingest_part(part);
+        let call_id = part
+            .get("functionCall")
+            .and_then(|call| self.tool_calls.observe(candidate_id.unwrap_or(0), call));
+        if part.get("functionCall").is_none() || call_id.is_some() {
+            self.thinking_acc.ingest_part(part);
+        }
         let media_text = render_part(part).and_then(|media| self.media.render(candidate_id, media));
         let is_thought = part
             .get("thought")
@@ -1397,18 +1546,18 @@ impl CodexResponsesStreamHandler {
             );
         }
 
-        if let Some(func_call) = part.get("functionCall") {
-            self.handle_tool_call(func_call, part, frames);
+        if let (Some(func_call), Some(call_id)) = (part.get("functionCall"), call_id) {
+            self.handle_tool_call(func_call, part, call_id, frames);
         }
     }
 
-    fn handle_tool_call(&mut self, func_call: &Value, part: &Value, frames: &mut Vec<Bytes>) {
-        let call_key = serde_json::to_string(func_call).unwrap_or_default();
-        if self.emitted_tool_calls.contains(&call_key) {
-            return;
-        }
-        self.emitted_tool_calls.insert(call_key.clone());
-
+    fn handle_tool_call(
+        &mut self,
+        func_call: &Value,
+        part: &Value,
+        call_id: String,
+        frames: &mut Vec<Bytes>,
+    ) {
         let name = func_call
             .get("name")
             .and_then(|v| v.as_str())
@@ -1419,24 +1568,6 @@ impl CodexResponsesStreamHandler {
         super::response::normalize_and_sanitize_tool_args(name, &mut args);
 
         let args_str = serde_json::to_string(&args).unwrap_or_default();
-
-        let sequence_number = self.sequence_number;
-        let call_id = func_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                use std::hash::{Hash, Hasher};
-                call_key.hash(&mut hasher);
-                sequence_number.hash(&mut hasher);
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .hash(&mut hasher);
-                format!("call_{:x}", hasher.finish())
-            });
 
         if let Some(sig) = part
             .get("thoughtSignature")
@@ -1832,6 +1963,7 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             }
         };
 
+        self.candidate_selection.project(&mut json);
         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
             inner
         } else {
@@ -1842,7 +1974,12 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
         }
 
-        if self.whole_prompt_blocked {
+        if self.whole_prompt_blocked
+            || matches!(
+                self.final_finish_reason.as_deref(),
+                Some("STOP" | "MAX_TOKENS")
+            )
+        {
             return frames;
         }
         self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
@@ -1851,6 +1988,7 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
         }
 
         self.media.begin_frame();
+        self.tool_calls.begin_frame();
         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
             let candidate_id = crate::proxy::mappers::gemini::candidate_indices(candidates)
                 .and_then(|ids| ids.first().copied());
@@ -1906,8 +2044,12 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
     }
 
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        self.whole_prompt_blocked
-            .then(|| std::time::Duration::from_millis(250))
+        (self.whole_prompt_blocked
+            || matches!(
+                self.final_finish_reason.as_deref(),
+                Some("STOP" | "MAX_TOKENS")
+            ))
+        .then(|| std::time::Duration::from_millis(250))
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
@@ -1997,6 +2139,41 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_codex_sse_stream_with_selection(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        _assistant_turn_index,
+        response_id,
+        completion_tx,
+        cache_tool_calls,
+        text_context_anchor,
+        tool_kinds,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_codex_sse_stream_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    _assistant_turn_index: usize,
+    response_id: String,
+    completion_tx: Option<
+        tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
+    >,
+    cache_tool_calls: bool,
+    text_context_anchor: Option<String>,
+    tool_kinds: super::request::ResponsesToolKinds,
+    candidate_selection: CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let trace_info = format!(
         "model={} session={} response_id={} messages={}",
         model, session_id, response_id, message_count
@@ -2010,6 +2187,7 @@ where
         cache_tool_calls,
     );
     handler.tool_kinds = tool_kinds;
+    handler.candidate_selection = candidate_selection;
     if let Some(anchor) = text_context_anchor {
         handler.thinking_acc = handler.thinking_acc.with_text_context_anchor(anchor);
     }
@@ -2022,6 +2200,102 @@ mod tests {
     use super::*;
     use futures::stream;
     use serde_json::json;
+
+    async fn r26_responses_events(items: Vec<Result<Bytes, String>>) -> Vec<Value> {
+        let mut output = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-2.5-flash".into(),
+            format!("r26-{}", uuid::Uuid::new_v4()),
+            1,
+            1,
+            "resp_r26".into(),
+            None,
+            false,
+        );
+        let mut events = Vec::new();
+        while let Some(chunk) = output.next().await {
+            for line in String::from_utf8_lossy(&chunk.unwrap()).lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn r26_responses_finished_transport_close_preserves_terminal_and_trailing_usage() {
+        for (reason, status) in [("STOP", "completed"), ("MAX_TOKENS", "incomplete")] {
+            let first = json!({"response":{
+                "candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":reason}],
+                "usageMetadata":{"promptTokenCount":100}
+            }});
+            let trailer = json!({"response":{
+                "candidates":[{"content":{"parts":[{"text":"must not append"}]}}],
+                "usageMetadata":{"candidatesTokenCount":7,"totalTokenCount":107}
+            }});
+            let events = r26_responses_events(vec![
+                Ok(Bytes::from(format!("data: {first}\n\n"))),
+                Ok(Bytes::from(format!("data: {trailer}\n\n"))),
+                Err("connection reset by peer".into()),
+            ])
+            .await;
+            assert!(!events.iter().any(|event| event["type"] == "error"));
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal["type"], format!("response.{status}"));
+            assert_eq!(terminal["response"]["status"], status);
+            assert_eq!(
+                terminal["response"]["output"][0]["content"][0]["text"],
+                "answer"
+            );
+            assert_eq!(terminal["response"]["usage"]["input_tokens"], 100);
+            assert_eq!(terminal["response"]["usage"]["output_tokens"], 7);
+            if reason == "MAX_TOKENS" {
+                assert_eq!(
+                    terminal["response"]["incomplete_details"]["reason"],
+                    "max_output_tokens"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r26_responses_real_interruptions_and_structured_tail_errors_remain_failed() {
+        for (reason, structured) in [
+            (None, false),
+            (Some("FINISH_REASON_UNSPECIFIED"), false),
+            (Some("STOP"), true),
+            (Some("MAX_TOKENS"), true),
+        ] {
+            let mut candidate = json!({"content":{"parts":[{"text":"answer"}]}});
+            if let Some(reason) = reason {
+                candidate["finishReason"] = json!(reason);
+            }
+            let first = json!({"response":{"candidates":[candidate]}});
+            let failure = if structured {
+                Ok(Bytes::from("data: {\"response\":{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"overloaded\"}}}\n\n"))
+            } else {
+                Err("connection reset by peer".into())
+            };
+            let events =
+                r26_responses_events(vec![Ok(Bytes::from(format!("data: {first}\n\n"))), failure])
+                    .await;
+            assert!(events.iter().any(|event| event["type"] == "error"));
+            assert_eq!(events.last().unwrap()["type"], "response.failed");
+            assert!(!events
+                .iter()
+                .any(|event| event["type"] == "response.completed"
+                    || event["type"] == "response.incomplete"));
+            if structured {
+                assert_eq!(
+                    events.last().unwrap()["response"]["error"]["upstream_status"],
+                    503
+                );
+            }
+        }
+    }
 
     fn sparse_usage_chunks(explicit_zero: bool) -> Vec<Value> {
         let mut final_usage = json!({"candidatesTokenCount": 5, "totalTokenCount": 105});
@@ -3159,6 +3433,7 @@ mod tests {
         );
 
         let mut all_content = String::new();
+        let mut saw_model_failure = false;
         let mut final_finish_reason: Option<String> = None;
 
         while let Some(result) = openai_stream.next().await {
@@ -3168,6 +3443,7 @@ mod tests {
                     if line.starts_with("data: ") && !line.contains("[DONE]") {
                         let json_str = line.trim_start_matches("data: ").trim();
                         if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                            saw_model_failure |= json["error"]["code"] == "upstream_finish_error";
                             if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                                 if let Some(choice) = choices.first() {
                                     if let Some(delta) = choice.get("delta") {
@@ -3196,7 +3472,8 @@ mod tests {
             "Expected empty content, got: {}",
             all_content
         );
-        assert_eq!(final_finish_reason, Some("stop".to_string()));
+        assert_eq!(final_finish_reason, None);
+        assert!(saw_model_failure);
     }
 
     #[tokio::test]
@@ -3508,3 +3785,15 @@ mod error_usage_snapshot_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "response_usability_tests.rs"]
+mod response_usability_tests;
+
+#[cfg(test)]
+#[path = "response_failures_tests.rs"]
+mod response_failures_tests;
+
+#[cfg(test)]
+#[path = "response_selection_tests.rs"]
+mod response_selection_tests;

@@ -547,32 +547,53 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
     }
 }
 
-/// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
-pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
-    if depth > 10 {
-        return;
-    }
-    match value {
-        Value::Object(map) => {
-            // 移除值为 "[undefined]" 的键
-            map.retain(|_, v| {
-                if let Some(s) = v.as_str() {
-                    s != "[undefined]"
-                } else {
-                    true
+/// Remove client placeholders only from known Gemini control fields.
+/// Text, tool arguments/results and schemas may legitimately contain this literal.
+pub fn clean_undefined_control_fields(body: &mut Value) {
+    fn clean_fields(value: &mut Value, fields: &[&str]) {
+        if let Some(object) = value.as_object_mut() {
+            for field in fields {
+                if object.get(*field).and_then(Value::as_str) == Some("[undefined]") {
+                    object.remove(*field);
                 }
-            });
-            // 递归处理嵌套
-            for v in map.values_mut() {
-                deep_clean_undefined(v, depth + 1);
             }
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                deep_clean_undefined(v, depth + 1);
-            }
+    }
+
+    let body = if body.get("request").is_some_and(Value::is_object) {
+        &mut body["request"]
+    } else {
+        body
+    };
+    if let Some(config) = body.get_mut("generationConfig") {
+        clean_fields(
+            config,
+            &[
+                "temperature",
+                "topP",
+                "topK",
+                "candidateCount",
+                "maxOutputTokens",
+                "presencePenalty",
+                "frequencyPenalty",
+                "seed",
+                "responseMimeType",
+                "responseLogprobs",
+                "logprobs",
+            ],
+        );
+        if let Some(thinking) = config.get_mut("thinkingConfig") {
+            clean_fields(
+                thinking,
+                &["thinkingBudget", "thinkingLevel", "includeThoughts"],
+            );
         }
-        _ => {}
+        if let Some(image) = config.get_mut("imageConfig") {
+            clean_fields(image, &["aspectRatio", "imageSize", "personGeneration"]);
+        }
+    }
+    if let Some(calling) = body.pointer_mut("/toolConfig/functionCallingConfig") {
+        clean_fields(calling, &["mode"]);
     }
 }
 
@@ -751,42 +772,158 @@ pub fn map_claude_tool_choice_to_gemini(tool_choice: &Value) -> Option<Value> {
     }
 }
 
-/// 将 OpenAI 的 tool_choice 规范化映射为 Google Gemini 标准的 toolConfig
-/// 遵循“客户端有就传，没有就不传”原则：支持 "auto", "required", "none" 及 {"type": "function", "function": {"name": "..."}}
-pub fn map_openai_tool_choice_to_gemini(tool_choice: &Value) -> Option<Value> {
+/// Resolve selectors against the final declarations, so namespace qualification
+/// and allowed-tool filtering cannot leave a dangling function name upstream.
+pub fn map_openai_tool_choice_to_gemini(
+    tool_choice: &Value,
+    declarations: &mut Vec<Value>,
+    tools: &[Value],
+) -> Result<Option<Value>, String> {
+    let config = |mode: &str| json!({"functionCallingConfig": {"mode": mode}});
     if let Some(s) = tool_choice.as_str() {
-        match s.to_lowercase().as_str() {
-            "auto" => Some(json!({
-                "functionCallingConfig": { "mode": "AUTO" }
-            })),
-            "required" => Some(json!({
-                "functionCallingConfig": { "mode": "ANY" }
-            })),
-            "none" => Some(json!({
-                "functionCallingConfig": { "mode": "NONE" }
-            })),
-            _ => None,
-        }
-    } else if let Some(obj) = tool_choice.as_object() {
-        let choice_type = obj.get("type").and_then(Value::as_str);
-        if choice_type == Some("function") {
-            let func_name = obj
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .or_else(|| obj.get("name").and_then(Value::as_str))?;
-            Some(json!({
-                "functionCallingConfig": {
-                    "mode": "ANY",
-                    "allowedFunctionNames": [func_name]
-                }
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
+        return match s.to_lowercase().as_str() {
+            "auto" => Ok(Some(config("AUTO"))),
+            "required" if !declarations.is_empty() => Ok(Some(config("ANY"))),
+            "none" => Ok(Some(config("NONE"))),
+            _ => Err("tool_choice requires a supported mode and declared tools".into()),
+        };
     }
+    if tool_choice.is_null() {
+        return Ok(None);
+    }
+
+    let is_builtin = |kind: &str| {
+        matches!(
+            kind,
+            "web_search"
+                | "web_search_preview"
+                | "file_search"
+                | "code_interpreter"
+                | "computer_use_preview"
+                | "image_generation"
+                | "mcp"
+                | "apply_patch"
+                | "shell"
+                | "local_shell"
+        )
+    };
+    let choice_kind = tool_choice
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if is_builtin(choice_kind) && tools.iter().any(|tool| tool["type"] == choice_kind) {
+        // These server tools are not client functions. Retain the existing
+        // best-effort adapter behavior instead of rejecting their nameless selector.
+        return Ok(None);
+    }
+    let tool_kinds =
+        crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(Some(tools));
+
+    let resolve = |selector: &Value| -> Result<Vec<String>, String> {
+        let kind = selector.get("type").and_then(Value::as_str).unwrap_or("");
+        let function = selector
+            .get("function")
+            .or_else(|| selector.get("custom"))
+            .unwrap_or(selector);
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| is_builtin(kind).then_some(kind))
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| "tool_choice selector requires a tool name".to_string())?;
+        let namespace = selector
+            .get("namespace")
+            .or_else(|| function.get("namespace"))
+            .and_then(Value::as_str);
+        let qualified = tool_kinds.backend_name(name, namespace);
+        let names: Vec<String> = match kind {
+            "function" | "custom" => declarations
+                .iter()
+                .filter_map(|decl| decl["name"].as_str())
+                .filter(|declared| *declared == qualified)
+                .filter(|declared| {
+                    namespace.is_none_or(|ns| {
+                        tool_kinds
+                            .qualified_names_in_namespace(ns)
+                            .contains(declared)
+                    })
+                })
+                .map(str::to_owned)
+                .collect(),
+            "namespace" => {
+                let selected_namespace = namespace.map_or_else(
+                    || name.to_owned(),
+                    |ns| {
+                        crate::proxy::mappers::openai::request::qualify_namespace_tool_name(
+                            ns, name,
+                        )
+                    },
+                );
+                let members = tool_kinds.qualified_names_in_namespace(&selected_namespace);
+                declarations
+                    .iter()
+                    .filter_map(|decl| decl["name"].as_str())
+                    .filter(|declared| members.contains(declared))
+                    .map(str::to_owned)
+                    .collect()
+            }
+            kind if is_builtin(kind) => declarations
+                .iter()
+                .filter_map(|decl| decl["name"].as_str())
+                .filter(|declared| *declared == name)
+                .map(str::to_owned)
+                .collect(),
+            _ => return Err(format!("Unsupported tool_choice selector type: {kind}")),
+        };
+        if names.is_empty() {
+            return Err(format!(
+                "tool_choice references an undeclared tool: {qualified}"
+            ));
+        }
+        Ok(names)
+    };
+
+    let is_allowed = tool_choice["type"] == "allowed_tools";
+    let (mode, selected) = if is_allowed {
+        let policy = tool_choice.get("allowed_tools").unwrap_or(tool_choice);
+        let mode = match policy.get("mode").and_then(Value::as_str) {
+            Some("auto") => "AUTO",
+            Some("required") => "ANY",
+            _ => return Err("allowed_tools requires mode auto or required".into()),
+        };
+        let selectors = policy
+            .get("tools")
+            .and_then(Value::as_array)
+            .filter(|tools| !tools.is_empty())
+            .ok_or_else(|| "allowed_tools requires a non-empty tool list".to_string())?;
+        let mut selected = HashSet::new();
+        for selector in selectors {
+            selected.extend(resolve(selector)?);
+        }
+        (mode, selected)
+    } else {
+        ("ANY", resolve(tool_choice)?.into_iter().collect())
+    };
+    // Preserve declaration order. AUTO does not support allowedFunctionNames,
+    // so filter the declarations themselves for both allowed_tools modes.
+    let names: Vec<String> = declarations
+        .iter()
+        .filter_map(|decl| decl["name"].as_str())
+        .filter(|name| selected.contains(*name))
+        .map(str::to_owned)
+        .collect();
+    if is_allowed {
+        declarations.retain(|decl| {
+            decl["name"]
+                .as_str()
+                .is_some_and(|name| selected.contains(name))
+        });
+    }
+    let mut result = config(mode);
+    if mode == "ANY" {
+        result["functionCallingConfig"]["allowedFunctionNames"] = json!(names);
+    }
+    Ok(Some(result))
 }
 
 /// 检测是否携带任何工具定义 (无论是本地函数还是联网工具)
@@ -2878,19 +3015,26 @@ mod defense_tests {
 
     #[test]
     fn test_map_openai_tool_choice_to_gemini() {
+        let mut declarations = vec![json!({"name":"query_db"})];
         // 1. "auto"
         let auto_choice = json!("auto");
-        let mapped = map_openai_tool_choice_to_gemini(&auto_choice).unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&auto_choice, &mut declarations, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "AUTO");
 
         // 2. "required"
         let req_choice = json!("required");
-        let mapped = map_openai_tool_choice_to_gemini(&req_choice).unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&req_choice, &mut declarations, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "ANY");
 
         // 3. "none"
         let none_choice = json!("none");
-        let mapped = map_openai_tool_choice_to_gemini(&none_choice).unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&none_choice, &mut declarations, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "NONE");
 
         // 4. {"type": "function", "function": {"name": "query_db"}}
@@ -2898,7 +3042,9 @@ mod defense_tests {
             "type": "function",
             "function": { "name": "query_db" }
         });
-        let mapped = map_openai_tool_choice_to_gemini(&func_choice).unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&func_choice, &mut declarations, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "ANY");
         assert_eq!(
             mapped["functionCallingConfig"]["allowedFunctionNames"][0],

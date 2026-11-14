@@ -25,7 +25,16 @@ pub struct UpstreamStreamError {
 impl UpstreamStreamError {
     /// A response may be replayed only before both output and measured work.
     pub fn replay_safe(&self) -> bool {
-        !self.after_output && !has_measured_usage(self.usage.as_ref())
+        !self.after_output && !has_measured_usage(self.usage.as_ref()) && !self.is_model_failure()
+    }
+
+    fn is_model_failure(&self) -> bool {
+        serde_json::from_str::<Value>(&self.body)
+            .ok()
+            .is_some_and(|value| {
+                value.pointer("/error/type").and_then(Value::as_str)
+                    == Some("upstream_finish_error")
+            })
     }
 
     /// The protocol collector has complete events; the bounded observer can miss
@@ -42,29 +51,80 @@ impl UpstreamStreamError {
 #[derive(Default)]
 struct Observation {
     failure: Option<UpstreamStreamError>,
+    candidate_failures: std::collections::BTreeMap<u64, UpstreamStreamError>,
+    first_candidate_index: Option<u64>,
     has_output: bool,
     usage: Option<Value>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UpstreamStreamErrorObserver {
     state: Arc<Mutex<Observation>>,
+    detect_model_failures: bool,
+    candidate_selection: Option<super::candidate_selection::CandidateSelection>,
+}
+
+impl Default for UpstreamStreamErrorObserver {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            detect_model_failures: true,
+            candidate_selection: None,
+        }
+    }
 }
 
 impl UpstreamStreamErrorObserver {
+    /// Claude and Responses project the first candidate; unselected candidates
+    /// must not turn the selected answer into a failed response.
+    pub fn with_selected_candidate(mut self) -> Self {
+        self.candidate_selection = Some(Default::default());
+        self
+    }
+
+    pub fn candidate_selection(&self) -> Option<super::candidate_selection::CandidateSelection> {
+        self.candidate_selection.clone()
+    }
+
+    fn selected_index(&self, state: &Observation) -> Option<u64> {
+        self.candidate_selection
+            .as_ref()
+            .and_then(|selection| selection.index())
+            .or(state.first_candidate_index)
+    }
+
     pub fn failure(&self) -> Option<UpstreamStreamError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.failure.clone().map(|mut failure| {
-            failure.after_output |= state.has_output;
-            failure.usage = state.usage.clone();
-            failure
-        })
+        state
+            .failure
+            .as_ref()
+            .or_else(|| {
+                self.selected_index(&state)
+                    .and_then(|index| state.candidate_failures.get(&index))
+            })
+            .cloned()
+            .map(|mut failure| {
+                failure.after_output |= state.has_output;
+                failure.usage = state.usage.clone();
+                failure
+            })
     }
 
     /// Transport/EOF failures have no structured envelope. Preserve measured
     /// work before adapters flatten them into a generic collection error.
     pub fn failure_or_incomplete(&self, incomplete: Option<&str>) -> Option<UpstreamStreamError> {
-        if let Some(failure) = self.failure() {
+        if let Some(mut failure) = self.failure() {
+            if failure.is_model_failure() {
+                if let Some(partial) = incomplete
+                    .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                    .and_then(|value| value.get("partial_response").cloned())
+                {
+                    if let Ok(mut body) = serde_json::from_str::<Value>(&failure.body) {
+                        body["partial_response"] = partial;
+                        failure.body = body.to_string();
+                    }
+                }
+            }
             return Some(failure);
         }
         let message = incomplete?;
@@ -82,11 +142,16 @@ impl UpstreamStreamErrorObserver {
 
     pub fn take(&self) -> Option<UpstreamStreamError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.failure.take().map(|mut failure| {
-            failure.after_output |= state.has_output;
-            failure.usage = state.usage.clone();
-            failure
-        })
+        let selected = self.selected_index(&state);
+        state
+            .failure
+            .take()
+            .or_else(|| selected.and_then(|index| state.candidate_failures.remove(&index)))
+            .map(|mut failure| {
+                failure.after_output |= state.has_output;
+                failure.usage = state.usage.clone();
+                failure
+            })
     }
 
     pub fn has_measured_usage(&self) -> bool {
@@ -121,7 +186,50 @@ impl UpstreamStreamErrorObserver {
         if state.failure.is_some() {
             return;
         }
+        let global_finish_failure = inner
+            .get("finishReason")
+            .or_else(|| inner.get("finish_reason"))
+            .and_then(Value::as_str)
+            .is_some_and(is_failure_finish_reason);
+        if self.candidate_selection.is_some()
+            && error_envelope(value).is_none()
+            && !global_finish_failure
+        {
+            if let Some(candidates) = inner.get("candidates").and_then(Value::as_array) {
+                if let Some(indices) = crate::proxy::mappers::gemini::candidate_indices(candidates)
+                {
+                    if state.first_candidate_index.is_none() {
+                        state.first_candidate_index = indices.first().copied();
+                    }
+                    for (candidate, index) in candidates.iter().zip(indices) {
+                        if !self.detect_model_failures
+                            || state.candidate_failures.contains_key(&index)
+                        {
+                            continue;
+                        }
+                        if !candidate
+                            .get("finishReason")
+                            .or_else(|| candidate.get("finish_reason"))
+                            .and_then(Value::as_str)
+                            .is_some_and(is_failure_finish_reason)
+                        {
+                            continue;
+                        }
+                        let mut selected = inner.clone();
+                        selected["candidates"] = json!([candidate]);
+                        if let Some(mut failure) = model_finish_failure(&selected, false) {
+                            failure.after_output = state.has_output;
+                            state.candidate_failures.insert(index, failure);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if let Some(mut failure) = upstream_error_from_event(value) {
+            if !self.detect_model_failures && failure.is_model_failure() {
+                return;
+            }
             failure.after_output = state.has_output;
             state.failure = Some(failure);
         }
@@ -141,6 +249,59 @@ pub fn is_refusal_finish_reason(reason: &str) -> bool {
             | "IMAGE_PROHIBITED_CONTENT"
             | "MODEL_ARMOR"
     )
+}
+
+/// A provider finish outside the documented success, limit and refusal states
+/// is an execution failure. The default enum value is not a terminal state.
+pub fn is_failure_finish_reason(reason: &str) -> bool {
+    !matches!(
+        reason,
+        "" | "FINISH_REASON_UNSPECIFIED" | "STOP" | "MAX_TOKENS"
+    ) && !is_refusal_finish_reason(reason)
+}
+
+pub fn model_finish_error(reason: &str) -> Value {
+    json!({"type":"upstream_finish_error", "code":"upstream_finish_error",
+        "message":format!("Gemini generation ended with {reason}"), "finish_reason":reason})
+}
+
+/// Preserve the upstream partial payload for JSON errors. Stream collectors
+/// replace this last-frame snapshot with their complete protocol partial.
+fn model_finish_failure(value: &Value, first_candidate_only: bool) -> Option<UpstreamStreamError> {
+    let raw = value
+        .get("response")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
+    let reason = raw
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| {
+            candidates
+                .iter()
+                .take(if first_candidate_only { 1 } else { usize::MAX })
+                .filter_map(|candidate| {
+                    candidate
+                        .get("finishReason")
+                        .or_else(|| candidate.get("finish_reason"))
+                        .and_then(Value::as_str)
+                })
+                .find(|reason| is_failure_finish_reason(reason))
+        })
+        .or_else(|| {
+            raw.get("finishReason")
+                .or_else(|| raw.get("finish_reason"))
+                .and_then(Value::as_str)
+                .filter(|reason| is_failure_finish_reason(reason))
+        })?;
+    Some(UpstreamStreamError {
+        status: 502,
+        body: json!({"error":model_finish_error(reason), "partial_response":raw}).to_string(),
+        usage: raw
+            .get("usageMetadata")
+            .filter(|usage| usage.is_object())
+            .cloned(),
+        after_output: has_substantive_output(raw),
+    })
 }
 
 /// A blocked prompt terminates the entire response; a refused candidate may
@@ -191,7 +352,20 @@ pub fn error_envelope(value: &Value) -> Option<&Value> {
 }
 
 pub fn upstream_error_from_event(value: &Value) -> Option<UpstreamStreamError> {
-    let error = error_envelope(value)?;
+    upstream_error_for_selection(value, false)
+}
+
+pub fn upstream_error_from_selected_candidate(value: &Value) -> Option<UpstreamStreamError> {
+    upstream_error_for_selection(value, true)
+}
+
+fn upstream_error_for_selection(
+    value: &Value,
+    first_candidate_only: bool,
+) -> Option<UpstreamStreamError> {
+    let Some(error) = error_envelope(value) else {
+        return model_finish_failure(value, first_candidate_only);
+    };
     Some(UpstreamStreamError {
         status: error_status(error).unwrap_or(502),
         body: json!({"error": error}).to_string(),
@@ -332,7 +506,12 @@ impl Default for UpstreamSseErrorDetector {
                 capture_limit: None,
                 ..Default::default()
             },
-            observer: UpstreamStreamErrorObserver::default(),
+            // Adapters render model failures after delivering their frame's
+            // content. Only actual error envelopes preempt content processing.
+            observer: UpstreamStreamErrorObserver {
+                detect_model_failures: false,
+                ..Default::default()
+            },
         }
     }
 }
@@ -395,6 +574,22 @@ fn error_status(error: &Value) -> Option<u16> {
     }
 }
 
+/// Code and execution results are generated output even without a text part.
+pub(crate) fn has_code_execution_output(part: &Value) -> bool {
+    [
+        ("executableCode", "executable_code", "code"),
+        ("codeExecutionResult", "code_execution_result", "output"),
+    ]
+    .iter()
+    .any(|(camel, snake, field)| {
+        part.get(*camel)
+            .or_else(|| part.get(*snake))
+            .and_then(|value| value.get(*field))
+            .and_then(Value::as_str)
+            .is_some_and(|output| !output.is_empty())
+    })
+}
+
 fn has_substantive_output(value: &Value) -> bool {
     value
         .get("candidates")
@@ -407,9 +602,11 @@ fn has_substantive_output(value: &Value) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|parts| {
                         parts.iter().any(|part| {
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
+                            has_code_execution_output(part)
+                                || part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
                                 || part
                                     .get("functionCall")
                                     .or_else(|| part.get("function_call"))
@@ -578,6 +775,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn r26_code_output_blocks_error_replay_before_usage_arrives() {
+        for (part, has_output) in [
+            (
+                json!({"executableCode":{"language":"PYTHON","code":"print(42)"}}),
+                true,
+            ),
+            (
+                json!({"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"42"}}),
+                true,
+            ),
+            (json!({"executable_code":{"code":"print(42)"}}), true),
+            (json!({"code_execution_result":{"output":"42"}}), true),
+            (json!({"thought":true,"text":"computing"}), true),
+            (json!({"codeExecutionResult":{"output":""}}), false),
+        ] {
+            let observer = UpstreamStreamErrorObserver::default();
+            let frames = [
+                json!({"response":{"candidates":[{"content":{"parts":[part]}}]}}),
+                json!({"response":{"error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"}}}),
+            ];
+            let source = futures::stream::iter(
+                frames
+                    .into_iter()
+                    .map(|value| Ok::<_, String>(Bytes::from(format!("data: {value}\n\n")))),
+            );
+            let _: Vec<_> = observe_response_errors(source, observer.clone(), true)
+                .collect()
+                .await;
+            let failure = observer.failure().expect("structured failure must survive");
+            assert_eq!(failure.status, 503);
+            assert_eq!(failure.after_output, has_output);
+            assert_eq!(failure.replay_safe(), !has_output);
+            assert!(failure.usage.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn collected_large_events_keep_authoritative_failure_usage() {

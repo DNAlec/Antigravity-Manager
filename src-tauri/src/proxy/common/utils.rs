@@ -39,6 +39,36 @@ pub fn normalize_tool_id(id: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(id)
 }
 
+/// Resolve client ID aliases only when they identify a single original call ID.
+pub(crate) struct ToolIdNormalizer {
+    collisions: std::collections::HashSet<String>,
+}
+
+impl ToolIdNormalizer {
+    pub(crate) fn new<'a>(ids: impl Iterator<Item = &'a str>) -> Self {
+        let mut originals = std::collections::HashMap::new();
+        let mut collisions = std::collections::HashSet::new();
+        for id in ids {
+            let normalized = normalize_tool_id(id).into_owned();
+            if let Some(previous) = originals.insert(normalized.clone(), id) {
+                if previous != id {
+                    collisions.insert(normalized);
+                }
+            }
+        }
+        Self { collisions }
+    }
+
+    pub(crate) fn normalize<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        let normalized = normalize_tool_id(id);
+        if self.collisions.contains(normalized.as_ref()) {
+            std::borrow::Cow::Borrowed(id)
+        } else {
+            normalized
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -226,7 +226,43 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_claude_sse_stream_with_selection(
+        gemini_stream,
+        trace_id,
+        email,
+        session_id,
+        scaling_enabled,
+        context_limit,
+        estimated_prompt_tokens,
+        message_count,
+        client_adapter,
+        registered_tool_names,
+        text_context_anchor,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_claude_sse_stream_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    trace_id: String,
+    email: String,
+    session_id: Option<String>, // [NEW v3.3.17] Session ID for signature caching
+    scaling_enabled: bool,      // [NEW] Flag for context usage scaling
+    context_limit: u32,
+    estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
+    message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
+    client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
+    registered_tool_names: Vec<String>,   // [FIX #MCP] Tool names for fuzzy matching
+    text_context_anchor: Option<String>,
+    candidate_selection: crate::proxy::pipeline::candidate_selection::CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let mut state = StreamingState::new();
+    state.candidate_selection = candidate_selection;
     if let Some(anchor) = text_context_anchor {
         state.thinking_acc = state.thinking_acc.with_text_context_anchor(anchor);
     }
@@ -296,12 +332,14 @@ fn process_sse_line(
     }
 
     // 解析 JSON
-    let json_value: serde_json::Value = match serde_json::from_str(data_str) {
+    let mut json_value: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
     let mut chunks = Vec::new();
+
+    state.candidate_selection.project(&mut json_value);
 
     // 解包 response 字段 (如果存在)
     let raw_json = json_value.get("response").unwrap_or(&json_value);
@@ -354,6 +392,7 @@ fn process_sse_line(
 
     // 处理所有 parts
     state.media.begin_frame();
+    state.tool_calls.begin_frame();
     state.media_candidate = raw_json
         .get("candidates")
         .and_then(serde_json::Value::as_array)
@@ -367,8 +406,22 @@ fn process_sse_line(
         .and_then(|p| p.as_array())
     {
         for part_value in parts {
-            state.thinking_acc.ingest_part(part_value);
-            if let Ok(part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
+            if let Ok(mut part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
+                if let Some(call) = part_value.get("functionCall") {
+                    let tracked = state
+                        .tool_calls
+                        .track_snapshot(state.media_candidate.unwrap_or(0), call);
+                    if !tracked.is_new {
+                        if let Some(signature) = part.thought_signature {
+                            state.pending_tool_signatures.push((tracked.id, signature));
+                        }
+                        continue;
+                    }
+                    if let Some(call) = &mut part.function_call {
+                        call.id = Some(tracked.id);
+                    }
+                }
+                state.thinking_acc.ingest_part(part_value);
                 let mut processor = PartProcessor::new(state);
                 chunks.extend(processor.process(&part));
             }
@@ -416,6 +469,7 @@ fn process_sse_line(
         if state.has_thinking
             && !state.has_content
             && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
+            && !crate::proxy::pipeline::stream_error::is_failure_finish_reason(finish_reason)
         {
             tracing::warn!(
                 "[{}] Upstream emitted finishReason '{}' after thinking without content. Suppressing message_stop to allow native client retry.",
@@ -471,6 +525,86 @@ mod usage_tail_tests {
     use super::*;
     use futures::StreamExt;
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    async fn r26_claude_cumulative_tools_emit_each_independent_call_once() {
+        let anonymous = json!({"functionCall":{"name":"inspect","args":{"path":"src"}}});
+        let first = json!({"functionCall":{"id":"first","name":"inspect","args":{}}});
+        let second = json!({"functionCall":{"id":"second","name":"inspect","args":{}}});
+        let parts = json!([anonymous.clone(), anonymous, first, second]);
+        let frames = [
+            frame(json!({"candidates":[{"index":3,"content":{"parts":parts.clone()}}]})),
+            frame(
+                json!({"candidates":[{"index":3,"content":{"parts":parts},"finishReason":"STOP"}]}),
+            ),
+        ];
+        let output = events(Box::pin(futures::stream::iter(frames))).await;
+        let calls: Vec<_> = output
+            .iter()
+            .filter_map(|event| {
+                (event["type"] == "content_block_start"
+                    && event["content_block"]["type"] == "tool_use")
+                    .then_some(&event["content_block"])
+            })
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        assert_eq!(calls[2]["id"], "first");
+        assert_eq!(calls[3]["id"], "second");
+        assert!(output
+            .iter()
+            .any(|event| event["delta"]["stop_reason"] == "tool_use"));
+    }
+
+    #[test]
+    fn r26_claude_repeated_tool_keeps_late_signature_without_reopening_block() {
+        let mut state = StreamingState::new();
+        let call = json!({"functionCall":{"id":"same","name":"inspect","args":{}}});
+        let first = format!(
+            "data: {}",
+            json!({"candidates":[{"content":{"parts":[call.clone()]}}]})
+        );
+        process_sse_line(&first, &mut state, "r26", "r26@example.test");
+        let mut signed = call;
+        signed["thoughtSignature"] = json!("late-signature");
+        let second = format!(
+            "data: {}",
+            json!({"candidates":[{"content":{"parts":[signed]}}]})
+        );
+        let output = process_sse_line(&second, &mut state, "r26", "r26@example.test");
+        assert!(output.is_none());
+        assert_eq!(
+            state.pending_tool_signatures,
+            vec![("same".into(), "late-signature".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn r26_claude_changed_argument_snapshots_keep_existing_emission_behavior() {
+        let frames = [
+            frame(
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","name":"inspect","args":{"path":"first"}}}]}}]}),
+            ),
+            frame(
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","name":"inspect","args":{"path":"updated"}}}]},"finishReason":"STOP"}]}),
+            ),
+        ];
+        let output = events(Box::pin(futures::stream::iter(frames))).await;
+        let arguments: Vec<Value> = output
+            .iter()
+            .filter_map(|event| {
+                event["delta"]["partial_json"]
+                    .as_str()
+                    .map(|value| serde_json::from_str(value).unwrap())
+            })
+            .collect();
+        // Deduplication is limited to repeated complete snapshots. Supporting
+        // argument replacement in emitted blocks requires a separate contract.
+        assert_eq!(
+            arguments,
+            vec![json!({"path":"first"}), json!({"path":"updated"})]
+        );
+    }
 
     async fn events(
         source: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,

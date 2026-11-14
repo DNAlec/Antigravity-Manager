@@ -7,6 +7,205 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Default)]
+struct ChoiceAccumulator {
+    role: Option<String>,
+    content_parts: Vec<String>,
+    reasoning_parts: Vec<String>,
+    finish_reason: Option<String>,
+    tool_calls_map: HashMap<u32, (String, String, String, Vec<String>)>,
+}
+
+impl ChoiceAccumulator {
+    fn ingest(&mut self, choice: &Value) {
+        if let Some(delta) = choice.get("delta") {
+            // Role
+            if let Some(r) = delta.get("role").and_then(|v| v.as_str()) {
+                self.role = Some(r.to_string());
+            }
+
+            // Content
+            if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                self.content_parts.push(c.to_string());
+            }
+
+            // Reasoning Content
+            if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                self.reasoning_parts.push(rc.to_string());
+            }
+
+            // Tool Calls aggregation by index
+            // [FIX] When multiple tool calls arrive with the same index but
+            // different IDs, treat them as SEPARATE tool calls instead of
+            // merging into one (which would concatenate their arguments).
+            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    let raw_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let new_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // If this index already has a DIFFERENT id, it's a new tool call
+                    // Assign it a unique index to avoid merging
+                    let index = if !new_id.is_empty() {
+                        if let Some(existing) = self.tool_calls_map.get(&raw_index) {
+                            if !existing.0.is_empty() && existing.0 != new_id {
+                                // Find next available index
+                                let mut next_idx = raw_index + 1;
+                                while self.tool_calls_map.contains_key(&next_idx) {
+                                    next_idx += 1;
+                                }
+                                next_idx
+                            } else {
+                                raw_index
+                            }
+                        } else {
+                            raw_index
+                        }
+                    } else {
+                        raw_index
+                    };
+
+                    let entry = self.tool_calls_map.entry(index).or_insert_with(|| {
+                        (
+                            String::new(),
+                            String::from("function"),
+                            String::new(),
+                            Vec::new(),
+                        )
+                    });
+
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            entry.0 = id.to_string();
+                        }
+                    }
+
+                    if let Some(tc_type) = tc.get("type").and_then(|v| v.as_str()) {
+                        if !tc_type.is_empty() {
+                            entry.1 = tc_type.to_string();
+                        }
+                    }
+
+                    if let Some(custom) = tc.get("custom") {
+                        if let Some(name) = custom.get("name").and_then(Value::as_str) {
+                            entry.2 = name.to_owned();
+                        }
+                        if let Some(input) = custom.get("input").and_then(Value::as_str) {
+                            entry.3.push(input.to_owned());
+                        }
+                    }
+
+                    if let Some(func) = tc.get("function") {
+                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                entry.2 = name.to_string();
+                            }
+                        }
+                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                            entry.3.push(args.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            self.finish_reason = Some(fr.to_string());
+        }
+    }
+
+    fn finish(self, index: u32) -> Choice {
+        let Self {
+            role,
+            content_parts,
+            reasoning_parts,
+            finish_reason,
+            tool_calls_map,
+        } = self;
+        // Construct final message
+        let full_content = content_parts.join("");
+        let full_reasoning = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join(""))
+        };
+
+        // Build aggregated tool_calls
+        let final_tool_calls: Option<Vec<ToolCall>> = if tool_calls_map.is_empty() {
+            None
+        } else {
+            let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
+                .into_iter()
+                .map(|(index, (id, tc_type, name, args_parts))| {
+                    let payload = args_parts.join("");
+                    let (function, custom) = if tc_type == "custom" {
+                        (
+                            None,
+                            Some(ToolCustom {
+                                name,
+                                input: payload,
+                            }),
+                        )
+                    } else {
+                        (
+                            Some(ToolFunction {
+                                name,
+                                arguments: payload,
+                            }),
+                            None,
+                        )
+                    };
+                    (
+                        index,
+                        ToolCall {
+                            id,
+                            r#type: tc_type,
+                            function,
+                            custom,
+                            signature: None,
+                            status: None,
+                            call_id: None,
+                            operation: None,
+                        },
+                    )
+                })
+                .collect();
+            calls.sort_by_key(|(index, _)| *index);
+            Some(calls.into_iter().map(|(_, tc)| tc).collect())
+        };
+
+        let final_finish_reason = if final_tool_calls.is_some()
+            && matches!(
+                finish_reason.as_deref(),
+                None | Some("stop" | "function_call")
+            ) {
+            Some("tool_calls".to_string())
+        } else {
+            finish_reason.or(Some("stop".to_string()))
+        };
+
+        let message = OpenAIMessage {
+            role: role.unwrap_or("assistant".to_string()),
+            content: if full_content.is_empty() && final_tool_calls.is_some() {
+                None
+            } else {
+                Some(OpenAIContent::String(full_content))
+            },
+            reasoning_content: full_reasoning,
+            signature: None,
+            tool_calls: final_tool_calls,
+            tool_call_id: None,
+            name: None,
+            refusal: None,
+        };
+
+        Choice {
+            index,
+            message,
+            finish_reason: final_finish_reason,
+        }
+    }
+}
+
 /// Collects an OpenAI SSE stream into a complete OpenAIResponse
 pub async fn collect_stream_to_json<S, E>(mut stream: S) -> Result<OpenAIResponse, String>
 where
@@ -22,12 +221,8 @@ where
         usage: None,
     };
 
-    let mut role: Option<String> = None;
-    let mut content_parts: Vec<String> = Vec::new();
-    let mut reasoning_parts: Vec<String> = Vec::new();
-    let mut finish_reason: Option<String> = None;
-    // Tool calls aggregation: index -> (id, type, name, arguments_parts)
-    let mut tool_calls_map: HashMap<u32, (String, String, String, Vec<String>)> = HashMap::new();
+    let mut choices_by_index: std::collections::BTreeMap<u32, ChoiceAccumulator> =
+        Default::default();
     let mut line_buffer = bytes::BytesMut::new();
 
     while let Some(chunk_result) = stream.next().await {
@@ -56,6 +251,27 @@ where
                 if let Ok(json) = serde_json::from_str::<Value>(data_str) {
                     if let Some(error) = crate::proxy::pipeline::stream_error::error_envelope(&json)
                     {
+                        if error.get("code").and_then(Value::as_str)
+                            == Some("upstream_finish_error")
+                        {
+                            response.choices = choices_by_index
+                                .into_iter()
+                                .map(|(index, state)| {
+                                    let mut choice = state.finish(index);
+                                    choice.finish_reason = None;
+                                    choice
+                                })
+                                .collect();
+                            if let Some(usage) = json.get("usage") {
+                                response.usage = serde_json::from_value(usage.clone())
+                                    .ok()
+                                    .or(response.usage);
+                            }
+                            return Err(
+                                serde_json::json!({"error":error, "partial_response":response})
+                                    .to_string(),
+                            );
+                        }
                         return Err(error
                             .get("message")
                             .and_then(Value::as_str)
@@ -82,105 +298,10 @@ where
 
                     // Collect Choices Delta
                     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
-                        if let Some(choice) = choices.first() {
-                            if let Some(delta) = choice.get("delta") {
-                                // Role
-                                if let Some(r) = delta.get("role").and_then(|v| v.as_str()) {
-                                    role = Some(r.to_string());
-                                }
-
-                                // Content
-                                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-                                    content_parts.push(c.to_string());
-                                }
-
-                                // Reasoning Content
-                                if let Some(rc) =
-                                    delta.get("reasoning_content").and_then(|v| v.as_str())
-                                {
-                                    reasoning_parts.push(rc.to_string());
-                                }
-
-                                // Tool Calls aggregation by index
-                                // [FIX] When multiple tool calls arrive with the same index but
-                                // different IDs, treat them as SEPARATE tool calls instead of
-                                // merging into one (which would concatenate their arguments).
-                                if let Some(tcs) =
-                                    delta.get("tool_calls").and_then(|v| v.as_array())
-                                {
-                                    for tc in tcs {
-                                        let raw_index =
-                                            tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
-                                                as u32;
-                                        let new_id =
-                                            tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-
-                                        // If this index already has a DIFFERENT id, it's a new tool call
-                                        // Assign it a unique index to avoid merging
-                                        let index = if !new_id.is_empty() {
-                                            if let Some(existing) = tool_calls_map.get(&raw_index) {
-                                                if !existing.0.is_empty() && existing.0 != new_id {
-                                                    // Find next available index
-                                                    let mut next_idx = raw_index + 1;
-                                                    while tool_calls_map.contains_key(&next_idx) {
-                                                        next_idx += 1;
-                                                    }
-                                                    next_idx
-                                                } else {
-                                                    raw_index
-                                                }
-                                            } else {
-                                                raw_index
-                                            }
-                                        } else {
-                                            raw_index
-                                        };
-
-                                        let entry =
-                                            tool_calls_map.entry(index).or_insert_with(|| {
-                                                (
-                                                    String::new(),
-                                                    String::from("function"),
-                                                    String::new(),
-                                                    Vec::new(),
-                                                )
-                                            });
-
-                                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                            if !id.is_empty() {
-                                                entry.0 = id.to_string();
-                                            }
-                                        }
-
-                                        if let Some(tc_type) =
-                                            tc.get("type").and_then(|v| v.as_str())
-                                        {
-                                            if !tc_type.is_empty() {
-                                                entry.1 = tc_type.to_string();
-                                            }
-                                        }
-
-                                        if let Some(func) = tc.get("function") {
-                                            if let Some(name) =
-                                                func.get("name").and_then(|v| v.as_str())
-                                            {
-                                                if !name.is_empty() {
-                                                    entry.2 = name.to_string();
-                                                }
-                                            }
-                                            if let Some(args) =
-                                                func.get("arguments").and_then(|v| v.as_str())
-                                            {
-                                                entry.3.push(args.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                                finish_reason = Some(fr.to_string());
-                            }
+                        for choice in choices {
+                            let index =
+                                choice.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                            choices_by_index.entry(index).or_default().ingest(choice);
                         }
                     }
                 }
@@ -188,72 +309,10 @@ where
         }
     }
 
-    // Construct final message
-    let full_content = content_parts.join("");
-    let full_reasoning = if reasoning_parts.is_empty() {
-        None
-    } else {
-        Some(reasoning_parts.join(""))
-    };
-
-    // Build aggregated tool_calls
-    let final_tool_calls: Option<Vec<ToolCall>> = if tool_calls_map.is_empty() {
-        None
-    } else {
-        let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
-            .into_iter()
-            .map(|(index, (id, tc_type, name, args_parts))| {
-                (
-                    index,
-                    ToolCall {
-                        id,
-                        r#type: tc_type,
-                        function: Some(ToolFunction {
-                            name,
-                            arguments: args_parts.join(""),
-                        }),
-                        signature: None,
-                        status: None,
-                        call_id: None,
-                        operation: None,
-                    },
-                )
-            })
-            .collect();
-        calls.sort_by_key(|(index, _)| *index);
-        Some(calls.into_iter().map(|(_, tc)| tc).collect())
-    };
-
-    let final_finish_reason = if final_tool_calls.is_some()
-        && matches!(
-            finish_reason.as_deref(),
-            None | Some("stop" | "function_call")
-        ) {
-        Some("tool_calls".to_string())
-    } else {
-        finish_reason.or(Some("stop".to_string()))
-    };
-
-    let message = OpenAIMessage {
-        role: role.unwrap_or("assistant".to_string()),
-        content: if full_content.is_empty() && final_tool_calls.is_some() {
-            None
-        } else {
-            Some(OpenAIContent::String(full_content))
-        },
-        reasoning_content: full_reasoning,
-        signature: None,
-        tool_calls: final_tool_calls,
-        tool_call_id: None,
-        name: None,
-        refusal: None,
-    };
-
-    response.choices.push(Choice {
-        index: 0,
-        message,
-        finish_reason: final_finish_reason,
-    });
+    response.choices = choices_by_index
+        .into_iter()
+        .map(|(index, state)| state.finish(index))
+        .collect();
 
     Ok(response)
 }

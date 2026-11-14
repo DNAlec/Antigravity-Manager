@@ -313,24 +313,20 @@ fn take_responses_input_items(body: &mut Value) -> Vec<Value> {
 }
 
 fn responses_item_tool_name(item: &Value) -> Option<String> {
+    responses_item_tool_name_with_tools(item, &Default::default())
+}
+
+fn responses_item_tool_name_with_tools(
+    item: &Value,
+    kinds: &crate::proxy::mappers::openai::request::ResponsesToolKinds,
+) -> Option<String> {
     let name = item
         .get("name")
         .and_then(Value::as_str)
-        .or_else(|| {
-            item.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| item.get("tool_name").and_then(Value::as_str))
-        .or_else(|| {
-            item.get("tool")
-                .and_then(|t| t.get("name"))
-                .and_then(Value::as_str)
-        })?;
-    Some(match item.get("namespace").and_then(Value::as_str) {
-        Some(ns) => crate::proxy::mappers::openai::request::qualify_namespace_tool_name(ns, name),
-        None => name.to_owned(),
-    })
+        .or_else(|| item["function"]["name"].as_str())
+        .or_else(|| item["tool_name"].as_str())
+        .or_else(|| item["tool"]["name"].as_str())?;
+    Some(kinds.backend_name(name, item["namespace"].as_str()))
 }
 
 fn push_responses_content_part(
@@ -850,7 +846,8 @@ fn openai_content_text(content: &OpenAIContent) -> String {
         OpenAIContent::Array(parts) => parts
             .iter()
             .filter_map(|part| match part {
-                OpenAIContentBlock::Text { text } => Some(text.as_str()),
+                OpenAIContentBlock::Text { text }
+                | OpenAIContentBlock::Refusal { refusal: text } => Some(text.as_str()),
                 _ => None,
             })
             .collect(),
@@ -1389,10 +1386,9 @@ mod responses_conversion_terminal_tests {
     }
 }
 
-/// 仅识别客户端本地私有展示项（如本地渲染的思考块），绝不误杀伴随工具调用的真实过程进度说明。
-/// 只有明确以 `msg_thought_` 为 ID 前缀或历史遗留以 `**Thinking**` 开头的消息才被视为 transcript-only。
-/// 真实的 `phase="commentary"` 消息包含正文说明，必须作为上下文历史保留以保证模型少样本进度输出范式。
-fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool {
+/// Only explicitly marked local thought-message IDs are transcript-only.
+/// Ordinary assistant text, including Markdown headings, remains history.
+fn is_codex_transcript_only_assistant_message(item: &Value) -> bool {
     if responses_input_item_type(item) != "message"
         || item.get("role").and_then(Value::as_str) != Some("assistant")
     {
@@ -1402,7 +1398,6 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
     item.get("id")
         .and_then(Value::as_str)
         .is_some_and(|id| id.starts_with(CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX))
-        || text.trim_start().starts_with("**Thinking**")
 }
 
 #[cfg(test)]
@@ -2238,7 +2233,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             "phase": "commentary",
             "content": [{"type": "output_text", "text": "progress"}],
         });
-        let contaminated_final = json!({
+        let ordinary_heading = json!({
             "type": "message",
             "role": "assistant",
             "phase": "final_answer",
@@ -2251,21 +2246,14 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             "content": [{"type": "output_text", "text": "done"}],
         });
 
-        assert!(is_codex_transcript_only_assistant_message(
-            &thought, "thinking"
+        assert!(is_codex_transcript_only_assistant_message(&thought));
+        assert!(!is_codex_transcript_only_assistant_message(
+            &normal_commentary
         ));
         assert!(!is_codex_transcript_only_assistant_message(
-            &normal_commentary,
-            "progress"
+            &ordinary_heading
         ));
-        assert!(is_codex_transcript_only_assistant_message(
-            &contaminated_final,
-            "**Thinking**\n\nlegacy thought"
-        ));
-        assert!(!is_codex_transcript_only_assistant_message(
-            &clean_final,
-            "done"
-        ));
+        assert!(!is_codex_transcript_only_assistant_message(&clean_final));
     }
 
     #[test]
@@ -2864,6 +2852,9 @@ pub async fn handle_chat_completions(
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
+    let chat_tool_kinds = crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(
+        openai_req.tools.as_deref(),
+    );
 
     // 1. 获取 UpstreamClient (Clone handle)
     let upstream = state.upstream.clone();
@@ -3453,7 +3444,7 @@ pub async fn handle_chat_completions(
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
-                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_context;
+                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_tool_kinds;
                 // Internal streaming is an implementation detail of JSON responses;
                 // the collector needs the usage trailer even without stream_options.
                 let include_usage = !client_wants_stream
@@ -3462,7 +3453,7 @@ pub async fn handle_chat_completions(
                         .as_ref()
                         .map(|o| o.include_usage)
                         .unwrap_or(false);
-                let mut openai_stream = create_openai_sse_stream_with_context(
+                let mut openai_stream = create_openai_sse_stream_with_tool_kinds(
                     gemini_stream,
                     openai_req.model.clone(),
                     session_id.clone(),
@@ -3471,6 +3462,7 @@ pub async fn handle_chat_completions(
                     include_usage,
                     Some(causal_anchor),
                     response_text_context.clone(),
+                    Some(chat_tool_kinds.clone()),
                 );
 
                 let mut first_data_chunk = None;
@@ -3924,6 +3916,23 @@ pub async fn handle_chat_completions(
                     }
                 };
 
+            if let Some(failure) =
+                crate::proxy::pipeline::stream_error::upstream_error_from_event(&gemini_resp)
+            {
+                retry_state.preserve_http_stop(
+                    failure.status,
+                    &failure.body,
+                    &token_manager.get_sticky_config().await,
+                    config.request_type != "image_gen",
+                );
+                failure_statuses.record(
+                    StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                );
+                terminal_stream_usage = failure.usage;
+                last_error = failure.body;
+                break 'attempts;
+            }
+
             if let Some(confirmation) = session_confirmation.as_mut() {
                 confirmation.observe_json(&gemini_resp);
             }
@@ -3960,12 +3969,13 @@ pub async fn handle_chat_completions(
             }
 
             let openai_response =
-                crate::proxy::mappers::openai::response::transform_openai_response_with_context(
+                crate::proxy::mappers::openai::response::transform_openai_response_with_tool_kinds(
                     &gemini_resp,
                     Some(&session_id),
                     message_count,
                     Some(&client_tool_names),
                     response_text_context.clone(),
+                    Some(&chat_tool_kinds),
                 );
             if debug_logger::is_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
@@ -4590,7 +4600,7 @@ fn validate_responses_continuation(
     fn unique_tools(
         tools: &[Value],
         namespaces: &mut Vec<String>,
-        names: &mut std::collections::HashSet<String>,
+        names: &mut std::collections::HashSet<(Vec<String>, String)>,
     ) -> bool {
         for tool in tools {
             if tool["type"] == "namespace" {
@@ -4608,10 +4618,7 @@ fn validate_responses_continuation(
                 .as_str()
                 .or_else(|| tool["name"].as_str())
             {
-                let qualified = namespaces.iter().rev().fold(name.to_owned(), |child, ns| {
-                    crate::proxy::mappers::openai::request::qualify_namespace_tool_name(ns, &child)
-                });
-                if !names.insert(qualified) {
+                if !names.insert((namespaces.clone(), name.to_owned())) {
                     return false;
                 }
             }
@@ -4625,7 +4632,7 @@ fn validate_responses_continuation(
         return Err((
             "ambiguous_tool_name",
             "tools",
-            "Tool names must remain unique after namespace qualification",
+            "Tool names must be unique within their declared namespace",
         ));
     }
     if validate_openai_tool_schemas(body["tools"].as_array().map(Vec::as_slice)).is_err() {
@@ -4786,6 +4793,10 @@ pub async fn handle_completions(
 
     // 1. Convert Payload to Messages (Shared Chat Format)
     if is_codex_style {
+        let input_tool_kinds =
+            crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(
+                body["tools"].as_array().map(Vec::as_slice),
+            );
         let instructions = body
             .get("instructions")
             .and_then(|v| v.as_str())
@@ -4848,7 +4859,8 @@ pub async fn handle_completions(
                         } else if item_type == "web_search_call" {
                             "google_search".to_string()
                         } else {
-                            responses_item_tool_name(item).unwrap_or_else(|| "unknown".to_string())
+                            responses_item_tool_name_with_tools(item, &input_tool_kinds)
+                                .unwrap_or_else(|| "unknown".to_string())
                         };
 
                         call_id_to_name.insert(call_id.to_string(), name.to_string());
@@ -4880,7 +4892,7 @@ pub async fn handle_completions(
                             .to_string();
                         let (content, joined_text, has_media) =
                             responses_message_content(&mut item, step_marker);
-                        if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                        if is_codex_transcript_only_assistant_message(&item) {
                             continue;
                         }
 
@@ -4926,8 +4938,9 @@ pub async fn handle_completions(
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call"
                     | "web_search_call" => {
-                        let mut name = responses_item_tool_name(&item)
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let mut name =
+                            responses_item_tool_name_with_tools(&item, &input_tool_kinds)
+                                .unwrap_or_else(|| "unknown".to_string());
                         let mut args_str = item
                             .get("arguments")
                             .and_then(|v| v.as_str())
@@ -5975,6 +5988,11 @@ pub async fn handle_completions(
                 // Preserve structured upstream errors before protocol conversion.
                 let stream_errors =
                     crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
+                let stream_errors = if is_responses_api {
+                    stream_errors.with_selected_candidate()
+                } else {
+                    stream_errors
+                };
                 let gemini_stream = Box::pin(
                     crate::proxy::pipeline::stream_error::observe_response_errors(
                         gemini_stream,
@@ -5998,7 +6016,7 @@ pub async fn handle_completions(
                 if client_wants_stream {
                     let mut session_completion_rx = None;
                     let mut openai_stream = if is_codex_style {
-                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_context;
+                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_selection;
                         let completion_tx = if store_response {
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             session_completion_rx = Some(rx);
@@ -6006,7 +6024,7 @@ pub async fn handle_completions(
                         } else {
                             None
                         };
-                        create_codex_sse_stream_with_context(
+                        create_codex_sse_stream_with_selection(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id_str.clone(),
@@ -6017,6 +6035,7 @@ pub async fn handle_completions(
                             store_response,
                             response_text_context.clone(),
                             responses_tool_kinds.clone(),
+                            stream_errors.candidate_selection().unwrap_or_default(),
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_context;
@@ -6155,19 +6174,34 @@ pub async fn handle_completions(
                 } else {
                     // Forced Stream Internal -> Convert to Legacy JSON
                     // Use CHAT SSE Stream (so Collector can parse it)
-                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_context;
-                    // Note: We use create_openai_sse_stream regardless of is_codex_style here,
-                    // because we just want the content aggregation which chat stream does well.
-                    let mut openai_stream = create_openai_sse_stream_with_context(
-                        gemini_stream,
-                        openai_req.model.clone(),
-                        session_id_str.clone(),
-                        message_count,
-                        Some(client_tool_names.clone()),
-                        true,
-                        Some(causal_anchor),
-                        response_text_context.clone(),
-                    );
+                    use crate::proxy::mappers::openai::streaming::{
+                        create_openai_sse_stream_for_responses_with_selection,
+                        create_openai_sse_stream_with_context,
+                    };
+                    let mut openai_stream = if is_responses_api {
+                        create_openai_sse_stream_for_responses_with_selection(
+                            gemini_stream,
+                            openai_req.model.clone(),
+                            session_id_str.clone(),
+                            message_count,
+                            Some(client_tool_names.clone()),
+                            true,
+                            Some(causal_anchor),
+                            response_text_context.clone(),
+                            stream_errors.candidate_selection().unwrap_or_default(),
+                        )
+                    } else {
+                        create_openai_sse_stream_with_context(
+                            gemini_stream,
+                            openai_req.model.clone(),
+                            session_id_str.clone(),
+                            message_count,
+                            Some(client_tool_names.clone()),
+                            true,
+                            Some(causal_anchor),
+                            response_text_context.clone(),
+                        )
+                    };
 
                     // [Pipeline StreamPeek] 内部强制流（非流式客户端）：返回前仍需首包，
                     // 统一走 pipeline::stream_peek；超时属于时间问题（不跨账号重放），其余错误仍可换号。
@@ -6572,6 +6606,28 @@ pub async fn handle_completions(
                     }
                 };
 
+            let model_failure = if is_responses_api {
+                crate::proxy::pipeline::stream_error::upstream_error_from_selected_candidate(
+                    &gemini_resp,
+                )
+            } else {
+                crate::proxy::pipeline::stream_error::upstream_error_from_event(&gemini_resp)
+            };
+            if let Some(failure) = model_failure {
+                retry_state.preserve_http_stop(
+                    failure.status,
+                    &failure.body,
+                    &token_manager.get_sticky_config().await,
+                    config.request_type != "image_gen",
+                );
+                failure_statuses.record(
+                    StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                );
+                terminal_stream_usage = failure.usage;
+                last_error = failure.body;
+                break 'attempts;
+            }
+
             if let Some(confirmation) = session_confirmation.as_mut() {
                 confirmation.observe_json(&gemini_resp);
             }
@@ -6583,14 +6639,23 @@ pub async fn handle_completions(
                 response_text_context.as_deref(),
             );
 
-            let chat_resp =
+            let chat_resp = if is_responses_api {
+                crate::proxy::mappers::openai::response::transform_openai_response_for_responses_with_context(
+                    &gemini_resp,
+                    Some(&signature_session_id_str),
+                    1,
+                    Some(&client_tool_names),
+                    response_text_context.clone(),
+                )
+            } else {
                 crate::proxy::mappers::openai::response::transform_openai_response_with_context(
                     &gemini_resp,
                     Some(&signature_session_id_str),
                     1,
                     Some(&client_tool_names),
                     response_text_context.clone(),
-                );
+                )
+            };
 
             let is_responses_api = is_responses_api_path(uri.path());
 
@@ -9298,6 +9363,9 @@ fn dedupe_function_calls_by_call_id(items: Vec<Value>) -> Vec<Value> {
 }
 
 fn convert_codex_to_openai_request(mut body: Value) -> Value {
+    let input_tool_kinds = crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(
+        body["tools"].as_array().map(Vec::as_slice),
+    );
     let instructions = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -9357,7 +9425,8 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     } else if item_type == "web_search_call" {
                         "web_search_call".to_string()
                     } else {
-                        responses_item_tool_name(&item).unwrap_or_else(|| "unknown".to_string())
+                        responses_item_tool_name_with_tools(&item, &input_tool_kinds)
+                            .unwrap_or_else(|| "unknown".to_string())
                     };
                     call_id_to_name.insert(call_id.to_string(), name);
                 }
@@ -9384,7 +9453,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         .to_string();
                     let (content, joined_text, has_media) =
                         responses_message_content(&mut item, step_marker);
-                    if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                    if is_codex_transcript_only_assistant_message(&item) {
                         continue;
                     }
 
@@ -9398,8 +9467,8 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     messages.push(responses_reasoning_message(&item));
                 }
                 "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
-                    let mut name =
-                        responses_item_tool_name(&item).unwrap_or_else(|| "unknown".to_string());
+                    let mut name = responses_item_tool_name_with_tools(&item, &input_tool_kinds)
+                        .unwrap_or_else(|| "unknown".to_string());
                     let mut args_str = item
                         .get("arguments")
                         .and_then(|v| v.as_str())
@@ -9478,7 +9547,9 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     let (mut output_str, output_media) = responses_tool_output_parts(&mut item);
 
                     let name = match call_id_to_name.get(&call_id).cloned().or_else(|| {
-                        get_cached_tool_call(&call_id).and_then(|v| responses_item_tool_name(&v))
+                        get_cached_tool_call(&call_id).and_then(|v| {
+                            responses_item_tool_name_with_tools(&v, &input_tool_kinds)
+                        })
                     }) {
                         Some(name) => name,
                         None if item_type == "custom_tool_call_output" => {
@@ -11260,18 +11331,21 @@ mod r19_responses_regressions {
     }
 
     #[test]
-    fn ambiguous_namespace_tools_are_rejected_in_both_declaration_orders() {
+    fn r28_colliding_namespace_names_are_accepted_but_duplicate_identities_are_rejected() {
         let flat = json!({"type":"function","name":"repo__lookup","parameters":{"type":"object"}});
         let ns =
             json!({"type":"namespace","name":"repo","tools":[{"type":"custom","name":"lookup"}]});
         for tools in [json!([flat, ns]), json!([ns, flat])] {
             let body = json!({"type":"response.create","model":"g","input":"hi","tools":tools});
-            assert_eq!(
-                validate_responses_continuation(&body).unwrap_err().0,
-                "ambiguous_tool_name"
-            );
-            assert!(normalize_responses_websocket_request(body, &mut state()).is_err());
+            assert!(validate_responses_continuation(&body).is_ok());
+            assert!(normalize_responses_websocket_request(body, &mut state()).is_ok());
         }
+        assert_eq!(
+            validate_responses_continuation(&json!({"tools":[flat,flat]}))
+                .unwrap_err()
+                .0,
+            "ambiguous_tool_name"
+        );
         assert!(validate_responses_continuation(&json!({"tools":[{"type":"function","name":"plain"},{"type":"namespace","name":"repo","tools":[{"type":"custom","name":"lookup"}]}]})).is_ok());
     }
 
@@ -11700,3 +11774,11 @@ mod responses_plaintext_compatibility_tests {
         assert_eq!(marker["input"][0], json!({"type":"compaction_summary"}));
     }
 }
+
+#[cfg(test)]
+#[path = "openai_request_identity_tests.rs"]
+mod request_identity_tests;
+
+#[cfg(test)]
+#[path = "openai_request_text_tests.rs"]
+mod request_text_tests;

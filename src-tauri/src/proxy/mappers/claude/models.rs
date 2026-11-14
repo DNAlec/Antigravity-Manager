@@ -123,6 +123,13 @@ pub enum ContentBlock {
         cache_control: Option<serde_json::Value>,
     },
 
+    #[serde(rename = "search_result")]
+    SearchResult {
+        source: String,
+        title: String,
+        content: Vec<McpTextBlock>,
+    },
+
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
 
@@ -161,6 +168,87 @@ pub enum ContentBlock {
         #[serde(default)]
         content: serde_json::Value,
     },
+
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
+
+    #[serde(
+        rename = "code_execution_tool_result",
+        alias = "bash_code_execution_tool_result",
+        alias = "text_editor_code_execution_tool_result"
+    )]
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
+
+    #[serde(rename = "tool_search_tool_result")]
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchResultContent,
+    },
+
+    #[serde(rename = "mcp_tool_use")]
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: serde_json::Map<String, serde_json::Value>,
+    },
+
+    #[serde(rename = "mcp_tool_result")]
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: McpToolResultContent,
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolSearchResultContent {
+    #[serde(rename = "tool_search_tool_search_result")]
+    Found { tool_references: Vec<ToolReference> },
+    #[serde(rename = "tool_search_tool_result_error")]
+    Error {
+        error_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolReference {
+    #[serde(rename = "tool_reference")]
+    Tool { tool_name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpToolResultContent {
+    Text(String),
+    Blocks(Vec<McpTextBlock>),
+}
+
+impl Default for McpToolResultContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum McpTextBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 fn default_empty_object() -> serde_json::Value {

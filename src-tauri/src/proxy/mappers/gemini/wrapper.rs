@@ -52,16 +52,10 @@ pub fn wrap_request_v2(
         (body.clone(), None)
     };
 
-    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
-    crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
-
     // [PIPELINE] 统一清洗提示词与风控伪 Header（兼容第三方聚合器如 New API 以 Gemini 原生协议转入时的特征残留）
     crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
         &mut inner_request,
     );
-
-    // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
-    let is_target_claude = final_model_name.to_lowercase().contains("claude");
 
     let lower_model = final_model_name.to_lowercase();
 
@@ -126,9 +120,6 @@ pub fn wrap_request_v2(
         for (_i, content) in contents.iter_mut().enumerate() {
             let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
             let is_assistant = role == "model" || role == "assistant";
-
-            let mut name_counters: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
 
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 // 1. 如果是 assistant/model 轮次，预先扫描提取 turn_signature (对齐 Anthropic)
@@ -256,21 +247,6 @@ pub fn wrap_request_v2(
                         if let Some(obj) = part.as_object_mut() {
                             // 1. 处理 functionCall (Assistant 请求调用工具)
                             if let Some(fc) = obj.get_mut("functionCall") {
-                                if fc.get("id").is_none() && is_target_claude {
-                                    let name = fc
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    let count = name_counters.entry(name.to_string()).or_insert(0);
-                                    let call_id = format!("call_{}_{}", name, count);
-                                    *count += 1;
-
-                                    fc.as_object_mut()
-                                        .unwrap()
-                                        .insert("id".to_string(), json!(call_id));
-                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
-                                }
-
                                 // 处理签名校验与兼容性 (对齐 Anthropic)
                                 let _call_id =
                                     fc.get("id").and_then(|v| v.as_str()).map(str::to_string);
@@ -291,22 +267,6 @@ pub fn wrap_request_v2(
                             if obj.contains_key("functionResponse") {
                                 obj.remove("thoughtSignature");
                                 obj.remove("thought_signature");
-                            }
-                            if let Some(fr) = obj.get_mut("functionResponse") {
-                                if fr.get("id").is_none() && is_target_claude {
-                                    let name = fr
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    let count = name_counters.entry(name.to_string()).or_insert(0);
-                                    let call_id = format!("call_{}_{}", name, count);
-                                    *count += 1;
-
-                                    fr.as_object_mut()
-                                        .unwrap()
-                                        .insert("id".to_string(), json!(call_id));
-                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
-                                }
                             }
                         }
                         saw_non_thinking = true;
@@ -1845,5 +1805,52 @@ mod tests {
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
+    }
+}
+
+#[cfg(test)]
+mod r26_tool_identity_tests {
+    use super::*;
+
+    #[test]
+    fn r26_native_pipeline_preserves_colliding_original_ids_and_normalizes_other_aliases() {
+        let body = wrap_request(&json!({"contents":[
+            {"role":"user","parts":[{"text":"Run all three"}]},
+            {"role":"model","parts":[
+                {"functionCall":{"id":"call12","name":"read","args":{}}},
+                {"functionCall":{"id":"call_12","name":"write","args":{}}},
+                {"functionCall":{"id":"call34","name":"list","args":{}}}
+            ]},
+            {"role":"user","parts":[
+                {"functionResponse":{"id":"call12","name":"read","response":{"output":"READ"}}},
+                {"functionResponse":{"id":"call_12","name":"write","response":{"output":"WRITE"}}},
+                {"functionResponse":{"id":"call_34","name":"list","response":{"output":"LIST"}}}
+            ]}
+        ]}),"r26-project","gemini-2.5-flash",None,None,None).unwrap();
+        let parts: Vec<_> = body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .collect();
+        let calls: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.get("functionCall"))
+            .collect();
+        let results: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.get("functionResponse"))
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(results.len(), 3);
+        for (index, id, name) in [
+            (0, "call12", "read"),
+            (1, "call_12", "write"),
+            (2, "call_34", "list"),
+        ] {
+            assert_eq!(calls[index]["id"], id);
+            assert_eq!(results[index]["id"], id);
+            assert_eq!(results[index]["name"], name);
+        }
     }
 }

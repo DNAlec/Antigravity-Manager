@@ -90,95 +90,160 @@ pub(crate) fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str
     format!("{}__{}", ns, child)
 }
 
-fn flatten_tools(tools: &[Value]) -> Vec<Value> {
-    let mut flat = Vec::new();
-    for tool in tools {
-        let t = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if t == "namespace" {
-            let namespace_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(sub_tools) = tool.get("tools").and_then(|v| v.as_array()) {
-                let sub_flat = flatten_tools(sub_tools);
-                for mut sub_tool in sub_flat {
-                    if let Some(obj) = sub_tool.as_object_mut() {
-                        let mut name = String::new();
-                        if let Some(n) = obj.get("name").and_then(|v| v.as_str()) {
-                            name = n.to_string();
-                        } else if let Some(func) = obj.get("function") {
-                            if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
-                                name = n.to_string();
-                            }
-                        }
-                        if !name.is_empty() {
-                            let qualified = qualify_namespace_tool_name(namespace_name, &name);
-                            if obj.contains_key("name") {
-                                obj.insert("name".to_string(), json!(qualified));
-                            }
-                            if let Some(func) = obj.get_mut("function") {
-                                if let Some(func_obj) = func.as_object_mut() {
-                                    func_obj.insert("name".to_string(), json!(qualified));
-                                }
-                            }
-                        }
-                    }
-                    flat.push(sub_tool);
-                }
-            }
-        } else {
-            flat.push(tool.clone());
-        }
-    }
-    flat
+fn tool_name(tool: &Value) -> Option<&str> {
+    tool["function"]["name"]
+        .as_str()
+        .or_else(|| tool["custom"]["name"].as_str())
+        .or_else(|| tool["name"].as_str())
 }
 
-/// Resolve the Responses wire type by the qualified name actually sent to
-/// Gemini. Keep all declared functions as negative entries too: a function
-/// called "shell" is still a function even when its only parameter is input.
+fn collect_tool_leaves<'a>(
+    tools: &'a [Value],
+    path: &mut Vec<String>,
+    leaves: &mut Vec<(Vec<String>, &'a Value)>,
+) {
+    for tool in tools {
+        if tool["type"] == "namespace" {
+            if let (Some(ns), Some(children)) = (tool["name"].as_str(), tool["tools"].as_array()) {
+                path.push(ns.to_owned());
+                collect_tool_leaves(children, path, leaves);
+                path.pop();
+            }
+        } else {
+            leaves.push((path.clone(), tool));
+        }
+    }
+}
+
+fn namespace_path_name(path: &[String]) -> Option<String> {
+    path.iter()
+        .rev()
+        .cloned()
+        .reduce(|child, ns| qualify_namespace_tool_name(&ns, &child))
+}
+
+fn flatten_tools(tools: &[Value]) -> Vec<Value> {
+    let kinds = ResponsesToolKinds::from_tools(Some(tools));
+    let mut leaves = Vec::new();
+    collect_tool_leaves(tools, &mut Vec::new(), &mut leaves);
+    leaves
+        .into_iter()
+        .map(|(path, tool)| {
+            let mut tool = tool.clone();
+            if let Some(name) = tool_name(&tool) {
+                let namespace = namespace_path_name(&path);
+                let name = kinds.backend_name(name, namespace.as_deref());
+                let body = if tool["function"].is_object() {
+                    &mut tool["function"]
+                } else if tool["custom"].is_object() {
+                    &mut tool["custom"]
+                } else {
+                    &mut tool
+                };
+                body["name"] = json!(name);
+            }
+            tool
+        })
+        .collect()
+}
+
+/// One request-scoped identity table is used by declarations, selectors,
+/// history replay and response conversion. Literal delimiters are not identity.
 #[derive(Clone, Default)]
 pub struct ResponsesToolKinds {
     declarations_present: bool,
-    // Qualified Gemini name -> (wire name, explicitly declared namespace, kind).
     declarations: std::collections::HashMap<String, (String, Option<String>, bool)>,
+    backend_names: std::collections::HashMap<(String, Option<String>), String>,
+    namespace_members: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl ResponsesToolKinds {
+    pub(crate) fn qualified_names_in_namespace(&self, namespace: &str) -> Vec<&str> {
+        self.namespace_members
+            .get(namespace)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect()
+    }
+
+    pub(crate) fn backend_name(&self, name: &str, namespace: Option<&str>) -> String {
+        self.backend_names
+            .get(&(name.to_owned(), namespace.map(str::to_owned)))
+            .cloned()
+            .unwrap_or_else(|| {
+                namespace.map_or_else(
+                    || name.to_owned(),
+                    |ns| qualify_namespace_tool_name(ns, name),
+                )
+            })
+    }
+
     pub fn from_tools(tools: Option<&[Value]>) -> Self {
-        fn collect(tools: &[Value], namespaces: &mut Vec<String>, result: &mut ResponsesToolKinds) {
-            for tool in tools {
-                if tool["type"] == "namespace" {
-                    if let (Some(ns), Some(children)) =
-                        (tool["name"].as_str(), tool["tools"].as_array())
-                    {
-                        namespaces.push(ns.to_owned());
-                        collect(children, namespaces, result);
-                        namespaces.pop();
-                    }
-                } else if let Some(name) = tool["function"]["name"]
-                    .as_str()
-                    .or_else(|| tool["name"].as_str())
-                {
-                    let qualified = namespaces.iter().rev().fold(name.to_owned(), |child, ns| {
-                        qualify_namespace_tool_name(ns, &child)
-                    });
-                    let namespace = namespaces
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .reduce(|child, ns| qualify_namespace_tool_name(&ns, &child));
-                    result.declarations.insert(
-                        qualified,
-                        (name.to_owned(), namespace, tool["type"] == "custom"),
-                    );
-                }
-            }
-        }
+        use sha2::{Digest, Sha256};
+        use std::collections::{BTreeMap, HashMap, HashSet};
         let tools = tools.unwrap_or_default();
         let mut result = Self {
             declarations_present: !tools.is_empty(),
-            declarations: Default::default(),
+            ..Self::default()
         };
-        collect(tools, &mut Vec::new(), &mut result);
+        let mut leaves = Vec::new();
+        collect_tool_leaves(tools, &mut Vec::new(), &mut leaves);
+        let mut entries = BTreeMap::new();
+        for (path, tool) in leaves {
+            if let Some(name) = tool_name(tool) {
+                entries.insert((path, name.to_owned()), tool["type"] == "custom");
+            }
+        }
+        let preferred = |path: &[String], name: &str| {
+            path.iter().rev().fold(name.to_owned(), |child, ns| {
+                qualify_namespace_tool_name(ns, &child)
+            })
+        };
+        let mut counts = HashMap::<String, usize>::new();
+        for (path, name) in entries.keys() {
+            *counts.entry(preferred(path, name)).or_default() += 1;
+        }
+        // Reserve even names that will be remapped so a generated alias cannot
+        // steal the identity of a client-declared literal name.
+        let mut used: HashSet<String> = counts.keys().cloned().collect();
+        for ((path, name), custom) in entries {
+            let mut backend = preferred(&path, &name);
+            if counts.get(&backend).copied().unwrap_or_default() > 1 || backend.len() > 64 {
+                let mut hash = Sha256::new();
+                for component in path.iter().chain(std::iter::once(&name)) {
+                    hash.update((component.len() as u64).to_be_bytes());
+                    hash.update(component.as_bytes());
+                }
+                let digest = format!("{:x}", hash.finalize());
+                let base = format!("am_tool_{}", &digest[..40]);
+                backend = base.clone();
+                let mut suffix = 0u64;
+                while !used.insert(backend.clone()) {
+                    suffix += 1;
+                    backend = format!("{base}_{suffix}");
+                }
+            }
+            let namespace = namespace_path_name(&path);
+            for depth in 1..=path.len() {
+                if let Some(ns) = namespace_path_name(&path[..depth]) {
+                    result
+                        .namespace_members
+                        .entry(ns)
+                        .or_default()
+                        .push(backend.clone());
+                }
+            }
+            result
+                .backend_names
+                .insert((name.clone(), namespace.clone()), backend.clone());
+            result
+                .declarations
+                .insert(backend, (name, namespace, custom));
+        }
         result
     }
+
     pub(crate) fn wire_identity(&self, name: &str) -> Option<(String, Option<String>, bool)> {
         self.declarations_present.then(|| {
             self.declarations
@@ -196,16 +261,19 @@ fn gemini_custom_tool_declaration(tool: &Value) -> Option<Value> {
     if tool["type"] != "custom" {
         return None;
     }
+    let tool = tool.get("custom").unwrap_or(tool);
     let name = tool.get("name")?.as_str()?;
     let mut decl = json!({"name":name,"parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}});
     let description = tool["description"].as_str().unwrap_or_default();
     if let Some(definition) = tool
         .pointer("/format/definition")
+        .or_else(|| tool.pointer("/format/grammar/definition"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
         let syntax = tool
             .pointer("/format/syntax")
+            .or_else(|| tool.pointer("/format/grammar/syntax"))
             .and_then(Value::as_str)
             .unwrap_or("custom");
         decl["description"] = json!(format!(
@@ -223,10 +291,16 @@ pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections
         let flat_tools = flatten_tools(tools_list);
         for tool in flat_tools {
             let name_opt = tool
-                .get("function")
+                .get("custom")
                 .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
                 .or_else(|| {
                     tool.get("name")
                         .and_then(|v| v.as_str())
@@ -465,6 +539,15 @@ pub fn transform_openai_request_with_session(
         !key.is_empty() && seen_system_instruction_keys.insert(key.to_string())
     });
 
+    let tool_kinds = ResponsesToolKinds::from_tools(request.tools.as_deref());
+    let tool_ids = crate::proxy::common::utils::ToolIdNormalizer::new(
+        request
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+            .map(|call| call.id.as_str()),
+    );
     // Pre-scan to map tool_call_id to function name (for Codex)
     let mut tool_id_to_name = std::collections::HashMap::new();
     for msg in &request.messages {
@@ -472,18 +555,21 @@ pub fn transform_openai_request_with_session(
             for call in tool_calls {
                 let name = if let Some(func) = &call.function {
                     func.name.clone()
+                } else if let Some(custom) = &call.custom {
+                    custom.name.clone()
                 } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
                     "apply_patch".to_string()
                 } else {
                     continue;
                 };
+                let name = tool_kinds.backend_name(&name, None);
                 let final_name = if name == "local_shell_call" {
                     "shell"
                 } else {
                     &name
                 };
                 tool_id_to_name.insert(call.id.clone(), final_name.to_string());
-                let norm_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
+                let norm_id = tool_ids.normalize(&call.id);
                 if norm_id.as_ref() != call.id {
                     tool_id_to_name.insert(norm_id.into_owned(), final_name.to_string());
                 }
@@ -610,6 +696,11 @@ pub fn transform_openai_request_with_session(
                                             parts.extend(crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text));
                                         }
                                     }
+                                OpenAIContentBlock::Refusal { refusal } => {
+                                    if !refusal.is_empty() {
+                                        parts.push(json!({"text":refusal}));
+                                    }
+                                }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(",") {
@@ -742,12 +833,15 @@ pub fn transform_openai_request_with_session(
 
                     let (func_name, args_str) = if let Some(func) = &tc.function {
                         (func.name.clone(), func.arguments.clone())
+                    } else if let Some(custom) = &tc.custom {
+                        (custom.name.clone(), json!({"input":custom.input}).to_string())
                     } else if let Some(op) = &tc.operation {
                         ("apply_patch".to_string(), serde_json::to_string(op).unwrap_or_else(|_| "{}".to_string()))
                     } else {
                         continue;
                     };
 
+                    let func_name = tool_kinds.backend_name(&func_name, None);
                     let mut args = serde_json::from_str::<Value>(&args_str).unwrap_or(json!({}));
 
                     // [New] 利用通用引擎修正参数类型 (替代以前硬编码的 shell 工具修复逻辑)
@@ -777,24 +871,25 @@ pub fn transform_openai_request_with_session(
                 let name = msg.name.as_deref().unwrap_or("");
                 // 优先从前置 assistant 消息中查找匹配该 tool_call_id 的工具名称 (精准杜绝长会话 ID 碰撞时全局 Map 覆盖错误)
                 let matched_preceding_name = if let Some(ref target_id) = msg.tool_call_id {
-                    let norm_target_id = crate::proxy::common::utils::normalize_tool_id(target_id);
+                    let norm_target_id = tool_ids.normalize(target_id);
                     let mut found = None;
                     for prev_idx in (0..msg_index).rev() {
                         if let Some(prev_msg) = request.messages.get(prev_idx) {
                             if prev_msg.role == "assistant" {
                                 if let Some(ref calls) = prev_msg.tool_calls {
-                                    for call in calls {
-                                        let norm_call_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
-                                        if call.id == *target_id || norm_call_id.as_ref() == norm_target_id.as_ref() {
+                                    // Exact IDs always win over compatibility aliases.
+                                    let matched = calls.iter().find(|call| call.id == *target_id)
+                                        .or_else(|| calls.iter().find(|call| tool_ids.normalize(&call.id) == norm_target_id));
+                                    if let Some(call) = matched {
                                             found = if let Some(ref func) = call.function {
                                                 Some(if func.name == "local_shell_call" { "shell".to_string() } else { func.name.clone() })
+                                            } else if let Some(ref custom) = call.custom {
+                                                Some(custom.name.clone())
                                             } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
                                                 Some("apply_patch".to_string())
                                             } else {
                                                 None
                                             };
-                                            break;
-                                        }
                                     }
                                 }
                                 if found.is_some() {
@@ -818,7 +913,7 @@ pub fn transform_openai_request_with_session(
                 } else if name == "local_shell_call" {
                     "shell"
                 } else if let Some(id) = &msg.tool_call_id {
-                    let norm_id = crate::proxy::common::utils::normalize_tool_id(id);
+                    let norm_id = tool_ids.normalize(id);
                     tool_id_to_name
                         .get(id)
                         .or_else(|| tool_id_to_name.get(norm_id.as_ref()))
@@ -847,6 +942,8 @@ pub fn transform_openai_request_with_session(
                     }
                 }
                 let final_name = fallback_inferred_name.as_deref().unwrap_or(final_name);
+                let mapped_tool_name = tool_kinds.backend_name(final_name, None);
+                let final_name = mapped_tool_name.as_str();
 
                 let mut extra_parts = Vec::new();
 
@@ -861,7 +958,8 @@ pub fn transform_openai_request_with_session(
                         let mut texts = Vec::new();
                         for block in blocks {
                             match block {
-                                OpenAIContentBlock::Text { text } => texts.push(text.clone()),
+                                OpenAIContentBlock::Text { text }
+                                | OpenAIContentBlock::Refusal { refusal: text } => texts.push(text.clone()),
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(',') {
@@ -1205,7 +1303,7 @@ pub fn transform_openai_request_with_session(
         let raw_json = serde_json::to_string(original_tools).unwrap_or_default();
         if !raw_json.is_empty() {
             let key = crate::proxy::cache_manager::CacheManager::compute_tools_key(&format!(
-                "pure_tools_v3:{raw_json}"
+                "pure_tools_v4:{raw_json}"
             ));
             let cm = crate::proxy::cache_manager::global_cache_manager();
             if let Some(cached_json) = cm.lookup_tools(&key) {
@@ -1337,18 +1435,22 @@ pub fn transform_openai_request_with_session(
 
     // Removed auto-inject since we handle it above now if Codex passes it.
 
-    if !function_declarations.is_empty() {
-        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
-    }
-
     // [tool_choice] 客户端有就传，没有就不传：
     // 若客户端显式指定了 tool_choice，将其规范化映射为标准的 Gemini toolConfig
     if let Some(tool_choice) = &request.tool_choice {
         if let Some(gemini_tc) =
-            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(tool_choice)
+            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(
+                tool_choice,
+                &mut function_declarations,
+                request.tools.as_deref().unwrap_or_default(),
+            )?
         {
             inner_request["toolConfig"] = gemini_tc;
         }
+    }
+
+    if !function_declarations.is_empty() {
+        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
@@ -1589,9 +1691,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let tools = body
-            .pointer("/request/tools/0/functionDeclarations")
-            .expect("actual Gemini declarations");
+        let tools: Vec<_> = body["request"]["tools"]
+            .as_array()
+            .expect("actual Gemini tools")
+            .iter()
+            .filter_map(|tool| tool["functionDeclarations"].as_array())
+            .flatten()
+            .collect();
         let custom = &tools[0];
         assert_eq!(custom["name"], "scope__mytool");
         assert_eq!(
@@ -2025,6 +2131,7 @@ mod tests {
             messages: vec![OpenAIMessage {
                 role: "assistant".to_string(),
                 tool_calls: Some(vec![ToolCall {
+                    custom: None,
                     id: "call-parent".to_string(),
                     r#type: "function".to_string(),
                     function: Some(ToolFunction {
@@ -2429,6 +2536,7 @@ mod tests {
                 role: "assistant".to_string(),
                 reasoning_content: Some("Thinking...".to_string()),
                 tool_calls: Some(vec![ToolCall {
+                    custom: None,
                     id: "call_123".to_string(),
                     r#type: "function".to_string(),
                     function: Some(ToolFunction {
@@ -2479,6 +2587,7 @@ mod tests {
                 messages: vec![OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: "call_flash_test".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3280,6 +3389,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: call_1_id.clone(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3303,6 +3413,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: call_2_id.clone(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3380,6 +3491,7 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: "call_test_1".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3443,6 +3555,7 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: "call_duplicate_1025976".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3465,6 +3578,7 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: "call_duplicate_1025976".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3530,6 +3644,7 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: "call_shot_1".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3635,6 +3750,7 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
+                        custom: None,
                         id: tool_id.to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3761,5 +3877,337 @@ mod responses_reasoning_replay_tests {
             serde_json::to_value(&msg).unwrap()["content"],
             "Visible answer"
         );
+    }
+}
+
+#[cfg(test)]
+mod r24_tool_choice_tests {
+    use super::*;
+
+    fn request(choice: Value) -> OpenAIRequest {
+        serde_json::from_value(json!({
+            "model":"gemini-2.5-flash", "messages":[{"role":"user","content":"Look up the answer"}],
+            "tools":[
+                {"type":"namespace","name":"fs","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}},
+                    {"type":"custom","name":"edit"}
+                ]},
+                {"type":"function","function":{"name":"delete","parameters":{"type":"object"}}}
+            ], "tool_choice":choice
+        }))
+        .unwrap()
+    }
+
+    fn mapped(choice: Value) -> Value {
+        transform_openai_request(&request(choice), "project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0["request"]
+            .clone()
+    }
+
+    #[test]
+    fn r24_namespace_forced_choice_matches_final_declaration() {
+        for kind in ["function", "custom"] {
+            let name = if kind == "function" { "lookup" } else { "edit" };
+            let body = mapped(json!({"type":kind,"namespace":"fs","name":name}));
+            assert_eq!(
+                body["toolConfig"]["functionCallingConfig"],
+                json!({"mode":"ANY","allowedFunctionNames":[format!("fs__{name}")]})
+            );
+            let names: Vec<_> = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["functionDeclarations"][0]["name"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&format!("fs__{name}").as_str()));
+        }
+    }
+
+    #[test]
+    fn r24_allowed_tools_keep_required_auto_and_scope_on_cached_declarations() {
+        // Reuse the same tools to cover both cold and cached declaration paths.
+        for (mode, nested) in [("required", false), ("auto", true), ("required", true)] {
+            let policy =
+                json!({"mode":mode,"tools":[{"type":"function","namespace":"fs","name":"lookup"}]});
+            let choice = if nested {
+                json!({"type":"allowed_tools","allowed_tools":policy})
+            } else {
+                let mut choice = policy;
+                choice["type"] = json!("allowed_tools");
+                choice
+            };
+            let body = mapped(choice);
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["name"],
+                "fs__lookup"
+            );
+            let config = &body["toolConfig"]["functionCallingConfig"];
+            assert_eq!(
+                config["mode"],
+                if mode == "required" { "ANY" } else { "AUTO" }
+            );
+            if mode == "required" {
+                assert_eq!(config["allowedFunctionNames"], json!(["fs__lookup"]));
+            } else {
+                assert!(config.get("allowedFunctionNames").is_none());
+            }
+        }
+        let body = mapped(json!("auto"));
+        assert_eq!(
+            body["tools"].as_array().unwrap().len(),
+            3,
+            "filtering must not poison cached tools"
+        );
+    }
+
+    #[test]
+    fn r24_invalid_selectors_never_generate_dangling_names() {
+        for choice in [
+            json!({"type":"function","namespace":"missing","name":"lookup"}),
+            json!({"type":"function","name":"lookup"}),
+            json!({"type":"allowed_tools","mode":"required","tools":[]}),
+            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"delete"},{"type":"function","name":"missing"}]}),
+            json!({"type":"unsupported_client_tool","name":"delete"}),
+        ] {
+            assert!(transform_openai_request(
+                &request(choice),
+                "project",
+                "gemini-2.5-flash",
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn r24_namespace_membership_keeps_mcp_names_and_excludes_prefixed_top_level_tools() {
+        let mut request = request(json!("auto"));
+        request.tools = Some(vec![
+            json!({"type":"namespace","name":"fs","tools":[{"type":"function","name":"mcp__read","parameters":{"type":"object"}}]}),
+            json!({"type":"function","name":"fs__delete","parameters":{"type":"object"}}),
+        ]);
+        for selector in [
+            json!({"type":"namespace","name":"fs"}),
+            json!({"type":"function","namespace":"fs","name":"mcp__read"}),
+        ] {
+            request.tool_choice =
+                Some(json!({"type":"allowed_tools","mode":"required","tools":[selector]}));
+            let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
+                .unwrap()
+                .0;
+            assert_eq!(body["request"]["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body["request"]["tools"][0]["functionDeclarations"][0]["name"],
+                "mcp__read"
+            );
+            assert_eq!(
+                body["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+                json!(["mcp__read"])
+            );
+        }
+        request.tool_choice = Some(json!({"type":"function","namespace":"fs","name":"delete"}));
+        assert!(transform_openai_request(&request, "project", "gemini-2.5-flash", None).is_err());
+    }
+
+    #[test]
+    fn r24_builtin_selector_keeps_existing_usable_fallback() {
+        let mut request = request(json!({"type":"web_search_preview"}));
+        request.tools = Some(vec![json!({"type":"web_search_preview"})]);
+        let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0;
+        assert!(!body["request"]["contents"].as_array().unwrap().is_empty());
+        assert!(body["request"].get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn r24_boolean_union_is_normalized_in_actual_tool_and_output_schemas() {
+        let schema = json!({"type":"object","properties":{"value":{"anyOf":[true,false,{"type":"integer"}]}}});
+        for field in [
+            json!({"tools":[{"type":"function","function":{"name":"accept","parameters":schema}}]}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}}),
+        ] {
+            let mut input =
+                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Answer"}]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let typed = serde_json::from_value(input).unwrap();
+            let body = transform_openai_request(&typed, "project", "gemini-2.5-flash", None)
+                .unwrap()
+                .0;
+            let schema = body
+                .pointer("/request/tools/0/functionDeclarations/0/parameters")
+                .or_else(|| body.pointer("/request/generationConfig/responseSchema"))
+                .unwrap();
+            let branches = schema["properties"]["value"]["anyOf"].as_array().unwrap();
+            assert_eq!(branches.len(), 2);
+            assert!(branches.iter().all(Value::is_object));
+        }
+    }
+}
+
+#[cfg(test)]
+mod r26_request_compat_tests {
+    use super::*;
+    use crate::proxy::mappers::{claude, gemini};
+
+    fn mapped(input: Value) -> Value {
+        let request: OpenAIRequest = serde_json::from_value(input).unwrap();
+        transform_openai_request(&request, "r26-project", "gemini-2.5-flash", None)
+            .unwrap()
+            .0
+    }
+    fn parts<'a>(body: &'a Value, key: &str) -> Vec<&'a Value> {
+        body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part.get(key))
+            .collect()
+    }
+    fn declaration(name: &str) -> Value {
+        json!({"type":"function","function":{"name":name,"parameters":{"type":"object","properties":{"needle":{"type":"string"}},"required":["needle"]}}})
+    }
+
+    #[test]
+    fn r26_distinct_tool_ids_and_result_names_survive_the_complete_pipeline() {
+        for (first, second, expected_first) in [
+            ("call12", "call_12", "call12"),
+            ("call12", "call_13", "call_12"),
+            ("call_12", "call12", "call_12"),
+        ] {
+            let body = mapped(
+                json!({"model":"gemini-2.5-flash","tools":[declaration("read"),declaration("write")],"messages":[
+                    {"role":"user","content":"Perform both operations"},
+                    {"role":"assistant","tool_calls":[{"id":first,"type":"function","function":{"name":"read","arguments":"{\"needle\":\"READ_PATH\"}"}},{"id":second,"type":"function","function":{"name":"write","arguments":"{\"needle\":\"WRITE_PATH\"}"}}]},
+                    {"role":"tool","tool_call_id":first,"content":"READ_OUTPUT"},
+                    {"role":"tool","tool_call_id":second,"content":"WRITE_OUTPUT"},
+                    {"role":"user","content":"Summarize each operation"}
+                ]}),
+            );
+            let calls = parts(&body, "functionCall");
+            let results = parts(&body, "functionResponse");
+            assert_eq!(calls.len(), 2);
+            assert_eq!(results.len(), 2);
+            assert_eq!(calls[0]["id"], expected_first);
+            assert_ne!(calls[0]["id"], calls[1]["id"]);
+            for (index, name, output) in [(0, "read", "READ_OUTPUT"), (1, "write", "WRITE_OUTPUT")]
+            {
+                assert_eq!(results[index]["id"], calls[index]["id"]);
+                assert_eq!(results[index]["name"], name);
+                assert_eq!(results[index]["response"]["output"], output);
+            }
+        }
+    }
+
+    #[test]
+    fn r26_unambiguous_client_id_alias_still_pairs_its_result() {
+        let body = mapped(
+            json!({"model":"gemini-2.5-flash","tools":[declaration("read")],"messages":[
+                {"role":"user","content":"Read file"},
+                {"role":"assistant","tool_calls":[{"id":"call123","type":"function","function":{"name":"read","arguments":"{\"needle\":\"path\"}"}}]},
+                {"role":"tool","tool_call_id":"call_123","content":"OK"}
+            ]}),
+        );
+        assert_eq!(parts(&body, "functionCall")[0]["id"], "call_123");
+        assert_eq!(parts(&body, "functionResponse")[0]["id"], "call_123");
+        assert_eq!(parts(&body, "functionResponse")[0]["name"], "read");
+    }
+
+    #[test]
+    fn r26_literal_undefined_survives_all_request_adapters() {
+        for literal in ["[undefined]", "undefined"] {
+            let args = json!({"needle":literal});
+            let chat = mapped(
+                json!({"model":"gemini-2.5-flash","tools":[declaration("lookup")],"messages":[
+                    {"role":"user","content":literal},
+                    {"role":"assistant","tool_calls":[{"id":"call_literal","type":"function","function":{"name":"lookup","arguments":args.to_string()}}]},
+                    {"role":"tool","tool_call_id":"call_literal","content":literal}
+                ]}),
+            );
+            let native = gemini::wrapper::wrap_request(&json!({"contents":[
+                {"role":"user","parts":[{"text":literal}]},
+                {"role":"model","parts":[{"functionCall":{"id":"call_literal","name":"lookup","args":args}}]},
+                {"role":"user","parts":[{"functionResponse":{"id":"call_literal","name":"lookup","response":{"output":literal}}}]}
+            ]}), "r26-project", "gemini-2.5-flash", None, None, None).unwrap();
+            let claude_request: claude::models::ClaudeRequest = serde_json::from_value(json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
+                {"role":"user","content":literal},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_literal","name":"lookup","input":args}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_literal","content":literal}]}
+            ]})).unwrap();
+            let anthropic = claude::transform_claude_request_in(
+                &claude_request,
+                "r26-project",
+                false,
+                None,
+                "r26-undefined",
+                None,
+            )
+            .unwrap();
+            for (route, body) in [("chat", chat), ("native", native), ("claude", anthropic)] {
+                assert_eq!(
+                    parts(&body, "functionCall")[0]["args"]["needle"],
+                    literal,
+                    "{route}: {body}"
+                );
+                assert_eq!(
+                    parts(&body, "functionResponse")[0]["response"]["output"],
+                    literal,
+                    "{route}: {body}"
+                );
+                assert!(
+                    parts(&body, "text")
+                        .iter()
+                        .any(|text| text.as_str() == Some(literal)),
+                    "{route}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r26_legacy_declarations_choice_and_repeated_history_keep_the_tool_contract() {
+        let tool = declaration("lookup");
+        let legacy = mapped(
+            json!({"model":"gemini-2.5-flash","functions":[tool["function"]],"function_call":{"name":"lookup"},"messages":[
+                {"role":"user","content":"Look up both"},
+                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"FIRST_PATH\"}"}},
+                {"role":"function","name":"lookup","content":"FIRST_OUTPUT"},
+                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"SECOND_PATH\"}"}},
+                {"role":"function","name":"lookup","content":"SECOND_OUTPUT"},
+                {"role":"user","content":"What did you find?"}
+            ]}),
+        );
+        let modern = mapped(
+            json!({"model":"gemini-2.5-flash","tools":[tool],"tool_choice":{"type":"function","function":{"name":"lookup"}},"messages":[{"role":"user","content":"Look up both"}]}),
+        );
+        assert_eq!(legacy["request"]["tools"], modern["request"]["tools"]);
+        assert_eq!(
+            legacy["request"]["toolConfig"],
+            modern["request"]["toolConfig"]
+        );
+        assert_eq!(
+            legacy["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["lookup"])
+        );
+        let calls = parts(&legacy, "functionCall");
+        let results = parts(&legacy, "functionResponse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        for (index, needle, output) in [
+            (0, "FIRST_PATH", "FIRST_OUTPUT"),
+            (1, "SECOND_PATH", "SECOND_OUTPUT"),
+        ] {
+            assert_eq!(calls[index]["args"]["needle"], needle);
+            assert_eq!(results[index]["id"], calls[index]["id"]);
+            assert_eq!(results[index]["name"], "lookup");
+            assert_eq!(results[index]["response"]["output"], output);
+        }
     }
 }
