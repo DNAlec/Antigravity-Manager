@@ -3,6 +3,19 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.6 (2026-11-14)**:
+        -   **[工具 Schema 兼容性与资源保护] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
+            -   修复普通 `allOf`、`oneOf`、联合类型及本地引用导致的请求拒绝，包括 SendMessage 的重复 pattern 约束。保留可用的参数结构；无法完整表达的辅助约束采用兼容转换，工具调用与结构化输出共用处理。
+            -   支持本地 JSON Pointer 与有界递归引用，限制转换深度、展开规模和总大小，避免复杂 Schema 耗尽资源。超限仍返回明确错误，不发送部分转换结果。
+        -   **[明文历史与 Gemini 响应兼容] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
+            -   Responses 历史已有可读推理摘要时，不再因外部加密状态无法回放而拒绝；摘要作为普通上下文传给非思考模型，有效原生签名继续保留。HTTP、WebSocket 与预热路径保持一致。
+            -   接受带明文的 `compaction_summary` 和无关状态字段，在保留历史重置语义的同时传递摘要。只有不透明密文且缺少可用明文、缺失父历史或实际文件内容时仍明确报错。
+            -   Gemini 流式、JSON 响应与聚合支持无歧义的数字字符串候选索引，避免仅因索引表示差异丢失正文或工具调用；重复和歧义索引仍拒绝。
+        -   **[版本检查与发布附件] (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
+            -   上游版本检查仅显示版本提示，移除下载、安装和更新重启入口，避免上游安装包覆盖本分支。
+            -   未配置签名的 macOS 构建仍提供应用归档；更新清单仅包含有签名且附件存在的下载项。
+        -   本次未修复、未包含 OpenCode `myt` 的客户端能力配置问题；升级 AM 不会自动修复该配置。
+
     *   **v5.0.5 (2026-11-14)**:
         -   **[跨协议缓存连续性与历史恢复] (PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
             -   仅在成功终态且存在可交付内容时提交思考历史与签名；失败重试、连接中断和仅思考输出不污染下一轮，多候选分别判断，并在客户端收到终态前发布有效历史。

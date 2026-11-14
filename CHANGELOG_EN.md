@@ -3,6 +3,19 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.6 (2026-11-14)**:
+        -   **[Tool Schema compatibility and resource limits] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
+            -   Accept ordinary `allOf`, `oneOf`, union types and local references that previously rejected requests, including repeated pattern constraints in SendMessage. Preserve usable parameter structure and adapt auxiliary constraints that cannot be represented fully, for both tools and structured output.
+            -   Support local JSON Pointers and bounded recursive references while limiting conversion depth, expansion and total size. Over-budget schemas still return an explicit error without sending partially converted data.
+        -   **[Readable history and Gemini response compatibility] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
+            -   Accept Responses history with readable reasoning summaries even when external encrypted state cannot be replayed. Summaries reach non-thinking models as ordinary context, while valid native signatures are preserved across HTTP, WebSocket and prewarm requests.
+            -   Accept plaintext `compaction_summary` content and unrelated status fields, retaining the history reset and its readable summary. Opaque ciphertext without readable content, missing parent history and missing file contents still return explicit errors.
+            -   Accept unambiguous decimal string candidate indices in Gemini streaming, JSON responses and aggregation, preserving text and tool calls when only the index representation differs. Duplicate or ambiguous identities remain errors.
+        -   **[Version checks and release downloads] (PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
+            -   Upstream version checks display notifications only. Download, installation and update-restart actions have been removed to prevent upstream packages from replacing this fork.
+            -   Unsigned macOS builds still provide downloadable app archives. Update manifests include only signed entries whose release assets exist.
+        -   The OpenCode `myt` client capability configuration issue remains unresolved and is outside this release; upgrading AM does not repair that configuration.
+
     *   **v5.0.5 (2026-11-14)**:
         -   **[Cross-protocol cache continuity and history recovery] (PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5), Thanks to @DNAlec)**:
             -   Publish reasoning history and signatures only for successful, deliverable candidates. Failed retries, interrupted streams and thought-only failures cannot contaminate the next turn; candidates qualify independently and valid history is available before the client sees completion.
