@@ -443,6 +443,29 @@ mod tests {
     use std::io;
 
     #[tokio::test]
+    async fn numeric_string_indices_aggregate_with_numeric_continuations() {
+        let frames = [
+            json!({"response":{"candidates":[{"index":"1","content":{"parts":[{"text":"second "}]}},{"index":"0","content":{"parts":[{"text":"first "}]}}]}}),
+            json!({"candidates":[{"index":0,"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"},{"index":1,"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}]}),
+        ];
+        let source = stream::iter(
+            frames.map(|frame| Ok::<_, io::Error>(Bytes::from(format!("data: {frame}\n\n")))),
+        );
+        let response = collect_stream_to_json(source, "numeric-string-collector")
+            .await
+            .unwrap();
+        assert_eq!(response["candidates"].as_array().unwrap().len(), 2);
+        for (index, expected) in [(0, "first answer"), (1, "second answer")] {
+            assert_eq!(response["candidates"][index]["index"], index);
+            assert_eq!(
+                response["candidates"][index]["content"]["parts"][0]["text"],
+                expected
+            );
+            assert_eq!(response["candidates"][index]["finishReason"], "STOP");
+        }
+    }
+
+    #[tokio::test]
     async fn signed_plain_text_parts_keep_their_original_boundaries_at_eof() {
         for signed in [
             json!({"text":"second","thoughtSignature":"signed-fragment"}),

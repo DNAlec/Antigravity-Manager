@@ -2350,8 +2350,9 @@ impl InboundThinkingPipeline {
     }
 
     /// 统一对齐与规范化 Google Request 内部拓扑结构与稳定前缀（Pipeline First 核心归一）
-    pub fn align_google_request_prefix_topology(inner_request: &mut Value) {
-        Self::align_google_request_prefix_topology_with_model(inner_request, "", None);
+    pub fn align_google_request_prefix_topology(inner_request: &mut Value) -> Result<(), String> {
+        Self::align_google_request_prefix_topology_with_model(inner_request, "", None)?;
+        Ok(())
     }
 
     /// 支持传入 target_model 与 top_request_id 的增强版拓扑对齐:
@@ -2367,10 +2368,10 @@ impl InboundThinkingPipeline {
         inner_request: &mut Value,
         target_model: &str,
         top_request_id: Option<&str>,
-    ) {
+    ) -> Result<(), String> {
         let req_obj = match inner_request.as_object_mut() {
             Some(o) => o,
-            None => return,
+            None => return Ok(()),
         };
 
         // 1. contents (官方报文中 contents 置于首位)
@@ -2498,7 +2499,7 @@ impl InboundThinkingPipeline {
                                         let mut params = params_json_schema;
                                         crate::proxy::common::json_schema::clean_json_schema(
                                             &mut params,
-                                        );
+                                        )?;
                                         crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                             &mut params,
                                         );
@@ -2506,7 +2507,7 @@ impl InboundThinkingPipeline {
                                     } else if let Some(params) = decl_obj.get_mut("parameters") {
                                         crate::proxy::common::json_schema::clean_json_schema(
                                             params,
-                                        );
+                                        )?;
                                         crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                             params,
                                         );
@@ -2843,6 +2844,7 @@ impl InboundThinkingPipeline {
             }
         }
         *inner_request = Value::Object(reordered);
+        Ok(())
     }
 
     /// 统一规范化出站顶层信封结构（Pipeline First 核心归一出口）
@@ -2852,14 +2854,14 @@ impl InboundThinkingPipeline {
     /// 3. 对齐统一 project ("aicode-consumers")、userAgent ("antigravity") 与 requestType ("agent")
     /// 4. 统一处理内部 request 拓扑对齐
     /// 5. 顶层键序严格对齐: project -> requestId -> request -> model -> userAgent -> requestType -> 其余
-    pub fn align_official_envelope(body: &mut Value) {
+    pub fn align_official_envelope(body: &mut Value) -> Result<(), String> {
         if !body.is_object() {
-            return;
+            return Ok(());
         }
 
         let body_obj = match body.as_object_mut() {
             Some(obj) => obj,
-            None => return,
+            None => return Ok(()),
         };
 
         // 1. 处理 _session_thinking_id
@@ -2933,7 +2935,7 @@ impl InboundThinkingPipeline {
                 inner_req,
                 &model_str,
                 top_rid_str.as_deref(),
-            );
+            )?;
 
             // 若 requestType 缺失，根据 tools 或 contents 判定是否为 agent 请求
             if request_type.is_none() {
@@ -2978,8 +2980,8 @@ impl InboundThinkingPipeline {
                 body,
                 &model_str,
                 top_rid_str.as_deref(),
-            );
-            return;
+            )?;
+            return Ok(());
         }
 
         let inner_request = body_obj.remove("request");
@@ -3010,6 +3012,7 @@ impl InboundThinkingPipeline {
         }
 
         *body = Value::Object(reordered);
+        Ok(())
     }
 
     /// 统一规范化出站 countTokens 顶层信封结构
@@ -4954,7 +4957,8 @@ mod tests {
             &mut inner_request,
             "gemini-3.8-flash-high",
             Some("agent/test/123/abc/4"),
-        );
+        )
+        .unwrap();
 
         let contents = inner_request["contents"]
             .as_array()
@@ -5020,7 +5024,8 @@ mod tests {
             &mut inner_request,
             "gemini-3.8-flash-high",
             Some("agent/test/456/deep/1"),
-        );
+        )
+        .unwrap();
 
         let contents = inner_request["contents"]
             .as_array()
@@ -5153,7 +5158,8 @@ mod tests {
             &mut inner_request,
             "gemini-2.5-flash",
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             inner_request.get("toolConfig").is_none(),
@@ -5193,7 +5199,8 @@ mod tests {
             &mut request_with_tools,
             "gemini-2.5-flash",
             None,
-        );
+        )
+        .unwrap();
 
         assert!(request_with_tools.get("tools").is_some(), "tools 必须存在");
         assert!(
@@ -5232,7 +5239,8 @@ mod tests {
             &mut request,
             "gemini-2.5-flash",
             None,
-        );
+        )
+        .unwrap();
 
         let tools = request["tools"].as_array().expect("tools must be array");
         assert_eq!(tools.len(), 3, "工具数量必须保持一致");
@@ -5268,7 +5276,7 @@ mod tests {
             }
         });
 
-        InboundThinkingPipeline::align_official_envelope(&mut body);
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
 
         let req_id = body
             .get("requestId")
@@ -5314,7 +5322,8 @@ mod tests {
             &mut inner_req,
             "custom-unknown-model",
             None,
-        );
+        )
+        .unwrap();
 
         let fc_part = &inner_req["contents"][0]["parts"][0];
         assert_eq!(
@@ -5352,7 +5361,8 @@ mod tests {
             &mut inner_req,
             "claude-sonnet-4-6",
             None,
-        );
+        )
+        .unwrap();
 
         let parts = &inner_req["contents"][0]["parts"].as_array().unwrap();
         // 官方抓包铁证：Claude 模型绝不注入哨兵，所有并发工具保持留空无签名状态！
@@ -5399,7 +5409,8 @@ mod tests {
             &mut inner_req,
             "gemini-3.8-flash-low",
             None,
-        );
+        )
+        .unwrap();
 
         let parts = &inner_req["contents"][0]["parts"].as_array().unwrap();
         // 官方抓包第 41 段铁证：
@@ -5441,7 +5452,8 @@ mod tests {
             &mut inner_req,
             "gemini-3.1-pro-high",
             None,
-        );
+        )
+        .unwrap();
 
         let safety = inner_req["safetySettings"].as_array().unwrap();
         assert_eq!(safety.len(), 2, "不支持的分类必须被过滤");
@@ -5587,7 +5599,8 @@ mod tests {
             &mut inner_req,
             "claude-sonnet-4-6",
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             inner_req.get("toolConfig").is_some(),
@@ -5634,7 +5647,8 @@ mod tests {
             &mut inner_req,
             "gemini-3.8-flash-high",
             None,
-        );
+        )
+        .unwrap();
 
         assert!(inner_req.get("toolConfig").is_some());
         let gc = inner_req.get("generationConfig").expect("generationConfig");
@@ -5678,7 +5692,8 @@ mod tests {
             &mut inner_req,
             "claude-sonnet-4-6",
             None,
-        );
+        )
+        .unwrap();
 
         assert!(inner_req.get("toolConfig").is_some());
         let gc = inner_req.get("generationConfig").expect("generationConfig");
@@ -5746,7 +5761,8 @@ mod tests {
             &mut inner_req,
             "claude-sonnet-4-6",
             None,
-        );
+        )
+        .unwrap();
 
         let gc = inner_req.get("generationConfig").expect("generationConfig");
         let tc = gc.get("thinkingConfig").expect("thinkingConfig");
@@ -5777,7 +5793,8 @@ mod tests {
             &mut inner_req,
             "gemini-3.8-flash-low",
             None,
-        );
+        )
+        .unwrap();
 
         let gc = inner_req.get("generationConfig").expect("generationConfig");
         let tc = gc.get("thinkingConfig").expect("thinkingConfig");
@@ -6004,7 +6021,7 @@ mod mixed_tool_id_signature_tests {
             };
             let mut body = json!({"contents":h});
             let before = signatures(&body["contents"]);
-            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None);
+            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None).unwrap();
             let mut final_contents = body["contents"].as_array().unwrap().clone();
             finalize_request_text_context(&sid, &mut final_contents, model, true, false);
             let after = signatures(&json!(final_contents));
@@ -6075,12 +6092,81 @@ mod reconstructed_tool_signature_tests {
             };
             let mut body = json!({"contents":h});
             let before = signatures(&body["contents"]);
-            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None);
+            Pipe::align_google_request_prefix_topology_with_model(&mut body, model, None).unwrap();
             let mut final_contents = body["contents"].as_array().unwrap().clone();
             finalize_request_text_context(&sid, &mut final_contents, model, true, false);
             let after = signatures(&json!(final_contents));
             assert_eq!(before, ["A"]);
             assert_eq!(after, ["A"]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_budget_integration_tests {
+    use super::*;
+
+    #[test]
+    fn schema_budget_errors_reach_adapters_and_shared_pipeline() {
+        let schema = json!({"type":"object", "description":"x".repeat(
+            crate::proxy::common::json_schema::MAX_SCHEMA_BYTES + 1
+        )});
+        assert_schema_budget_rejected(schema);
+    }
+
+    #[test]
+    fn normalization_budget_errors_reach_adapters_and_shared_pipeline() {
+        let mut schema = json!({"type":"string"});
+        for _ in 0..9 {
+            schema = json!({
+                "type":"array", "items":schema,
+                "anyOf":[{"type":"array","minItems":1},{"type":"array","maxItems":2}]
+            });
+        }
+        assert_schema_budget_rejected(schema);
+    }
+
+    fn assert_schema_budget_rejected(schema: Value) {
+        let mut native = json!({
+            "contents":[{"role":"user","parts":[{"text":"hello"}]}],
+            "tools":[{"functionDeclarations":[{"name":"lookup","parameters":schema}]}]
+        });
+        assert!(crate::proxy::mappers::gemini::wrapper::wrap_request(
+            &native,
+            "project",
+            "gemini-2.5-flash",
+            None,
+            None,
+            None
+        )
+        .unwrap_err()
+        .contains("budget"));
+        assert!(
+            InboundThinkingPipeline::align_google_request_prefix_topology(&mut native)
+                .unwrap_err()
+                .contains("budget")
+        );
+        for extra in [
+            json!({"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}}),
+        ] {
+            let mut request =
+                json!({"model":"gemini-2.5-flash", "messages":[{"role":"user","content":"hello"}]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let typed = serde_json::from_value(request).unwrap();
+            assert!(
+                crate::proxy::mappers::openai::request::transform_openai_request(
+                    &typed,
+                    "project",
+                    "gemini-2.5-flash",
+                    None
+                )
+                .unwrap_err()
+                .contains("budget")
+            );
         }
     }
 }

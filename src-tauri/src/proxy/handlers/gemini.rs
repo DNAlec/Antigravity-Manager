@@ -413,7 +413,8 @@ pub async fn handle_generate(
             Some(&state.upstream),
             Some(&affinity_key),
             retried_without_thinking,
-        );
+        )
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
         heal_flags.reapply(&mut wrapped_body);
         // [Signature-Retry] 400 签名错误后的重试：由流水线统一清除签名（包含客户端自带的 thoughtSignature）
         if retried_without_thinking {
@@ -1099,6 +1100,20 @@ pub async fn handle_generate(
                 confirmation.observe_json(&gemini_resp);
             }
 
+            if crate::proxy::mappers::gemini::normalize_candidate_indices(&mut gemini_resp)
+                .is_none()
+            {
+                let inner = gemini_resp.get("response").unwrap_or(&gemini_resp);
+                let mut failure = json!({"error":{"code":502,"status":"INTERNAL","message":"Invalid or duplicate Gemini candidate index"}});
+                crate::proxy::pipeline::stream_error::attach_usage_metadata(
+                    &mut failure,
+                    inner.get("usageMetadata"),
+                );
+                return Ok(retry_state.finish_error_response(
+                    (StatusCode::BAD_GATEWAY, Json(failure)).into_response(),
+                ));
+            }
+
             // [FIX #1522] Inject Tool ID into Non-streaming Response
             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
                 &mut gemini_resp,
@@ -1112,21 +1127,6 @@ pub async fn handle_generate(
                 Some(&gemini_resp)
             };
 
-            if let Some(candidates) = inner_val
-                .and_then(|v| v.get("candidates"))
-                .and_then(Value::as_array)
-            {
-                if crate::proxy::mappers::gemini::candidate_indices(candidates).is_none() {
-                    let mut failure = json!({"error":{"code":502,"status":"INTERNAL","message":"Invalid or duplicate Gemini candidate index"}});
-                    crate::proxy::pipeline::stream_error::attach_usage_metadata(
-                        &mut failure,
-                        inner_val.and_then(|v| v.get("usageMetadata")),
-                    );
-                    return Ok(retry_state.finish_error_response(
-                        (StatusCode::BAD_GATEWAY, Json(failure)).into_response(),
-                    ));
-                }
-            }
             if inner_val
                 .and_then(|v| v.get("candidates"))
                 .and_then(Value::as_array)
@@ -1927,7 +1927,7 @@ mod r19_schema_validation_tests {
     use serde_json::json;
 
     #[test]
-    fn rejects_ambiguous_tool_union_before_native_wrapping() {
+    fn accepts_usable_tool_unions_before_native_wrapping() {
         for field in ["parameters", "parametersJsonSchema"] {
             for wrapped in [false, true] {
                 let tool = json!({"name":"lookup",field:{"type":"object","properties":{"value":{"oneOf":[{"type":"number"},{"type":"integer"}]}}}});
@@ -1937,10 +1937,20 @@ mod r19_schema_validation_tests {
                 } else {
                     body
                 };
-                assert!(validate_gemini_tool_schemas(&body).is_err());
+                assert!(validate_gemini_tool_schemas(&body).is_ok());
             }
         }
         let valid = json!({"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object","properties":{"oneOf":{"type":"string"},"value":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}]}]});
         assert!(validate_gemini_tool_schemas(&valid).is_ok());
+    }
+
+    #[test]
+    fn schema_budget_still_applies_before_native_wrapping() {
+        let body = json!({"tools":[{"functionDeclarations":[{"name":"lookup",
+            "parameters":{"type":"string","description":"x".repeat(1024 * 1024)}
+        }]}]});
+        assert!(validate_gemini_tool_schemas(&body)
+            .unwrap_err()
+            .contains("budget"));
     }
 }

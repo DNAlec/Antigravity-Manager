@@ -1499,7 +1499,7 @@ impl UpstreamClient {
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
         }
 
         // [Pipeline First] 在**统一的转出报文**（Gemini Canonical IR）上估一次 token：
@@ -2225,7 +2225,7 @@ impl UpstreamClient {
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
         }
         let client = self.get_client(account_id).await;
         let mut last_error = String::new();

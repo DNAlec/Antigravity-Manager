@@ -244,14 +244,20 @@ pub async fn probe_account_ban(
         "session_id": session_id
     });
 
-    let payload = crate::proxy::mappers::gemini::wrapper::wrap_request(
+    let payload = match crate::proxy::mappers::gemini::wrapper::wrap_request(
         &base_request,
         project_id.unwrap_or(""),
         BAN_PROBE_MODEL,
         account_id,
         Some(&session_id),
         None,
-    );
+    ) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!("Cannot build ban probe request: {}", error);
+            return BanProbeOutcome::Unknown;
+        }
+    };
 
     let mut last_outcome = BanProbeOutcome::Unknown;
 

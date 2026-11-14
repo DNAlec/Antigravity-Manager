@@ -688,7 +688,7 @@ pub fn transform_claude_request_in_timed(
         &mut inner_request,
         &config.final_model,
         Some(&request_id),
-    );
+    )?;
     let reordered_inner = inner_request;
 
     // [NEW] 动态检测是否需要标记为 agent 请求
@@ -719,7 +719,7 @@ pub fn transform_claude_request_in_timed(
         body["requestType"] = json!("agent");
     }
 
-    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
 
     deep_clean_cache_control(&mut body);
 
@@ -1663,7 +1663,7 @@ fn build_tools(
                 "properties": {}
             }));
             crate::proxy::common::json_schema::validate_tool_schema(&input_schema)?;
-            crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
+            crate::proxy::common::json_schema::clean_json_schema(&mut input_schema)?;
             crate::proxy::mappers::openai::request::enforce_uppercase_types(&mut input_schema);
 
             function_declarations.push(json!({
@@ -2127,7 +2127,7 @@ mod tests {
             "required": ["location"]
         });
 
-        clean_json_schema(&mut schema);
+        clean_json_schema(&mut schema).unwrap();
 
         // Check removed fields
         assert!(schema.get("$schema").is_none());
