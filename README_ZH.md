@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.6**（2026-11-14）：改善工具 Schema 和本地引用兼容性并保留资源限制，支持 Responses 明文推理与压缩历史，兼容无歧义的 Gemini 候选索引表示。上游版本检查改为仅提示，未签名 macOS 构建仍提供应用归档（PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5)，Thanks to @DNAlec）。OpenCode `myt` 客户端能力配置问题尚未修复，不包含在本次发布中。详见[完整更新日志](CHANGELOG.md)。
+> 最新版本 **v5.0.6**（2026-11-14）：改善工具 Schema 和本地引用兼容性并保留资源限制，支持 Responses 明文推理与压缩历史，兼容无歧义的 Gemini 候选索引表示。补齐直接 Chat/Responses/Claude 媒体输出，以及 URL、明文、嵌套文档和工具结果附件（PR [#9](https://github.com/DNAlec/Antigravity-Manager/pull/9)）。上游版本检查改为仅提示，未签名 macOS 构建仍提供应用归档（PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5)，Thanks to @DNAlec）。OpenCode `myt` 客户端能力配置问题尚未修复，不包含在本次发布中。详见[完整更新日志](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
