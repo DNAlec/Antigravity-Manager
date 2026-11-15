@@ -869,7 +869,7 @@ mod tests {
             }
         });
 
-        InboundThinkingPipeline::align_official_envelope(&mut body);
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
 
         // 顶层必须严格满足官方信封规范且包含 model 和 request
         let keys: Vec<&str> = body

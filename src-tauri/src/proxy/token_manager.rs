@@ -8376,6 +8376,9 @@ impl TokenManager {
             .min_by_key(|model| {
                 let lower = model.to_ascii_lowercase();
                 (
+                    crate::proxy::common::model_mapping::extract_gemini4_codename(&lower)
+                        .as_deref()
+                        == Some("argon"),
                     !lower.contains("flash"),
                     !token
                         .model_quotas
@@ -10065,6 +10068,11 @@ mod tests {
                     let port = port_reservation.local_addr().unwrap().port();
                     let mut initial = crate::models::AppConfig::default();
                     initial.proxy.port = port;
+                    initial.proxy.thinking_budget.flash_high_legacy_migrated = true;
+                    initial
+                        .proxy
+                        .thinking_budget
+                        .thinking_budget_32k_legacy_migrated = true;
                     initial.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
                     initial.proxy.api_key = "qos-stale-start-test".into();
                     initial.proxy.admin_password = None;
@@ -10129,7 +10137,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    assert!(!status.running);
+                    assert!(
+                        status.running,
+                        "upstream now starts an empty pool so accounts can be enabled later"
+                    );
                     assert_eq!(status.active_accounts, 0);
                     let reused_manager = state
                         .admin_server
@@ -14050,7 +14061,11 @@ mod tests {
 
         // 未解绑时调用 commit_session 不得覆写既有绑定（如强制轮换/生图换号）
         manager.commit_session(session_id, acc1);
-        manager.commit_session(session_id, acc2);
+        let claimed = manager
+            .session_accounts
+            .claim(&manager.session_accounts.snapshot(session_id), acc2, 0)
+            .unwrap();
+        manager.session_accounts.commit(&claimed, || true).unwrap();
         assert_eq!(
             manager.session_accounts.get(session_id).unwrap().as_str(),
             acc1,
@@ -17731,7 +17746,7 @@ mod tests {
             .insert("gemini-3.1-pro-high".to_string());
         probe_tok
             .model_quotas
-            .insert("gemini-3.1-pro-high".to_string(), 0);
+            .insert("gemini-3.1-pro-high".to_string(), 100);
         assert_eq!(
             TokenManager::select_probe_model(&probe_tok).as_deref(),
             Some("gemini-3.1-pro-high"),

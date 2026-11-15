@@ -227,7 +227,14 @@ async fn merge_beta11_deferred_qos_respects_captured_session_generation() {
                 Some(&stale),
             ),
         }
-        assert!(manager.qos_guardian.is_jailed_or_probing(ACCOUNT));
+        if phase < 2 {
+            assert!(manager.qos_guardian.is_jailed_or_probing(ACCOUNT));
+        } else {
+            assert!(
+                manager.qos_guardian.is_suspicious(ACCOUNT),
+                "missing usage must not create an ambiguous strike"
+            );
+        }
         assert!(manager.session_accounts.commit(&next, || true).is_some());
     }
 }
