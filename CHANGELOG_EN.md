@@ -3,6 +3,15 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.8 (2026-11-16)**:
+        -   **[Thinking budgets and protocol terminals] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
+            -   Preserve real MAX_TOKENS terminals and usage for thought-only or empty output instead of continuing with the same budget and reporting a misleading 502. Gemini, Chat, Responses and Claude emit their respective output-limit terminals without changing client output limits or thinking levels.
+            -   Fix lost root-level terminals/interruption markers, premature multi-candidate completion, synthetic STOP on unfinished tools, fabricated text in empty Claude budget results, and tool output overriding budget terminals. Undeliverable output still cannot publish replayable thinking history or signatures.
+        -   **[Error attribution and validation] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
+            -   Preserve error categories and explicit statuses through repeated wrapping; source paths, diagnostic parameters and generated text no longer supply misleading transport-error keywords.
+            -   274 focused Rust tests pass across four protocols, trailing usage, candidate isolation, tool terminals and history protection. Related gaps found during independent review have been fixed.
+        -   **Deployment boundary**: No configuration or database migration and no thinking-cache cleanup prompt. The causes of 270-second global and 15-second first-byte-stage timeouts remain separate investigations; this release does not claim to resolve every historical non-429 failure.
+
     *   **v5.0.7 (2026-11-15)**:
         -   **[Protocol usability and multi-turn tools] (PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), Thanks to @DNAlec)**:
             -   Preserve readable server-tool history, documents and media; support custom/namespaced tools, selectors and cross-turn associations. Keep candidate identities separate and prevent duplicated calls and incorrect completion states.
