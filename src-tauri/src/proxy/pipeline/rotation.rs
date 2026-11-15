@@ -97,6 +97,13 @@ pub enum RetryStrategy {
     GraceRetry(Duration),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRetryPlan {
+    pub strategy: RetryStrategy,
+    pub next: crate::proxy::pipeline::terminal::TerminalNextStep,
+    pub abandon_sticky_account: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct RequestRetryState {
     grace_retried_accounts: HashSet<String>,
@@ -107,6 +114,71 @@ pub struct RequestRetryState {
 }
 
 impl RequestRetryState {
+    /// Upstream HTTP plan API, sharing the fork's bounded HTTP/transport replay budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_http_retry(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        attempt: usize,
+        pool_size: usize,
+        mode: crate::proxy::sticky_config::SchedulingMode,
+        cache_bound: bool,
+        max_wait_seconds: u64,
+        allow_grace_policy: bool,
+        classification: &UpstreamClassification,
+    ) -> HttpRetryPlan {
+        use crate::proxy::pipeline::terminal::TerminalNextStep;
+        let scheduling = crate::proxy::sticky_config::StickySessionConfig {
+            mode,
+            max_wait_seconds,
+            ..Default::default()
+        };
+        if let Some(strategy) = self.cache_first_failure(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            &scheduling,
+            cache_bound,
+        ) {
+            let next = if matches!(strategy, RetryStrategy::NoRetry) {
+                TerminalNextStep::Stop
+            } else {
+                TerminalNextStep::RetrySameAccount
+            };
+            return HttpRetryPlan {
+                strategy,
+                next,
+                abandon_sticky_account: false,
+            };
+        }
+        let strategy = self.determine_strategy_adaptive_with_policy(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            attempt,
+            pool_size,
+            allow_grace_policy,
+        );
+        let next = match decide_rotation(status_code, Some(&strategy), false, false) {
+            RotationDecision::RetrySame => TerminalNextStep::RetrySameAccount,
+            RotationDecision::Rotate => TerminalNextStep::Rotate,
+            RotationDecision::Stop => TerminalNextStep::Stop,
+        };
+        HttpRetryPlan {
+            strategy,
+            next,
+            abandon_sticky_account: next != TerminalNextStep::RetrySameAccount
+                && classification.abandons_sticky_account(),
+        }
+    }
+
     /// Response policy belongs to the current attempt; retry allowances belong
     /// to the whole request. Call after the global budget gate so exhausting the
     /// budget while waiting still retains the previous protective decision.

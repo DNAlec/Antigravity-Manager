@@ -2373,8 +2373,20 @@ pub fn capture_gemini_response_with_context(
 /// 当会话在客户端成功生成 compact_boundary 或注入历史摘要后，该轮及其之前的历史属于压缩上下文。
 pub fn find_compaction_continuation_boundary(contents: &[Value]) -> Option<usize> {
     // [FIX #3697] 采用逆序扫描 contents，确保在长会话经历多次压缩时严格锚定到最新的第二次/后续压缩边界
+    // 仅检测客户端注入的纯文本用户接续轮次（排除模型回复正文及包含 tool_call/tool_response 的工具流，
+    // 防止技术讨论、进度汇报或代码检索里提及压缩关键字时误清空全部历史签名）。
     for (idx, content) in contents.iter().enumerate().rev() {
+        let role = content.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "model" || role == "assistant" {
+            continue;
+        }
         if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+            let has_tool_part = parts
+                .iter()
+                .any(|p| p.get("functionCall").is_some() || p.get("functionResponse").is_some());
+            if has_tool_part {
+                continue;
+            }
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     if crate::proxy::mappers::common_utils::is_post_compaction_continuation_text(
@@ -2436,19 +2448,10 @@ pub fn calculate_contents_metrics(contents: &[Value]) -> (usize, usize) {
 /// 识别文本中是否包含各主流 AI 客户端（Cline, Roo-Code, Cursor, Aider 等）常见的输出就地修剪/折叠占位标记
 pub fn is_truncated_or_folded_text(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("[output truncated")
-        || lower.contains("[result omitted")
-        || lower.contains("[tool result truncated")
-        || lower.contains("[output omitted")
-        || lower.contains("[content truncated")
-        || lower.contains("[image omitted")
-        || lower.contains("[image removed")
-        || lower.contains("truncated to save")
-        || lower.contains("... (truncated")
-        || lower.contains("...[truncated")
-        || lower.contains("[history truncated")
-        || lower.contains("[context truncated")
-        || lower.contains("<persisted-output>")
+    lower.lines().any(|line| {
+        let trimmed = line.trim_start();
+        line_starts_with_folded_marker(trimmed) || trimmed.ends_with("truncated to save]")
+    }) || lower.trim() == "truncated to save"
 }
 
 /// 检索 contents 中是否存在包含微观就地修剪、折叠或占位符的轮次最大索引
@@ -10717,4 +10720,19 @@ mod signature_placement_tests {
         );
         assert_ne!(scope1.client_id, scope2.client_id);
     }
+}
+
+fn line_starts_with_folded_marker(trimmed_lower: &str) -> bool {
+    trimmed_lower.starts_with("[output truncated")
+        || trimmed_lower.starts_with("[result omitted")
+        || trimmed_lower.starts_with("[tool result truncated")
+        || trimmed_lower.starts_with("[output omitted")
+        || trimmed_lower.starts_with("[content truncated")
+        || trimmed_lower.starts_with("[image omitted")
+        || trimmed_lower.starts_with("[image removed")
+        || trimmed_lower.starts_with("[history truncated")
+        || trimmed_lower.starts_with("[context truncated")
+        || trimmed_lower.starts_with("... (truncated")
+        || trimmed_lower.starts_with("...[truncated")
+        || trimmed_lower.starts_with("<persisted-output>")
 }

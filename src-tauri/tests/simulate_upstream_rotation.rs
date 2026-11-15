@@ -249,10 +249,10 @@ fn test_simulated_scenario_varying_durations_and_large_body_limit() {
     assert!(!small_plan.large_body);
     assert_eq!(small_plan.endpoint_attempt_limit, 2);
 
-    // 2. 大上下文/高 Token (>= 1MB 或 >= 30,000 tokens): 限制为 1 个端点尝试，避免冗余重传耗光预算
+    // 2. 大上下文/高载荷 (>= large_body_threshold_bytes): 限制为 1 个端点尝试，避免冗余重传耗光预算
     let large_context_plan = UpstreamClient::plan_upstream_timeouts_with_observed(
         PayloadMediaKind::TextChat,
-        1024 * 1024,
+        upload_cfg.large_body_threshold_bytes(),
         &upload_cfg,
         None,
     );

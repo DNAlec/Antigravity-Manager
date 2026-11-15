@@ -101,6 +101,7 @@ struct ChatCandidateState {
     thinking_active: bool,
     finished: bool,
     upstream_finished: bool,
+    json_fence: JsonFenceStream,
 }
 
 /// OpenAI Chat 协议流渲染器（实现 ProtocolStreamHandler Trait）
@@ -129,6 +130,7 @@ pub struct OpenAIChatStreamHandler {
     pub has_emitted_done: bool,
     pub refused: bool,
     pub whole_prompt_blocked: bool,
+    structured_output: bool,
 }
 
 impl OpenAIChatStreamHandler {
@@ -164,6 +166,7 @@ impl OpenAIChatStreamHandler {
             has_emitted_done: false,
             refused: false,
             whole_prompt_blocked: false,
+            structured_output: false,
         }
     }
 }
@@ -434,6 +437,9 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         chunks.push(Bytes::from(sse_out));
                     }
 
+                    if self.structured_output {
+                        content_out = state.json_fence.push(&content_out, finish_reason.is_some());
+                    }
                     if !content_out.is_empty() || finish_reason.is_some() {
                         state.thinking_active = false;
                         if !content_out.is_empty() {
@@ -749,6 +755,7 @@ where
         text_context_anchor,
         None,
         Some(candidate_selection),
+        false,
     )
 }
 
@@ -807,6 +814,39 @@ where
         text_context_anchor,
         chat_tool_kinds,
         None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_openai_sse_stream_with_format<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
+    text_context_anchor: Option<String>,
+    chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
+    structured_output: bool,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        causal_anchor,
+        text_context_anchor,
+        chat_tool_kinds,
+        None,
+        structured_output,
     )
 }
 
@@ -822,6 +862,7 @@ fn create_openai_sse_stream_with_options<S, E>(
     text_context_anchor: Option<String>,
     chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
     candidate_selection: Option<CandidateSelection>,
+    structured_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -857,6 +898,7 @@ where
     handler.include_usage = include_usage;
     handler.chat_tool_kinds = chat_tool_kinds;
     handler.candidate_selection = candidate_selection;
+    handler.structured_output = structured_output;
 
     let config =
         StreamLifecycleConfig::new("openai", "create_openai_sse_stream_with_anchor", trace_info);
@@ -3767,3 +3809,106 @@ mod response_selection_tests;
 #[cfg(test)]
 #[path = "response_completion_tests.rs"]
 mod response_completion_tests;
+
+/// Strip only an outer JSON fence, tolerating arbitrary upstream chunk boundaries.
+#[derive(Default)]
+struct JsonFenceStream {
+    pending: String,
+    decided: bool,
+    fenced: bool,
+}
+impl JsonFenceStream {
+    fn push(&mut self, text: &str, done: bool) -> String {
+        self.pending.push_str(text);
+        if !self.decided {
+            let trimmed = self.pending.trim_start();
+            let lower = trimmed.to_ascii_lowercase();
+            if !done
+                && self.pending.len() < 64
+                && (lower.is_empty() || "```json".starts_with(&lower) || lower == "```")
+            {
+                return String::new();
+            }
+            self.decided = true;
+            if let Some(rest) = trimmed.strip_prefix("```") {
+                let rest = if rest
+                    .get(..4)
+                    .is_some_and(|tag| tag.eq_ignore_ascii_case("json"))
+                {
+                    &rest[4..]
+                } else {
+                    rest
+                };
+                if rest.starts_with(char::is_whitespace)
+                    || rest.starts_with('{')
+                    || rest.starts_with('[')
+                {
+                    self.fenced = true;
+                    self.pending = rest.trim_start().to_owned();
+                }
+            }
+        }
+        if !self.fenced {
+            return std::mem::take(&mut self.pending);
+        }
+        if done {
+            let text = std::mem::take(&mut self.pending);
+            return text
+                .trim_end()
+                .strip_suffix("```")
+                .unwrap_or(&text)
+                .trim_end()
+                .to_owned();
+        }
+        // Retain a possible closing fence and following whitespace, not whole responses.
+        let trimmed = self.pending.trim_end();
+        let ticks = trimmed
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'`')
+            .count()
+            .min(3);
+        let keep_from = if ticks > 0 {
+            trimmed.len() - ticks
+        } else {
+            self.pending.len()
+        };
+        let output = self.pending[..keep_from].to_owned();
+        self.pending.drain(..keep_from);
+        if self.pending.len() > 4096 {
+            return output + &std::mem::take(&mut self.pending);
+        }
+        output
+    }
+}
+#[cfg(test)]
+mod merged_json_fence_tests {
+    use super::JsonFenceStream;
+    #[test]
+    fn merge_beta11_json_fence_survives_every_split() {
+        for input in [
+            "```json\n{\"x\":\"中文```inside\"}\n```",
+            "```JSON{\"x\":1}```",
+            "{\"x\":\"```\"}",
+        ] {
+            let expected =
+                crate::proxy::handlers::openai::unwrap_outer_code_fence_if_structured(input);
+            for split in 0..=input.len() {
+                if !input.is_char_boundary(split) {
+                    continue;
+                }
+                let mut filter = JsonFenceStream::default();
+                let actual =
+                    filter.push(&input[..split], false) + &filter.push(&input[split..], true);
+                assert_eq!(actual.trim(), expected, "split={split}");
+            }
+            let mut filter = JsonFenceStream::default();
+            let mut actual = String::new();
+            for ch in input.chars() {
+                actual.push_str(&filter.push(&ch.to_string(), false));
+            }
+            actual.push_str(&filter.push("", true));
+            assert_eq!(actual.trim(), expected);
+        }
+    }
+}

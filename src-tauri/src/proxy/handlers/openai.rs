@@ -9,10 +9,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, error, info}; // Import Engine trait for encode method
 
-use crate::proxy::mappers::gemini::SUMMARY_REQUEST_TIMEOUT_SECS;
 use crate::proxy::mappers::openai::{
-    transform_openai_request, transform_openai_request_with_session, OpenAIContent,
-    OpenAIContentBlock, OpenAIMessage, OpenAIRequest, OpenAIResponse,
+    transform_openai_request_with_session, OpenAIContent, OpenAIContentBlock, OpenAIRequest,
+    OpenAIResponse,
 };
 use crate::proxy::pipeline::timing::{TimingBuilderExt, TimingHeaders};
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
@@ -24,8 +23,8 @@ use crate::proxy::pipeline::{
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+#[cfg(test)]
 const MAX_TOTAL_INPUT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
 use super::common::{
@@ -36,7 +35,6 @@ use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
 use crate::proxy::session_manager::SessionManager;
 use axum::http::HeaderMap;
-use std::collections::VecDeque;
 use std::io;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -870,7 +868,7 @@ fn responses_usage_value(chat_response: &OpenAIResponse) -> Value {
         })
 }
 
-/// 剥离最外层 Markdown 代码块围栏（如 ```json ... ```），确保 Codex Desktop 原生 JSON.parse 正常解析。
+/// 剥离最外层 Markdown 代码块围栏（如 ```json ... ```），确保客户端原生 json.loads / JSON.parse 正常解析。
 /// 严格执行整包匹配（starts_with 与 ends_with），绝不在正文中进行贪婪查找或截断，彻底避免误杀。
 pub(crate) fn unwrap_outer_code_fence_if_structured(text: &str) -> String {
     let trimmed = text.trim();
@@ -880,12 +878,20 @@ pub(crate) fn unwrap_outer_code_fence_if_structured(text: &str) -> String {
     }
 
     // 2. 仅当整段输出被 ``` ... ``` 严格包裹时执行整包剥离
-    if trimmed.starts_with("```") && trimmed.ends_with("```") && trimmed.len() >= 6 {
-        if let Some(first_newline) = trimmed.find('\n') {
-            let inner = trimmed[first_newline + 1..trimmed.len() - 3].trim();
-            if serde_json::from_str::<serde_json::Value>(inner).is_ok() {
-                return inner.to_string();
-            }
+    let without_prefix = if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("```JSON") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest
+    } else {
+        return text.to_string();
+    };
+
+    if let Some(inner) = without_prefix.strip_suffix("```") {
+        let inner_trimmed = inner.trim();
+        if serde_json::from_str::<serde_json::Value>(inner_trimmed).is_ok() {
+            return inner_trimmed.to_string();
         }
     }
 
@@ -897,7 +903,7 @@ pub(crate) fn unwrap_outer_code_fence_if_structured(text: &str) -> String {
 pub(crate) fn is_request_structured_output(req: &OpenAIRequest) -> bool {
     req.response_format
         .as_ref()
-        .is_some_and(|f| f.r#type == "json_schema" || f.r#type == "json_object")
+        .is_some_and(|f| f.r#type() == "json_schema" || f.r#type() == "json_object")
         || req.text.as_ref().and_then(|t| t.get("format")).is_some()
 }
 
@@ -2083,6 +2089,65 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             unwrap_outer_code_fence_if_structured(conversational),
             conversational
         );
+
+        // 7. [Issue #3951] 支持 ```JSON 大写与单行紧凑包裹
+        let wrapped_uppercase = "```JSON\n{\"status\": \"ok\"}\n```";
+        assert_eq!(
+            unwrap_outer_code_fence_if_structured(wrapped_uppercase),
+            "{\"status\": \"ok\"}"
+        );
+        let wrapped_compact = "```json{\"status\": \"ok\"}```";
+        assert_eq!(
+            unwrap_outer_code_fence_if_structured(wrapped_compact),
+            "{\"status\": \"ok\"}"
+        );
+    }
+
+    #[test]
+    fn test_is_request_structured_output_supports_both_string_and_object_format_issue_3951() {
+        use super::is_request_structured_output;
+        use crate::proxy::mappers::openai::models::OpenAIRequest;
+
+        // 1. 对象语法：{"type": "json_object"}
+        let req_obj: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-tiered",
+            "messages": [{"role": "user", "content": "Return json"}],
+            "response_format": {"type": "json_object"}
+        }))
+        .unwrap();
+        assert!(is_request_structured_output(&req_obj));
+
+        // 2. 字符串语法： "json_object"
+        let req_str: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-tiered",
+            "messages": [{"role": "user", "content": "Return json"}],
+            "response_format": "json_object"
+        }))
+        .unwrap();
+        assert!(is_request_structured_output(&req_str));
+
+        // 3. json_schema 语法
+        let req_schema: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-tiered",
+            "messages": [{"role": "user", "content": "Return schema"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "result",
+                    "schema": {"type": "object"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(is_request_structured_output(&req_schema));
+
+        // 4. 普通文本：无 response_format
+        let req_plain: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-tiered",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+        assert!(!is_request_structured_output(&req_plain));
     }
 
     #[test]
@@ -2483,11 +2548,8 @@ mod variant_tests {
 
 fn codex_ledger_from_body(
     body: &Value,
-) -> (
-    Option<crate::proxy::mappers::openai::interaction_ledger::InteractionLedger>,
-    VecDeque<String>,
-) {
-    let ledger = crate::proxy::mappers::openai::interaction_ledger::build_codex_interaction_ledger(
+) -> Option<crate::proxy::mappers::openai::interaction_ledger::InteractionLedger> {
+    crate::proxy::mappers::openai::interaction_ledger::build_codex_interaction_ledger(
         body.get("input"),
         body.get("instructions").and_then(|v| v.as_str()),
         body.get("session_id")
@@ -2496,20 +2558,7 @@ fn codex_ledger_from_body(
         body.get("previous_response_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-    );
-
-    let mut markers = VecDeque::new();
-    if let Some(ledger) = &ledger {
-        for step in ledger.turns.iter().flat_map(|turn| turn.steps.iter()) {
-            if step.raw_item.get("type").and_then(|v| v.as_str()) != Some("instructions") {
-                markers.push_back(
-                    crate::proxy::mappers::openai::interaction_ledger::step_marker(step),
-                );
-            }
-        }
-    }
-
-    (ledger, markers)
+    )
 }
 
 fn responses_routing_session_id(
@@ -2548,12 +2597,6 @@ fn strip_codex_step_markers(content: &str) -> String {
         res.push('\n');
     }
     res
-}
-
-fn prefix_with_step_marker(_marker: Option<String>, content: String) -> String {
-    // Step markers are useful in debug ledgers, but must not be visible to
-    // Gemini. If they enter the prompt, the model learns to emit them as text.
-    strip_codex_step_markers(&content)
 }
 
 pub async fn handle_chat_completions(
@@ -2671,12 +2714,9 @@ pub async fn handle_chat_completions(
     }
 
     let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
-    let mut norm_ms = 0.0f64;
-    let mut think_fill_ms = 0.0f64;
     // TTFT 单源口径：仅记录“首个上游数据块”；流式发头时写 -1。
     let mut ttft_ms = crate::proxy::pipeline::stream_peek::TTFT_UNKNOWN_MS;
     let mut headers_ms = 0.0f64;
-    let mut fallback_overhead_ms = 0.0f64;
 
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     info!(
@@ -3064,13 +3104,8 @@ pub async fn handle_chat_completions(
         }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
-        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
-        think_fill_ms = tf_micros as f64 / 1000.0;
-        let _ =
-            crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
-                &mut gemini_body,
-                &mapped_model,
-            );
+        let norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        let think_fill_ms = tf_micros as f64 / 1000.0;
         crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
             &mut gemini_body,
         );
@@ -3313,7 +3348,7 @@ pub async fn handle_chat_completions(
 
         let effective_attempt_start = call_result.effective_attempt_start;
         let mut fallback_attempts = call_result.fallback_attempts.clone();
-        fallback_overhead_ms = call_result.fallback_overhead_s() * 1000.0;
+        let fallback_overhead_ms = call_result.fallback_overhead_s() * 1000.0;
         let attempts_b64 =
             crate::proxy::handlers::common::encode_attempts_header(&fallback_attempts);
 
@@ -3425,6 +3460,26 @@ pub async fn handle_chat_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                let qos_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
+                    &gemini_body,
+                    Some(&mapped_model),
+                ) || effort_hint.is_some()
+                    || openai_req.thinking.is_some()
+                    || openai_req.reasoning.is_some()
+                    || openai_req.reasoning_effort.is_some();
+                let qos_tracker =
+                    std::sync::Arc::new(crate::proxy::pipeline::qos::QosAttemptTracker::new(
+                        token_manager.clone(),
+                        account_id.clone(),
+                        Some(affinity_key.clone()),
+                        qos_is_thinking,
+                        Some(estimated_input_tokens),
+                        session_lease.clone(),
+                    ));
+                let gemini_stream = crate::proxy::pipeline::qos::wrap_gemini_stream_with_qos_usage(
+                    gemini_stream,
+                    qos_tracker.clone(),
+                );
                 // Preserve structured upstream errors before protocol conversion.
                 let stream_errors =
                     crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
@@ -3445,7 +3500,7 @@ pub async fn handle_chat_completions(
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
-                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_tool_kinds;
+                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_format;
                 // Internal streaming is an implementation detail of JSON responses;
                 // the collector needs the usage trailer even without stream_options.
                 let include_usage = !client_wants_stream
@@ -3454,7 +3509,7 @@ pub async fn handle_chat_completions(
                         .as_ref()
                         .map(|o| o.include_usage)
                         .unwrap_or(false);
-                let mut openai_stream = create_openai_sse_stream_with_tool_kinds(
+                let mut openai_stream = create_openai_sse_stream_with_format(
                     gemini_stream,
                     openai_req.model.clone(),
                     session_id.clone(),
@@ -3464,6 +3519,7 @@ pub async fn handle_chat_completions(
                     Some(causal_anchor),
                     response_text_context.clone(),
                     Some(chat_tool_kinds.clone()),
+                    is_request_structured_output(&openai_req),
                 );
 
                 let mut first_data_chunk = None;
@@ -3506,15 +3562,7 @@ pub async fn handle_chat_completions(
                             bytes, ..
                         } => {
                             ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
-                            crate::proxy::handlers::common::report_qos_ttft(
-                                &token_manager,
-                                &account_id,
-                                Some(affinity_key.as_str()),
-                                ttft_ms,
-                                is_thinking,
-                                Some(estimated_input_tokens),
-                                session_lease.as_ref(),
-                            );
+                            qos_tracker.on_first_byte(ttft_ms);
                             if let Some(effective_item) =
                                 fallback_attempts.iter_mut().find(|a| a.is_effective)
                             {
@@ -3680,18 +3728,7 @@ pub async fn handle_chat_completions(
                     Box<dyn futures::Stream<Item = Result<Bytes, String>> + Send>,
                 > = if client_wants_stream {
                     let ttft_start = effective_attempt_start;
-                    let ttft_tm = token_manager.clone();
-                    let ttft_account = account_id.clone();
-                    let ttft_session = affinity_key.clone();
-                    let ttft_lease = session_lease.clone();
-                    let ttft_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
-                        &gemini_body,
-                        Some(&mapped_model),
-                    ) || effort_hint.is_some()
-                        || openai_req.thinking.is_some()
-                        || openai_req.reasoning.is_some()
-                        || openai_req.reasoning_effort.is_some();
-                    let ttft_tokens = estimated_input_tokens;
+                    let qos_tracker_cb = qos_tracker.clone();
                     Box::pin(
                         crate::proxy::pipeline::stream_peek::wrap_stream_with_ttft_probe(
                             combined_stream,
@@ -3704,15 +3741,7 @@ pub async fn handle_chat_completions(
                             },
                             move |ttft| {
                                 let _ = ttft_seen_cb.set(ttft);
-                                crate::proxy::handlers::common::report_qos_ttft(
-                                    &ttft_tm,
-                                    &ttft_account,
-                                    Some(ttft_session.as_str()),
-                                    ttft,
-                                    ttft_is_thinking,
-                                    Some(ttft_tokens),
-                                    ttft_lease.as_ref(),
-                                );
+                                qos_tracker_cb.on_first_byte(ttft);
                             },
                         ),
                     )
@@ -3954,22 +3983,15 @@ pub async fn handle_chat_completions(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if cached > 0 {
-                    let cm = crate::proxy::cache_manager::global_cache_manager();
-                    cm.record_implicit_hit(&_prefix_hash);
-                    // [CACHE] 分层统计日志
-                    let stats = cm.get_layer_stats();
                     tracing::info!(
-                        "[Cache-Opt] Implicit cache HIT: prefix_hash={} cached_tokens={} | L1(SI): {}/{}, L2(Tools): {}/{}, L3(Prefix): {}/{}",
+                        "[Cache-Opt] Implicit cache HIT: prefix_hash={} cached_tokens={}",
                         &_prefix_hash[.._prefix_hash.len().min(16)],
                         cached,
-                        stats.si_hits, stats.si_total,
-                        stats.tools_hits, stats.tools_total,
-                        stats.prefix_hits, stats.prefix_total,
                     );
                 }
             }
 
-            let openai_response =
+            let mut openai_response =
                 crate::proxy::mappers::openai::response::transform_openai_response_with_tool_kinds(
                     &gemini_resp,
                     Some(&session_id),
@@ -3978,6 +4000,13 @@ pub async fn handle_chat_completions(
                     response_text_context.clone(),
                     Some(&chat_tool_kinds),
                 );
+            if is_request_structured_output(&openai_req) {
+                for choice in &mut openai_response.choices {
+                    if let Some(OpenAIContent::String(ref mut text)) = choice.message.content {
+                        *text = unwrap_outer_code_fence_if_structured(text);
+                    }
+                }
+            }
             if debug_logger::is_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
                     .unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }));
@@ -4135,15 +4164,6 @@ pub async fn handle_chat_completions(
         // 每账号一次，不存在无界等待。Claude 因历史原因仍按调度模式决定是否原地等待。
 
         // 确定重试策略：传入当前 attempt 与 pool_size，执行智能自适应裁决
-        let strategy = retry_state.determine_strategy_adaptive(
-            &account_id,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            retried_without_thinking,
-            attempt,
-            pool_size,
-        );
         // 统一流水线决策判定：协议无关的限流与错误判定
 
         if classification.is_model_not_found() {
@@ -4160,6 +4180,7 @@ pub async fn handle_chat_completions(
             );
 
             if can_rotate {
+                token_manager.abandon_session_lease(&mut session_lease);
                 tracing::warn!(
                     "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
                     trace_id, status_code, email, mapped_model, attempt, pool_size
@@ -4211,6 +4232,24 @@ pub async fn handle_chat_completions(
             }
         }
 
+        let sticky_cfg = token_manager.get_sticky_config().await;
+        // [Grace Policy] 非 CacheFirst 下维持 429 微间隙 GraceRetry 账号池保护（每账号限 1 次）；
+        // CacheFirst 下统一由 plan_http_retry 对瞬态 500/503/529 及可恢复 429 执行原地退避并保住 KV 缓存。
+        let http_plan = retry_state.plan_http_retry(
+            &account_id,
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            retried_without_thinking,
+            attempt,
+            pool_size,
+            sticky_cfg.mode,
+            config.request_type != "image_gen",
+            sticky_cfg.max_wait_seconds,
+            true,
+            &classification,
+        );
+
         let should_mark_limited = classification.should_lock_account_on_attempt(
             status_code,
             &error_text,
@@ -4230,7 +4269,7 @@ pub async fn handle_chat_completions(
         } else {
             false
         };
-        if !matches!(&strategy, RetryStrategy::GraceRetry(_)) {
+        if !matches!(&http_plan.strategy, RetryStrategy::GraceRetry(_)) {
             drop(image_permit.take());
         }
         if needs_quota_refresh {
@@ -4239,7 +4278,7 @@ pub async fn handle_chat_completions(
                 .await;
         }
 
-        if classification.abandons_sticky_account() {
+        if http_plan.abandon_sticky_account {
             token_manager.abandon_session_lease(&mut session_lease);
         }
 
@@ -4283,7 +4322,7 @@ pub async fn handle_chat_completions(
 
         // 执行退避
         if apply_retry_strategy(
-            strategy.clone(),
+            http_plan.strategy.clone(),
             attempt,
             max_attempts,
             status_code,
@@ -4291,16 +4330,6 @@ pub async fn handle_chat_completions(
         )
         .await
         {
-            if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                    session_lease.clone(),
-                ));
-            }
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
                 if adapter.let_it_crash() && attempt > 0 {
@@ -4312,29 +4341,39 @@ pub async fn handle_chat_completions(
                 }
             }
 
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
-                debug!(
-                    "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
-                    trace_id, status_code
-                );
-                force_rotate = false;
-            } else {
-                crate::proxy::pipeline::rotation::record_attempted_account(
-                    &mut attempted_accounts,
-                    &account_id,
-                    pool_size,
-                    &mut force_rotate,
-                );
+            match http_plan.next {
+                crate::proxy::pipeline::TerminalNextStep::RetrySameAccount => {
+                    debug!(
+                        "[{}] Keeping same account {} for status {} (CacheFirst/Grace in-place retry)",
+                        trace_id, email, status_code
+                    );
+                    force_rotate = false;
+                    retry_credentials = Some((
+                        access_token.clone(),
+                        project_id.clone(),
+                        email.clone(),
+                        account_id.clone(),
+                        0,
+                        session_lease.clone(),
+                    ));
+                }
+                crate::proxy::pipeline::TerminalNextStep::Rotate => {
+                    crate::proxy::pipeline::rotation::record_attempted_account(
+                        &mut attempted_accounts,
+                        &account_id,
+                        pool_size,
+                        &mut force_rotate,
+                    );
+                    tracing::warn!(
+                        "OpenAI Upstream {} on {} attempt {}/{}, rotating account",
+                        status_code,
+                        email,
+                        attempt + 1,
+                        max_attempts
+                    );
+                }
+                crate::proxy::pipeline::TerminalNextStep::Stop => break,
             }
-
-            tracing::warn!(
-                "OpenAI Upstream {} on {} attempt {}/{}, rotating account",
-                status_code,
-                email,
-                attempt + 1,
-                max_attempts
-            );
             continue;
         }
 
@@ -4351,6 +4390,13 @@ pub async fn handle_chat_completions(
         }
 
         // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错返回双轨制友好报文，不进行无效轮换
+        if classification.abandons_sticky_account() {
+            token_manager.abandon_session_lease(&mut session_lease);
+            tracing::debug!(
+                "[OpenAI] Unbound session {} from account {} due to non-retryable error (status {})",
+                affinity_key, email, status_code
+            );
+        }
         error!(
             "OpenAI Upstream non-retryable error {} on account {}: {}",
             status_code, email, error_text
@@ -4865,7 +4911,7 @@ pub async fn handle_completions(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let (interaction_ledger, mut step_markers) = codex_ledger_from_body(&body);
+        let interaction_ledger = codex_ledger_from_body(&body);
         let mut input_items = body
             .as_object_mut()
             .and_then(|obj| obj.remove("input"))
@@ -4944,7 +4990,6 @@ pub async fn handle_completions(
         {
             for mut item in input_items {
                 let item_type = responses_input_item_type(&item).to_string();
-                let step_marker = step_markers.pop_front();
                 if item_type == "custom_tool_call"
                     && item.get("status").and_then(|v| v.as_str()) == Some("incomplete")
                 {
@@ -4958,7 +5003,7 @@ pub async fn handle_completions(
                             .unwrap_or("user")
                             .to_string();
                         let (content, joined_text, has_media) =
-                            responses_message_content(&mut item, step_marker);
+                            responses_message_content(&mut item, None);
                         if is_codex_transcript_only_assistant_message(&item) {
                             continue;
                         }
@@ -5098,7 +5143,7 @@ pub async fn handle_completions(
                             "shell".to_string()
                         };
 
-                        output_str = prefix_with_step_marker(step_marker, output_str);
+                        output_str = strip_codex_step_markers(&output_str);
                         let output_content =
                             build_responses_tool_output_content(output_str, output_media);
 
@@ -5507,8 +5552,6 @@ pub async fn handle_completions(
     let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
     // TTFT 单源口径：仅记录“首个上游数据块”；流式发头时写 -1。
     let mut ttft_ms = crate::proxy::pipeline::stream_peek::TTFT_UNKNOWN_MS;
-    let mut headers_ms = 0.0f64;
-    let mut fallback_overhead_ms = 0.0f64;
 
     if debug_logger::is_enabled(&debug_cfg) {
         let payload = json!({
@@ -5548,6 +5591,7 @@ pub async fn handle_completions(
         retry_state.begin_attempt();
 
         let norm_start = std::time::Instant::now();
+        let headers_ms;
         // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -5698,11 +5742,6 @@ pub async fn handle_completions(
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         let norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
         let think_fill_ms = tf_micros as f64 / 1000.0;
-        let _ =
-            crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
-                &mut gemini_body,
-                &mapped_model,
-            );
         crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
             &mut gemini_body,
         );
@@ -5949,7 +5988,7 @@ pub async fn handle_completions(
 
         let effective_attempt_start = call_result.effective_attempt_start;
         let mut fallback_attempts = call_result.fallback_attempts.clone();
-        fallback_overhead_ms = call_result.fallback_overhead_s() * 1000.0;
+        let fallback_overhead_ms = call_result.fallback_overhead_s() * 1000.0;
         let attempts_b64 =
             crate::proxy::handlers::common::encode_attempts_header(&fallback_attempts);
 
@@ -6029,6 +6068,25 @@ pub async fn handle_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                let qos_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
+                    &gemini_body,
+                    Some(&mapped_model),
+                ) || openai_req.thinking.is_some()
+                    || openai_req.reasoning.is_some()
+                    || openai_req.reasoning_effort.is_some();
+                let qos_tracker =
+                    std::sync::Arc::new(crate::proxy::pipeline::qos::QosAttemptTracker::new(
+                        token_manager.clone(),
+                        account_id.clone(),
+                        Some(affinity_key.clone()),
+                        qos_is_thinking,
+                        Some(estimated_input_tokens),
+                        session_lease.clone(),
+                    ));
+                let gemini_stream = crate::proxy::pipeline::qos::wrap_gemini_stream_with_qos_usage(
+                    gemini_stream,
+                    qos_tracker.clone(),
+                );
                 // Preserve structured upstream errors before protocol conversion.
                 let stream_errors =
                     crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default();
@@ -6097,21 +6155,11 @@ pub async fn handle_completions(
                     // 负责首字宽限与心跳保活，不再阻塞等待首包（与 Claude / Gemini 同构）。
                     headers_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
                     ttft_ms = crate::proxy::pipeline::stream_peek::TTFT_UNKNOWN_MS;
-                    // [QoS] Responses 流式与 chat 同口径：首个真实数据块上报 TTFT
+                    // [QoS] Responses 流式与 chat 同口径：首个真实数据块触发 Phase 1，流尾 usageMetadata 完成 Phase 2 核销
                     let ttft_seen = std::sync::Arc::new(std::sync::OnceLock::<f64>::new());
                     let ttft_seen_cb = ttft_seen.clone();
                     let ttft_start = effective_attempt_start;
-                    let ttft_tm = token_manager.clone();
-                    let ttft_account = account_id.clone();
-                    let ttft_session = affinity_key.clone();
-                    let ttft_lease = session_lease.clone();
-                    let ttft_is_thinking = crate::proxy::pipeline::qos::payload_enables_thinking(
-                        &gemini_body,
-                        Some(&mapped_model),
-                    ) || openai_req.thinking.is_some()
-                        || openai_req.reasoning.is_some()
-                        || openai_req.reasoning_effort.is_some();
-                    let ttft_tokens = estimated_input_tokens;
+                    let qos_tracker_cb = qos_tracker.clone();
                     let combined_stream =
                         crate::proxy::pipeline::stream_peek::wrap_stream_with_ttft_probe(
                             openai_stream,
@@ -6124,15 +6172,7 @@ pub async fn handle_completions(
                             },
                             move |ttft| {
                                 let _ = ttft_seen_cb.set(ttft);
-                                crate::proxy::handlers::common::report_qos_ttft(
-                                    &ttft_tm,
-                                    &ttft_account,
-                                    Some(ttft_session.as_str()),
-                                    ttft,
-                                    ttft_is_thinking,
-                                    Some(ttft_tokens),
-                                    ttft_lease.as_ref(),
-                                );
+                                qos_tracker_cb.on_first_byte(ttft);
                             },
                         );
                     let converted_meta = json!({
@@ -6285,15 +6325,7 @@ pub async fn handle_completions(
                         } => {
                             ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
                             // 非流式 Responses：因为删除了 tail 上报，这里必须补一次真实首块样本
-                            crate::proxy::handlers::common::report_qos_ttft(
-                                &token_manager,
-                                &account_id,
-                                Some(affinity_key.as_str()),
-                                ttft_ms,
-                                is_thinking,
-                                Some(estimated_input_tokens),
-                                session_lease.as_ref(),
-                            );
+                            qos_tracker.on_first_byte(ttft_ms);
                             if let Some(effective_item) =
                                 fallback_attempts.iter_mut().find(|a| a.is_effective)
                             {
@@ -6939,6 +6971,7 @@ pub async fn handle_completions(
                 || token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900)),
             );
             if can_rotate {
+                token_manager.abandon_session_lease(&mut session_lease);
                 tracing::warn!(
                     "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
                     trace_id, status_code, email, mapped_model, attempt, pool_size
@@ -6995,15 +7028,10 @@ pub async fn handle_completions(
             }
         }
 
-        if classification.abandons_sticky_account() {
-            token_manager.abandon_session_lease(&mut session_lease);
-        }
-
-        // [Grace Policy] SchedulingMode 不参与此裁决：429 微间隙 GraceRetry 属于
-        // “账号池保护”（Fixes #3329/#3409），单账号等待已由 RequestRetryState 限制为
-        // 每账号一次，不存在无界等待。Claude 因历史原因仍按调度模式决定是否原地等待。
-
-        let strategy = retry_state.determine_strategy_adaptive(
+        let sticky_cfg = token_manager.get_sticky_config().await;
+        // [Grace Policy] 非 CacheFirst 下维持 429 微间隙 GraceRetry 账号池保护（每账号限 1 次）；
+        // CacheFirst 下统一由 plan_http_retry 对瞬态 500/503/529 及可恢复 429 执行原地退避并保住 KV 缓存。
+        let http_plan = retry_state.plan_http_retry(
             &account_id,
             status_code,
             &error_text,
@@ -7011,11 +7039,20 @@ pub async fn handle_completions(
             false,
             attempt,
             pool_size,
+            sticky_cfg.mode,
+            config.request_type != "image_gen",
+            sticky_cfg.max_wait_seconds,
+            true,
+            &classification,
         );
 
-        // 执行退备
+        if http_plan.abandon_sticky_account {
+            token_manager.abandon_session_lease(&mut session_lease);
+        }
+
+        // 执行退避
         if apply_retry_strategy(
-            strategy.clone(),
+            http_plan.strategy.clone(),
             attempt,
             max_attempts,
             status_code,
@@ -7023,28 +7060,42 @@ pub async fn handle_completions(
         )
         .await
         {
-            if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                    session_lease.clone(),
-                ));
-            }
-            force_rotate = should_rotate_account(status_code, Some(&strategy));
-            if force_rotate {
-                crate::proxy::pipeline::rotation::record_attempted_account(
-                    &mut attempted_accounts,
-                    &account_id,
-                    pool_size,
-                    &mut force_rotate,
-                );
+            match http_plan.next {
+                crate::proxy::pipeline::TerminalNextStep::RetrySameAccount => {
+                    debug!(
+                        "[{}] Keeping same account {} for status {} (CacheFirst/Grace in-place retry)",
+                        trace_id, email, status_code
+                    );
+                    force_rotate = false;
+                    retry_credentials = Some((
+                        access_token.clone(),
+                        project_id.clone(),
+                        email.clone(),
+                        account_id.clone(),
+                        0,
+                        session_lease.clone(),
+                    ));
+                }
+                crate::proxy::pipeline::TerminalNextStep::Rotate => {
+                    crate::proxy::pipeline::rotation::record_attempted_account(
+                        &mut attempted_accounts,
+                        &account_id,
+                        pool_size,
+                        &mut force_rotate,
+                    );
+                }
+                crate::proxy::pipeline::TerminalNextStep::Stop => break,
             }
             continue;
         } else {
             // 不可重试
+            if classification.abandons_sticky_account() {
+                token_manager.abandon_session_lease(&mut session_lease);
+                tracing::debug!(
+                    "[OpenAI] Unbound session {} from account {} due to non-retryable error (status {})",
+                    affinity_key, email, status_code
+                );
+            }
             let protocol = if is_responses_api {
                 "responses"
             } else {
@@ -9416,7 +9467,7 @@ fn try_convert_codex_to_openai_request(mut body: Value) -> Result<Value, String>
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let (interaction_ledger, mut step_markers) = codex_ledger_from_body(&body);
+    let interaction_ledger = codex_ledger_from_body(&body);
     let mut input_items = body
         .as_object_mut()
         .and_then(|obj| obj.remove("input"))
@@ -9483,7 +9534,6 @@ fn try_convert_codex_to_openai_request(mut body: Value) -> Result<Value, String>
     {
         for mut item in input_items {
             let item_type = responses_input_item_type(&item).to_string();
-            let step_marker = step_markers.pop_front();
             if item_type == "custom_tool_call"
                 && item.get("status").and_then(|v| v.as_str()) == Some("incomplete")
             {
@@ -9497,7 +9547,7 @@ fn try_convert_codex_to_openai_request(mut body: Value) -> Result<Value, String>
                         .unwrap_or("user")
                         .to_string();
                     let (content, joined_text, has_media) =
-                        responses_message_content(&mut item, step_marker);
+                        responses_message_content(&mut item, None);
                     if is_codex_transcript_only_assistant_message(&item) {
                         continue;
                     }
@@ -9585,7 +9635,7 @@ fn try_convert_codex_to_openai_request(mut body: Value) -> Result<Value, String>
                         None => "shell".to_string(),
                     };
 
-                    output_str = prefix_with_step_marker(step_marker, output_str);
+                    output_str = strip_codex_step_markers(&output_str);
                     let output_content =
                         build_responses_tool_output_content(output_str, output_media);
 
@@ -9794,191 +9844,6 @@ The structure MUST be as follows:
 3. File paths must use absolute paths
 4. The thinking signature must be copied exactly, no modifications
 "#;
-
-async fn call_openai_gemini_sync(
-    model: &str,
-    request: &OpenAIRequest,
-    token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
-    upstream: &std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>,
-    trace_id: &str,
-) -> Result<String, String> {
-    let (access_token, project_id, _, account_id, _wait_ms) = token_manager
-        .get_token("gemini", false, None, model)
-        .await
-        .map_err(|e| format!("Failed to get account: {}", e))?;
-
-    let token_obj = token_manager.get_token_by_id(&account_id);
-    let session_id = format!("bg_sid_{}", chrono::Utc::now().timestamp_subsec_millis());
-    let (gemini_body, _, _, _) =
-        transform_openai_request(request, &project_id, &session_id, token_obj.as_ref())?;
-
-    debug!(
-        "[{}] [OpenAI-BG] Calling {} via cloudcode v1internal for summary",
-        trace_id, model
-    );
-
-    // 走共享的辅助调用通道。
-    //
-    // 历史实现把 `transform_openai_request` 产出的**已包装 cloudcode 信封**
-    // （内含 project / request / model / userAgent / requestId / requestType）
-    // POST 到 `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
-    // —— host 与形状双双不符。实测该 host 对 Antigravity 账号恒返回
-    // 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`（token 不具备公共 Generative Language API 权限），
-    // 因此该后台摘要从未成功过。
-    let gemini_response = upstream
-        .call_v1_internal_auxiliary(
-            "generateContent",
-            &access_token,
-            gemini_body,
-            Some(account_id.as_str()),
-            SUMMARY_REQUEST_TIMEOUT_SECS,
-        )
-        .await?;
-
-    // 上游返回 `{"response": {...}}` 包装体，必须先解包。
-    let unwrapped = crate::proxy::mappers::gemini::unwrap_response(&gemini_response);
-
-    // 只拼接「非思考 part」的文本：前面可能存在 `{"thought": true, "text": ""}` 的空块，
-    // 直接取 `parts[0].text` 会拿到空串并把空摘要当成功。
-    unwrapped
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|parts| parts.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter(|part| !crate::proxy::thinking_store::is_thought_part(part))
-                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-                .collect::<String>()
-        })
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| "Failed to extract text from response".to_string())
-}
-
-async fn try_compress_openai_with_summary(
-    original_request: &OpenAIRequest,
-    trace_id: &str,
-    token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
-    upstream: &std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>,
-    session_id_str: &str,
-) -> Result<OpenAIRequest, String> {
-    info!(
-        "[{}] [Layer-3] [OpenAI] Starting context compression with XML summary",
-        trace_id
-    );
-
-    let last_signature =
-        crate::proxy::mappers::context_manager::ContextManager::extract_last_openai_valid_signature(
-            session_id_str,
-        );
-
-    if let Some(ref sig) = last_signature {
-        debug!(
-            "[{}] [Layer-3] [OpenAI] Extracted signature (len: {})",
-            trace_id,
-            sig.len()
-        );
-    }
-
-    let mut summary_messages = original_request.messages.clone();
-
-    let signature_instruction = if let Some(ref sig) = last_signature {
-        format!("\n\n**CRITICAL**: The last thinking signature is:\n```\n{}\n```\nYou MUST include this EXACTLY in the <latest_thinking_signature> section.", sig)
-    } else {
-        "\n\n**Note**: No thinking signature found in history. Leave <latest_thinking_signature> empty.".to_string()
-    };
-
-    summary_messages.push(OpenAIMessage {
-        role: "user".to_string(),
-        content: Some(
-            crate::proxy::mappers::openai::models::OpenAIContent::String(format!(
-                "{}{}",
-                CONTEXT_SUMMARY_PROMPT, signature_instruction
-            )),
-        ),
-        refusal: None,
-        reasoning_content: None,
-        signature: None,
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-    });
-
-    // 兜底简单任务模型完全由当前号池动态推导（优先最新 flash-low，其次无后缀 flash），绝不硬编码
-    let background_model =
-        crate::proxy::common::model_gate::pick_background_model_from_pool(token_manager.as_ref())
-            .ok_or_else(|| "No flash model available in the current quota pool".to_string())?;
-
-    let mut summary_request = original_request.clone();
-    summary_request.messages = summary_messages;
-    summary_request.model = background_model.to_string();
-    summary_request.stream = false;
-    summary_request.max_tokens = Some(8000);
-    summary_request.temperature = Some(0.3);
-
-    debug!(
-        "[{}] [Layer-3] [OpenAI] Calling {} for summary generation",
-        trace_id, background_model
-    );
-
-    let xml_summary = call_openai_gemini_sync(
-        &background_model,
-        &summary_request,
-        token_manager,
-        upstream,
-        trace_id,
-    )
-    .await?;
-
-    info!(
-        "[{}] [Layer-3] [OpenAI] Generated XML summary (len: {} chars)",
-        trace_id,
-        xml_summary.len()
-    );
-
-    let mut forked_messages = vec![
-        OpenAIMessage {
-            role: "user".to_string(),
-            content: Some(crate::proxy::mappers::openai::models::OpenAIContent::String(format!(
-                "Context has been compressed. Here is the structured summary of our conversation history:\n\n{}",
-                xml_summary
-            ))),
-            refusal: None,
-            reasoning_content: None,
-            signature: None,
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-        OpenAIMessage {
-            role: "assistant".to_string(),
-            content: Some(crate::proxy::mappers::openai::models::OpenAIContent::String(
-                "I have reviewed the compressed context summary. I understand the current state and will continue from here.".to_string()
-            )),
-            refusal: None,
-            reasoning_content: None,
-            signature: None,
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-    ];
-
-    if let Some(last_msg) = original_request.messages.last() {
-        if last_msg.role == "user" {
-            if !matches!(&last_msg.content, Some(crate::proxy::mappers::openai::models::OpenAIContent::String(s)) if s.contains(CONTEXT_SUMMARY_PROMPT))
-            {
-                forked_messages.push(last_msg.clone());
-            }
-        }
-    }
-
-    let mut forked_request = original_request.clone();
-    forked_request.messages = forked_messages;
-    Ok(forked_request)
-}
 
 #[cfg(test)]
 mod nonstream_peek_timeout_tests {
@@ -11848,3 +11713,9 @@ mod response_completion_tests;
 #[cfg(test)]
 #[path = "openai_request_history_tests.rs"]
 mod request_history_tests;
+
+fn prefix_with_step_marker(_marker: Option<String>, content: String) -> String {
+    // Step markers are useful in debug ledgers, but must not be visible to
+    // Gemini. If they enter the prompt, the model learns to emit them as text.
+    strip_codex_step_markers(&content)
+}

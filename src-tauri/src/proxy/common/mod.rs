@@ -1,7 +1,5 @@
 // Common 模块 - 公共工具
 
-// pub mod error;
-// pub mod rate_limiter;
 pub mod client_adapter;
 pub mod client_adapters;
 pub mod json_schema;
@@ -11,7 +9,6 @@ pub(crate) mod response_media;
 #[cfg(test)]
 mod response_media_tests;
 pub(crate) mod response_tools;
-pub mod schema_cache;
 pub mod session;
 pub mod utils; // [ADDED v4.1.24] Tools for deriving stable session identifiers
 pub mod variant_mapping; // Canonical model + variant → real model ID + params

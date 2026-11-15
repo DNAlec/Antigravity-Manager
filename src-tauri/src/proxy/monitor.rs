@@ -255,7 +255,7 @@ pub(crate) struct UpstreamCapture {
 }
 
 #[derive(Clone, Default)]
-pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
+pub struct UpstreamRequestBodyHolder(pub(crate) std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
 
 tokio::task_local! {
     pub static CURRENT_UPSTREAM_CAPTURE: UpstreamRequestBodyHolder;
@@ -522,6 +522,18 @@ impl ProxyMonitor {
             enabled: Arc::new(AtomicBool::new(false)), // Default to disabled
             capture_health_logs: Arc::new(AtomicBool::new(false)), // Default to false
             app_handle,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(max_logs: usize) -> Self {
+        Self {
+            logs: RwLock::new(VecDeque::with_capacity(max_logs)),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs,
+            enabled: Arc::new(AtomicBool::new(false)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
         }
     }
 
