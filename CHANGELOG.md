@@ -3,6 +3,17 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.7 (2026-11-15)**:
+        -   **[协议可用性与多轮工具历史] (PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), Thanks to @DNAlec)**:
+            -   保留可读服务端工具记录、文档和媒体，支持自定义与命名空间工具、工具选择限制和跨轮关联；隔离多候选，防止串接回答、重复调用和错误终态。
+            -   完整输出在尾部连接异常时仍可交付；真实中断、残缺工具参数和缺失必要内容继续明确报告。上游版本检查继续仅提示，下载和安装更新入口保持禁用。
+        -   **[上游 beta.8–beta.11 与 PR #3959] (PR [#12](https://github.com/DNAlec/Antigravity-Manager/pull/12), Thanks to @DNAlec)**:
+            -   合入上游最新已选定开发版本及 [PR #3959](https://github.com/lbjlaq/Antigravity-Manager/pull/3959) 的 Hub 指纹统一与扁平请求封装修复 (Thanks to @cubelikeplayDaniel)。
+            -   对齐官方模型目录、Gemini 4 配额与思考等级、账号可用性门禁和模型开关，保留分支缓存连续性策略 ([PR #3933](https://github.com/lbjlaq/Antigravity-Manager/pull/3933), [#3936](https://github.com/lbjlaq/Antigravity-Manager/pull/3936), [#3938](https://github.com/lbjlaq/Antigravity-Manager/pull/3938), [#3949](https://github.com/lbjlaq/Antigravity-Manager/pull/3949), Thanks to @jeikl, @cubelikeplayDaniel, @lbjlaq)。
+            -   合入 CacheFirst 暂态恢复、QoS 用量校准、签名防覆盖及压缩边界修复 ([PR #3935](https://github.com/lbjlaq/Antigravity-Manager/pull/3935), [#3942](https://github.com/lbjlaq/Antigravity-Manager/pull/3942), [#3943](https://github.com/lbjlaq/Antigravity-Manager/pull/3943), [#3945](https://github.com/lbjlaq/Antigravity-Manager/pull/3945), Ref #3944, Thanks to @mclinyeshi)。
+            -   修复 Gemini 心跳帧兼容、结构化 JSON 输出与推理用量统计，缩小身份提示清洗范围；增加 Android ARM64 Headless 发布附件 ([PR #3953](https://github.com/lbjlaq/Antigravity-Manager/pull/3953), [#3954](https://github.com/lbjlaq/Antigravity-Manager/pull/3954), [#3946](https://github.com/lbjlaq/Antigravity-Manager/pull/3946), Thanks to @koeria, @cubelikeplayDaniel)。
+        -   **部署边界**: 配套 sub2api v0.2.20-nekocloud.7 提供 inline system/developer 与可选推理历史修复。用户报告的聚合模式 502 尚缺失败日志，不能据本次发布认定根因已修复。
+
     *   **v5.0.6 (2026-11-14)**:
         -   **[工具 Schema 兼容性与资源保护] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
             -   修复普通 `allOf`、`oneOf`、联合类型及本地引用导致的请求拒绝，包括 SendMessage 的重复 pattern 约束。保留可用的参数结构；无法完整表达的辅助约束采用兼容转换，工具调用与结构化输出共用处理。

@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.6)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.7)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.6-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.7-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.6**（2026-11-14）：改善工具 Schema 和本地引用兼容性并保留资源限制，支持 Responses 明文推理与压缩历史，兼容无歧义的 Gemini 候选索引表示。补齐直接 Chat/Responses/Claude 媒体输出，以及 URL、明文、嵌套文档和工具结果附件（PR [#9](https://github.com/DNAlec/Antigravity-Manager/pull/9)）。上游版本检查改为仅提示，未签名 macOS 构建仍提供应用归档（PR [#6](https://github.com/DNAlec/Antigravity-Manager/pull/6), [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Ref PR [#5](https://github.com/DNAlec/Antigravity-Manager/pull/5)，Thanks to @DNAlec）。OpenCode `myt` 客户端能力配置问题尚未修复，不包含在本次发布中。详见[完整更新日志](CHANGELOG.md)。
+> 最新版本 **v5.0.7**（2026-11-15）：改善多轮工具与历史兼容性和候选隔离，合入上游 beta.11 及 PR #3959 的 Hub 指纹与扁平请求封装修复。上游更新保持仅检查。详见[完整更新日志](CHANGELOG.md)（PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), [#12](https://github.com/DNAlec/Antigravity-Manager/pull/12)，Thanks to @DNAlec 及日志所列上游贡献者）。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
