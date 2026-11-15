@@ -204,13 +204,13 @@ fn process_upstream_line<H: ProtocolStreamHandler>(
 ) -> (Vec<Bytes>, Option<String>) {
     let decoded = detector.process_line(line);
     if let Err(failure) = decoded {
-        let mut report = crate::proxy::mappers::error_classifier::report_stream_error(
+        let report = crate::proxy::mappers::error_classifier::report_upstream_error(
             config.adapter_name,
             config.function_name,
+            failure.status,
             &format!("upstream stream error {}: {}", failure.status, failure.body),
             &config.trace_info,
         );
-        report.upstream_status = Some(failure.status);
         let mut frames = failure
             .usage
             .as_ref()

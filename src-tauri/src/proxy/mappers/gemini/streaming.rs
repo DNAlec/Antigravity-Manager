@@ -42,6 +42,7 @@ pub struct GeminiStreamHandler {
 struct CandidateState {
     thinking: Option<TurnAccumulator>,
     finish: bool,
+    allows_empty_completion: bool,
     active_thought: bool,
     has_content: bool,
 }
@@ -228,12 +229,18 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                 .or_insert_with(|| CandidateState {
                     thinking: (!self.buffered).then(|| self.capture_template.clone()),
                     finish: false,
+                    allows_empty_completion: false,
                     active_thought: false,
                     has_content: false,
                 });
             if super::has_candidate_finish(cand) {
                 self.saw_finish_reason = true;
                 state.finish = true;
+                state.allows_empty_completion = cand
+                    .get("finishReason")
+                    .or_else(|| cand.get("finish_reason"))
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::proxy::pipeline::stream_error::allows_empty_completion);
             }
             if let Some(parts) = cand
                 .get("content")
@@ -306,13 +313,21 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
     }
 
     fn finalize_without_content(&self) -> bool {
-        self.blocked_prompt || self.invalid_candidates
+        self.whole_prompt_blocked
+            || self.invalid_candidates
+            || (!self.incomplete_candidates()
+                && self
+                    .candidates
+                    .values()
+                    .all(|candidate| candidate.has_content || candidate.allows_empty_completion))
     }
 
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        // Only prompt refusal completes every candidate in the response.
-        (self.whole_prompt_blocked || self.invalid_candidates)
-            .then(|| std::time::Duration::from_millis(250))
+        // Keep a bounded window for trailing usage after every candidate ended.
+        (self.whole_prompt_blocked
+            || self.invalid_candidates
+            || (!self.has_content && self.finalize_without_content()))
+        .then(|| std::time::Duration::from_millis(250))
     }
 
     fn has_content(&self) -> bool {
@@ -353,16 +368,21 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         // [Fixes #3813] 情形 B 异常收尾：上游输出了正文但未下发任何 finishReason 即遭遇未预期 EOF
         // 必须提供明确的合成终态与 finishMessage 诊断，标明流在正常完成前被提前截断，杜绝下游误判为正常结束
         if self.has_content && !self.saw_finish_reason && !self.blocked_prompt {
+            if self.saw_function_call {
+                let report = crate::proxy::mappers::error_classifier::report_upstream_error(
+                    "gemini",
+                    "emit_finalize",
+                    502,
+                    &"upstream stream ended before tool calls received finishReason",
+                    "",
+                );
+                return self.emit_initial_error(&report);
+            }
             self.saw_finish_reason = true;
-            let finish_reason = if self.saw_function_call {
-                "STOP"
-            } else {
-                "MAX_TOKENS"
-            };
 
             let recovery_json = serde_json::json!({
                 "candidates": [{
-                    "finishReason": finish_reason,
+                    "finishReason": "MAX_TOKENS",
                     "finishMessage": "Stream closed prematurely (EOF without finishReason) by upstream. Preceding content preserved by gateway.",
                     "gatewayInterrupted": true,
                     "index": 0
@@ -391,14 +411,12 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         if !self.has_content || self.saw_finish_reason {
             return chunks;
         }
+        if self.saw_function_call {
+            let mut report = error_report.clone();
+            report.upstream_status.get_or_insert(502);
+            return self.emit_initial_error(&report);
+        }
         self.saw_finish_reason = true;
-
-        // 工具调用契约保护：若本轮已有工具调用输出，终结原因保持 STOP，否则标记 MAX_TOKENS
-        let finish_reason = if self.saw_function_call {
-            "STOP"
-        } else {
-            "MAX_TOKENS"
-        };
 
         // [Fixes #3813] 诊断信息如实传达：通过官方标准 finishMessage 及流内诊断字段透传真实中断原因，
         // 既保全已生成的成千上万 token 与客户端兼容性，又彻底避免下游将连接中断/超时误诊为模型自然输出上限
@@ -411,7 +429,7 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
 
         let recovery_json = serde_json::json!({
             "candidates": [{
-                "finishReason": finish_reason,
+                "finishReason": "MAX_TOKENS",
                 "finishMessage": finish_message,
                 "gatewayInterrupted": true,
                 "gatewayError": {

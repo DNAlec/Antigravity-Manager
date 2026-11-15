@@ -12,9 +12,7 @@ use crate::proxy::mappers::error_classifier::{
     preview_payload, report_stream_error, StreamErrorReport,
 };
 use crate::proxy::pipeline::candidate_selection::CandidateSelection;
-use crate::proxy::pipeline::stream_error::{
-    is_refusal_finish_reason, response_has_prompt_refusal, response_is_refusal,
-};
+use crate::proxy::pipeline::stream_error::{is_refusal_finish_reason, response_has_prompt_refusal};
 use crate::proxy::pipeline::usage::merge_cumulative_usage;
 use crate::proxy::pipeline::{run_stream_lifecycle, ProtocolStreamHandler, StreamLifecycleConfig};
 
@@ -100,6 +98,7 @@ struct ChatCandidateState {
     has_thinking: bool,
     thinking_active: bool,
     finished: bool,
+    allows_empty_completion: bool,
     upstream_finished: bool,
     json_fence: JsonFenceStream,
 }
@@ -118,6 +117,7 @@ pub struct OpenAIChatStreamHandler {
     candidate_selection: Option<CandidateSelection>,
     tool_calls: ToolCallTracker,
     candidates: std::collections::BTreeMap<u64, ChatCandidateState>,
+    expected_candidates: usize,
     marked_multi_candidate: bool,
     pub final_usage: Option<super::models::OpenAIUsage>,
     // Retain raw cumulative fields even after a translated usage frame is emitted.
@@ -128,7 +128,6 @@ pub struct OpenAIChatStreamHandler {
     pub is_thinking_active: bool,
     pub has_emitted_finish_reason: bool,
     pub has_emitted_done: bool,
-    pub refused: bool,
     pub whole_prompt_blocked: bool,
     structured_output: bool,
 }
@@ -155,6 +154,7 @@ impl OpenAIChatStreamHandler {
             candidate_selection: None,
             tool_calls: ToolCallTracker::default(),
             candidates: Default::default(),
+            expected_candidates: 1,
             marked_multi_candidate: false,
             final_usage: None,
             usage_metadata: None,
@@ -164,10 +164,17 @@ impl OpenAIChatStreamHandler {
             is_thinking_active: false,
             has_emitted_finish_reason: false,
             has_emitted_done: false,
-            refused: false,
             whole_prompt_blocked: false,
             structured_output: false,
         }
+    }
+
+    fn missing_candidates(&self) -> bool {
+        !self.whole_prompt_blocked
+            && (self.candidates.len() < self.expected_candidates
+                || (self.expected_candidates > 1
+                    && (0..self.expected_candidates as u64)
+                        .any(|index| !self.candidates.contains_key(&index))))
     }
 }
 
@@ -206,7 +213,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 return chunks;
             }
             self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
-            self.refused |= response_is_refusal(&actual_data);
             self.media.begin_frame();
             self.tool_calls.begin_frame();
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -407,6 +413,8 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         reason if is_refusal_finish_reason(reason) => Some("content_filter"),
                         _ => None,
                     });
+                    state.allows_empty_completion = raw_finish_reason
+                        .is_some_and(crate::proxy::pipeline::stream_error::allows_empty_completion);
 
                     let finish_reason =
                         if state.tool_call_index > 0 && gemini_finish_reason == Some("stop") {
@@ -550,23 +558,38 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     }
 
     fn finalize_without_content(&self) -> bool {
-        self.refused
+        self.whole_prompt_blocked
+            || (!self.missing_candidates()
+                && self.candidates.values().all(|candidate| {
+                    candidate.finished
+                        && (candidate.has_content || candidate.allows_empty_completion)
+                }))
     }
 
     fn upstream_completion(&self) -> Option<bool> {
         Some(
             self.whole_prompt_blocked
-                || (!self.candidates.is_empty()
+                || (!self.missing_candidates()
                     && self.candidates.values().all(|candidate| candidate.finished)),
         )
     }
 
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        self.whole_prompt_blocked
+        (self.whole_prompt_blocked || (!self.has_content && self.finalize_without_content()))
             .then(|| std::time::Duration::from_millis(250))
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
+        if self.missing_candidates() {
+            let report = crate::proxy::mappers::error_classifier::report_upstream_error(
+                "openai",
+                "emit_finalize",
+                502,
+                &"upstream stream ended before all requested candidates arrived",
+                "",
+            );
+            return self.emit_abnormal_finalize(&report);
+        }
         let mut chunks = Vec::new();
 
         // include_usage=false puts known usage on the finish chunk. A later
@@ -597,10 +620,11 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         if self.has_emitted_done {
             return Vec::new();
         }
-        if !self
-            .candidates
-            .values()
-            .any(|candidate| candidate.tool_call_index > 0 && !candidate.finished)
+        if !self.missing_candidates()
+            && !self
+                .candidates
+                .values()
+                .any(|candidate| candidate.tool_call_index > 0 && !candidate.finished)
         {
             let mut chunks = Vec::new();
             for (index, candidate) in &mut self.candidates {
@@ -654,7 +678,9 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     }
 
     fn on_finish(&mut self) {
-        let multiple = self.candidates.len() > 1 || self.candidates.keys().any(|index| *index != 0);
+        let multiple = self.expected_candidates > 1
+            || self.candidates.len() > 1
+            || self.candidates.keys().any(|index| *index != 0);
         for state in self.candidates.values_mut() {
             if !state.upstream_finished || !state.has_content {
                 continue;
@@ -756,6 +782,7 @@ where
         None,
         Some(candidate_selection),
         false,
+        1,
     )
 }
 
@@ -815,6 +842,7 @@ where
         chat_tool_kinds,
         None,
         false,
+        1,
     )
 }
 
@@ -830,6 +858,7 @@ pub fn create_openai_sse_stream_with_format<S, E>(
     text_context_anchor: Option<String>,
     chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
     structured_output: bool,
+    expected_candidates: usize,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -847,6 +876,7 @@ where
         chat_tool_kinds,
         None,
         structured_output,
+        expected_candidates,
     )
 }
 
@@ -863,6 +893,7 @@ fn create_openai_sse_stream_with_options<S, E>(
     chat_tool_kinds: Option<super::request::ResponsesToolKinds>,
     candidate_selection: Option<CandidateSelection>,
     structured_output: bool,
+    expected_candidates: usize,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -899,6 +930,7 @@ where
     handler.chat_tool_kinds = chat_tool_kinds;
     handler.candidate_selection = candidate_selection;
     handler.structured_output = structured_output;
+    handler.expected_candidates = expected_candidates.max(1);
 
     let config =
         StreamLifecycleConfig::new("openai", "create_openai_sse_stream_with_anchor", trace_info);
@@ -910,7 +942,6 @@ where
 /// Candidate identity, media, usage, and interrupted tools follow the same path.
 pub struct LegacyCompletionStreamHandler {
     chat: OpenAIChatStreamHandler,
-    expected_candidates: usize,
 }
 
 impl LegacyCompletionStreamHandler {
@@ -954,11 +985,7 @@ impl LegacyCompletionStreamHandler {
     }
 
     fn missing_candidates(&self) -> bool {
-        !self.chat.whole_prompt_blocked
-            && (self.chat.candidates.len() < self.expected_candidates
-                || (self.expected_candidates > 1
-                    && (0..self.expected_candidates as u64)
-                        .any(|index| !self.chat.candidates.contains_key(&index))))
+        self.chat.missing_candidates()
     }
 
     fn error_frames(&mut self, report: &StreamErrorReport, code: &str) -> Vec<Bytes> {
@@ -1091,17 +1118,16 @@ where
     if let Some(anchor) = text_context_anchor {
         thinking_acc = thinking_acc.with_text_context_anchor(anchor);
     }
-    let handler = LegacyCompletionStreamHandler {
-        chat: OpenAIChatStreamHandler::new(
-            format!("cmpl-{}", Uuid::new_v4()),
-            Utc::now().timestamp(),
-            model,
-            session_id,
-            message_count,
-            thinking_acc,
-        ),
-        expected_candidates: expected_candidates.max(1),
-    };
+    let mut chat = OpenAIChatStreamHandler::new(
+        format!("cmpl-{}", Uuid::new_v4()),
+        Utc::now().timestamp(),
+        model,
+        session_id,
+        message_count,
+        thinking_acc,
+    );
+    chat.expected_candidates = expected_candidates.max(1);
+    let handler = LegacyCompletionStreamHandler { chat };
     let config =
         StreamLifecycleConfig::new("openai-legacy", "create_legacy_sse_stream", trace_info);
     run_stream_lifecycle(gemini_stream, handler, config)
@@ -1823,7 +1849,11 @@ impl CodexResponsesStreamHandler {
         } else {
             Value::Null
         };
-        let mut terminal_error = if refused {
+        let mut terminal_error = if self
+            .final_finish_reason
+            .as_deref()
+            .is_some_and(crate::proxy::pipeline::stream_error::allows_empty_completion)
+        {
             Value::Null
         } else if missing_actionable_output {
             json!({"code":"empty_response","message":"Gemini stream ended without a final assistant message or tool call."})
@@ -3760,6 +3790,109 @@ mod tests {
             vec!["stop".to_string()],
             "Completed stream must not emit duplicate finish_reason"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_candidate_completion_tests {
+    use super::*;
+    use futures::stream;
+
+    #[tokio::test]
+    async fn output_limit_waits_for_a_later_requested_candidate() {
+        let source = async_stream::stream! {
+            yield Ok::<Bytes, String>(Bytes::from(
+                "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"thought\":true,\"text\":\"reasoning\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n",
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            yield Ok(Bytes::from(
+                "data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\"second answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":7}}\n\n",
+            ));
+        };
+        let mapped = create_openai_sse_stream_with_format(
+            Box::pin(source),
+            "gemini-flash".into(),
+            format!("delayed-candidate-{}", Uuid::new_v4()),
+            1,
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+            2,
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::collector::collect_stream_to_json(mapped),
+        )
+        .await
+        .expect("the second candidate must arrive within the fixture timeout")
+        .expect("both requested candidates completed");
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+        assert_eq!(response["choices"][1]["finish_reason"], "stop");
+        assert_eq!(
+            response["choices"][1]["message"]["content"],
+            "second answer"
+        );
+        assert_eq!(response["usage"]["completion_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn missing_requested_candidate_is_an_error_after_eof_done_or_reset() {
+        for thinking in [false, true] {
+            for ending in ["eof", "done", "reset"] {
+                let first = json!({"candidates":[{
+                    "index":0,
+                    "content":{"parts":[{"thought":thinking,"text":"first branch"}]},
+                    "finishReason":"MAX_TOKENS"
+                }]});
+                let mut raw = vec![Ok::<Bytes, String>(Bytes::from(format!(
+                    "data: {first}\n\n"
+                )))];
+                match ending {
+                    "done" => raw.push(Ok(Bytes::from("data: [DONE]\n\n"))),
+                    "reset" => raw.push(Err("connection reset before the second candidate".into())),
+                    _ => {}
+                }
+                let mapped = create_openai_sse_stream_with_format(
+                    Box::pin(stream::iter(raw)),
+                    "gemini-flash".into(),
+                    format!("missing-candidate-{}", Uuid::new_v4()),
+                    1,
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                    false,
+                    2,
+                );
+                let wire: Vec<_> = mapped.collect().await;
+                let stream_error = wire.iter().any(Result::is_err);
+                let error_event =
+                    wire.iter()
+                        .filter_map(|chunk| chunk.as_ref().ok())
+                        .any(|chunk| {
+                            String::from_utf8_lossy(chunk).lines().any(|line| {
+                                line.strip_prefix("data: ")
+                                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                                    .is_some_and(|event| event.get("error").is_some())
+                            })
+                        });
+                assert!(
+                    stream_error || error_event,
+                    "thinking={thinking}, ending={ending}"
+                );
+                assert!(
+                    super::super::collector::collect_stream_to_json(stream::iter(wire))
+                        .await
+                        .is_err()
+                );
+            }
+        }
     }
 }
 

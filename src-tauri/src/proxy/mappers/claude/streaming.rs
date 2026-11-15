@@ -415,15 +415,16 @@ impl StreamingState {
             return chunks;
         }
 
-        // 确定 stop_reason：若触发工具调用，必须严格优先保持 tool_use；若触发最大长度或截断异常收尾，标记 max_tokens
+        // Refusal and output limits take precedence over tool output: only a
+        // completed tool turn may advertise tool_use.
         let stop_reason = if finish_reason
             .is_some_and(crate::proxy::pipeline::stream_error::is_refusal_finish_reason)
         {
             "refusal"
-        } else if self.used_tool {
-            "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"
+        } else if self.used_tool {
+            "tool_use"
         } else {
             "end_turn"
         };
@@ -844,6 +845,43 @@ impl<'a> PartProcessor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_output_preserves_limit_refusal_and_stop_terminals() {
+        for (finish, expected) in [
+            ("MAX_TOKENS", "max_tokens"),
+            ("SAFETY", "refusal"),
+            ("STOP", "tool_use"),
+        ] {
+            let part: GeminiPart = serde_json::from_value(json!({
+                "functionCall":{"name":"inspect","args":{"path":"src"},"id":"call_limit"}
+            }))
+            .unwrap();
+            let mut state = StreamingState::new();
+            let mut chunks = PartProcessor::new(&mut state).process(&part);
+            chunks.extend(state.emit_finish(Some(finish), None));
+            let events: Vec<Value> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    String::from_utf8_lossy(chunk)
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str(data).ok())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let terminal = events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(terminal["delta"]["stop_reason"], expected);
+            assert!(events.iter().any(|event| {
+                event["type"] == "content_block_start"
+                    && event["content_block"]["type"] == "tool_use"
+            }));
+            assert_eq!(events.last().unwrap()["type"], "message_stop");
+        }
+    }
 
     #[test]
     fn test_signature_manager() {

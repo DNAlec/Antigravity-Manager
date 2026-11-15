@@ -256,6 +256,50 @@ pub fn is_refusal_finish_reason(reason: &str) -> bool {
     )
 }
 
+/// A model may exhaust its output budget before producing visible content.
+/// This is a real terminal, unlike an empty STOP or a transport interruption.
+/// Callers must first validate the upstream terminal (including gateway markers).
+pub(crate) fn allows_empty_completion(reason: &str) -> bool {
+    reason == "MAX_TOKENS" || is_refusal_finish_reason(reason)
+}
+
+/// Only an upstream model terminal can complete a generation. Gateway recovery
+/// frames and protobuf defaults must not authorize continuation or success.
+pub(crate) fn model_finish_reason(candidate: &Value) -> Option<&str> {
+    if candidate["gatewayInterrupted"] == true {
+        return None;
+    }
+    candidate
+        .get("finishReason")
+        .or_else(|| candidate.get("finish_reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty() && *reason != "FINISH_REASON_UNSPECIFIED")
+}
+
+/// Preserve a response-wide interruption when unwrapping or selecting candidates.
+/// Returns whether normalization was needed; ordinary upstream frames stay intact.
+pub(crate) fn normalize_response_interruption(value: &mut Value) -> bool {
+    if value["gatewayInterrupted"] != true
+        && value.pointer("/response/gatewayInterrupted") != Some(&Value::Bool(true))
+    {
+        return false;
+    }
+    let inner = if value.get("response").is_some_and(Value::is_object) {
+        &mut value["response"]
+    } else {
+        value
+    };
+    inner["gatewayInterrupted"] = Value::Bool(true);
+    if let Some(candidates) = inner.get_mut("candidates").and_then(Value::as_array_mut) {
+        for candidate in candidates {
+            if let Some(candidate) = candidate.as_object_mut() {
+                candidate.insert("gatewayInterrupted".into(), Value::Bool(true));
+            }
+        }
+    }
+    true
+}
+
 /// These gateway errors carry generated output only as a failed partial response.
 pub fn is_partial_response_error(error: &Value) -> bool {
     matches!(
@@ -551,7 +595,16 @@ impl UpstreamSseErrorDetector {
         }
         if line.starts_with("data:") {
             let data = &self.parser.data;
-            if data == b"[DONE]" || serde_json::from_slice::<Value>(data).is_ok() {
+            if data == b"[DONE]" {
+                return Ok(Some(format!("data: {}", String::from_utf8_lossy(data))));
+            }
+            if let Ok(mut value) = serde_json::from_slice::<Value>(data) {
+                // A response-wide interruption applies to every candidate.
+                // Normalize once before adapters select or unwrap candidates,
+                // so a synthetic MAX_TOKENS cannot authorize model completion.
+                if normalize_response_interruption(&mut value) {
+                    return Ok(Some(format!("data: {value}")));
+                }
                 return Ok(Some(format!("data: {}", String::from_utf8_lossy(data))));
             }
             // Hold JSON fragments until the event is complete. Non-JSON lines

@@ -922,12 +922,19 @@ impl EmptyThinkingState {
         self.saw_thought
             && !self.saw_content
             && !self.saw_tool_call
-            && self.finish_reason.is_some()
+            && self.finish_reason.as_deref() == Some("STOP")
             && !self.rejected
     }
 
     fn continuation_is_complete(&self) -> bool {
-        self.rejected || ((self.saw_content || self.saw_tool_call) && self.finish_reason.is_some())
+        // A real output limit must retain its terminal reason even with no
+        // answer. Other provider failures likewise belong to stream_error;
+        // replacing them with a generic continuation error loses their cause.
+        self.rejected
+            || self
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| reason != "STOP" || self.saw_content || self.saw_tool_call)
     }
 
     fn observe(&mut self, inner: &Value) -> (bool, bool) {
@@ -935,9 +942,12 @@ impl EmptyThinkingState {
             crate::proxy::pipeline::usage::merge_cumulative_usage(&mut self.usage, usage);
         }
         self.rejected |= crate::proxy::pipeline::stream_error::error_envelope(inner).is_some()
-            || crate::proxy::pipeline::stream_error::response_is_refusal(inner);
+            || crate::proxy::pipeline::stream_error::response_has_prompt_refusal(inner);
         let mut chunk_has_finish = false;
         let mut chunk_has_parts = false;
+        let root_interrupted = inner["gatewayInterrupted"] == true;
+        let mut candidate_has_finish_field = false;
+        let mut candidate_interrupted = false;
         if let Some(candidates) = inner.get("candidates").and_then(Value::as_array) {
             for candidate in candidates {
                 inspect_gemini_candidate_parts(
@@ -950,41 +960,57 @@ impl EmptyThinkingState {
                     .pointer("/content/parts")
                     .and_then(Value::as_array)
                     .is_some_and(|parts| !parts.is_empty());
-                if let Some(reason) = candidate
-                    .get("finishReason")
-                    .or_else(|| candidate.get("finish_reason"))
-                    .and_then(Value::as_str)
-                    .filter(|reason| !reason.is_empty() && *reason != "FINISH_REASON_UNSPECIFIED")
-                {
-                    chunk_has_finish = true;
-                    self.finish_reason = Some(reason.to_owned());
+                candidate_has_finish_field |= candidate.get("finishReason").is_some()
+                    || candidate.get("finish_reason").is_some();
+                candidate_interrupted |= candidate["gatewayInterrupted"] == true;
+                if !root_interrupted {
+                    if let Some(reason) =
+                        crate::proxy::pipeline::stream_error::model_finish_reason(candidate)
+                    {
+                        chunk_has_finish = true;
+                        self.record_finish_reason(reason);
+                    }
                 }
+            }
+        }
+        // Legacy root terminals apply only when no candidate supplied its own
+        // terminal field. An explicit invalid candidate must not fall back to a
+        // root STOP/MAX_TOKENS and authorize a continuation or completion.
+        if !candidate_has_finish_field && !candidate_interrupted && !root_interrupted {
+            if let Some(reason) = crate::proxy::pipeline::stream_error::model_finish_reason(inner) {
+                chunk_has_finish = true;
+                self.record_finish_reason(reason);
             }
         }
         (chunk_has_finish, chunk_has_parts)
     }
 
+    fn record_finish_reason(&mut self, reason: &str) {
+        self.finish_reason = Some(reason.to_owned());
+        self.rejected |= crate::proxy::pipeline::stream_error::is_refusal_finish_reason(reason);
+    }
+
     fn process(&mut self, event: AutoHealEvent) -> Option<Bytes> {
         if event.data == b"[DONE]" {
-            return (self.saw_content || self.saw_tool_call || self.rejected)
+            return (self.saw_content || self.saw_tool_call || self.continuation_is_complete())
                 .then(|| event.into_bytes());
         }
         let Ok(mut json) = serde_json::from_slice::<Value>(&event.data) else {
             return Some(event.into_bytes());
         };
+        super::stream_error::normalize_response_interruption(&mut json);
         let inner = if json.get("response").is_some_and(Value::is_object) {
             json.get_mut("response").unwrap()
         } else {
             &mut json
         };
         let (chunk_has_finish, chunk_has_parts) = self.observe(inner);
-        if self.rejected
-            || self.saw_content
-            || self.saw_tool_call
-            || !self.saw_thought
-            || !chunk_has_finish
-        {
+        if !chunk_has_finish || !self.needs_continuation() {
             return Some(event.into_bytes());
+        }
+        if let Some(object) = inner.as_object_mut() {
+            object.remove("finishReason");
+            object.remove("finish_reason");
         }
         if let Some(candidates) = inner.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
@@ -1205,6 +1231,7 @@ fn continuation_event(
     let Ok(mut json) = serde_json::from_slice::<Value>(&event.data) else {
         return event.into_bytes();
     };
+    super::stream_error::normalize_response_interruption(&mut json);
     let inner = if json.get("response").is_some_and(Value::is_object) {
         json.get_mut("response").unwrap()
     } else {
@@ -1212,10 +1239,14 @@ fn continuation_event(
     };
     let has_usage = inner.get("usageMetadata").is_some_and(Value::is_object);
     state.observe(inner);
-    // Do not emit a successful finish before the continuation has produced an
-    // answer/tool result. EOF/error will report the incomplete attempt instead.
+    // An empty STOP still needs an answer/tool result. Preserve output limits
+    // and provider failures so downstream can render their actual termination.
     let mut stripped_finish = false;
     if !state.continuation_is_complete() {
+        if let Some(object) = inner.as_object_mut() {
+            stripped_finish |= object.remove("finishReason").is_some();
+            stripped_finish |= object.remove("finish_reason").is_some();
+        }
         if let Some(candidates) = inner.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
                 if let Some(object) = candidate.as_object_mut() {
@@ -1300,6 +1331,251 @@ mod continuation_accounting_tests {
         assert!(!state.continuation_is_complete());
         assert!(!state.needs_continuation());
     }
+
+    #[test]
+    fn output_limit_preserves_empty_or_thinking_only_terminal_and_usage() {
+        for wrapped in [false, true] {
+            for finish_key in ["finishReason", "finish_reason"] {
+                for thinking in [false, true] {
+                    let parts = if thinking {
+                        vec![json!({"thought":true,"text":"reasoning"})]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut value = json!({
+                        "candidates":[{"content":{"parts":parts}}],
+                        "usageMetadata":{"promptTokenCount":32,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":48}
+                    });
+                    value["candidates"][0][finish_key] = json!("MAX_TOKENS");
+                    if wrapped {
+                        value = json!({"response":value});
+                    }
+                    let mut state = EmptyThinkingState::default();
+                    assert_eq!(parsed(state.process(event(value.clone())).unwrap()), value);
+                    assert!(!state.needs_continuation());
+                    assert!(state.continuation_is_complete());
+                    let mut decoder = AutoHealEventDecoder::default();
+                    let done = decoder.push(b"data: [DONE]\n\n").pop().unwrap();
+                    assert_eq!(state.process(done).unwrap().as_ref(), b"data: [DONE]\n\n");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_output_limit_preserves_finish_and_combines_attempt_usage() {
+        let first_usage = json!({"promptTokenCount":32,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":48});
+        let value = json!({"response":{
+            "candidates":[{"content":{"parts":[{"thought":true,"text":"reasoning"}]},"finishReason":"MAX_TOKENS"}],
+            "usageMetadata":{"promptTokenCount":35,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":51}
+        }});
+        let mut state = EmptyThinkingState::default();
+        let out = parsed(continuation_event(
+            event(value),
+            Some(&first_usage),
+            &mut state,
+        ));
+        assert_eq!(
+            out["response"]["candidates"][0]["finishReason"],
+            "MAX_TOKENS"
+        );
+        assert_eq!(
+            out["response"]["usageMetadata"],
+            json!({
+                "promptTokenCount":67,"thoughtsTokenCount":26,"candidatesTokenCount":6,"totalTokenCount":99
+            })
+        );
+        assert!(state.continuation_is_complete());
+        assert!(!state.needs_continuation());
+        assert!(out["response"].get("error").is_none());
+    }
+
+    #[test]
+    fn root_output_limit_preserves_first_and_continuation_terminal() {
+        for wrapped in [false, true] {
+            for finish_key in ["finishReason", "finish_reason"] {
+                for separate_terminal in [false, true] {
+                    let thought = json!({"candidates":[{
+                        "content":{"parts":[{"thought":true,"text":"reasoning"}]}
+                    }]});
+                    let mut value = if separate_terminal {
+                        json!({})
+                    } else {
+                        thought.clone()
+                    };
+                    value[finish_key] = json!("MAX_TOKENS");
+                    value["usageMetadata"] = json!({"promptTokenCount":35,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":51});
+                    if wrapped {
+                        value = json!({"response":value});
+                    }
+                    let mut first = EmptyThinkingState::default();
+                    let mut second = EmptyThinkingState::default();
+                    if separate_terminal {
+                        first.process(event(thought.clone()));
+                        continuation_event(event(thought), None, &mut second);
+                    }
+                    assert_eq!(parsed(first.process(event(value.clone())).unwrap()), value);
+                    assert!(!first.needs_continuation());
+                    assert!(first.continuation_is_complete());
+
+                    let first_usage = json!({"promptTokenCount":32,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":48});
+                    let out = parsed(continuation_event(
+                        event(value),
+                        Some(&first_usage),
+                        &mut second,
+                    ));
+                    let inner = out.get("response").unwrap_or(&out);
+                    assert_eq!(inner[finish_key], "MAX_TOKENS");
+                    assert_eq!(inner["usageMetadata"]["totalTokenCount"], 99);
+                    assert!(!second.needs_continuation());
+                    assert!(second.continuation_is_complete());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_stop_is_withheld_until_continuation_produces_output() {
+        for finish_key in ["finishReason", "finish_reason"] {
+            let mut value = json!({"candidates":[{
+                "content":{"parts":[{"thought":true,"text":"reasoning"}]}
+            }]});
+            value[finish_key] = json!("STOP");
+            let mut first = EmptyThinkingState::default();
+            let out = parsed(first.process(event(value.clone())).unwrap());
+            assert!(out.get(finish_key).is_none());
+            assert!(first.needs_continuation());
+
+            let mut second = EmptyThinkingState::default();
+            let out = parsed(continuation_event(event(value.clone()), None, &mut second));
+            assert!(out.get(finish_key).is_none());
+            assert!(!second.continuation_is_complete());
+
+            value["candidates"][0]["content"]["parts"] = json!([{"text":"answer"}]);
+            let out = parsed(continuation_event(event(value), None, &mut second));
+            assert_eq!(out[finish_key], "STOP");
+            assert!(second.continuation_is_complete());
+        }
+    }
+
+    #[test]
+    fn invalid_candidate_terminal_cannot_fall_back_to_root_terminal() {
+        for finish_key in ["finishReason", "finish_reason"] {
+            for invalid in [
+                json!(""),
+                json!("FINISH_REASON_UNSPECIFIED"),
+                Value::Null,
+                json!(0),
+            ] {
+                for root_reason in ["STOP", "MAX_TOKENS"] {
+                    let mut value = json!({"candidates":[{
+                        "content":{"parts":[{"thought":true,"text":"reasoning"}]}
+                    }]});
+                    value[finish_key] = json!(root_reason);
+                    value["candidates"][0][finish_key] = invalid.clone();
+                    let mut first = EmptyThinkingState::default();
+                    first.process(event(value.clone()));
+                    assert!(!first.needs_continuation(), "{value}");
+                    assert!(!first.continuation_is_complete(), "{value}");
+
+                    let mut second = EmptyThinkingState::default();
+                    let out = parsed(continuation_event(event(value.clone()), None, &mut second));
+                    assert!(out.get(finish_key).is_none(), "{out}");
+                    assert!(out["candidates"][0].get(finish_key).is_none(), "{out}");
+                    assert!(!second.continuation_is_complete(), "{value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_interruption_cannot_authorize_continuation_or_completion() {
+        for root_finish in [false, true] {
+            for root_interruption in [false, true] {
+                for reason in ["STOP", "MAX_TOKENS", "SAFETY"] {
+                    let mut value = json!({"candidates":[{
+                        "content":{"parts":[{"thought":true,"text":"reasoning"}]}
+                    }]});
+                    if root_finish {
+                        value["finishReason"] = json!(reason);
+                    } else {
+                        value["candidates"][0]["finishReason"] = json!(reason);
+                    }
+                    if root_interruption {
+                        value["gatewayInterrupted"] = json!(true);
+                    } else {
+                        value["candidates"][0]["gatewayInterrupted"] = json!(true);
+                    }
+                    let mut first = EmptyThinkingState::default();
+                    first.process(event(value.clone()));
+                    assert!(!first.needs_continuation(), "{value}");
+                    assert!(!first.continuation_is_complete(), "{value}");
+
+                    let mut second = EmptyThinkingState::default();
+                    continuation_event(event(value.clone()), None, &mut second);
+                    assert!(!second.continuation_is_complete(), "{value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_failure_terminal_retains_original_cause_without_continuation() {
+        for reason in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "OTHER",
+            "FUTURE_PROVIDER_FAILURE",
+        ] {
+            let value = json!({"candidates":[{
+                "content":{"parts":[{"thought":true,"text":"reasoning"}]},
+                "finishReason":reason
+            }]});
+            let mut first = EmptyThinkingState::default();
+            assert_eq!(parsed(first.process(event(value.clone())).unwrap()), value);
+            assert!(!first.needs_continuation());
+            let mut second = EmptyThinkingState::default();
+            let out = parsed(continuation_event(event(value.clone()), None, &mut second));
+            assert_eq!(out, value);
+            assert!(second.continuation_is_complete());
+            let failure = crate::proxy::pipeline::stream_error::upstream_error_from_event(&out)
+                .expect("provider failure should reach the shared error classifier");
+            let body: Value = serde_json::from_str(&failure.body).unwrap();
+            assert_eq!(body["error"]["finish_reason"], reason);
+        }
+    }
+
+    #[test]
+    fn output_usage_without_terminal_does_not_imply_completion() {
+        let value = json!({
+            "candidates":[{"content":{"parts":[{"thought":true,"text":"reasoning"}]}}],
+            "usageMetadata":{"promptTokenCount":32,"thoughtsTokenCount":13,"candidatesTokenCount":3,"totalTokenCount":48}
+        });
+        let mut state = EmptyThinkingState::default();
+        assert_eq!(parsed(state.process(event(value.clone())).unwrap()), value);
+        assert!(!state.needs_continuation());
+        assert!(!state.continuation_is_complete());
+    }
+
+    #[test]
+    fn stop_with_deliverable_output_keeps_terminal_without_continuation() {
+        for output in [
+            json!({"text":"answer"}),
+            json!({"functionCall":{"name":"search","args":{"query":"example"}}}),
+            json!({"inlineData":{"mimeType":"image/png","data":"AA=="}}),
+            json!({"fileData":{"mimeType":"image/png","fileUri":"https://example.test/image"}}),
+        ] {
+            let value = json!({"candidates":[{
+                "content":{"parts":[{"thought":true,"text":"reasoning"},output]},
+                "finishReason":"STOP"
+            }]});
+            let mut state = EmptyThinkingState::default();
+            assert_eq!(parsed(state.process(event(value.clone())).unwrap()), value);
+            assert!(!state.needs_continuation());
+            assert!(state.continuation_is_complete());
+        }
+    }
+
     #[test]
     fn continuation_empty_or_unspecified_finish_is_not_successful_wire() {
         for reason in ["STOP", "", "FINISH_REASON_UNSPECIFIED"] {
@@ -1624,7 +1900,8 @@ fn requests_multiple_candidates(body: &Value) -> bool {
 /// 对上游原始 Gemini SSE 流进行透明包装：
 /// - 思考内容实时透传；
 /// - 若正常产出正文或工具调用，全流程无任何额外开销；
-/// - 若发现仅产出思考后立即返回终止符，截留终止信号并在同一连接中自动续跑；
+/// - 若发现仅产出思考后返回 STOP，截留终止信号并在同一连接中自动续跑；
+/// - 输出预算耗尽、拒绝及其他上游终结原因原样交给下游处理；
 /// - 续跑上限严格为 1 次，具有完备的熔断与兜底保障。
 pub fn wrap_stream_with_empty_thinking_auto_heal<S, E>(
     stream: Pin<Box<S>>,
@@ -1659,7 +1936,7 @@ where
         // 1. 存在思考块 (saw_thought)
         // 2. 无任何正文 (saw_content == false)
         // 3. 无任何工具调用 (saw_tool_call == false)
-        // 4. 上游正常返回了结束符 (saw_finish_reason == true)
+        // 4. 上游明确返回 STOP（输出上限和其他终结原因不应自动续跑）
         if state.needs_continuation() {
             tracing::warn!(
                 "[{}] [Stream-AutoHeal] 🚨 Detected empty thinking completion (thought present, 0 content, 0 tool_calls, finishReason={:?}). Triggering auto-heal continuation 1/1...",
