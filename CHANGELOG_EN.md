@@ -3,6 +3,17 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.7 (2026-11-15)**:
+        -   **[Protocol usability and multi-turn tools] (PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), Thanks to @DNAlec)**:
+            -   Preserve readable server-tool history, documents and media; support custom/namespaced tools, selectors and cross-turn associations. Keep candidate identities separate and prevent duplicated calls and incorrect completion states.
+            -   Deliver completed output despite transport tail failures while keeping genuine interruptions, incomplete tool arguments and missing required content explicit. Upstream version checks remain notification-only; installation and update actions remain disabled.
+        -   **[Upstream beta.8–beta.11 and PR #3959] (PR [#12](https://github.com/DNAlec/Antigravity-Manager/pull/12), Thanks to @DNAlec)**:
+            -   Integrate the selected upstream development baseline and [PR #3959](https://github.com/lbjlaq/Antigravity-Manager/pull/3959) for calibrated Hub fingerprints and flat request envelopes (Thanks to @cubelikeplayDaniel).
+            -   Align the official model catalog, Gemini 4 quota/thinking levels, account availability gates and model toggles while preserving fork cache continuity ([PR #3933](https://github.com/lbjlaq/Antigravity-Manager/pull/3933), [#3936](https://github.com/lbjlaq/Antigravity-Manager/pull/3936), [#3938](https://github.com/lbjlaq/Antigravity-Manager/pull/3938), [#3949](https://github.com/lbjlaq/Antigravity-Manager/pull/3949), Thanks to @jeikl, @cubelikeplayDaniel, @lbjlaq).
+            -   Integrate CacheFirst transient recovery, QoS usage reconciliation, signature overwrite protection and compaction boundary fixes ([PR #3935](https://github.com/lbjlaq/Antigravity-Manager/pull/3935), [#3942](https://github.com/lbjlaq/Antigravity-Manager/pull/3942), [#3943](https://github.com/lbjlaq/Antigravity-Manager/pull/3943), [#3945](https://github.com/lbjlaq/Antigravity-Manager/pull/3945), Ref #3944, Thanks to @mclinyeshi).
+            -   Fix Gemini heartbeat compatibility, structured JSON output and reasoning token accounting; narrow identity-prompt sanitization and add Android ARM64 headless release assets ([PR #3953](https://github.com/lbjlaq/Antigravity-Manager/pull/3953), [#3954](https://github.com/lbjlaq/Antigravity-Manager/pull/3954), [#3946](https://github.com/lbjlaq/Antigravity-Manager/pull/3946), Thanks to @koeria, @cubelikeplayDaniel).
+        -   **Deployment scope**: Pair with sub2api v0.2.20-nekocloud.7 for inline system/developer and optional reasoning-history fixes. The reported aggregation-mode 502 still needs failure logs; this release does not establish that its root cause is resolved.
+
     *   **v5.0.6 (2026-11-14)**:
         -   **[Tool Schema compatibility and resource limits] (PR [#7](https://github.com/DNAlec/Antigravity-Manager/pull/7), Thanks to @DNAlec)**:
             -   Accept ordinary `allOf`, `oneOf`, union types and local references that previously rejected requests, including repeated pattern constraints in SendMessage. Preserve usable parameter structure and adapt auxiliary constraints that cannot be represented fully, for both tools and structured output.
