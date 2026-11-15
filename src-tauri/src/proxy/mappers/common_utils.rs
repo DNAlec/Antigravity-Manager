@@ -1508,6 +1508,89 @@ mod tests {
     }
 
     #[test]
+    fn r36_text_attachments_use_shared_readable_projection_with_aliases_and_metadata() {
+        use base64::{engine::general_purpose, Engine as _};
+        for (mime, text) in [
+            ("text/plain", "x"),
+            ("text/markdown", "# 中文\n**正文**"),
+            ("text/csv", "name,value\na,1"),
+            ("text/html", "<p>DOC_36</p>"),
+            ("Text/Plain; charset=utf-8", "UTF8_36"),
+        ] {
+            let data = general_purpose::STANDARD.encode(text);
+            assert_eq!(
+                create_gemini_inline_part(Some(mime), &data, "File"),
+                json!({"text":text})
+            );
+            for wrapped in [false, true] {
+                let body = json!({
+                    "contents":[{"role":"user","parts":[{"inline_data":{"mime_type":mime,"data":data},"thoughtSignature":"KEEP_SIGNATURE_36"}]}],
+                    "system_instruction":{"parts":[{"inlineData":{"mimeType":mime,"data":data}}]}
+                });
+                let mut body = if wrapped {
+                    json!({"request":body})
+                } else {
+                    body
+                };
+                assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 0);
+                let inner = if wrapped { &body["request"] } else { &body };
+                assert_eq!(
+                    inner["contents"][0]["parts"][0],
+                    json!({"text":text,"thoughtSignature":"KEEP_SIGNATURE_36"})
+                );
+                assert_eq!(
+                    inner["system_instruction"]["parts"][0],
+                    json!({"text":text})
+                );
+                let once = body.clone();
+                assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 0);
+                assert_eq!(body, once);
+            }
+        }
+        let unicode = "???中文";
+        let data = general_purpose::URL_SAFE.encode(unicode);
+        assert!(data.contains('_'));
+        assert_eq!(
+            create_gemini_inline_part(Some("text/plain"), &data, "File"),
+            json!({"text":unicode})
+        );
+    }
+
+    #[test]
+    fn r36_text_projection_keeps_binary_validation_and_rejects_invalid_text() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let json_data = STANDARD.encode(r#"{"value":"JSON_36"}"#);
+        let audio = STANDARD.encode([1, 2, 3]);
+        let text = STANDARD.encode("DOC_BODY_36");
+        let invalid_utf8 = STANDARD.encode([0xff, 0xfe, 0xff]);
+        let mut body = json!({"contents":[{"role":"user","parts":[
+            {"inlineData":{"mimeType":"image/png","data":png}},
+            {"inlineData":{"mimeType":"application/json","data":json_data}},
+            {"inlineData":{"mimeType":"audio/wav","data":audio}},
+            {"inlineData":{"mimeType":"image/png","data":text}},
+            {"inlineData":{"mimeType":"application/pdf","data":text}},
+            {"inlineData":{"mimeType":"text/plain","data":invalid_utf8}},
+            {"inlineData":{"mimeType":"text/plain","data":"INVALID_BASE64!"}}
+        ]}]});
+        assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 4);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        for (index, mime, data) in [
+            (0, "image/png", png),
+            (1, "application/json", json_data.as_str()),
+            (2, "audio/wav", audio.as_str()),
+        ] {
+            assert_eq!(
+                parts[index]["inlineData"],
+                json!({"mimeType":mime,"data":data})
+            );
+        }
+        assert!(parts[3..].iter().all(|part| part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("invalid or corrupted"))));
+    }
+
+    #[test]
     fn test_sanitize_gemini_payload_inline_data() {
         let valid_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let mut payload = json!({
@@ -1688,53 +1771,211 @@ mod tests {
     }
 }
 
-/// [FIX] Parse markdown base64 images from text and split into Gemini parts
-/// This prevents base64 reflection bloat where generated images are sent back as huge text strings
-pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
-    let mut parts = Vec::new();
-    // Match ![...](data:image/...;base64,...)
-    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
-        let mut last_match = 0;
+// Strip visible container prefixes for block recognition; offsets still refer
+// to the original text so protected source is always retained verbatim.
+fn markdown_unquote_line(mut line: &str) -> &str {
+    loop {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 || !trimmed.starts_with('>') {
+            return line;
+        }
+        line = &trimmed[1..];
+        if line.starts_with([' ', '\t']) {
+            line = &line[1..];
+        }
+    }
+}
 
-        for cap in re.captures_iter(text) {
-            let m = cap.get(0).unwrap();
+fn markdown_list_content_start(line: &str, active_indent: Option<usize>) -> Option<usize> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 && !active_indent.is_some_and(|active| indent >= active) {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let marker_len = match bytes.first()? {
+        b'-' | b'+' | b'*' => 1,
+        b'0'..=b'9' => {
+            let digits = bytes
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits > 9 || !matches!(bytes.get(digits), Some(b'.' | b')')) {
+                return None;
+            }
+            digits + 1
+        }
+        _ => return None,
+    };
+    if !matches!(bytes.get(marker_len), Some(b' ' | b'\t')) {
+        return None;
+    }
+    Some(indent + marker_len + 1)
+}
 
-            // Add preceding text
-            if m.start() > last_match {
-                let preceding = &text[last_match..m.start()];
-                if !preceding.trim().is_empty() {
-                    parts.push(json!({"text": preceding}));
+/// Markdown code is source text, not a visual input. Keep this recognition shared
+/// by normal message text and tool output before either lowers images to Gemini.
+fn markdown_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut blocks = Vec::new();
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut list_indent = None;
+    let mut offset = 0;
+    for source_line in text.split_inclusive('\n') {
+        let mut line = markdown_unquote_line(source_line);
+        if fence.is_none() {
+            if let Some(start) = markdown_list_content_start(line, list_indent) {
+                list_indent = Some(start);
+                line = &line[start..];
+            } else if let Some(indent) = list_indent {
+                if line.as_bytes().iter().take_while(|&&b| b == b' ').count() >= indent {
+                    line = &line[indent..];
+                } else if !line.trim().is_empty() {
+                    list_indent = None;
                 }
             }
-
-            // Add inlineData image
-            let mime = cap.get(1).unwrap().as_str();
-            let b64 = cap.get(2).unwrap().as_str();
-            let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
-            parts.push(part);
-
-            last_match = m.end();
-        }
-
-        // Add remaining text
-        if last_match < text.len() {
-            let remaining = &text[last_match..];
-            if !remaining.trim().is_empty() {
-                parts.push(json!({"text": remaining}));
+        } else if let Some(indent) = list_indent {
+            if line.as_bytes().iter().take_while(|&&b| b == b' ').count() >= indent {
+                line = &line[indent..];
             }
         }
-
-        if parts.is_empty() && !text.trim().is_empty() {
-            parts.push(json!({"text": text}));
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let bytes = trimmed.as_bytes();
+        let marker = bytes.first().copied().unwrap_or_default();
+        let run = bytes.iter().take_while(|&&b| b == marker).count();
+        if let Some((opening, length, start)) = fence {
+            if indent <= 3 && marker == opening && run >= length && trimmed[run..].trim().is_empty()
+            {
+                blocks.push(start..offset + source_line.len());
+                fence = None;
+            }
+        } else if indent <= 3
+            && matches!(marker, b'`' | b'~')
+            && run >= 3
+            && (marker != b'`' || !trimmed[run..].contains('`'))
+        {
+            fence = Some((marker, run, offset));
+        } else if indent >= 4 || line.starts_with('\t') {
+            blocks.push(offset..offset + source_line.len());
         }
-
-        return parts;
+        offset += source_line.len();
+    }
+    if let Some((_, _, start)) = fence {
+        blocks.push(start..text.len());
     }
 
-    if !text.trim().is_empty() {
-        parts.push(json!({"text": text}));
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for block in blocks {
+        markdown_inline_code_ranges(text, start..block.start, &mut ranges);
+        start = block.end;
+        ranges.push(block);
     }
+    markdown_inline_code_ranges(text, start..text.len(), &mut ranges);
+    ranges
+}
 
+fn markdown_is_escaped(text: &str, position: usize) -> bool {
+    text.as_bytes()[..position]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn markdown_inline_code_ranges(
+    text: &str,
+    range: std::ops::Range<usize>,
+    ranges: &mut Vec<std::ops::Range<usize>>,
+) {
+    let bytes = text.as_bytes();
+    let mut runs = Vec::new();
+    let mut cursor = range.start;
+    while cursor < range.end {
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < range.end && bytes[cursor] == b'`' {
+            cursor += 1;
+        }
+        runs.push(start..cursor);
+    }
+    // Index the next exact-length delimiter once, including escaped closing
+    // ticks (backslashes are literal inside code), to avoid quadratic scans.
+    let mut next_by_length = std::collections::HashMap::new();
+    let mut closing = vec![None; runs.len()];
+    for (index, run) in runs.iter().enumerate().rev() {
+        closing[index] = next_by_length.insert(run.len(), index);
+    }
+    let mut index = 0;
+    while index < runs.len() {
+        if !markdown_is_escaped(text, runs[index].start) {
+            if let Some(end) = closing[index] {
+                ranges.push(runs[index].start..runs[end].end);
+                index = end + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+}
+
+fn markdown_image_matches(text: &str) -> Vec<(std::ops::Range<usize>, &str, &str)> {
+    static IMAGE: Lazy<Option<regex::Regex>> = Lazy::new(|| {
+        regex::Regex::new(
+            r"!\[(?:\\.|[^\]\\])*\]\(data:(image/[^;\s)]+);base64,([a-zA-Z0-9+/=]+)\)",
+        )
+        .ok()
+    });
+    let Some(pattern) = IMAGE.as_ref() else {
+        return Vec::new();
+    };
+    if !text.contains("data:image/") {
+        return Vec::new();
+    }
+    let code = markdown_code_ranges(text);
+    let mut code_index = 0;
+    pattern
+        .captures_iter(text)
+        .filter_map(|capture| {
+            let (matched, mime, data) = (capture.get(0)?, capture.get(1)?, capture.get(2)?);
+            while code_index < code.len() && code[code_index].end <= matched.start() {
+                code_index += 1;
+            }
+            if markdown_is_escaped(text, matched.start())
+                || code
+                    .get(code_index)
+                    .is_some_and(|range| range.start < matched.end())
+            {
+                return None;
+            }
+            Some((matched.range(), mime.as_str(), data.as_str()))
+        })
+        .collect()
+}
+
+/// Promote rendered Markdown data images while retaining literal source examples.
+pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
+    let mut parts = Vec::new();
+    let mut last_match = 0;
+    for (matched, mime, data) in markdown_image_matches(text) {
+        if matched.start > last_match {
+            parts.push(json!({"text": &text[last_match..matched.start]}));
+        }
+        parts.push(create_gemini_inline_part(
+            Some(mime),
+            data,
+            "Markdown Image",
+        ));
+        last_match = matched.end;
+    }
+    if last_match < text.len() {
+        parts.push(json!({"text": &text[last_match..]}));
+    }
     parts
 }
 
@@ -1835,42 +2076,32 @@ pub fn extract_multimodal_from_tool_text(raw_text: &str, extra_parts: &mut Vec<V
         }
     }
 
-    // 3. 严格检测 Markdown 图片语法：![alt](data:image/...;base64,...)
-    // 只有明确采用 Markdown 图片语法的结构才允许解构提取，绝不从普通文本/终端输出中模糊切词匹配
-    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
-        let mut clean_text = String::new();
-        let mut last_match = 0;
-        let mut found_image = false;
-
-        for cap in re.captures_iter(raw_text) {
-            let m = cap.get(0).unwrap();
-            let mime_type = cap.get(1).unwrap().as_str();
-            let b64_data = cap.get(2).unwrap().as_str();
-
-            if is_supported_tool_image_mime(mime_type) {
-                if let Some((valid_mime, valid_b64)) =
-                    validate_and_sanitize_inline_data(Some(mime_type), b64_data)
-                {
-                    clean_text.push_str(&raw_text[last_match..m.start()]);
-                    extra_parts.push(create_gemini_inline_part(
-                        Some(&valid_mime),
-                        &valid_b64,
-                        "Tool Result Image",
-                    ));
-                    clean_text.push_str(&format!(
-                        "[Image: forwarded to visual input ({})]",
-                        valid_mime
-                    ));
-                    last_match = m.end();
-                    found_image = true;
-                }
-            }
+    // Use the same Markdown source boundaries as normal message text.
+    let mut clean_text = String::new();
+    let mut last_match = 0;
+    for (matched, mime_type, b64_data) in markdown_image_matches(raw_text) {
+        if !is_supported_tool_image_mime(mime_type) {
+            continue;
         }
-
-        if found_image {
-            clean_text.push_str(&raw_text[last_match..]);
-            return clean_text;
+        if let Some((valid_mime, valid_b64)) =
+            validate_and_sanitize_inline_data(Some(mime_type), b64_data)
+        {
+            clean_text.push_str(&raw_text[last_match..matched.start]);
+            extra_parts.push(create_gemini_inline_part(
+                Some(&valid_mime),
+                &valid_b64,
+                "Tool Result Image",
+            ));
+            clean_text.push_str(&format!(
+                "[Image: forwarded to visual input ({})]",
+                valid_mime
+            ));
+            last_match = matched.end;
         }
+    }
+    if last_match > 0 {
+        clean_text.push_str(&raw_text[last_match..]);
+        return clean_text;
     }
 
     // 4. 普通纯文本（代码、日志、测试数据等）：对齐官方原生，100% 原始透传，绝不破坏文本内容
@@ -2091,19 +2322,39 @@ pub fn create_gemini_file_part(
     Ok(json!({"fileData": {"fileUri": source_uri, "mimeType": mime}}))
 }
 
-/// Helper to create a Gemini inlineData part or fallback text if invalid
+fn normalized_inline_part(mime_type: Option<&str>, b64_data: &str) -> Option<Value> {
+    let is_text = mime_type.is_some_and(|mime| {
+        mime.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("text/")
+    });
+    if is_text {
+        use base64::{engine::general_purpose, Engine as _};
+        let data = general_purpose::STANDARD
+            .decode(b64_data.trim())
+            .or_else(|_| general_purpose::URL_SAFE.decode(b64_data.trim()))
+            .ok()?;
+        // Text files have no image magic or minimum size. Project their UTF-8
+        // body as text so every adapter can use it without MIME support upstream.
+        return String::from_utf8(data)
+            .ok()
+            .map(|text| json!({"text": text}));
+    }
+    let (mime, data) = validate_and_sanitize_inline_data(mime_type, b64_data)?;
+    Some(json!({"inlineData": {"mimeType": mime, "data": data}}))
+}
+
+/// Create a readable text part, validated binary inlineData, or a fallback for invalid data.
 pub fn create_gemini_inline_part(
     mime_type: Option<&str>,
     b64_data: &str,
     fallback_label: &str,
 ) -> Value {
-    if let Some((valid_mime, valid_data)) = validate_and_sanitize_inline_data(mime_type, b64_data) {
-        json!({
-            "inlineData": {
-                "mimeType": valid_mime,
-                "data": valid_data
-            }
-        })
+    if let Some(part) = normalized_inline_part(mime_type, b64_data) {
+        part
     } else {
         tracing::warn!(
             "[Image-Defense] Omitted invalid or corrupt base64 data (len: {}, mime: {:?})",
@@ -2117,7 +2368,8 @@ pub fn create_gemini_inline_part(
 }
 
 /// Sanitizes any inlineData in an entire Gemini JSON request payload in-place.
-/// Replaces invalid inlineData / inline_data parts with placeholder text parts.
+/// Projects UTF-8 text attachments into readable text and replaces invalid binary
+/// inlineData / inline_data parts with placeholders. Returns the invalid part count.
 pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
     let mut total_sanitized = 0;
 
@@ -2142,20 +2394,9 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
 
-                    if let Some((valid_mime, valid_data)) =
-                        validate_and_sanitize_inline_data(mime, data)
-                    {
-                        // Ensure mimeType and data are normalized
-                        obj.insert(
-                            "inlineData".to_string(),
-                            json!({
-                                "mimeType": valid_mime,
-                                "data": valid_data
-                            }),
-                        );
-                        if key == "inline_data" {
-                            obj.remove("inline_data");
-                        }
+                    if let Some(Value::Object(normalized)) = normalized_inline_part(mime, data) {
+                        obj.remove(key);
+                        obj.extend(normalized);
                     } else {
                         total_sanitized += 1;
                         tracing::warn!(

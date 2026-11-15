@@ -637,13 +637,12 @@ pub fn build_dual_track_error_with_ua_and_lang(
     // [Fixes #3763] 剔除内部链路控制标记，避免大体积上传终态标记泄漏到客户端报文
     let sanitized_error_text = crate::proxy::upstream::client::strip_internal_markers(error_text);
     let error_text = sanitized_error_text.as_str();
-    // Model failures include generated partial output. Do not scan that output
+    // Generation failures include partial output. Do not scan that output
     // for transport/quota keywords or parse HTTP prefixes inside quoted text.
     if let Ok(mut failure) = serde_json::from_str::<serde_json::Value>(error_text) {
         if failure
-            .pointer("/error/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("upstream_finish_error")
+            .get("error")
+            .is_some_and(crate::proxy::pipeline::stream_error::is_partial_response_error)
         {
             if protocol == "claude" {
                 failure["type"] = serde_json::json!("error");

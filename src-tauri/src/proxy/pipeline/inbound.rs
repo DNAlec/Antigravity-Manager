@@ -460,29 +460,6 @@ impl InboundThinkingPipeline {
                                     continue;
                                 }
 
-                                // 跨家族协议自愈：检查是否夹带 <think> 标签包裹的思考内容（如从 Claude 跨切回 Gemini）
-                                if let Some((extracted_thought, clean_visible)) =
-                                    crate::proxy::thinking_store::extract_think_tags(raw_text)
-                                {
-                                    if thinking_part.is_none() && is_thinking_enabled {
-                                        if crate::proxy::thinking_store::is_meaningful_thought(
-                                            &extracted_thought,
-                                        ) {
-                                            // 铁律 I4：思考块绝不携带签名
-                                            // （官方报文里 thought:true 的 part 没有 thoughtSignature）
-                                            let t_obj = json!({
-                                                "text": extracted_thought.as_str(),
-                                                "thought": true,
-                                            });
-                                            thinking_part = Some(t_obj);
-                                        }
-                                    }
-                                    if !clean_visible.is_empty() {
-                                        other_parts.push(json!({ "text": clean_visible }));
-                                    }
-                                    continue;
-                                }
-
                                 other_parts.push(part);
                             } else {
                                 other_parts.push(part);
@@ -3941,50 +3918,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_family_think_tag_extraction_and_elevation_for_gemini() {
-        let thought_text = "Analyzing user code structure and determining route.";
-        let visible_answer = "The issue has been identified and isolated.";
-        let wrapped_text = format!("<think>\n{}\n</think>\n\n{}", thought_text, visible_answer);
-
-        let mut contents = vec![json!({
-            "role": "model",
-            "parts": [
-                { "text": wrapped_text }
-            ]
-        })];
-
-        // 1. 测试 Claude 目标：成功提升为 thought: true 思考块并保留正文回答
-        let mut claude_contents = contents.clone();
-        InboundThinkingPipeline::process_contents(
-            &mut claude_contents,
+    fn r32_plain_think_tags_remain_visible_across_model_families() {
+        let wrapped = "<think>Business XML, not protocol metadata.</think>Visible answer.";
+        for model in [
             "claude-sonnet-4-6",
-            true,
-            None,
-            false,
-        );
-        let c_parts = claude_contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：思考块被丢弃，仅保留可见正文（具体文本随协议归一化而变）
-        assert!(c_parts.iter().all(|p| p.get("thought").is_none()));
-        assert!(!c_parts.is_empty());
-
-        // 2. 测试 Gemini 目标：历史模型轮次存在可见正文时依规剥离思考块，保留纯净回答
-        InboundThinkingPipeline::process_contents(
-            &mut contents,
             "gemini-3.8-flash-tiered",
-            true,
-            None,
-            false,
-        );
-
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：思考块被剥离，但可见正文必须保留（位置随归一化而变）
-        assert!(
-            parts
-                .iter()
-                .any(|p| p["text"].as_str() == Some(visible_answer)),
-            "可见正文必须保留"
-        );
-        assert!(parts.iter().all(|p| p.get("thought").is_none()));
+            "gemini-2.5-flash",
+        ] {
+            for thinking in [false, true] {
+                let mut contents = vec![json!({"role":"model","parts":[{"text":wrapped}]})];
+                InboundThinkingPipeline::process_contents(
+                    &mut contents,
+                    model,
+                    thinking,
+                    None,
+                    false,
+                );
+                let parts = contents[0]["parts"].as_array().unwrap();
+                assert!(parts.iter().any(|part| part["text"] == wrapped));
+                assert!(parts.iter().all(|part| part.get("thought").is_none()));
+            }
+        }
     }
 
     // ============ 工具回执（functionResponse）role 归一化 ============

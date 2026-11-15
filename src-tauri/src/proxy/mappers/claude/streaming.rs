@@ -66,7 +66,7 @@ pub struct StreamingState {
     pub block_index: usize,
     pub message_start_sent: bool,
     pub message_stop_sent: bool,
-    used_tool: bool,
+    pub(super) used_tool: bool,
     signatures: SignatureManager,
     trailing_signature: Option<String>,
     pub web_search_query: Option<String>,
@@ -91,10 +91,6 @@ pub struct StreamingState {
     pub has_content: bool,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
-    // [FIX #MCP] Registered tool names for fuzzy matching
-    pub registered_tool_names: Vec<String>,
-    // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
-    pub text_delta_emitted_this_turn: bool,
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
     pub(super) upstream_finished: bool,
     pub(super) pending_tool_signatures: Vec<(String, String)>,
@@ -133,8 +129,6 @@ impl StreamingState {
             has_content: false,
             message_count: 0,
             client_adapter: None,
-            registered_tool_names: Vec::new(),
-            text_delta_emitted_this_turn: false,
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
             upstream_finished: false,
             pending_tool_signatures: Vec::new(),
@@ -148,11 +142,6 @@ impl StreamingState {
     // [NEW] Set client adapter
     pub fn set_client_adapter(&mut self, adapter: Option<std::sync::Arc<dyn ClientAdapter>>) {
         self.client_adapter = adapter;
-    }
-
-    // [FIX #MCP] Set registered tool names for fuzzy matching
-    pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
-        self.registered_tool_names = names;
     }
 
     /// 发送 SSE 事件
@@ -764,15 +753,8 @@ impl<'a> PartProcessor<'a> {
             return chunks;
         }
 
-        // Ordinary text (without signature)
-
-        // [FIX #3379] call:default_api:* leakage recovery bridge
-        // Attempt to recover leaked tool-call text as a proper tool_use block.
-        // Strict Fail-Closed: any unmet guard falls through to normal text_delta.
-        if let Some(recovery_chunks) = self.try_recover_call_default_api_text(text) {
-            return recovery_chunks;
-        }
-
+        // Text-part boundaries are arbitrary. A textual tool expression may be
+        // an unfinished prefix or an example; only functionCall creates tool_use.
         if self.state.current_block_type() != BlockType::Text {
             chunks.extend(
                 self.state
@@ -780,221 +762,9 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        self.state.text_delta_emitted_this_turn = true;
         chunks.push(self.state.emit_delta("text_delta", json!({ "text": text })));
 
         chunks
-    }
-
-    // -------------------------------------------------------------------------
-    // [FIX #3379] Helpers: call:default_api:* leakage detection & recovery
-    // -------------------------------------------------------------------------
-
-    /// Attempt to extract `(tool_name, args_str)` from a raw `call:default_api:*` text.
-    /// Returns None if the text does not strictly match the expected prefix format.
-    fn try_parse_call_default_api(text: &str) -> Option<(String, String)> {
-        const PREFIX: &str = "call:default_api:";
-        let trimmed = text.trim();
-        if !trimmed.starts_with(PREFIX) {
-            return None;
-        }
-        let rest = &trimmed[PREFIX.len()..];
-        // Tool name ends at the first `{` or `(` delimiter
-        let tool_end = rest.find(|c| c == '{' || c == '(').unwrap_or(rest.len());
-        let tool_name = rest[..tool_end].trim().to_string();
-        if tool_name.is_empty() {
-            return None;
-        }
-        let args_str = rest[tool_end..].trim().to_string();
-        Some((tool_name, args_str))
-    }
-
-    /// Two-phase JSON argument parser for Gemini's loose call:default_api format.
-    ///
-    /// Phase 1: standard `serde_json` parse (handles well-formed JSON).
-    /// Phase 2: lenient key-quoting heuristic for unquoted keys (e.g. `{file_path:foo}`).
-    /// Returns `None` (guard G6) if both phases fail.
-    fn parse_loose_json_args(args_str: &str) -> Option<serde_json::Value> {
-        if args_str.is_empty() {
-            // No-arg tool call → valid empty object
-            return Some(serde_json::json!({}));
-        }
-
-        // Phase 1: strict JSON
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_str) {
-            if v.is_object() {
-                return Some(v);
-            }
-        }
-
-        // Phase 2: lenient key-quoting for Gemini's internal pseudo-JSON
-        // Only attempt if the string looks like a {…} block.
-        let s = args_str.trim();
-        if !s.starts_with('{') || !s.ends_with('}') {
-            return None;
-        }
-        let inner = &s[1..s.len() - 1];
-
-        // Naïve key-quoting: add double-quotes around bare identifier keys.
-        // This covers the most common Gemini output patterns.
-        let mut result = String::from("{");
-        let mut in_value = false;
-        let mut i = 0;
-        let chars: Vec<char> = inner.chars().collect();
-        while i < chars.len() {
-            let c = chars[i];
-            match c {
-                ',' if !in_value => {
-                    result.push(',');
-                    i += 1;
-                }
-                ':' => {
-                    result.push(':');
-                    in_value = true;
-                    i += 1;
-                }
-                '"' if in_value => {
-                    // Quoted value — pass through until closing quote
-                    result.push('"');
-                    i += 1;
-                    while i < chars.len() && chars[i] != '"' {
-                        if chars[i] == '\\' {
-                            result.push('\\');
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            result.push(chars[i]);
-                            i += 1;
-                        }
-                    }
-                    if i < chars.len() {
-                        result.push('"');
-                        i += 1;
-                    }
-                    in_value = false;
-                }
-                _ if !in_value => {
-                    // Bare key — wrap with quotes
-                    let key_start = i;
-                    while i < chars.len() && chars[i] != ':' && chars[i] != ',' {
-                        i += 1;
-                    }
-                    let key: String = chars[key_start..i].iter().collect();
-                    let key_trimmed = key.trim();
-                    result.push('"');
-                    result.push_str(key_trimmed);
-                    result.push('"');
-                }
-                _ => {
-                    // Bare value — collect until `,` or end
-                    let val_start = i;
-                    while i < chars.len() && chars[i] != ',' {
-                        result.push(chars[i]);
-                        i += 1;
-                    }
-                    let _ = val_start; // consumed inline
-                    in_value = false;
-                }
-            }
-        }
-        result.push('}');
-
-        serde_json::from_str::<serde_json::Value>(&result)
-            .ok()
-            .filter(|v| v.is_object())
-    }
-
-    /// Fail-Closed recovery: attempts to convert a `call:default_api:*` text leak
-    /// into a proper `tool_use` block by passing 7 strict guards.
-    ///
-    /// Returns `Some(chunks)` when recovery succeeds, or `None` to let the caller
-    /// fall through to the normal `text_delta` path.
-    fn try_recover_call_default_api_text(&mut self, text: &str) -> Option<Vec<bytes::Bytes>> {
-        // G1: Tools must have been registered for this request
-        if self.state.registered_tool_names.is_empty() {
-            return None;
-        }
-
-        // G3: Strict prefix check before doing any expensive work
-        if !text.trim().starts_with("call:default_api:") {
-            return None;
-        }
-
-        let (tool_name, args_str) = Self::try_parse_call_default_api(text)?;
-
-        // G5: The entire text (trimmed) must consist solely of this one expression.
-        // This prevents documentation strings like "Use call:default_api:Read{...}" from
-        // being mistakenly executed.
-        let full_expr = format!(
-            "call:default_api:{}{}",
-            tool_name,
-            if args_str.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", args_str)
-            }
-        );
-        // Allow minor whitespace variance but reject any surrounding prose
-        let trimmed_text = text.trim();
-        // The text must start with call:default_api:<tool_name> and end right after the args block
-        if !trimmed_text.starts_with(&format!("call:default_api:{}", tool_name)) {
-            return None;
-        }
-        // After the tool name and args there must be nothing else (ignore trailing whitespace)
-        let after_tool_name = &trimmed_text["call:default_api:".len() + tool_name.len()..].trim();
-        // after_tool_name is either empty (no args) or is the args string itself
-        if !after_tool_name.is_empty()
-            && !after_tool_name.starts_with('{')
-            && !after_tool_name.starts_with('(')
-        {
-            // There is non-arg text after the tool name — reject
-            return None;
-        }
-        let _ = full_expr; // suppress unused warning
-
-        // G4: Tool name must be in the registered whitelist (exact match, case-insensitive)
-        let matched_name = self
-            .state
-            .registered_tool_names
-            .iter()
-            .find(|n| n.eq_ignore_ascii_case(&tool_name))
-            .cloned()?;
-
-        // G2: Current turn must NOT have already produced a structured functionCall
-        if self.state.used_tool {
-            tracing::warn!(
-                "[#3379] Detected call:default_api:{} leakage but used_tool=true; skipping recovery",
-                tool_name
-            );
-            return None;
-        }
-
-        // G7: No text_delta must have been emitted this turn
-        if self.state.text_delta_emitted_this_turn {
-            tracing::warn!(
-                "[#3379] Detected call:default_api:{} leakage but text_delta already emitted this turn; skipping recovery",
-                tool_name
-            );
-            return None;
-        }
-
-        // G6: Arguments must parse as a valid JSON object
-        let parsed_args = Self::parse_loose_json_args(&args_str)?;
-
-        // All guards passed — perform recovery
-        tracing::warn!(
-            "[#3379-RECOVERY] Recovering call:default_api:{} as tool_use (args_len={})",
-            matched_name,
-            args_str.len()
-        );
-
-        let fc = FunctionCall {
-            name: matched_name,
-            args: Some(parsed_args),
-            id: None,
-        };
-
-        Some(self.process_function_call(&fc, None))
     }
 
     /// Process FunctionCall and capture signature for global storage
@@ -1233,245 +1003,11 @@ mod tests {
         assert!(state.used_tool);
     }
 
-    // -------------------------------------------------------------------------
-    // [FIX #3379] Tests: call:default_api:* leakage recovery
-    // -------------------------------------------------------------------------
-
-    /// Helper: build a PartProcessor with registered tool names
-    fn make_processor_with_tools<'a>(
-        state: &'a mut StreamingState,
-        tools: Vec<&str>,
-    ) -> PartProcessor<'a> {
-        state.set_registered_tool_names(tools.into_iter().map(|s| s.to_string()).collect());
-        PartProcessor::new(state)
-    }
-
-    /// Collect all SSE chunks into a single string
-    fn chunks_to_string(chunks: &[bytes::Bytes]) -> String {
+    fn chunks_to_string(chunks: &[Bytes]) -> String {
         chunks
             .iter()
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    #[test]
-    fn test_3379_positive_recovery_standard_json() {
-        // Positive: registered tool, standard JSON args, no prose → should recover
-        let mut state = StreamingState::new();
-        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
-
-        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt","limit":100}"#;
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        // Should produce a tool_use block, not a text_delta
-        assert!(
-            output.contains(r#""type":"content_block_start""#),
-            "Expected tool_use block_start, got: {}",
-            output
-        );
-        assert!(
-            output.contains(r#""name":"Read""#),
-            "Expected tool name Read"
-        );
-        assert!(
-            !output.contains("text_delta"),
-            "Must NOT produce text_delta for recovered call"
-        );
-        assert!(state.used_tool, "used_tool must be true after recovery");
-    }
-
-    #[test]
-    fn test_3379_negative_tool_not_registered() {
-        // G4 guard: tool name not in whitelist → text_delta
-        let mut state = StreamingState::new();
-        let mut processor = make_processor_with_tools(&mut state, vec!["Write"]);
-
-        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains("text_delta"),
-            "Unregistered tool must fall through to text_delta"
-        );
-        assert!(!state.used_tool, "used_tool must remain false");
-    }
-
-    #[test]
-    fn test_3379_negative_no_tools_registered() {
-        // G1 guard: no tools in request → text_delta
-        let mut state = StreamingState::new(); // no registered_tool_names
-        let mut processor = PartProcessor::new(&mut state);
-
-        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains("text_delta"),
-            "Empty registered_tool_names must fall through to text_delta"
-        );
-    }
-
-    #[test]
-    fn test_3379_negative_surrounding_prose() {
-        // G5 guard: text not solely the call expression → text_delta
-        let mut state = StreamingState::new();
-        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
-
-        let text = "Here is what I am doing: call:default_api:Read{\"file_path\":\"/tmp/foo.txt\"}";
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains("text_delta"),
-            "Prose-wrapped call must fall through to text_delta"
-        );
-        assert!(!state.used_tool);
-    }
-
-    #[test]
-    fn test_3379_negative_broken_json_args() {
-        // G6 guard: args not valid JSON → text_delta
-        let mut state = StreamingState::new();
-        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
-
-        let text = "call:default_api:Read{file_path: NOT JSON !!!}";
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains("text_delta"),
-            "Broken JSON args must fall through to text_delta"
-        );
-        assert!(!state.used_tool);
-    }
-
-    #[test]
-    fn test_3379_negative_text_delta_already_emitted() {
-        // G7 guard: text_delta already emitted this turn → skip recovery
-        let mut state = StreamingState::new();
-        state.set_registered_tool_names(vec!["Read".to_string()]);
-        // Simulate a prior text_delta having been emitted
-        state.text_delta_emitted_this_turn = true;
-
-        let mut processor = PartProcessor::new(&mut state);
-        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
-        let part = GeminiPart {
-            text: Some(text.to_string()),
-            function_call: None,
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains("text_delta"),
-            "G7 must prevent recovery after text_delta was emitted"
-        );
-        assert!(!state.used_tool);
-    }
-
-    #[test]
-    fn test_3379_parse_loose_json_standard() {
-        // parse_loose_json_args: standard JSON passes Phase 1
-        let result =
-            PartProcessor::parse_loose_json_args(r#"{"file_path":"/tmp/foo","limit":100}"#);
-        assert!(result.is_some());
-        let v = result.unwrap();
-        assert_eq!(v["file_path"], "/tmp/foo");
-        assert_eq!(v["limit"], 100);
-    }
-
-    #[test]
-    fn test_3379_parse_loose_json_empty() {
-        // Empty args → valid empty object
-        let result = PartProcessor::parse_loose_json_args("");
-        assert_eq!(result, Some(serde_json::json!({})));
-    }
-
-    #[test]
-    fn test_3379_regression_native_function_call_unaffected() {
-        // Regression: native functionCall must still produce tool_use unaffected
-        let mut state = StreamingState::new();
-        state.set_registered_tool_names(vec!["Read".to_string()]);
-        let mut processor = PartProcessor::new(&mut state);
-
-        let fc = FunctionCall {
-            name: "Read".to_string(),
-            args: Some(json!({"file_path": "/tmp/native.txt"})),
-            id: Some("call_native_001".to_string()),
-        };
-        let part = GeminiPart {
-            text: None,
-            function_call: Some(fc),
-            inline_data: None,
-            file_data: None,
-            thought: None,
-            thought_signature: None,
-            function_response: None,
-        };
-        let chunks = processor.process(&part);
-        let output = chunks_to_string(&chunks);
-
-        assert!(
-            output.contains(r#""type":"content_block_start""#),
-            "Native functionCall must still produce tool_use"
-        );
-        assert!(output.contains(r#""name":"Read""#));
-        assert!(!output.contains("text_delta"));
-        assert!(state.used_tool);
+            .map(|chunk| String::from_utf8_lossy(chunk))
+            .collect()
     }
 
     #[test]

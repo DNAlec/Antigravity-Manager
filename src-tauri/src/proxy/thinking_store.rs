@@ -1337,12 +1337,16 @@ impl ThinkingStore {
                         let text = part["text"].as_str().unwrap_or("");
                         let text_trimmed = text.trim();
 
-                        // 0. 若正文带有 <think>...</think> 标签，精准切除标签与思考内容，保留剩余真实正文
-                        if let Some((_, rem)) = extract_think_tags(text) {
-                            if !rem.is_empty() {
-                                cleaned_parts.push(json!({ "text": rem }));
+                        // Only remove a complete legacy wrapper matching this stored thought.
+                        if let Some((thought, rem)) = extract_think_tags(text) {
+                            if !rec_thought_norm.is_empty()
+                                && normalize_ws(&thought) == rec_thought_norm
+                            {
+                                if !rem.is_empty() {
+                                    cleaned_parts.push(json!({ "text": rem }));
+                                }
+                                continue;
                             }
-                            continue;
                         }
 
                         // 1. 完全相同（之前作为独立降级部件存在）：直接丢弃该部件
@@ -3924,37 +3928,23 @@ pub fn is_meaningful_thought(thought: &str) -> bool {
     true
 }
 
-/// 提取并切除文本中的 `<think>...</think>` 标签内容（用于跨模型自愈与正文思考文本重提升）
-/// 支持任意大小写（<think> / <THINK>）、前后正文无缝缝合拼接、以及未闭合标签容错
-/// 返回 `Some((thought, remaining_visible))`
+/// Parse only a complete leading legacy thought wrapper. Callers must confirm
+/// it matches explicit stored reasoning before removing it from visible text.
 pub fn extract_think_tags(text: &str) -> Option<(String, String)> {
-    let lower = text.to_lowercase();
-    let start_tag = "<think>";
-    let end_tag = "</think>";
-
-    if let Some(start_pos) = lower.find(start_tag) {
-        let after_start = start_pos + start_tag.len();
-        if let Some(end_rel) = lower[after_start..].find(end_tag) {
-            let end_pos = after_start + end_rel;
-            let thought = text[after_start..end_pos].trim().to_string();
-            let before = text[..start_pos].trim();
-            let after = text[end_pos + end_tag.len()..].trim();
-            let visible = if before.is_empty() {
-                after.to_string()
-            } else if after.is_empty() {
-                before.to_string()
-            } else {
-                format!("{}\n\n{}", before, after)
-            };
-            return Some((thought, visible));
-        } else {
-            // 未闭合标签容错：截断到文本末尾
-            let thought = text[after_start..].trim().to_string();
-            let before = text[..start_pos].trim();
-            return Some((thought, before.to_string()));
-        }
+    let text = text.trim_start();
+    if !text
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<think>"))
+    {
+        return None;
     }
-    None
+    // ASCII-only folding preserves UTF-8 byte offsets in arbitrary user text.
+    let after_start = &text[7..];
+    let end = after_start.to_ascii_lowercase().find("</think>")?;
+    Some((
+        after_start[..end].trim().to_owned(),
+        after_start[end + 8..].trim().to_owned(),
+    ))
 }
 
 fn is_capturable_thought(thought: &str, signature: Option<&str>) -> bool {
@@ -9438,6 +9428,80 @@ mod tests {
 
         // No tags
         assert!(extract_think_tags("Just normal text").is_none());
+    }
+
+    #[test]
+    fn r32_cached_reasoning_only_removes_its_own_complete_think_wrapper() {
+        let store = ThinkingStore::new();
+        let thought = "Stored reasoning about the tool invocation.";
+        let real_sig = "Ep4MCpsMARFNMg9NDlK9RXXz5Mzq9mniX9KSQBBzbUx3k85w/qDgtcE+28NH+1EvPeULAprqUquvYXGMzUXGy1xJoMnqdkC4vqebuhyd2Xhs0oz+OhqcOTwLhGYOG0KBKQ87Hfw4q/sMCSgf2gz4vFMa6V6kKMJepYlPXKFJJF4ok+W6lUt3PfYln8K9Dh7wB/40iHiZ2BnJd++6hfUwu9Bz1n795S50l0yCj84EaSCDDF334Erxq7Fo";
+        for (index, visible, expected) in [
+            (
+                0,
+                format!("<think>{thought}</think>Visible answer."),
+                "Visible answer.".to_owned(),
+            ),
+            (
+                1,
+                "<think>BUSINESS_XML_42</think>Visible answer.".to_owned(),
+                "<think>BUSINESS_XML_42</think>Visible answer.".to_owned(),
+            ),
+            (
+                2,
+                format!("prefix <think>{thought}</think>Visible answer."),
+                format!("prefix <think>{thought}</think>Visible answer."),
+            ),
+        ] {
+            let key = format!("t:r32-wrapper-match-{index}");
+            let tool_id = format!("r32-wrapper-tool-{index}");
+            crate::modules::proxy_db::save_thinking_record(
+                &key,
+                "r32-wrapper-fingerprint",
+                thought,
+                Some(real_sig),
+                std::slice::from_ref(&tool_id),
+                &["read".to_owned()],
+                "Visible answer.",
+            )
+            .unwrap();
+            let mut contents = vec![
+                json!({"role":"user","parts":[{"text":"Read the file"}]}),
+                json!({"role":"model","parts":[{"text":visible},{"functionCall":{"name":"read","id":tool_id,"args":{}}}]}),
+                json!({"role":"user","parts":[{"functionResponse":{"name":"read","response":{"output":"done"}}}]}),
+            ];
+            assert_eq!(
+                store.restore_gemini_contents_with_model(
+                    &key,
+                    &mut contents,
+                    Some("gemini-3.8-flash-tiered")
+                ),
+                1
+            );
+            let parts = contents[1]["parts"].as_array().unwrap();
+            assert!(parts
+                .iter()
+                .any(|part| part["thought"] == true && part["text"] == thought));
+            assert!(parts
+                .iter()
+                .any(|part| part.get("thought").is_none() && part["text"] == expected));
+            crate::modules::proxy_db::delete_thinking_records_for_session(&key).unwrap();
+        }
+    }
+
+    #[test]
+    fn r32_think_tag_parser_requires_a_complete_leading_wrapper() {
+        for text in [
+            "prefix <think>business</think> suffix",
+            "```xml\n<think>business</think>\n```",
+            "<think>unfinished business XML",
+            "İ prefix <think>business</think>",
+        ] {
+            assert!(extract_think_tags(text).is_none(), "{text}");
+        }
+        assert_eq!(
+            extract_think_tags("<THINK>İ思考</THINK>答案"),
+            Some(("İ思考".into(), "答案".into()))
+        );
     }
 
     #[test]

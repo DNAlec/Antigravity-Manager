@@ -454,15 +454,7 @@ pub fn transform_claude_request_in_timed(
     let has_web_search_tool = claude_req
         .tools
         .as_ref()
-        .map(|tools| {
-            tools.iter().any(|t| {
-                t.is_web_search()
-                    || t.name.as_deref() == Some("google_search")
-                    || t.name.as_deref() == Some("builtin_web_search")
-                    || t.type_.as_deref() == Some("web_search_20250305")
-                    || t.type_.as_deref() == Some("builtin_web_search")
-            })
-        })
+        .map(|tools| tools.iter().any(Tool::is_web_search))
         .unwrap_or(false);
 
     // 用于存储 tool_use id -> name 映射
@@ -567,7 +559,7 @@ pub fn transform_claude_request_in_timed(
         has_web_search_tool,
         is_thinking_enabled,
         token, // [NEW] 传递 token 用于动态限额
-    );
+    )?;
 
     // 2. Contents (Messages)
     let contents = build_google_contents(
@@ -1017,6 +1009,25 @@ fn append_server_tool_result_parts(
         return Ok(());
     }
     match content.get("type").and_then(Value::as_str) {
+        Some("web_search_result") => {
+            // Search bodies are opaque, but page names and links are useful history.
+            for (field, label) in [("title", "Search result"), ("url", "URL")] {
+                if let Some(text) = content
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    parts.push(json!({"text": format!("{label}: {text}")}));
+                }
+            }
+        }
+        Some("web_search_tool_result_error") => {
+            let error = json!({
+                "type": "web_search_tool_result_error",
+                "error_code": content.get("error_code").and_then(Value::as_str)
+            });
+            parts.push(json!({"text": error.to_string()}));
+        }
         Some("web_fetch_result") => {
             if let Some(url) = content.get("url").and_then(Value::as_str) {
                 parts.push(json!({"text": format!("Fetched URL: {url}")}));
@@ -1109,12 +1120,10 @@ fn build_contents(
     match content {
         MessageContent::String(text) => {
             if text != "(no content)" {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
+                if !text.trim().is_empty() {
+                    // Leading indentation can make Markdown literal code.
                     parts.extend(
-                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
-                            trimmed,
-                        ),
+                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text),
                     );
                 }
             }
@@ -1122,7 +1131,10 @@ fn build_contents(
         MessageContent::Array(blocks) => {
             for item in blocks {
                 match item {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text }
+                    | ContentBlock::Compaction {
+                        content: Some(text),
+                    } => {
                         if text != "(no content)" && !text.trim().is_empty() {
                             // [2026-09-27] 如果 assistant 消息同时包含 tool_use，且该文本仅为占位符（如 "..."、"·" 等），
                             // 丢弃无实质意义的占位文本，避免在 Gemini 格式转换中被误选为签名锚点，
@@ -1148,6 +1160,10 @@ fn build_contents(
                             saw_non_thinking = true;
                         }
                     }
+                    // A null compaction summary is a documented failed-compaction no-op.
+                    ContentBlock::Compaction { content: None } => {}
+                    // The provider's fallback boundary is not conversational content.
+                    ContentBlock::Fallback {} => {}
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -1455,6 +1471,29 @@ fn build_contents(
                         }
                         parts.push(json!({ "functionResponse": response }));
                     }
+                    ContentBlock::AdvisorToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        match content {
+                            AdvisorResultContent::Result { text } => {
+                                if !text.is_empty() {
+                                    parts.push(json!({"text":text}));
+                                }
+                            }
+                            AdvisorResultContent::Error { error_code } => {
+                                parts.push(json!({"text":format!(
+                                    "Advisor tool error (call {tool_use_id}): {error_code}"
+                                )}));
+                            }
+                            AdvisorResultContent::Redacted {} => {
+                                parts.push(json!({"text":format!(
+                                    "Advisor result (call {tool_use_id}) is provider-encrypted; readable content is unavailable."
+                                )}));
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
                     ContentBlock::WebFetchToolResult { content, .. }
                     | ContentBlock::CodeExecutionToolResult { content, .. } => {
                         append_server_tool_result_parts(content, &mut parts, 0)?;
@@ -1532,10 +1571,25 @@ fn build_contents(
                         }
                         saw_non_thinking = true;
                     }
-                    // ContentBlock::RedactedThinking handled above at line 583
-                    ContentBlock::ServerToolUse { .. }
-                    | ContentBlock::WebSearchToolResult { .. } => {
-                        // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
+                    ContentBlock::WebSearchToolResult { content, .. } => {
+                        let previous_len = parts.len();
+                        let results = content
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_else(|| std::slice::from_ref(content));
+                        for result in results {
+                            if matches!(
+                                result.get("type").and_then(Value::as_str),
+                                Some("web_search_result" | "web_search_tool_result_error")
+                            ) {
+                                append_server_tool_result_parts(result, &mut parts, 0)?;
+                            }
+                        }
+                        saw_non_thinking |= parts.len() > previous_len;
+                    }
+                    ContentBlock::ServerToolUse { .. } => {
+                        // Historical server calls have already executed; their results above
+                        // remain readable without replaying a client function call.
                         continue;
                     }
                 }
@@ -1826,19 +1880,12 @@ fn build_tools(
         let mut function_declarations: Vec<Value> = Vec::new();
         let has_google_search = has_web_search;
 
-        let is_search_tool = |tool: &Tool| {
-            tool.is_web_search()
-                || tool.name.as_deref() == Some("google_search")
-                || tool.name.as_deref() == Some("builtin_web_search")
-                || tool.type_.as_deref() == Some("builtin_web_search")
-        };
         // 只有搜索工具时，改映射为上游 googleSearch，不进客户端函数列表。
         // 旁边还有 Bash/Read 等函数工具时，web_search 与其他协议一样留在 functionDeclarations。
-        let search_only =
-            !tools_list.is_empty() && tools_list.iter().all(|tool| is_search_tool(tool));
+        let search_only = !tools_list.is_empty() && tools_list.iter().all(Tool::is_web_search);
 
         for tool in tools_list {
-            if search_only && is_search_tool(tool) {
+            if search_only && tool.is_web_search() {
                 continue;
             }
             let name = tool
@@ -1916,7 +1963,7 @@ fn build_generation_config(
     _has_web_search: bool,
     is_thinking_enabled: bool,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW]
-) -> Value {
+) -> Result<Value, String> {
     let mut config = json!({});
 
     // Thinking 配置
@@ -1980,7 +2027,18 @@ fn build_generation_config(
     // max_tokens 映射与「maxOutputTokens > thinkingBudget」不变量、官方硬顶
     // 已由 `configure_inbound_thinking` 统一处理，适配器不再二次协商。
 
-    config
+    if let Some(OutputFormat::JsonSchema { schema }) = claude_req
+        .output_config
+        .as_ref()
+        .and_then(|output| output.format.as_ref())
+    {
+        let mut schema = schema.clone();
+        crate::proxy::common::json_schema::clean_response_schema(&mut schema)?;
+        config["responseMimeType"] = json!("application/json");
+        config["responseSchema"] = schema;
+    }
+
+    Ok(config)
 }
 
 /// Recursively remove 'thought' and 'thoughtSignature' fields

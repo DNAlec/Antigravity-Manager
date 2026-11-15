@@ -2,7 +2,6 @@
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
-use rand::Rng;
 use serde_json::{json, Value};
 use std::pin::Pin;
 use uuid::Uuid;
@@ -132,6 +131,43 @@ pub struct OpenAIChatStreamHandler {
     pub whole_prompt_blocked: bool,
 }
 
+impl OpenAIChatStreamHandler {
+    fn new(
+        stream_id: String,
+        created_ts: i64,
+        model: String,
+        session_id: String,
+        message_count: usize,
+        thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
+    ) -> Self {
+        Self {
+            media: MediaTracker::default(),
+            stream_id,
+            created_ts,
+            model,
+            session_id,
+            message_count,
+            client_tool_names: Default::default(),
+            include_usage: false,
+            chat_tool_kinds: None,
+            candidate_selection: None,
+            tool_calls: ToolCallTracker::default(),
+            candidates: Default::default(),
+            marked_multi_candidate: false,
+            final_usage: None,
+            usage_metadata: None,
+            thinking_acc,
+            has_content: false,
+            has_thinking: false,
+            is_thinking_active: false,
+            has_emitted_finish_reason: false,
+            has_emitted_done: false,
+            refused: false,
+            whole_prompt_blocked: false,
+        }
+    }
+}
+
 impl ProtocolStreamHandler for OpenAIChatStreamHandler {
     fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
         merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, usage);
@@ -184,6 +220,28 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                             ..Default::default()
                         }
                     });
+                    let raw_finish_reason = Some(candidate)
+                        .filter(|candidate| {
+                            crate::proxy::mappers::gemini::has_candidate_finish(candidate)
+                        })
+                        .and_then(|candidate| {
+                            candidate
+                                .get("finishReason")
+                                .or_else(|| candidate.get("finish_reason"))
+                        })
+                        .and_then(Value::as_str);
+                    // Freeze completed output, but an explicit later model failure
+                    // still has to reach clients, including for non-first candidates.
+                    if state.finished {
+                        if let Some(reason) = raw_finish_reason.filter(|reason| {
+                            crate::proxy::pipeline::stream_error::is_failure_finish_reason(reason)
+                        }) {
+                            model_failure = Some(
+                                crate::proxy::pipeline::stream_error::model_finish_error(reason),
+                            );
+                        }
+                        continue;
+                    }
                     let parts = candidate
                         .get("content")
                         .and_then(|c| c.get("parts"))
@@ -332,11 +390,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
 
                     state.upstream_finished |=
                         crate::proxy::mappers::gemini::has_successful_candidate_finish(candidate);
-                    let raw_finish_reason = candidate
-                        .get("finishReason")
-                        .or_else(|| candidate.get("finish_reason"))
-                        .and_then(|f| f.as_str());
-
                     let failed = raw_finish_reason.is_some_and(
                         crate::proxy::pipeline::stream_error::is_failure_finish_reason,
                     );
@@ -494,6 +547,14 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         self.refused
     }
 
+    fn upstream_completion(&self) -> Option<bool> {
+        Some(
+            self.whole_prompt_blocked
+                || (!self.candidates.is_empty()
+                    && self.candidates.values().all(|candidate| candidate.finished)),
+        )
+    }
+
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
         self.whole_prompt_blocked
             .then(|| std::time::Duration::from_millis(250))
@@ -501,8 +562,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
         let mut chunks = Vec::new();
-
-        chunks.extend(self.finish_unfinished_candidates(false));
 
         // include_usage=false puts known usage on the finish chunk. A later
         // sparse trailer still needs one final snapshot, including zero corrections.
@@ -528,37 +587,49 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
         chunks
     }
 
-    fn emit_abnormal_finalize(&mut self, _error_report: &StreamErrorReport) -> Vec<Bytes> {
-        let mut chunks = Vec::new();
-
-        // 终态与未产生内容防护：若已经发射 [DONE]，或从未产生任何正文/工具调用，绝不可伪造收尾
-        if self.has_emitted_done || !self.has_content {
+    fn emit_abnormal_finalize(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        if self.has_emitted_done {
+            return Vec::new();
+        }
+        if !self
+            .candidates
+            .values()
+            .any(|candidate| candidate.tool_call_index > 0 && !candidate.finished)
+        {
+            let mut chunks = Vec::new();
+            for (index, candidate) in &mut self.candidates {
+                if candidate.finished {
+                    continue;
+                }
+                candidate.finished = true;
+                let mut chunk = json!({
+                    "id": self.stream_id, "object": "chat.completion.chunk",
+                    "created": self.created_ts, "model": self.model,
+                    "choices": [{"index": index, "delta": {}, "finish_reason": "length"}]
+                });
+                if !self.include_usage {
+                    if let Some(usage) = self.final_usage.take() {
+                        chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
+                    }
+                }
+                chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
+            }
+            chunks.extend(self.emit_finalize());
             return chunks;
         }
-
-        self.is_thinking_active = false;
-
-        chunks.extend(self.finish_unfinished_candidates(true));
-
-        if self.include_usage {
-            if let Some(usage) = self.final_usage.take() {
-                let usage_chunk = json!({
-                    "id": &self.stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": self.created_ts,
-                    "model": &self.model,
-                    "choices": [],
-                    "usage": usage
-                });
-                chunks.push(Bytes::from(format!(
-                    "data: {}\n\n",
-                    serde_json::to_string(&usage_chunk).unwrap_or_default()
-                )));
-            }
-        }
         self.has_emitted_done = true;
-        chunks.push(Bytes::from("data: [DONE]\n\n"));
-        chunks
+        vec![
+            Bytes::from(openai_chat_error_frame(
+                &self.stream_id,
+                self.created_ts,
+                &self.model,
+                "chat.completion.chunk",
+                error_report,
+                self.final_usage.as_ref(),
+                "upstream_interrupted",
+            )),
+            Bytes::from("data: [DONE]\n\n"),
+        ]
     }
 
     fn emit_initial_error(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
@@ -570,6 +641,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 "chat.completion.chunk",
                 error_report,
                 self.final_usage.as_ref(),
+                "stream_error",
             )),
             Bytes::from("data: [DONE]\n\n"),
         ]
@@ -594,35 +666,6 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 acc.commit(&self.session_id);
             }
         }
-    }
-}
-
-impl OpenAIChatStreamHandler {
-    fn finish_unfinished_candidates(&mut self, interrupted: bool) -> Vec<Bytes> {
-        let mut chunks = Vec::new();
-        for (index, state) in &mut self.candidates {
-            if state.finished || (!state.has_content && !state.has_thinking) {
-                continue;
-            }
-            state.finished = true;
-            let reason = if state.tool_call_index > 0 {
-                "tool_calls"
-            } else if interrupted || !state.has_content {
-                "length"
-            } else {
-                "stop"
-            };
-            let mut chunk = json!({"id":self.stream_id,"object":"chat.completion.chunk",
-                "created":self.created_ts,"model":self.model,
-                "choices":[{"index":index,"delta":{},"finish_reason":reason}]});
-            if !self.include_usage {
-                if let Some(usage) = self.final_usage.take() {
-                    chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
-                }
-            }
-            chunks.push(Bytes::from(format!("data: {chunk}\n\n")));
-        }
-        chunks
     }
 }
 
@@ -802,31 +845,18 @@ where
         model, session_id, message_count
     );
 
-    let handler = OpenAIChatStreamHandler {
-        media: MediaTracker::default(),
+    let mut handler = OpenAIChatStreamHandler::new(
         stream_id,
         created_ts,
         model,
         session_id,
         message_count,
-        client_tool_names,
-        include_usage,
-        chat_tool_kinds,
-        candidate_selection,
-        tool_calls: ToolCallTracker::default(),
-        candidates: Default::default(),
-        marked_multi_candidate: false,
-        final_usage: None,
-        usage_metadata: None,
         thinking_acc,
-        has_content: false,
-        has_thinking: false,
-        is_thinking_active: false,
-        has_emitted_finish_reason: false,
-        has_emitted_done: false,
-        refused: false,
-        whole_prompt_blocked: false,
-    };
+    );
+    handler.client_tool_names = client_tool_names;
+    handler.include_usage = include_usage;
+    handler.chat_tool_kinds = chat_tool_kinds;
+    handler.candidate_selection = candidate_selection;
 
     let config =
         StreamLifecycleConfig::new("openai", "create_openai_sse_stream_with_anchor", trace_info);
@@ -834,204 +864,133 @@ where
     run_stream_lifecycle(gemini_stream, handler, config)
 }
 
-/// Legacy Completions（`text_completion`）流渲染器。
-///
-/// 心跳、首字宽限、过渡断崖跃迁、稳态滑动超时与错误终态全部由
-/// `pipeline::stream_lifecycle::run_stream_lifecycle` 统一驱动；
-/// 此处仅保留 Gemini SSE → OpenAI `text_completion` 的协议差异。
+/// Legacy output is a text projection of the shared Chat candidate state.
+/// Candidate identity, media, usage, and interrupted tools follow the same path.
 pub struct LegacyCompletionStreamHandler {
-    stream_id: String,
-    created_ts: i64,
-    model: String,
-    session_id: String,
-    message_count: usize,
-    final_usage: Option<super::models::OpenAIUsage>,
-    usage_metadata: Option<Value>,
-    thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
-    has_content: bool,
-    has_thinking: bool,
-    is_thinking_active: bool,
-    thinking_committed: bool,
-    upstream_finished: bool,
+    chat: OpenAIChatStreamHandler,
+    expected_candidates: usize,
 }
 
-impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
-    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
-        merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, usage);
-        Vec::new()
-    }
-
-    fn process_line(&mut self, line: &str) -> Vec<Bytes> {
-        let mut frames = Vec::new();
-        if !line.starts_with("data: ") {
-            return frames;
-        }
-        let json_part = line.trim_start_matches("data: ").trim();
-        if json_part.is_empty() || json_part == "[DONE]" {
-            return frames;
-        }
-
-        let mut json = match serde_json::from_str::<Value>(json_part) {
-            Ok(json) => json,
-            Err(_) => {
-                report_sse_json_parse(
-                    "openai-legacy",
-                    "create_legacy_sse_stream",
-                    json_part,
-                    format!(
-                        "model={} session={} messages={}",
-                        self.model, self.session_id, self.message_count
-                    ),
-                );
-                return frames;
-            }
-        };
-
-        let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-            inner
-        } else {
-            json
-        };
-        if let Some(u) = actual_data.get("usageMetadata") {
-            merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
-        }
-
-        let mut content_out = String::new();
-        if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
-            if let Some(candidate) = candidates.first() {
-                if let Some(parts) = candidate
-                    .get("content")
-                    .and_then(|c| c.get("parts"))
-                    .and_then(|p| p.as_array())
-                {
-                    for part in parts {
-                        self.thinking_acc.ingest_part(part);
-                        let is_thought = part
-                            .get("thought")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            if is_thought {
-                                let clean_text = text
-                                    .replace(" thinking\n", "")
-                                    .replace(" thinking", "")
-                                    .replace("\n response", "")
-                                    .replace(" response", "");
-                                if !clean_text.is_empty() {
-                                    self.has_thinking = true;
-                                    self.has_content = true;
-                                    self.is_thinking_active = true;
-                                }
-                                content_out.push_str(&clean_text);
-                            } else {
-                                if !text.is_empty() {
-                                    self.has_content = true;
-                                    self.is_thinking_active = false;
-                                }
-                                content_out.push_str(text);
-                            }
+impl LegacyCompletionStreamHandler {
+    fn project(chunks: Vec<Bytes>) -> Vec<Bytes> {
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                let Ok(line) = std::str::from_utf8(&chunk) else {
+                    return chunk;
+                };
+                let Some(data) = line.strip_prefix("data: ") else {
+                    return chunk;
+                };
+                let Ok(mut value) = serde_json::from_str::<Value>(data.trim()) else {
+                    return chunk;
+                };
+                if value.get("object").is_some() {
+                    value["object"] = json!("text_completion");
+                }
+                if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+                    for choice in choices {
+                        let delta = choice
+                            .as_object_mut()
+                            .and_then(|choice| choice.remove("delta"))
+                            .unwrap_or_default();
+                        let mut text = delta["reasoning_content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        text.push_str(delta["content"].as_str().unwrap_or_default());
+                        choice["text"] = json!(text);
+                        choice["logprobs"] = Value::Null;
+                        if choice["finish_reason"] == "tool_calls" {
+                            choice["finish_reason"] = json!("stop");
                         }
                     }
                 }
-            }
+                Bytes::from(format!("data: {value}\n\n"))
+            })
+            .collect()
+    }
+
+    fn missing_candidates(&self) -> bool {
+        !self.chat.whole_prompt_blocked
+            && (self.chat.candidates.len() < self.expected_candidates
+                || (self.expected_candidates > 1
+                    && (0..self.expected_candidates as u64)
+                        .any(|index| !self.chat.candidates.contains_key(&index))))
+    }
+
+    fn error_frames(&mut self, report: &StreamErrorReport, code: &str) -> Vec<Bytes> {
+        if self.chat.has_emitted_done {
+            return Vec::new();
         }
-
-        self.upstream_finished |= actual_data
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|candidates| candidates.first())
-            .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
-        let finish_reason = actual_data
-            .get("candidates")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("finishReason").or_else(|| c.get("finish_reason")))
-            .and_then(|f| f.as_str())
-            .or_else(|| response_has_prompt_refusal(&actual_data).then_some("SAFETY"))
-            .map(|f| match f {
-                "STOP" => "stop",
-                "MAX_TOKENS" => "length",
-                reason if is_refusal_finish_reason(reason) => "content_filter",
-                _ => "stop",
-            });
-
-        let mut legacy_chunk = json!({
-            "id": &self.stream_id,
-            "object": "text_completion",
-            "created": self.created_ts,
-            "model": &self.model,
-            "choices": [{ "text": content_out, "index": 0, "logprobs": null, "finish_reason": finish_reason }]
-        });
-        if let Some(ref usage) = self.final_usage {
-            legacy_chunk["usage"] = serde_json::to_value(usage).unwrap();
-        }
-        if finish_reason.is_some() {
-            self.final_usage = None;
-        }
-        if self.upstream_finished {
-            self.on_finish();
-        }
-        frames.push(Bytes::from(format!(
-            "data: {}\n\n",
-            serde_json::to_string(&legacy_chunk).unwrap_or_default()
-        )));
-        frames
-    }
-
-    fn has_content(&self) -> bool {
-        self.has_content
-    }
-
-    fn has_thinking(&self) -> bool {
-        self.has_thinking
-    }
-
-    fn is_thinking_active(&self) -> bool {
-        self.is_thinking_active
-    }
-
-    fn finalize_without_content(&self) -> bool {
-        // 空 text_completion 仍以 [DONE] 表达流正常结束，保持历史行为。
-        true
-    }
-
-    fn emit_finalize(&mut self) -> Vec<Bytes> {
-        vec![Bytes::from("data: [DONE]\n\n")]
-    }
-
-    fn emit_abnormal_finalize(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        self.chat.has_emitted_done = true;
         vec![
             Bytes::from(openai_chat_error_frame(
-                &self.stream_id,
-                self.created_ts,
-                &self.model,
+                &self.chat.stream_id,
+                self.chat.created_ts,
+                &self.chat.model,
                 "text_completion",
-                error_report,
-                self.final_usage.as_ref(),
+                report,
+                self.chat.final_usage.as_ref(),
+                code,
             )),
             Bytes::from("data: [DONE]\n\n"),
         ]
     }
+}
 
-    fn emit_initial_error(&mut self, _error_report: &StreamErrorReport) -> Vec<Bytes> {
-        // 统一由 emit_error_finalize 下发协议终结错误，避免重复错误帧。
+impl ProtocolStreamHandler for LegacyCompletionStreamHandler {
+    fn observe_upstream_usage(&mut self, usage: &Value) -> Vec<Bytes> {
+        self.chat.observe_upstream_usage(usage)
+    }
+    fn process_line(&mut self, line: &str) -> Vec<Bytes> {
+        let chunks = self.chat.process_line(line);
+        // Legacy exposes reasoning as ordinary text, so completed reasoning-only
+        // candidates also have visible history worth retaining.
+        for state in self.chat.candidates.values_mut() {
+            state.has_content |= state.has_thinking;
+        }
+        self.chat.on_finish();
+        Self::project(chunks)
+    }
+    fn has_content(&self) -> bool {
+        self.chat.has_content || self.chat.has_thinking
+    }
+    fn has_thinking(&self) -> bool {
+        self.chat.has_thinking
+    }
+    fn is_thinking_active(&self) -> bool {
+        self.chat.is_thinking_active
+    }
+    fn finalize_without_content(&self) -> bool {
+        true
+    }
+    fn is_terminal(&self) -> bool {
+        self.chat.is_terminal()
+    }
+    fn upstream_completion(&self) -> Option<bool> {
+        Some(!self.missing_candidates() && self.chat.upstream_completion() == Some(true))
+    }
+    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
+        (self.upstream_completion() == Some(true)).then(|| std::time::Duration::from_millis(250))
+    }
+    fn emit_finalize(&mut self) -> Vec<Bytes> {
+        Self::project(self.chat.emit_finalize())
+    }
+    fn emit_abnormal_finalize(&mut self, report: &StreamErrorReport) -> Vec<Bytes> {
+        if self.missing_candidates() {
+            return self.error_frames(report, "upstream_interrupted");
+        }
+        Self::project(self.chat.emit_abnormal_finalize(report))
+    }
+    fn emit_initial_error(&mut self, _report: &StreamErrorReport) -> Vec<Bytes> {
         Vec::new()
     }
-
-    fn emit_error_finalize(&mut self, error_report: &StreamErrorReport) -> (Vec<Bytes>, bool) {
-        (self.emit_abnormal_finalize(error_report), true)
+    fn emit_error_finalize(&mut self, report: &StreamErrorReport) -> (Vec<Bytes>, bool) {
+        (self.error_frames(report, "stream_error"), true)
     }
-
     fn on_finish(&mut self) {
-        if self.thinking_committed || !self.upstream_finished {
-            return;
-        }
-        self.thinking_committed = true;
-        let acc = std::mem::take(&mut self.thinking_acc);
-        if let Some(sig) = acc.observed_signature() {
-            store_thought_signature(sig, &self.session_id, self.message_count);
-        }
-        acc.commit(&self.session_id);
+        self.chat.on_finish();
     }
 }
 
@@ -1060,15 +1019,28 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    let random_str: String = (0..28)
-        .map(|_| {
-            let idx = rng.gen_range(0..charset.len());
-            charset.chars().nth(idx).unwrap()
-        })
-        .collect();
+    create_legacy_sse_stream_with_candidate_count(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        text_context_anchor,
+        1,
+    )
+}
 
+pub fn create_legacy_sse_stream_with_candidate_count<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    text_context_anchor: Option<String>,
+    expected_candidates: usize,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let trace_info = format!(
         "model={} session={} messages={}",
         model, session_id, message_count
@@ -1078,19 +1050,15 @@ where
         thinking_acc = thinking_acc.with_text_context_anchor(anchor);
     }
     let handler = LegacyCompletionStreamHandler {
-        stream_id: format!("cmpl-{}", random_str),
-        created_ts: Utc::now().timestamp(),
-        model,
-        session_id,
-        message_count,
-        final_usage: None,
-        usage_metadata: None,
-        thinking_acc,
-        has_content: false,
-        has_thinking: false,
-        is_thinking_active: false,
-        thinking_committed: false,
-        upstream_finished: false,
+        chat: OpenAIChatStreamHandler::new(
+            format!("cmpl-{}", Uuid::new_v4()),
+            Utc::now().timestamp(),
+            model,
+            session_id,
+            message_count,
+            thinking_acc,
+        ),
+        expected_candidates: expected_candidates.max(1),
     };
     let config =
         StreamLifecycleConfig::new("openai-legacy", "create_legacy_sse_stream", trace_info);
@@ -1180,6 +1148,7 @@ fn openai_chat_error_frame(
     object: &str,
     report: &StreamErrorReport,
     usage: Option<&super::models::OpenAIUsage>,
+    code: &str,
 ) -> String {
     let mut error_chunk = json!({
         "id": stream_id,
@@ -1190,7 +1159,7 @@ fn openai_chat_error_frame(
         "error": {
             "type": report.classified.error_type,
             "message": report.client_message(),
-            "code": "stream_error",
+            "code": code,
             "upstream_status": report.upstream_status,
             "i18n_key": report.classified.i18n_key,
             "function": report.function,
@@ -1279,6 +1248,13 @@ pub struct CodexResponsesStreamHandler {
 }
 
 impl CodexResponsesStreamHandler {
+    fn has_model_terminal(&self) -> bool {
+        self.whole_prompt_blocked
+            || self.final_finish_reason.as_deref().is_some_and(|reason| {
+                matches!(reason, "STOP" | "MAX_TOKENS") || is_refusal_finish_reason(reason)
+            })
+    }
+
     fn new(
         model: String,
         session_id: String,
@@ -1974,12 +1950,7 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
             merge_openai_usage(&mut self.usage_metadata, &mut self.final_usage, u);
         }
 
-        if self.whole_prompt_blocked
-            || matches!(
-                self.final_finish_reason.as_deref(),
-                Some("STOP" | "MAX_TOKENS")
-            )
-        {
+        if self.has_model_terminal() {
             return frames;
         }
         self.whole_prompt_blocked = response_has_prompt_refusal(&actual_data);
@@ -2044,12 +2015,12 @@ impl ProtocolStreamHandler for CodexResponsesStreamHandler {
     }
 
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        (self.whole_prompt_blocked
-            || matches!(
-                self.final_finish_reason.as_deref(),
-                Some("STOP" | "MAX_TOKENS")
-            ))
-        .then(|| std::time::Duration::from_millis(250))
+        self.has_model_terminal()
+            .then(|| std::time::Duration::from_millis(250))
+    }
+
+    fn upstream_completion(&self) -> Option<bool> {
+        self.has_model_terminal().then_some(true)
     }
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
@@ -2575,7 +2546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_stream_error_after_content_emits_error_and_single_done() {
+    async fn test_legacy_stream_error_after_content_preserves_truncated_text_and_single_done() {
         let items = vec![
             Ok::<Bytes, String>(Bytes::from(
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Partial.\"}]}}]}\n\n",
@@ -2587,11 +2558,11 @@ mod tests {
         let (raw, events) = collect_legacy_stream(items).await;
 
         assert_eq!(events[0]["choices"][0]["text"], "Partial.");
-        let error_ev = events
-            .iter()
-            .find(|event| event.get("error").is_some())
-            .expect("legacy error frame");
-        assert_eq!(error_ev["error"]["code"], "stream_error");
+        assert!(!events.iter().any(|event| event.get("error").is_some()));
+        assert_eq!(
+            events.last().unwrap()["choices"][0]["finish_reason"],
+            "length"
+        );
         assert_eq!(raw.matches("data: [DONE]").count(), 1, "exactly one [DONE]");
     }
 
@@ -3477,7 +3448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_openai_stream_emits_fallback_finish_reason_when_upstream_omits_it() {
+    async fn test_openai_stream_reports_interruption_when_upstream_omits_finish_reason() {
         // [Fixes #3716] 模拟上游只吐了文本且随流关闭正常 EOF，未显式发送 finishReason 候选块
         let chunk1_json = json!({
             "candidates": [{
@@ -3544,11 +3515,10 @@ mod tests {
         }
 
         assert!(got_done, "Stream must terminate with [DONE]");
-        // 关键断言：即使上游未显式发送 finishReason，网关在终态必须补发带有 finish_reason: 'stop' 的收尾块
         assert_eq!(
             finish_reasons,
-            vec!["stop".to_string()],
-            "Must emit finish_reason 'stop' before stream end to avoid finish=unknown"
+            vec!["length"],
+            "EOF must remain distinguishable from natural completion"
         );
     }
 
@@ -3612,11 +3582,8 @@ mod tests {
         }
 
         assert!(got_done, "Stream must terminate with [DONE]");
-        assert_eq!(
-            finish_reasons,
-            vec!["length".to_string()],
-            "Abnormal drop must emit finish_reason: 'length'"
-        );
+        assert_eq!(finish_reasons, vec!["length"]);
+        assert!(!all_chunks.iter().any(|chunk| chunk.get("error").is_some()));
 
         let all_text: String = all_chunks
             .iter()
@@ -3636,7 +3603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_openai_stream_abnormal_interruption_preserves_tool_calls() {
+    async fn test_openai_stream_abnormal_interruption_does_not_authorize_tool_calls() {
         let chunk1_json = json!({
             "candidates": [{
                 "content": {
@@ -3689,11 +3656,9 @@ mod tests {
             }
         }
 
-        // 工具调用断流时必须保证终结原因为 "tool_calls"，绝不能降级为 "length"
-        assert_eq!(
-            finish_reasons,
-            vec!["tool_calls".to_string()],
-            "Tool calls must preserve finish_reason: 'tool_calls'"
+        assert!(
+            finish_reasons.is_empty(),
+            "Interrupted tools must not receive execution authorization"
         );
     }
 
@@ -3772,6 +3737,7 @@ mod error_usage_snapshot_tests {
             "chat.completion.chunk",
             &report,
             Some(&usage),
+            "stream_error",
         );
         let event: Value =
             serde_json::from_str(rendered.trim().strip_prefix("data: ").unwrap()).unwrap();
@@ -3797,3 +3763,7 @@ mod response_failures_tests;
 #[cfg(test)]
 #[path = "response_selection_tests.rs"]
 mod response_selection_tests;
+
+#[cfg(test)]
+#[path = "response_completion_tests.rs"]
+mod response_completion_tests;

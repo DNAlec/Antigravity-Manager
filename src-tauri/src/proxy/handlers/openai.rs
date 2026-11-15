@@ -2631,7 +2631,8 @@ pub async fn handle_chat_completions(
         normalize_responses_plaintext(&mut body)
             .map_err(|(_, _, message)| (StatusCode::BAD_REQUEST, message.to_owned()))?;
         debug!("Detected Responses API format, converting with structured role preservation");
-        body = convert_codex_to_openai_request(body);
+        body = try_convert_codex_to_openai_request(body)
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     }
 
     let normalized_interaction_ledger = body.get("_interaction_ledger").cloned();
@@ -4477,6 +4478,59 @@ fn responses_reasoning_message(item: &Value) -> Value {
     }
 }
 
+fn responses_has_readable_history(items: &[Value]) -> bool {
+    let mut has_user = false;
+    for item in items {
+        if item.get("type").is_some_and(|kind| kind != "message")
+            || is_codex_transcript_only_assistant_message(item)
+            || item
+                .get("status")
+                .is_some_and(|status| !status.is_null() && status != "completed")
+        {
+            continue;
+        }
+        let content = &item["content"];
+        let readable = content.as_str().is_some_and(|text| !text.trim().is_empty())
+            || content.as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    let text = match part["type"].as_str() {
+                        Some("text" | "input_text" | "output_text") => part["text"].as_str(),
+                        Some("refusal") if item["role"] == "assistant" => part["refusal"].as_str(),
+                        _ => None,
+                    };
+                    text.is_some_and(|text| !text.trim().is_empty())
+                })
+            });
+        if readable {
+            match item["role"].as_str() {
+                Some("user") => has_user = true,
+                Some("assistant") if has_user => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn responses_has_opaque_reasoning(item: &Value) -> bool {
+    item["type"] == "reasoning"
+        && item
+            .get("encrypted_content")
+            .is_some_and(|value| !value.is_null() && value != "")
+        && responses_plaintext_summary(item).is_none()
+}
+
+fn responses_is_foreign_opaque_reasoning(item: &Value) -> bool {
+    // AM stores native signatures separately; it does not mint encrypted_content.
+    // Never discard signed/local state through this foreign-metadata fallback.
+    item["encrypted_content"]
+        .as_str()
+        .is_some_and(|text| !text.trim().is_empty())
+        && ["thoughtSignature", "thought_signature", "signature"]
+            .iter()
+            .all(|key| item.get(key).is_none_or(Value::is_null))
+}
+
 fn normalize_responses_plaintext(
     body: &mut Value,
 ) -> Result<(), (&'static str, &'static str, &'static str)> {
@@ -4485,9 +4539,20 @@ fn normalize_responses_plaintext(
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return Ok(());
     };
+    builtin_history::normalize(items).map_err(|_| {
+        (
+            "invalid_builtin_history",
+            "input",
+            "Malformed built-in tool history",
+        )
+    })?;
     let mut normalized = Vec::with_capacity(items.len());
     for mut item in std::mem::take(items) {
         match item["type"].as_str() {
+            Some("reasoning") if responses_has_opaque_reasoning(&item) => {
+                // Validation requires an independent readable conversation before
+                // dropping foreign reasoning that Gemini cannot decrypt.
+            }
             Some("reasoning") if responses_plaintext_summary(&item).is_some() => {
                 if let Some(fields) = item.as_object_mut() {
                     fields.remove("encrypted_content");
@@ -4572,12 +4637,10 @@ fn validate_responses_continuation(
         }
     }
     if let Some(items) = body["input"].as_array() {
+        let has_readable_history = responses_has_readable_history(items);
         for item in items {
-            if item["type"] == "reasoning"
-                && item
-                    .get("encrypted_content")
-                    .is_some_and(|v| !v.is_null() && v != "")
-                && responses_plaintext_summary(item).is_none()
+            if responses_has_opaque_reasoning(item)
+                && (!has_readable_history || !responses_is_foreign_opaque_reasoning(item))
             {
                 return Err((
                     "unsupported_reasoning",
@@ -4803,7 +4866,7 @@ pub async fn handle_completions(
             .unwrap_or_default()
             .to_string();
         let (interaction_ledger, mut step_markers) = codex_ledger_from_body(&body);
-        let input_items = body
+        let mut input_items = body
             .as_object_mut()
             .and_then(|obj| obj.remove("input"))
             .and_then(|value| match value {
@@ -4811,6 +4874,13 @@ pub async fn handle_completions(
                 _ => None,
             })
             .unwrap_or_default();
+        if let Err(message) = builtin_history::normalize(&mut input_items) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"type":"invalid_request_error","message":message}})),
+            )
+                .into_response();
+        }
         bounded_session_input = store_response.then(|| {
             session_delta_input
                 .drain(..)
@@ -4846,17 +4916,14 @@ pub async fn handle_completions(
                     continue;
                 }
                 match item_type.as_str() {
-                    "function_call" | "custom_tool_call" | "local_shell_call"
-                    | "web_search_call" => {
+                    "function_call" | "custom_tool_call" | "web_search_call" => {
                         let call_id = item
                             .get("call_id")
                             .and_then(|v| v.as_str())
                             .or_else(|| item.get("id").and_then(|v| v.as_str()))
                             .unwrap_or("unknown");
 
-                        let name = if item_type == "local_shell_call" {
-                            "shell".to_string()
-                        } else if item_type == "web_search_call" {
+                        let name = if item_type == "web_search_call" {
                             "google_search".to_string()
                         } else {
                             responses_item_tool_name_with_tools(item, &input_tool_kinds)
@@ -4936,8 +5003,7 @@ pub async fn handle_completions(
                     "reasoning" => {
                         messages.push(responses_reasoning_message(&item));
                     }
-                    "function_call" | "custom_tool_call" | "local_shell_call"
-                    | "web_search_call" => {
+                    "function_call" | "custom_tool_call" | "web_search_call" => {
                         let mut name =
                             responses_item_tool_name_with_tools(&item, &input_tool_kinds)
                                 .unwrap_or_else(|| "unknown".to_string());
@@ -4957,28 +5023,6 @@ pub async fn handle_completions(
                             if let Some(input) = item.get("input").and_then(|v| v.as_str()) {
                                 args_str = serde_json::to_string(&json!({ "input": input }))
                                     .unwrap_or_else(|_| "{}".to_string());
-                            }
-                        } else if item_type == "local_shell_call" {
-                            name = "shell".to_string();
-                            if let Some(action) = item.get("action") {
-                                if let Some(exec) = action.get("exec") {
-                                    let mut args_obj = serde_json::Map::new();
-                                    if let Some(cmd) = exec.get("command") {
-                                        let cmd_val = if cmd.is_string() {
-                                            json!([cmd])
-                                        } else {
-                                            cmd.clone()
-                                        };
-                                        args_obj.insert("command".to_string(), cmd_val);
-                                    }
-                                    if let Some(wd) =
-                                        exec.get("working_directory").or(exec.get("workdir"))
-                                    {
-                                        args_obj.insert("workdir".to_string(), wd.clone());
-                                    }
-                                    args_str = serde_json::to_string(&args_obj)
-                                        .unwrap_or("{}".to_string());
-                                }
                             }
                         } else if item_type == "web_search_call" {
                             name = "google_search".to_string();
@@ -6038,13 +6082,14 @@ pub async fn handle_completions(
                             stream_errors.candidate_selection().unwrap_or_default(),
                         )
                     } else {
-                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_context;
-                        create_legacy_sse_stream_with_context(
+                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_candidate_count;
+                        create_legacy_sse_stream_with_candidate_count(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id,
                             message_count,
                             response_text_context.clone(),
+                            openai_req.n.unwrap_or(1) as usize,
                         )
                     };
 
@@ -9362,7 +9407,7 @@ fn dedupe_function_calls_by_call_id(items: Vec<Value>) -> Vec<Value> {
     filtered
 }
 
-fn convert_codex_to_openai_request(mut body: Value) -> Value {
+fn try_convert_codex_to_openai_request(mut body: Value) -> Result<Value, String> {
     let input_tool_kinds = crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(
         body["tools"].as_array().map(Vec::as_slice),
     );
@@ -9372,7 +9417,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
         .unwrap_or_default()
         .to_string();
     let (interaction_ledger, mut step_markers) = codex_ledger_from_body(&body);
-    let input_items = body
+    let mut input_items = body
         .as_object_mut()
         .and_then(|obj| obj.remove("input"))
         .map(|value| match value {
@@ -9389,6 +9434,8 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
             })],
         })
         .unwrap_or_default();
+
+    builtin_history::normalize(&mut input_items)?;
 
     let mut messages = Vec::new();
     if !instructions.is_empty() {
@@ -9414,15 +9461,13 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                 continue;
             }
             match item_type {
-                "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
+                "function_call" | "custom_tool_call" | "web_search_call" => {
                     let call_id = item
                         .get("call_id")
                         .and_then(|v| v.as_str())
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
-                    let name = if item_type == "local_shell_call" {
-                        "local_shell_call".to_string()
-                    } else if item_type == "web_search_call" {
+                    let name = if item_type == "web_search_call" {
                         "web_search_call".to_string()
                     } else {
                         responses_item_tool_name_with_tools(&item, &input_tool_kinds)
@@ -9466,7 +9511,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                 "reasoning" => {
                     messages.push(responses_reasoning_message(&item));
                 }
-                "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
+                "function_call" | "custom_tool_call" | "web_search_call" => {
                     let mut name = responses_item_tool_name_with_tools(&item, &input_tool_kinds)
                         .unwrap_or_else(|| "unknown".to_string());
                     let mut args_str = item
@@ -9484,28 +9529,6 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         if let Some(input) = item.get("input").and_then(|v| v.as_str()) {
                             args_str = serde_json::to_string(&json!({ "input": input }))
                                 .unwrap_or_else(|_| "{}".to_string());
-                        }
-                    } else if item_type == "local_shell_call" || name == "local_shell_call" {
-                        name = "shell".to_string();
-                        if let Some(action) = item.get("action") {
-                            if let Some(exec) = action.get("exec") {
-                                let mut args_obj = serde_json::Map::new();
-                                if let Some(cmd) = exec.get("command") {
-                                    let cmd_val = if cmd.is_string() {
-                                        json!([cmd])
-                                    } else {
-                                        cmd.clone()
-                                    };
-                                    args_obj.insert("command".to_string(), cmd_val);
-                                }
-                                if let Some(wd) =
-                                    exec.get("working_directory").or(exec.get("workdir"))
-                                {
-                                    args_obj.insert("workdir".to_string(), wd.clone());
-                                }
-                                args_str = serde_json::to_string(&args_obj)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                            }
                         }
                     } else if item_type == "web_search_call" || name == "web_search_call" {
                         name = "google_search".to_string();
@@ -9599,7 +9622,12 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
         obj.remove("input");
         obj.remove("instructions");
     }
-    body
+    Ok(body)
+}
+
+#[cfg(test)]
+fn convert_codex_to_openai_request(body: Value) -> Value {
+    try_convert_codex_to_openai_request(body).expect("valid Responses test request")
 }
 
 fn websocket_http_error_event(status: u16, body: &[u8]) -> Value {
@@ -10271,12 +10299,6 @@ mod responses_http_history_tests {
             vec![sse(
                 json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"SAFETY"}]}),
             )],
-            vec![
-                sse(
-                    json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
-                ),
-                Err("connection reset before stream EOF".into()),
-            ],
         ] {
             let (id, response) = stream_with_history(frames, true).await;
             assert_ne!(response["status"], "completed");
@@ -10285,6 +10307,39 @@ mod responses_http_history_tests {
                 "non-resumable response: {response}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn r38_max_tokens_before_transport_reset_keeps_partial_history_resumable() {
+        let frames = vec![
+            sse(
+                json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+            ),
+            Err("connection reset after model terminal".into()),
+        ];
+        let (id, response) = stream_with_history(frames, true).await;
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(response["error"].is_null());
+        assert_eq!(response["output"][0]["content"][0]["text"], "partial");
+        let saved = get_session(&id).await.unwrap();
+        assert_eq!(
+            &saved.input_items[3..],
+            response["output"].as_array().unwrap()
+        );
+        let followup = json!({"role":"user","content":"Continue the partial answer."});
+        let prepared = prepare_session_input_with_storage(
+            saved.input_items.clone(),
+            vec![followup.clone()],
+            &HashMap::new(),
+            true,
+        );
+        assert!(!prepared.reset_parent);
+        assert!(prepared.merged.starts_with(&saved.input_items));
+        assert_eq!(prepared.merged.last(), Some(&followup));
     }
 
     #[tokio::test]
@@ -11782,3 +11837,14 @@ mod request_identity_tests;
 #[cfg(test)]
 #[path = "openai_request_text_tests.rs"]
 mod request_text_tests;
+
+#[path = "openai_builtin_history.rs"]
+mod builtin_history;
+
+#[cfg(test)]
+#[path = "response_completion_tests.rs"]
+mod response_completion_tests;
+
+#[cfg(test)]
+#[path = "openai_request_history_tests.rs"]
+mod request_history_tests;

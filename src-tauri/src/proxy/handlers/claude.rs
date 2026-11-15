@@ -751,6 +751,45 @@ mod variant_tests {
     }
 
     #[test]
+    fn r34_variant_routing_consumes_effort_but_preserves_output_format() {
+        for routed in [false, true] {
+            let mut request = request_with_effort("gemini-3.5-flash", "low", 10_000);
+            let format = json!({"type":"json_schema","schema":{
+                "type":"object","properties":{"code":{"type":"string","enum":["SCHEMA_CODE_42"]}},"required":["code"]
+            }});
+            request.output_config.as_mut().unwrap().format =
+                Some(serde_json::from_value(format.clone()).unwrap());
+            if routed {
+                request.model = "gemini-3.5-flash-extra-low".into();
+                apply_routed_spec(&mut request, None).unwrap();
+            } else {
+                let effort = crate::proxy::common::variant_mapping::tier_from_effort(Some("low"));
+                apply_variant(&mut request, effort, Some(10_000)).unwrap();
+            }
+            let output = serde_json::to_value(&request).unwrap()["output_config"].clone();
+            assert_eq!(output, json!({"format":format}));
+            let mapped = crate::proxy::mappers::claude::transform_claude_request_in(
+                &request,
+                "r34-project",
+                false,
+                None,
+                "r34-variant-format",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                mapped["request"]["generationConfig"]["responseMimeType"],
+                "application/json"
+            );
+            assert_eq!(
+                mapped["request"]["generationConfig"]["responseSchema"]["properties"]["code"]
+                    ["enum"],
+                json!(["SCHEMA_CODE_42"])
+            );
+        }
+    }
+
+    #[test]
     fn applies_pro_high_effort_over_low_budget() {
         let mut request = request_with_effort("gemini-3.1-pro", "high", 1_000);
         let effort = crate::proxy::common::variant_mapping::tier_from_effort(
@@ -881,7 +920,13 @@ fn apply_spec_to_request(
             display: None,
         });
     }
-    request.output_config = None;
+    // Variant routing consumes reasoning effort, not the independent output constraint.
+    if let Some(output) = request.output_config.as_mut() {
+        output.effort = None;
+        if output.format.is_none() {
+            request.output_config = None;
+        }
+    }
     // 尊重客户端显式 max_tokens，只做官方硬顶收敛；缺省交给流水线按官方上限补齐/协商
     if let Some(client_max) = request.max_tokens {
         // 单点硬顶在流水线：`configure_inbound_thinking` 会按官方 max_output_tokens

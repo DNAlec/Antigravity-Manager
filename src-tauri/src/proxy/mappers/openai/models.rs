@@ -193,6 +193,9 @@ fn normalize_chat_request(value: &mut Value) -> Result<(), String> {
         let Some(message) = message.as_object_mut() else {
             continue;
         };
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            preserve_audio_transcript(message)?;
+        }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 if call["type"] == "custom" {
@@ -262,6 +265,46 @@ fn normalize_chat_request(value: &mut Value) -> Result<(), String> {
             message.insert("tool_call_id".into(), json!(id));
         }
     }
+    Ok(())
+}
+
+/// Replay an available audio transcript as visible assistant history.
+fn preserve_audio_transcript(message: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let Some(audio) = message.get("audio").filter(|audio| !audio.is_null()) else {
+        return Ok(());
+    };
+    let audio = audio
+        .as_object()
+        .ok_or("Assistant audio must be an object or null")?;
+    let transcript = match audio.get("transcript") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::String(text)) if text.is_empty() => return Ok(()),
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => return Err("Assistant audio transcript must be a string or null".into()),
+    };
+    match message.get_mut("content") {
+        None | Some(Value::Null) => {
+            message.insert("content".into(), Value::String(transcript));
+        }
+        Some(Value::String(content)) if content == &transcript => {}
+        Some(Value::String(content)) => {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&transcript);
+        }
+        Some(Value::Array(parts)) => {
+            if !parts
+                .iter()
+                .any(|part| part["type"] == "text" && part["text"] == transcript)
+            {
+                parts.push(json!({"type":"text","text":transcript}));
+            }
+        }
+        Some(_) => return Err("Assistant content must be text, an array, or null".into()),
+    }
+    // The transcript is now ordinary content; a second normalization must not append it again.
+    message.remove("audio");
     Ok(())
 }
 
@@ -780,5 +823,28 @@ mod r26_request_boundary_tests {
             parsed.messages[4].tool_call_id.as_deref(),
             Some("call_legacy_1")
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_history_tests {
+    use super::*;
+
+    #[test]
+    fn r32_audio_transcript_normalization_is_idempotent() {
+        for content in [
+            Value::Null,
+            json!("prefix"),
+            json!("transcript"),
+            json!([{"type":"text","text":"prefix"}]),
+            json!([{"type":"text","text":"transcript"}]),
+        ] {
+            let mut body = json!({"model":"g","messages":[{"role":"assistant","content":content,"audio":{"id":"audio_1","transcript":"transcript"}}]});
+            normalize_chat_request(&mut body).unwrap();
+            let once = body.clone();
+            normalize_chat_request(&mut body).unwrap();
+            assert_eq!(body, once);
+            assert!(body["messages"][0].get("audio").is_none());
+        }
     }
 }

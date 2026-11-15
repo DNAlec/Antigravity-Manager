@@ -251,9 +251,7 @@ where
                 if let Ok(json) = serde_json::from_str::<Value>(data_str) {
                     if let Some(error) = crate::proxy::pipeline::stream_error::error_envelope(&json)
                     {
-                        if error.get("code").and_then(Value::as_str)
-                            == Some("upstream_finish_error")
-                        {
+                        if crate::proxy::pipeline::stream_error::is_partial_response_error(error) {
                             response.choices = choices_by_index
                                 .into_iter()
                                 .map(|(index, state)| {

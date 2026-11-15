@@ -132,9 +132,13 @@ impl UpstreamStreamErrorObserver {
         if !state.has_output && !has_measured_usage(state.usage.as_ref()) {
             return None;
         }
+        let body = serde_json::from_str::<Value>(message)
+            .ok()
+            .filter(|value| value.get("error").is_some_and(is_partial_response_error))
+            .unwrap_or_else(|| json!({"error":{"code":502,"message":message}}));
         Some(UpstreamStreamError {
             status: 502,
-            body: json!({"error":{"code":502,"message":message}}).to_string(),
+            body: body.to_string(),
             usage: state.usage.clone(),
             after_output: state.has_output,
         })
@@ -246,8 +250,17 @@ pub fn is_refusal_finish_reason(reason: &str) -> bool {
             | "PROHIBITED_CONTENT"
             | "SPII"
             | "IMAGE_SAFETY"
+            | "IMAGE_RECITATION"
             | "IMAGE_PROHIBITED_CONTENT"
             | "MODEL_ARMOR"
+    )
+}
+
+/// These gateway errors carry generated output only as a failed partial response.
+pub fn is_partial_response_error(error: &Value) -> bool {
+    matches!(
+        error.get("code").and_then(Value::as_str),
+        Some("upstream_finish_error" | "upstream_interrupted")
     )
 }
 
