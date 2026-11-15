@@ -9,16 +9,6 @@ pub fn generate_random_id() -> String {
         .collect()
 }
 
-/// 根据模型名称推测功能类型
-// 注意：此函数已弃用，请改用 mappers::common_utils::resolve_request_config
-pub fn _deprecated_infer_quota_group(model: &str) -> String {
-    if model.to_lowercase().starts_with("claude") {
-        "claude".to_string()
-    } else {
-        "gemini".to_string()
-    }
-}
-
 /// 工具调用 ID 统一归一化处理。
 ///
 /// 规范格式统一为以 `call_` 开头（如 `call_573077`）。
@@ -30,13 +20,43 @@ pub fn normalize_tool_id(id: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = id.trim();
     if trimmed.starts_with("call") && !trimmed.starts_with("call_") && trimmed.len() > 4 {
         let rest = &trimmed[4..];
-        if rest.chars().next().map_or(false, |c| c.is_ascii_digit())
+        if rest.chars().next().is_some_and(|c| c.is_ascii_digit())
             || (rest.len() >= 6 && rest.chars().all(|c| c.is_ascii_hexdigit()))
         {
             return std::borrow::Cow::Owned(format!("call_{}", rest));
         }
     }
     std::borrow::Cow::Borrowed(id)
+}
+
+/// Resolve client ID aliases only when they identify a single original call ID.
+pub(crate) struct ToolIdNormalizer {
+    collisions: std::collections::HashSet<String>,
+}
+
+impl ToolIdNormalizer {
+    pub(crate) fn new<'a>(ids: impl Iterator<Item = &'a str>) -> Self {
+        let mut originals = std::collections::HashMap::new();
+        let mut collisions = std::collections::HashSet::new();
+        for id in ids {
+            let normalized = normalize_tool_id(id).into_owned();
+            if let Some(previous) = originals.insert(normalized.clone(), id) {
+                if previous != id {
+                    collisions.insert(normalized);
+                }
+            }
+        }
+        Self { collisions }
+    }
+
+    pub(crate) fn normalize<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        let normalized = normalize_tool_id(id);
+        if self.collisions.contains(normalized.as_ref()) {
+            std::borrow::Cow::Borrowed(id)
+        } else {
+            normalized
+        }
+    }
 }
 
 #[cfg(test)]

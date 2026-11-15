@@ -31,7 +31,7 @@ pub struct ClaudeRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Output configuration for effort level (Claude API v2.0.67+)
+    /// Output configuration for reasoning effort and structured output
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
     // [NEW] Image generation parameters (for Anthropic protocol compatibility)
@@ -100,6 +100,15 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
 
+    #[serde(rename = "compaction")]
+    Compaction {
+        #[serde(default)]
+        content: Option<String>,
+    },
+
+    #[serde(rename = "fallback")]
+    Fallback {},
+
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -121,6 +130,13 @@ pub enum ContentBlock {
         source: DocumentSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<serde_json::Value>,
+    },
+
+    #[serde(rename = "search_result")]
+    SearchResult {
+        source: String,
+        title: String,
+        content: Vec<McpTextBlock>,
     },
 
     #[serde(rename = "redacted_thinking")]
@@ -161,6 +177,104 @@ pub enum ContentBlock {
         #[serde(default)]
         content: serde_json::Value,
     },
+
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
+
+    #[serde(rename = "advisor_tool_result")]
+    AdvisorToolResult {
+        tool_use_id: String,
+        content: AdvisorResultContent,
+    },
+
+    #[serde(
+        rename = "code_execution_tool_result",
+        alias = "bash_code_execution_tool_result",
+        alias = "text_editor_code_execution_tool_result"
+    )]
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+    },
+
+    #[serde(rename = "tool_search_tool_result")]
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchResultContent,
+    },
+
+    #[serde(rename = "mcp_tool_use")]
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: serde_json::Map<String, serde_json::Value>,
+    },
+
+    #[serde(rename = "mcp_tool_result")]
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: McpToolResultContent,
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AdvisorResultContent {
+    #[serde(rename = "advisor_result")]
+    Result { text: String },
+    #[serde(rename = "advisor_tool_result_error")]
+    Error { error_code: String },
+    #[serde(rename = "advisor_redacted_result")]
+    Redacted {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolSearchResultContent {
+    #[serde(rename = "tool_search_tool_search_result")]
+    Found { tool_references: Vec<ToolReference> },
+    #[serde(rename = "tool_search_tool_result_error")]
+    Error {
+        error_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolReference {
+    #[serde(rename = "tool_reference")]
+    Tool { tool_name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpToolResultContent {
+    Text(String),
+    Blocks(Vec<McpTextBlock>),
+}
+
+impl Default for McpToolResultContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum McpTextBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -219,19 +333,20 @@ pub struct Tool {
 impl Tool {
     /// Check if this is the web_search server tool
     pub fn is_web_search(&self) -> bool {
-        // Check by type (preferred for server tools)
-        if let Some(ref t) = self.type_ {
-            if t.starts_with("web_search") {
-                return true;
-            }
+        // A client function owns its name, including names used by server tools.
+        if self.type_.as_deref() == Some("custom") || self.input_schema.is_some() {
+            return false;
         }
-        // Check by name (fallback)
-        if let Some(ref n) = self.name {
-            if n == "web_search" {
-                return true;
-            }
+        if let Some(kind) = self.type_.as_deref() {
+            return kind == "web_search"
+                || kind.starts_with("web_search_")
+                || kind == "builtin_web_search";
         }
-        false
+        // Retain legacy schema-less search declarations.
+        matches!(
+            self.name.as_deref(),
+            Some("web_search" | "google_search" | "builtin_web_search")
+        )
     }
 
     /// Get the effective tool name
@@ -257,12 +372,21 @@ pub struct Metadata {
 }
 
 /// Output Configuration (Claude API v2.0.67+)
-/// Controls effort level for model reasoning
+/// Controls reasoning effort independently of the output format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<OutputFormat>,
     /// Effort level: "high", "medium", "low"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+}
+
+/// Anthropic structured-output constraint, normalized by the request adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    JsonSchema { schema: serde_json::Value },
 }
 
 /// Claude API 响应

@@ -182,3 +182,59 @@ async fn image_transient_failure_cools_account_without_evicting_protected_text_s
         }
     }
 }
+
+#[tokio::test]
+async fn merge_beta11_deferred_qos_respects_captured_session_generation() {
+    for phase in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(dir.path().to_path_buf());
+        let stale = warm_session(&manager);
+        prepare_penalty(&manager, &stale, false);
+        let next = manager.session_accounts.candidate(
+            &manager.session_accounts.snapshot(SESSION),
+            "successor-account",
+        );
+        let next = manager.session_accounts.commit(&next, || true).unwrap();
+        match phase {
+            0 => {
+                assert!(manager.record_qos_phase1_ttft(
+                    ACCOUNT,
+                    Some(SESSION),
+                    "PRO",
+                    50_000.0,
+                    false,
+                    Some(100),
+                    Some(&stale)
+                ));
+            }
+            1 => manager.record_qos_with_usage(
+                ACCOUNT,
+                Some(SESSION),
+                "PRO",
+                50_000.0,
+                false,
+                100,
+                100,
+                Some(&stale),
+            ),
+            _ => manager.record_qos_without_usage(
+                ACCOUNT,
+                Some(SESSION),
+                "PRO",
+                50_000.0,
+                false,
+                Some(100),
+                Some(&stale),
+            ),
+        }
+        if phase < 2 {
+            assert!(manager.qos_guardian.is_jailed_or_probing(ACCOUNT));
+        } else {
+            assert!(
+                manager.qos_guardian.is_suspicious(ACCOUNT),
+                "missing usage must not create an ambiguous strike"
+            );
+        }
+        assert!(manager.session_accounts.commit(&next, || true).is_some());
+    }
+}

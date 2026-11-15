@@ -579,6 +579,20 @@ mod tests {
         assert_eq!(gc_argon["thinkingConfig"]["thinkingLevel"], "MEDIUM");
         assert_eq!(gc_argon["thinkingConfig"]["includeThoughts"], true);
         assert!(gc_argon["thinkingConfig"].get("thinkingBudget").is_none());
+
+        // 8. Orchestrator (Argon) 必须通过官方 thinkingLevel: 3 走 HIGH 等级通道，严禁输出 thinkingBudget
+        let mut gc_orch = json!({});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-pro-orchestrator-g1-pro",
+            &mut gc_orch,
+            ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(gc_orch["thinkingConfig"]["thinkingLevel"], "HIGH");
+        assert_eq!(gc_orch["thinkingConfig"]["includeThoughts"], true);
+        assert!(gc_orch["thinkingConfig"].get("thinkingBudget").is_none());
     }
 
     #[test]
@@ -841,5 +855,38 @@ mod tests {
         assert_eq!(gc["thinkingConfig"]["includeThoughts"], false);
 
         update_thinking_budget_config(ThinkingBudgetConfig::default());
+    }
+
+    #[test]
+    fn test_flat_body_envelope_alignment() {
+        let mut body = json!({
+            "model": "gemini-4-argon",
+            "contents": [
+                { "role": "user", "parts": [{ "text": "hello" }] }
+            ],
+            "generationConfig": {
+                "maxOutputTokens": 2048
+            }
+        });
+
+        InboundThinkingPipeline::align_official_envelope(&mut body).unwrap();
+
+        // 顶层必须严格满足官方信封规范且包含 model 和 request
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["project", "requestId", "request", "model", "userAgent"]
+        );
+
+        assert_eq!(body["model"], "gemini-4-argon");
+        assert_eq!(body["project"], "aicode-consumers");
+        assert_eq!(body["userAgent"], "antigravity");
+        assert!(body["request"]["contents"].is_array());
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 2048);
     }
 }

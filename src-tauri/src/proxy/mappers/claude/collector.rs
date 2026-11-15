@@ -279,6 +279,16 @@ where
             "error" => {
                 // 错误事件
                 let error_data = event.data.get("error").unwrap_or(&event.data);
+                if crate::proxy::pipeline::stream_error::is_partial_response_error(error_data) {
+                    if let Some(usage) = event.data.get("usage") {
+                        if let Ok(usage) = serde_json::from_value(usage.clone()) {
+                            response.usage = usage;
+                        }
+                    }
+                    let mut partial = serde_json::to_value(&response).unwrap_or_default();
+                    partial["stop_reason"] = Value::Null;
+                    return Err(json!({"error":error_data, "partial_response":partial}).to_string());
+                }
                 let message = error_data
                     .get("message")
                     .and_then(|v| v.as_str())

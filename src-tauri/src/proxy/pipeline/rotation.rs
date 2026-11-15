@@ -97,6 +97,13 @@ pub enum RetryStrategy {
     GraceRetry(Duration),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRetryPlan {
+    pub strategy: RetryStrategy,
+    pub next: crate::proxy::pipeline::terminal::TerminalNextStep,
+    pub abandon_sticky_account: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct RequestRetryState {
     grace_retried_accounts: HashSet<String>,
@@ -107,6 +114,71 @@ pub struct RequestRetryState {
 }
 
 impl RequestRetryState {
+    /// Upstream HTTP plan API, sharing the fork's bounded HTTP/transport replay budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_http_retry(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        attempt: usize,
+        pool_size: usize,
+        mode: crate::proxy::sticky_config::SchedulingMode,
+        cache_bound: bool,
+        max_wait_seconds: u64,
+        allow_grace_policy: bool,
+        classification: &UpstreamClassification,
+    ) -> HttpRetryPlan {
+        use crate::proxy::pipeline::terminal::TerminalNextStep;
+        let scheduling = crate::proxy::sticky_config::StickySessionConfig {
+            mode,
+            max_wait_seconds,
+            ..Default::default()
+        };
+        if let Some(strategy) = self.cache_first_failure(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            &scheduling,
+            cache_bound,
+        ) {
+            let next = if matches!(strategy, RetryStrategy::NoRetry) {
+                TerminalNextStep::Stop
+            } else {
+                TerminalNextStep::RetrySameAccount
+            };
+            return HttpRetryPlan {
+                strategy,
+                next,
+                abandon_sticky_account: false,
+            };
+        }
+        let strategy = self.determine_strategy_adaptive_with_policy(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            attempt,
+            pool_size,
+            allow_grace_policy,
+        );
+        let next = match decide_rotation(status_code, Some(&strategy), false, false) {
+            RotationDecision::RetrySame => TerminalNextStep::RetrySameAccount,
+            RotationDecision::Rotate => TerminalNextStep::Rotate,
+            RotationDecision::Stop => TerminalNextStep::Stop,
+        };
+        HttpRetryPlan {
+            strategy,
+            next,
+            abandon_sticky_account: next != TerminalNextStep::RetrySameAccount
+                && classification.abandons_sticky_account(),
+        }
+    }
+
     /// Response policy belongs to the current attempt; retry allowances belong
     /// to the whole request. Call after the global budget gate so exhausting the
     /// budget while waiting still retains the previous protective decision.
@@ -561,7 +633,7 @@ pub fn determine_retry_strategy_adaptive(
             }
 
             // [FIX #3329, #3409] 关键防线：微间隙优先原地 GraceRetry (Micro-gap Grace Retry First)
-            // 若上游返回了明确且极短的重置延迟 (<= 2500ms，例如 Google 图像生成典型的 1.17s quotaResetDelay)
+            // 若上游返回了明确且极短的重置延迟 (<= 5000ms，例如 Google 图像生成典型的 1.17s quotaResetDelay)
             // 且该账号本轮尚未执行过 GraceRetry：
             // 绝不能在第 1 轮就无脑 50ms 闪电切号！
             // 因为 50ms 闪电切号会在 300ms 内把全池所有账号全部轮询打一遍，并将它们全部作为 RateLimitExceeded 封锁进入 RateLimitTracker，
@@ -569,9 +641,9 @@ pub fn determine_retry_strategy_adaptive(
             // 优先在当前账号原地等待 actual_ms (如 1.37s) 并在上游配额刚恢复的瞬间重试，即可原地满血复活，完全避免全池被连坐封死！
             if let Some(delay) = parsed_delay {
                 let actual_ms = delay.actual_wait_ms();
-                if actual_ms <= 2500 && allow_grace_retry {
+                if actual_ms <= 5000 && allow_grace_retry {
                     tracing::info!(
-                        "[Retry] Multi-account 429 micro-gap ({}ms <= 2500ms): applying GraceRetry on current account instead of fast-rotating to protect pool",
+                        "[Retry] Multi-account 429 micro-gap ({}ms <= 5000ms): applying GraceRetry on current account instead of fast-rotating to protect pool",
                         actual_ms
                     );
                     return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));

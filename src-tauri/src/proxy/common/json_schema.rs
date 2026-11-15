@@ -278,6 +278,31 @@ fn flatten_refs(
     Ok(())
 }
 
+fn normalize_boolean_union(map: &mut serde_json::Map<String, Value>) {
+    let Some(branches) = map.get_mut("anyOf").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // A false alternative cannot match. Gemini's Schema message cannot encode
+    // the unconstrained true schema, so use the same string fallback as items.
+    branches.retain(|branch| branch != &Value::Bool(false));
+    for branch in branches.iter_mut() {
+        if branch == &Value::Bool(true) {
+            *branch = json!({"type": "string"});
+        }
+    }
+    if branches.is_empty() {
+        map.remove("anyOf");
+        let fallback = if map.contains_key("properties") {
+            "object"
+        } else if map.contains_key("items") {
+            "array"
+        } else {
+            "string"
+        };
+        map.entry("type").or_insert_with(|| json!(fallback));
+    }
+}
+
 /// [FIX #3682] 递归深度达到上限时的防御性合规兜底（Fail-safe Fallback）。
 ///
 /// 使用基于堆的显式迭代遍历，杜绝调用栈溢出风险。
@@ -293,6 +318,11 @@ fn apply_minimal_failsafe(root: &mut Value, budget: &mut SchemaBudget) -> Result
         budget.charge_size(1, 16)?;
         match current {
             Value::Object(map) => {
+                merge_all_of(map, budget)?;
+                if let Some(branches) = map.remove("oneOf") {
+                    map.entry("anyOf").or_insert(branches);
+                }
+                normalize_boolean_union(map);
                 let is_array = match map.get("type") {
                     Some(Value::String(s)) => s.eq_ignore_ascii_case("array"),
                     Some(Value::Array(arr)) => arr.iter().any(|v| {
@@ -338,10 +368,25 @@ fn apply_minimal_failsafe(root: &mut Value, budget: &mut SchemaBudget) -> Result
                     }
                 }
 
-                // 压入子节点继续迭代合规兜底
-                for v in map.values_mut() {
-                    if v.is_object() || v.is_array() {
-                        stack.push(v);
+                if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                    properties.retain(|_, child| child.is_object());
+                    let keys: std::collections::HashSet<_> = properties.keys().cloned().collect();
+                    if let Some(required) = map.get_mut("required").and_then(Value::as_array_mut) {
+                        required.retain(|key| key.as_str().is_some_and(|key| keys.contains(key)));
+                    }
+                }
+
+                // Follow schema edges only; boolean values in enum/default
+                // objects belong to the client and must not be rewritten.
+                for (key, value) in map.iter_mut() {
+                    match key.as_str() {
+                        "properties" => {
+                            if let Some(properties) = value.as_object_mut() {
+                                stack.extend(properties.values_mut());
+                            }
+                        }
+                        "items" | "anyOf" => stack.push(value),
+                        _ => {}
                     }
                 }
             }
@@ -387,6 +432,7 @@ fn clean_json_schema_recursive(
             if let Some(branches) = map.remove("oneOf") {
                 map.entry("anyOf".to_string()).or_insert(branches);
             }
+            normalize_boolean_union(map);
             if map.contains_key("anyOf") && map.get("type").is_some_and(Value::is_array) {
                 // Keep the explicit alternatives instead of selecting the first
                 // type or materializing a potentially exponential intersection.
@@ -2826,5 +2872,54 @@ mod compatibility_tests {
         assert_eq!(terminal["type"], "object");
         assert!(terminal.get("$ref").is_none());
         assert!(schema.to_string().len() < 1024);
+    }
+}
+
+#[cfg(test)]
+mod r24_boolean_union_tests {
+    use super::*;
+
+    #[test]
+    fn r24_boolean_compositions_become_schema_objects_without_touching_literal_values() {
+        let mut schema = json!({"type":"object","properties":{
+            "union":{"anyOf":[false,true,{"type":"integer"}]},
+            "exclusive":{"oneOf":[false,{"type":"boolean"}]},
+            "impossible":{"anyOf":[false]},
+            "implicit":{"properties":{"value":{"type":"string"}},"anyOf":[false]},
+            "inherited":{"allOf":[{"anyOf":[true,{"type":"number"}]}]},
+            "literal":{"type":"string","enum":[true,false],"nullable":false}
+        }});
+        clean_json_schema(&mut schema).unwrap();
+        assert_eq!(
+            schema["properties"]["union"]["anyOf"],
+            json!([{"type":"string"},{"type":"integer"}])
+        );
+        assert_eq!(schema["properties"]["exclusive"]["type"], "boolean");
+        assert_eq!(schema["properties"]["impossible"]["type"], "string");
+        assert_eq!(schema["properties"]["implicit"]["type"], "object");
+        assert!(schema["properties"]["inherited"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_object));
+        assert_eq!(
+            schema["properties"]["literal"]["enum"],
+            json!(["true", "false"])
+        );
+        assert_eq!(schema["properties"]["literal"]["nullable"], false);
+    }
+
+    #[test]
+    fn r24_boolean_union_is_normalized_beyond_recursive_cleaner_depth() {
+        let mut schema = json!({"anyOf":[false,true,{"type":"integer"}]});
+        for _ in 0..(MAX_CLEAN_RECURSION_DEPTH + 3) {
+            schema = json!({"type":"array","items":schema});
+        }
+        clean_json_schema(&mut schema).unwrap();
+        let mut leaf = &schema;
+        for _ in 0..(MAX_CLEAN_RECURSION_DEPTH + 3) {
+            leaf = &leaf["items"];
+        }
+        assert_eq!(leaf["anyOf"], json!([{"type":"string"},{"type":"integer"}]));
     }
 }

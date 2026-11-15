@@ -771,7 +771,9 @@ fn inspect_gemini_candidate_parts(
                     *saw_content = true;
                 }
             }
-            if crate::proxy::mappers::gemini::has_media(part) {
+            if crate::proxy::mappers::gemini::has_media(part)
+                || super::stream_error::has_code_execution_output(part)
+            {
                 *saw_content = true;
             }
             if part.get("functionCall").is_some() {
@@ -1255,6 +1257,48 @@ mod continuation_accounting_tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn r26_code_output_finishes_without_auto_heal_but_thinking_alone_still_continues() {
+        for code in [
+            json!({"executableCode":{"language":"PYTHON","code":"print(42)"}}),
+            json!({"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"42"}}),
+            json!({"executable_code":{"code":"print(42)"}}),
+            json!({"code_execution_result":{"output":"42"}}),
+        ] {
+            for thinking in [false, true] {
+                let mut parts = vec![code.clone()];
+                if thinking {
+                    parts.insert(0, json!({"thought":true,"text":"computing"}));
+                }
+                let mut state = EmptyThinkingState::default();
+                let input = json!({"response":{"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}});
+                let output = parsed(state.process(event(input.clone())).unwrap());
+                assert_eq!(output, input, "code output must keep its terminal frame");
+                assert!(!state.needs_continuation());
+                assert!(state.continuation_is_complete());
+            }
+        }
+        let mut state = EmptyThinkingState::default();
+        let output = parsed(
+            state
+                .process(event(json!({"candidates":[{"content":{"parts":[
+            {"thought":true,"text":"computing"},{"codeExecutionResult":{"output":""}}
+        ]},"finishReason":"STOP"}]})))
+                .unwrap(),
+        );
+        assert!(state.needs_continuation());
+        assert!(!state.continuation_is_complete());
+        assert!(output["candidates"][0].get("finishReason").is_none());
+    }
+
+    #[test]
+    fn r26_code_output_without_finish_does_not_complete_continuation() {
+        let mut state = EmptyThinkingState::default();
+        state.observe(&json!({"candidates":[{"content":{"parts":[{"codeExecutionResult":{"output":"42"}}]}}]}));
+        assert!(!state.continuation_is_complete());
+        assert!(!state.needs_continuation());
     }
     #[test]
     fn continuation_empty_or_unspecified_finish_is_not_successful_wire() {

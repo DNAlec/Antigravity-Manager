@@ -53,6 +53,10 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
         self.state.message_stop_sent
     }
 
+    fn upstream_completion(&self) -> Option<bool> {
+        Some(self.state.pending_finish_reason.is_some() || self.state.message_stop_sent)
+    }
+
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
         self.state
             .pending_finish_reason
@@ -115,7 +119,7 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
             return out;
         }
 
-        // 异常收尾终结事件：纯净收尾，绝不篡改模型正文；工具调用优先 tool_use，纯文本断流标记 stop_reason: max_tokens
+        // Keep readable partial content, but do not synthesize a completed turn.
         out.extend(emit_abnormal_force_stop(&mut self.state, error_report));
         out
     }
@@ -226,7 +230,43 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_claude_sse_stream_with_selection(
+        gemini_stream,
+        trace_id,
+        email,
+        session_id,
+        scaling_enabled,
+        context_limit,
+        estimated_prompt_tokens,
+        message_count,
+        client_adapter,
+        registered_tool_names,
+        text_context_anchor,
+        Default::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_claude_sse_stream_with_selection<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    trace_id: String,
+    email: String,
+    session_id: Option<String>, // [NEW v3.3.17] Session ID for signature caching
+    scaling_enabled: bool,      // [NEW] Flag for context usage scaling
+    context_limit: u32,
+    estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
+    message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
+    client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
+    _registered_tool_names: Vec<String>,  // Retained for constructor compatibility.
+    text_context_anchor: Option<String>,
+    candidate_selection: crate::proxy::pipeline::candidate_selection::CandidateSelection,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let mut state = StreamingState::new();
+    state.candidate_selection = candidate_selection;
     if let Some(anchor) = text_context_anchor {
         state.thinking_acc = state.thinking_acc.with_text_context_anchor(anchor);
     }
@@ -237,7 +277,6 @@ where
     state.context_limit = context_limit;
     state.estimated_prompt_tokens = estimated_prompt_tokens;
     state.set_client_adapter(client_adapter);
-    state.set_registered_tool_names(registered_tool_names);
 
     let session_str = state.session_id.clone().unwrap_or_else(|| "-".to_string());
     let trace_info = format!(
@@ -288,6 +327,8 @@ fn process_sse_line(
     }
 
     if data_str == "[DONE]" {
+        // A transport sentinel cannot replace a missing model finish reason.
+        state.pending_finish_reason.as_ref()?;
         let chunks = emit_force_stop(state);
         if chunks.is_empty() {
             return None;
@@ -296,12 +337,14 @@ fn process_sse_line(
     }
 
     // 解析 JSON
-    let json_value: serde_json::Value = match serde_json::from_str(data_str) {
+    let mut json_value: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
     let mut chunks = Vec::new();
+
+    state.candidate_selection.project(&mut json_value);
 
     // 解包 response 字段 (如果存在)
     let raw_json = json_value.get("response").unwrap_or(&json_value);
@@ -354,6 +397,7 @@ fn process_sse_line(
 
     // 处理所有 parts
     state.media.begin_frame();
+    state.tool_calls.begin_frame();
     state.media_candidate = raw_json
         .get("candidates")
         .and_then(serde_json::Value::as_array)
@@ -367,8 +411,22 @@ fn process_sse_line(
         .and_then(|p| p.as_array())
     {
         for part_value in parts {
-            state.thinking_acc.ingest_part(part_value);
-            if let Ok(part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
+            if let Ok(mut part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
+                if let Some(call) = part_value.get("functionCall") {
+                    let tracked = state
+                        .tool_calls
+                        .track_snapshot(state.media_candidate.unwrap_or(0), call);
+                    if !tracked.is_new {
+                        if let Some(signature) = part.thought_signature {
+                            state.pending_tool_signatures.push((tracked.id, signature));
+                        }
+                        continue;
+                    }
+                    if let Some(call) = &mut part.function_call {
+                        call.id = Some(tracked.id);
+                    }
+                }
+                state.thinking_acc.ingest_part(part_value);
                 let mut processor = PartProcessor::new(state);
                 chunks.extend(processor.process(&part));
             }
@@ -416,6 +474,7 @@ fn process_sse_line(
         if state.has_thinking
             && !state.has_content
             && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
+            && !crate::proxy::pipeline::stream_error::is_failure_finish_reason(finish_reason)
         {
             tracing::warn!(
                 "[{}] Upstream emitted finishReason '{}' after thinking without content. Suppressing message_stop to allow native client retry.",
@@ -471,6 +530,86 @@ mod usage_tail_tests {
     use super::*;
     use futures::StreamExt;
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    async fn r26_claude_cumulative_tools_emit_each_independent_call_once() {
+        let anonymous = json!({"functionCall":{"name":"inspect","args":{"path":"src"}}});
+        let first = json!({"functionCall":{"id":"first","name":"inspect","args":{}}});
+        let second = json!({"functionCall":{"id":"second","name":"inspect","args":{}}});
+        let parts = json!([anonymous.clone(), anonymous, first, second]);
+        let frames = [
+            frame(json!({"candidates":[{"index":3,"content":{"parts":parts.clone()}}]})),
+            frame(
+                json!({"candidates":[{"index":3,"content":{"parts":parts},"finishReason":"STOP"}]}),
+            ),
+        ];
+        let output = events(Box::pin(futures::stream::iter(frames))).await;
+        let calls: Vec<_> = output
+            .iter()
+            .filter_map(|event| {
+                (event["type"] == "content_block_start"
+                    && event["content_block"]["type"] == "tool_use")
+                    .then_some(&event["content_block"])
+            })
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        assert_eq!(calls[2]["id"], "first");
+        assert_eq!(calls[3]["id"], "second");
+        assert!(output
+            .iter()
+            .any(|event| event["delta"]["stop_reason"] == "tool_use"));
+    }
+
+    #[test]
+    fn r26_claude_repeated_tool_keeps_late_signature_without_reopening_block() {
+        let mut state = StreamingState::new();
+        let call = json!({"functionCall":{"id":"same","name":"inspect","args":{}}});
+        let first = format!(
+            "data: {}",
+            json!({"candidates":[{"content":{"parts":[call.clone()]}}]})
+        );
+        process_sse_line(&first, &mut state, "r26", "r26@example.test");
+        let mut signed = call;
+        signed["thoughtSignature"] = json!("late-signature");
+        let second = format!(
+            "data: {}",
+            json!({"candidates":[{"content":{"parts":[signed]}}]})
+        );
+        let output = process_sse_line(&second, &mut state, "r26", "r26@example.test");
+        assert!(output.is_none());
+        assert_eq!(
+            state.pending_tool_signatures,
+            vec![("same".into(), "late-signature".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn r26_claude_changed_argument_snapshots_keep_existing_emission_behavior() {
+        let frames = [
+            frame(
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","name":"inspect","args":{"path":"first"}}}]}}]}),
+            ),
+            frame(
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","name":"inspect","args":{"path":"updated"}}}]},"finishReason":"STOP"}]}),
+            ),
+        ];
+        let output = events(Box::pin(futures::stream::iter(frames))).await;
+        let arguments: Vec<Value> = output
+            .iter()
+            .filter_map(|event| {
+                event["delta"]["partial_json"]
+                    .as_str()
+                    .map(|value| serde_json::from_str(value).unwrap())
+            })
+            .collect();
+        // Deduplication is limited to repeated complete snapshots. Supporting
+        // argument replacement in emitted blocks requires a separate contract.
+        assert_eq!(
+            arguments,
+            vec![json!({"path":"first"}), json!({"path":"updated"})]
+        );
+    }
 
     async fn events(
         source: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,
@@ -706,32 +845,42 @@ pub fn emit_force_stop(state: &mut StreamingState) -> Vec<Bytes> {
     vec![]
 }
 
-/// 发送异常中断强制结束事件：纯净收尾，绝不篡改模型正文；保护工具调用契约
+/// Preserve truncated text, but report unfinished tool turns as failures.
 pub fn emit_abnormal_force_stop(
     state: &mut StreamingState,
-    _error_report: &StreamErrorReport,
+    error_report: &StreamErrorReport,
 ) -> Vec<Bytes> {
     if state.message_stop_sent {
         return vec![];
     }
-
+    // Text clients preserve partial answers on max_tokens. Tool execution needs
+    // a real model terminal and must never be authorized by this fallback.
+    if !state.used_tool {
+        let usage = state.last_usage.clone();
+        return state.emit_finish(Some("MAX_TOKENS"), usage.as_ref());
+    }
     let mut chunks = Vec::new();
-
-    // 若当前仍有未闭合的 content_block，下发 content_block_stop 优雅闭合
-    if state.current_block_type() != BlockType::None {
+    if state.current_block_type() != BlockType::Function {
         chunks.extend(state.end_block());
     }
-
-    let usage = state.last_usage.clone();
-    // emit_finish 内部按优先级判定 stop_reason：若 self.used_tool == true，严格保持 "tool_use"；
-    // 仅当纯文本生成断流时，才标记为截断语义 "max_tokens"
-    chunks.extend(state.emit_finish(Some("MAX_TOKENS"), usage.as_ref()));
-    if !state.message_stop_sent {
-        chunks.push(Bytes::from(
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        ));
-        state.message_stop_sent = true;
+    let mut error = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "code": "upstream_interrupted",
+            "message": error_report.client_message(),
+        }
+    });
+    if let Some(usage) = state.last_usage.as_ref() {
+        error["usage"] = serde_json::to_value(utils::to_claude_usage(
+            usage,
+            state.scaling_enabled,
+            state.context_limit,
+        ))
+        .unwrap_or_default();
     }
+    chunks.push(state.emit("error", error));
+    state.message_stop_sent = true;
     chunks
 }
 
@@ -925,18 +1074,24 @@ mod tests {
     }
 
     #[test]
-    fn test_process_sse_line_done() {
-        let mut state = StreamingState::new();
-        let result = process_sse_line("data: [DONE]", &mut state, "test_id", "test@example.com");
-        assert!(result.is_some());
-        let chunks = result.unwrap();
-        assert!(!chunks.is_empty());
-
-        let all_text: String = chunks
-            .iter()
-            .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default())
-            .collect();
-        assert!(all_text.contains("message_stop"));
+    fn test_process_sse_line_done_requires_model_finish() {
+        for finish in [None, Some("STOP")] {
+            let mut state = StreamingState::new();
+            state.pending_finish_reason = finish.map(str::to_owned);
+            let result =
+                process_sse_line("data: [DONE]", &mut state, "test_id", "test@example.com");
+            if finish.is_none() {
+                assert!(result.is_none());
+                assert!(!state.message_stop_sent);
+            } else {
+                let output: String = result
+                    .unwrap()
+                    .iter()
+                    .map(|bytes| String::from_utf8_lossy(bytes))
+                    .collect();
+                assert!(output.contains("message_stop"));
+            }
+        }
     }
 
     #[test]
@@ -1036,8 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_claude_sse_stream_mid_stream_interruption_gracefully_finalizes_with_terminal_triad(
-    ) {
+    async fn test_create_claude_sse_stream_mid_stream_interruption_preserves_partial_with_limit() {
         use futures::StreamExt;
 
         // 模拟一个发送了部分内容后发生网络中断的流
@@ -1088,38 +1242,19 @@ mod tests {
             "Must NOT inject bilingual gateway notice"
         );
 
-        // 3. [黄金三元组契约] 必须优雅闭合 content_block 并下发 message_delta(max_tokens) + message_stop，
-        // 满足 qu !== null && zb && El === null，激活客户端 keepPartial 豁免逻辑，杜绝丢弃已生成 Token 与重思死循环
-        assert!(
-            output.contains("content_block_stop"),
-            "Must close open content block with content_block_stop"
-        );
-        assert!(
-            output.contains(r#""stop_reason":"max_tokens""#),
-            "Must emit stop_reason max_tokens to align with length/interruption semantics"
-        );
-        assert!(
-            output.contains("event: message_stop"),
-            "Must emit message_stop to finish SSE stream"
-        );
-
-        // 4. 严禁在已输出内容后发送 event: error 或 overloaded_error
-        assert!(
-            !output.contains("event: error"),
-            "Must NOT emit event: error after content was already emitted"
-        );
-        assert!(
-            !output.contains(r#""type":"overloaded_error""#),
-            "Must NOT emit overloaded_error which triggers infinite client retries"
-        );
+        assert!(output.contains("content_block_stop"));
+        assert!(!output.contains("event: error"));
+        assert!(output.contains("event: message_stop"));
+        assert!(output.contains(r#""stop_reason":"max_tokens""#));
+        assert!(!output.contains(r#""type":"overloaded_error""#));
         assert!(
             !error_propagated,
-            "Mid-stream network error must NOT propagate as raw Err after content emitted"
+            "Partial text must retain a valid terminal"
         );
     }
 
     #[tokio::test]
-    async fn test_create_claude_sse_stream_tool_call_interruption_preserves_tool_use_stop_reason() {
+    async fn test_create_claude_sse_stream_tool_call_interruption_does_not_authorize_execution() {
         use futures::StreamExt;
 
         // 模拟一个发送了工具调用后发生网络中断的流
@@ -1149,18 +1284,10 @@ mod tests {
         }
         let output = all_chunks.join("");
 
-        // 核心契约保护：已有工具调用时，必须严格保持 stop_reason: tool_use，绝不可覆盖为 max_tokens
         assert!(output.contains(r#""name":"bash""#));
-        assert!(
-            output.contains(r#""stop_reason":"tool_use""#),
-            "Tool call interruption must strictly preserve stop_reason: tool_use, got: {}",
-            output
-        );
-        assert!(
-            !output.contains(r#""stop_reason":"max_tokens""#),
-            "Tool call interruption must NOT be overwritten by max_tokens"
-        );
-        assert!(output.contains("event: message_stop"));
+        assert!(output.contains(r#""code":"upstream_interrupted""#));
+        assert!(!output.contains(r#""stop_reason":"tool_use""#));
+        assert!(!output.contains("event: message_stop"));
     }
 
     #[tokio::test]
@@ -1514,7 +1641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clean_upstream_eof_without_finish_reason_emits_valid_completion_triplet() {
+    async fn test_clean_upstream_eof_without_finish_reason_preserves_text_as_truncated() {
         use futures::StreamExt;
 
         // 模拟正常生成文本后，上游连接正常 EOF (返回 None) 但未显式下发 finishReason
@@ -1557,28 +1684,12 @@ mod tests {
         }
         let output = all_chunks.join("");
 
-        // 验证 Claude Code 终止三元组 complete: bf !== null && Kw && fd === null
-        // 1. content_block_stop 必须发出，确保 active block 指针 fd 被重置为 null (防止 StreamTruncatedError)
-        assert!(
-            output.contains("event: content_block_stop"),
-            "Must close content block before message_stop"
-        );
-
-        // 2. message_delta 必须发出有效 stop_reason ("end_turn") 且保留 usage
-        assert!(
-            output.contains(r#""stop_reason":"end_turn""#),
-            "Must emit stop_reason end_turn on clean EOF"
-        );
-        assert!(
-            output.contains(r#""output_tokens":35"#),
-            "Must preserve usage on clean EOF"
-        );
-
-        // 3. message_stop 必须发出
-        assert!(
-            output.contains("event: message_stop"),
-            "Must emit message_stop on clean EOF"
-        );
+        assert!(output.contains("Code refactored cleanly."));
+        assert!(output.contains("event: content_block_stop"));
+        assert!(output.contains(r#""stop_reason":"max_tokens""#));
+        assert!(output.contains(r#""output_tokens":35"#));
+        assert!(!output.contains(r#""stop_reason":"end_turn""#));
+        assert!(output.contains("event: message_stop"));
     }
 
     #[test]

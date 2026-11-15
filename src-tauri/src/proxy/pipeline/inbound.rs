@@ -37,6 +37,42 @@ pub fn routing_effort<'a>(explicit_disable: bool, effort: Option<&'a str>) -> Op
     }
 }
 
+/// 从 JSON 值提取思考等级文本（同时兼容 `"LOW"/"HIGH"` 字符串与 `1/2/3/100` 整数）
+pub fn extract_thinking_level_str(val: &Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+        return None;
+    }
+    val.as_i64()
+        .or_else(|| val.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .map(|n| n.to_string())
+}
+
+/// 将官方目录/请求中的 `thinkingLevel` 原值转换为上游出站 JSON 值：
+/// - `1 / low` -> `"LOW"`
+/// - `2 / medium` -> `"MEDIUM"`
+/// - `3 / high` -> `"HIGH"`
+/// - `xhigh / x-high` -> `"XHIGH"`（不合并进 HIGH，保留独立档位语义）
+/// - `4`（历史未同步占位值）-> `"HIGH"` 兼容兜底
+/// - `> 4` 的扩展整数（如官方实抓 `100`）-> 原样保留整数 JSON 值
+fn parse_official_thinking_level_value(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().replace('_', "-").as_str() {
+        "1" | "low" => Some(json!("LOW")),
+        "2" | "medium" => Some(json!("MEDIUM")),
+        "3" | "4" | "high" => Some(json!("HIGH")),
+        "xhigh" | "x-high" => Some(json!("XHIGH")),
+        _ => trimmed
+            .parse::<i64>()
+            .ok()
+            .filter(|&n| n > 4)
+            .map(|n| json!(n)),
+    }
+}
+
 /// 统一归一化提取客户端思考开关状态（适用于 OpenAI / Claude / Gemini / Codex 等所有协议）
 pub fn extract_client_thinking_switch(
     thinking_type: Option<&str>,
@@ -144,6 +180,9 @@ impl InboundThinkingPipeline {
         // 彻底解决不同客户端在 tool call ID 格式上不一致（如缺少下划线 `call573077` vs `call_573077`）的问题，
         // 将 `functionCall.id` 与 `functionResponse.id` 统一对齐为带 `_` 的标准形态 (`call_...`)。
         Self::normalize_tool_call_ids(contents);
+        if is_claude {
+            Self::pair_missing_tool_call_ids(contents);
+        }
 
         // 0.05 工具名称双向自愈与非法回执降级防护（Pipeline First 统一治理，Fixes #3679）：
         Self::repair_and_sanitize_tool_names(contents);
@@ -454,48 +493,6 @@ impl InboundThinkingPipeline {
                                         "[InboundPipeline] Dropped placeholder text part (text={:?})",
                                         raw_text
                                     );
-                                    continue;
-                                }
-
-                                // 跨家族协议自愈：检查是否夹带 <think> 标签包裹的思考内容（如从 Claude 跨切回 Gemini）
-                                if let Some((extracted_thought, clean_visible)) =
-                                    crate::proxy::thinking_store::extract_think_tags(raw_text)
-                                {
-                                    if thinking_part.is_none() && is_thinking_enabled {
-                                        if crate::proxy::thinking_store::is_meaningful_thought(
-                                            &extracted_thought,
-                                        ) {
-                                            // 铁律 I4：思考块绝不携带签名
-                                            // （官方报文里 thought:true 的 part 没有 thoughtSignature）
-                                            let t_obj = json!({
-                                                "text": extracted_thought.as_str(),
-                                                "thought": true,
-                                            });
-                                            thinking_part = Some(t_obj);
-                                        }
-                                    }
-                                    if !clean_visible.is_empty() {
-                                        other_parts.push(json!({ "text": clean_visible }));
-                                    }
-                                    continue;
-                                }
-
-                                // 协议无关自愈：检查是否夹带旧版遗留思考前缀 (如 **Thinking**)
-                                if raw_text.trim_start().starts_with("**Thinking**") {
-                                    let clean_thought = Self::strip_thinking_prefix(raw_text);
-                                    if thinking_part.is_none() && is_thinking_enabled {
-                                        if crate::proxy::thinking_store::is_meaningful_thought(
-                                            &clean_thought,
-                                        ) {
-                                            // 铁律 I4：思考块绝不携带签名
-                                            let t_obj = json!({
-                                                "text": clean_thought,
-                                                "thought": true,
-                                            });
-                                            thinking_part = Some(t_obj);
-                                        }
-                                    }
-                                    // 若已有思考块，该遗留思考块作为陈旧副本剥离，防止二次污染正文
                                     continue;
                                 }
 
@@ -1056,19 +1053,118 @@ impl InboundThinkingPipeline {
         pruned_count
     }
 
+    /// Claude requires IDs even for native Gemini calls that omitted them.
+    /// Pair by pending occurrence across split result contents, reserving every
+    /// explicit ID before allocating any synthetic one.
+    fn pair_missing_tool_call_ids(contents: &mut [Value]) {
+        use std::collections::{HashMap, HashSet};
+        let mut used: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .flat_map(|part| {
+                [
+                    part["functionCall"]["id"].as_str(),
+                    part["functionResponse"]["id"].as_str(),
+                ]
+            })
+            .flatten()
+            .map(str::to_owned)
+            .collect();
+        let explicit_results: HashSet<String> = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .filter_map(|part| part["functionResponse"]["id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        let mut counters = HashMap::<String, usize>::new();
+        let mut pending = Vec::<(String, String)>::new();
+        let mut results_started = false;
+        for content in contents {
+            let is_model = matches!(content["role"].as_str(), Some("model" | "assistant"));
+            let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let has_calls = parts.iter().any(|part| part.get("functionCall").is_some());
+            let has_results = parts
+                .iter()
+                .any(|part| part.get("functionResponse").is_some());
+            if (is_model && results_started) || (!is_model && !has_calls && !has_results) {
+                pending.clear();
+                results_started = false;
+            }
+            for part in parts {
+                if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
+                    let Some(name) = call.get("name").and_then(Value::as_str).map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let id = if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        id.to_owned()
+                    } else {
+                        let counter = counters.entry(name.clone()).or_default();
+                        let id = loop {
+                            let candidate = format!("call_{name}_{counter}");
+                            *counter += 1;
+                            if used.insert(candidate.clone()) {
+                                break candidate;
+                            }
+                        };
+                        call.insert("id".into(), json!(id));
+                        id
+                    };
+                    pending.push((name, id));
+                } else if let Some(response) = part
+                    .get_mut("functionResponse")
+                    .and_then(Value::as_object_mut)
+                {
+                    results_started = true;
+                    let name = response
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    let explicit_id = response.get("id").and_then(Value::as_str);
+                    let position = match explicit_id {
+                        Some(id) => pending.iter().position(|(_, pending_id)| pending_id == id),
+                        None => pending.iter().position(|(pending_name, id)| {
+                            pending_name == &name && !explicit_results.contains(id)
+                        }),
+                    };
+                    if let Some(position) = position {
+                        let (_, id) = pending.remove(position);
+                        if explicit_id.is_none() {
+                            response.insert("id".into(), json!(id));
+                        }
+                    } else if explicit_id.is_none() {
+                        *part = json!({"text":format!("Tool result without matching call ({name}): {}", json!(response))});
+                    }
+                }
+            }
+        }
+    }
+
     /// 工具调用 ID 统一规范化治理（Pipeline First）：
     /// 规范化 contents 中所有的 `functionCall` 与 `functionResponse` 的 `id`，
     /// 统一对齐为带下划线的标准形态 (`call_...`)，杜绝客户端格式漂移导致的签名与思考回填脱落。
     ///
     /// 返回被规范化的 ID 数量。
     pub fn normalize_tool_call_ids(contents: &mut [Value]) -> usize {
+        let normalizer = crate::proxy::common::utils::ToolIdNormalizer::new(
+            contents
+                .iter()
+                .filter_map(|content| content["parts"].as_array())
+                .flatten()
+                .filter_map(|part| part["functionCall"]["id"].as_str()),
+        );
         let mut normalized_count = 0usize;
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts.iter_mut() {
                     if let Some(fc) = part.get_mut("functionCall") {
                         if let Some(id_val) = fc.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fc["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;
@@ -1077,7 +1173,7 @@ impl InboundThinkingPipeline {
                     }
                     if let Some(fr) = part.get_mut("functionResponse") {
                         if let Some(id_val) = fr.get("id").and_then(|v| v.as_str()) {
-                            let norm = crate::proxy::common::utils::normalize_tool_id(id_val);
+                            let norm = normalizer.normalize(id_val);
                             if norm.as_ref() != id_val {
                                 fr["id"] = serde_json::json!(norm.as_ref());
                                 normalized_count += 1;
@@ -1896,48 +1992,63 @@ impl InboundThinkingPipeline {
         let tb_config = crate::proxy::config::get_thinking_budget_config();
 
         // 等级取值优先级：
-        // ① 具名档位后缀（模型名即档位，对齐官方客户端：-low → LOW）
+        // ① 具名档位后缀（模型名即档位：-low → "LOW"；-xhigh 若官方声明扩展数值如 100 则发整数 100）
         // ② 无后缀 / 自适应模型 → 客户端 effort
-        // ③ 官方结构体声明的等级数值（如 tiered=3、2.5-flash=1）
-        // ④ 网关配置 effort → ⑤ MEDIUM 兜底
-        let resolve_level_for_model = |raw_effort: Option<&str>| -> String {
+        // ③ 官方结构体声明的等级数值（如 tiered=3 → "HIGH"、hydrogen-xhigh=100 → 100）
+        // ④ 网关配置 effort → ⑤ "MEDIUM" 兜底
+        let resolve_level_for_model = |raw_effort: Option<&str>| -> Value {
             let lower = target_model.to_lowercase();
+            let official_level_value = official_level.and_then(parse_official_thinking_level_value);
+
             if lower.ends_with("-low")
                 || lower.ends_with("-extra-low")
                 || lower.ends_with("-minimal")
                 || lower.ends_with("-lite")
             {
-                return "LOW".to_string();
+                return json!("LOW");
             }
-            if lower.ends_with("-high")
-                || lower.ends_with("-xhigh")
-                || lower.ends_with("-max")
-                || lower.ends_with("-extreme")
-            {
-                return "HIGH".to_string();
+            if lower.ends_with("-xhigh") {
+                return official_level_value.unwrap_or_else(|| json!("XHIGH"));
+            }
+            if lower.ends_with("-high") || lower.ends_with("-max") || lower.ends_with("-extreme") {
+                return json!("HIGH");
             }
             if lower.ends_with("-medium")
                 || lower.ends_with("-default")
                 || lower.ends_with("-normal")
             {
-                return "MEDIUM".to_string();
+                return json!("MEDIUM");
             }
 
             // 自适应/裸模型：客户端显式档位优先
-            if let Some(eff) =
-                raw_effort.and_then(crate::proxy::model_specs::normalize_client_thinking_level)
-            {
-                return eff.to_string();
+            // 若客户端请求 xhigh / 100：
+            // - 若官方模型支持扩展数字档（如 100）→ 发 100
+            // - 若官方模型仅在标准 1/2/3 三档内（如 3.8-flash-tiered）→ 钳制到 "HIGH"
+            // - 否则原样保留 "XHIGH"，不强行并入 "HIGH"
+            if let Some(raw) = raw_effort {
+                let norm = raw.trim().to_ascii_lowercase().replace('_', "-");
+                let wants_extended =
+                    norm == "xhigh" || norm == "x-high" || norm.parse::<i64>().is_ok_and(|n| n > 4);
+                if wants_extended {
+                    if let Some(val) = official_level_value.as_ref().filter(|v| v.is_number()) {
+                        return val.clone();
+                    }
+                    if official_level
+                        .and_then(|l| l.trim().parse::<i64>().ok())
+                        .is_some_and(|n| (1..=3).contains(&n))
+                    {
+                        return json!("HIGH");
+                    }
+                    return json!("XHIGH");
+                }
+                if let Some(eff) = crate::proxy::model_specs::normalize_client_thinking_level(raw) {
+                    return json!(eff);
+                }
             }
 
-            // 官方结构体声明的等级（数字 1/2/3 或字符串 LOW/MEDIUM/HIGH）
-            if let Some(raw) = official_level {
-                match raw.trim().to_ascii_lowercase().as_str() {
-                    "1" | "low" => return "LOW".to_string(),
-                    "2" | "medium" => return "MEDIUM".to_string(),
-                    "3" | "high" => return "HIGH".to_string(),
-                    _ => {}
-                }
+            // 官方结构体声明的等级（1/2/3 → LOW/MEDIUM/HIGH，100 等扩展数值 → 原样整数）
+            if let Some(val) = official_level_value {
+                return val;
             }
 
             if let Some(eff) = tb_config
@@ -1945,9 +2056,16 @@ impl InboundThinkingPipeline {
                 .as_deref()
                 .and_then(crate::proxy::model_specs::normalize_client_thinking_level)
             {
-                return eff.to_string();
+                if eff == "XHIGH"
+                    && official_level
+                        .and_then(|l| l.trim().parse::<i64>().ok())
+                        .is_some_and(|n| (1..=3).contains(&n))
+                {
+                    return json!("HIGH");
+                }
+                return json!(eff);
             }
-            "MEDIUM".to_string()
+            json!("MEDIUM")
         };
 
         // ════════════════════════════════════════════════════════════════════
@@ -2018,10 +2136,31 @@ impl InboundThinkingPipeline {
         }
 
         // 终审上限保护与不变量协调状态机：
-        // 1. 获取官方模型结构体的物理最大输出硬顶 (safe_limit)
-        let safe_limit = official_info
-            .as_ref()
-            .and_then(|info| info.max_output_tokens)
+        // 1. 优先采信当前选中账号动态拉取的 model_limits，再回退官方模型结构体物理上限，最后兜底 65536
+        let lower_target = target_model.trim().to_lowercase();
+        let base_target = crate::proxy::common::model_mapping::strip_tier_suffix(&lower_target);
+        let std_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model);
+        let token_limit = token.and_then(|t| {
+            t.model_limits
+                .get(target_model)
+                .or_else(|| t.model_limits.get(&lower_target))
+                .or_else(|| t.model_limits.get(&base_target))
+                .or_else(|| {
+                    std_target
+                        .as_deref()
+                        .and_then(|sid| t.model_limits.get(sid))
+                })
+                .copied()
+                .filter(|&v| v > 0)
+                .map(|v| v.max(8192) as i64)
+        });
+        let safe_limit = token_limit
+            .or_else(|| {
+                official_info
+                    .as_ref()
+                    .and_then(|info| info.max_output_tokens)
+            })
             .unwrap_or(65536);
 
         // 客户端/用户当前传入的 maxOutputTokens（若缺省则默认按官方 safe_limit 填齐）
@@ -2150,13 +2289,21 @@ impl InboundThinkingPipeline {
                     changed = true;
                 }
 
-                // 2. thinkingLevel 降级：HIGH 降级为 MEDIUM
+                // 2. thinkingLevel 降级：数字扩展档（如 100）或 XHIGH 降级为 HIGH；HIGH 降级为 MEDIUM
                 if let Some(level_val) = obj.get("thinkingLevel") {
-                    if let Some(level) = level_val.as_str() {
-                        if level.eq_ignore_ascii_case("HIGH") {
-                            obj.insert("thinkingLevel".to_string(), json!("MEDIUM"));
-                            changed = true;
-                        }
+                    if level_val.as_i64().is_some_and(|n| n > 3)
+                        || level_val
+                            .as_str()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("XHIGH"))
+                    {
+                        obj.insert("thinkingLevel".to_string(), json!("HIGH"));
+                        changed = true;
+                    } else if level_val
+                        .as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("HIGH"))
+                    {
+                        obj.insert("thinkingLevel".to_string(), json!("MEDIUM"));
+                        changed = true;
                     }
                 }
             }
@@ -2202,10 +2349,13 @@ impl InboundThinkingPipeline {
             }
         }
 
-        // 检查模型名是否带 -high 后缀，替换为 -medium
+        // 检查模型名是否带 -xhigh / -high 后缀，按档位降一级（-xhigh -> -high, -high -> -medium）
         let mut degrade_model_str = |m_val: &mut Value| {
             if let Some(m_str) = m_val.as_str() {
-                if m_str.ends_with("-high") || m_str.contains("-high") {
+                if let Some(prefix) = m_str.strip_suffix("-xhigh") {
+                    *m_val = json!(format!("{}-high", prefix));
+                    degraded = true;
+                } else if m_str.ends_with("-high") || m_str.contains("-high") {
                     *m_val = json!(m_str.replace("-high", "-medium"));
                     degraded = true;
                 }
@@ -2903,88 +3053,59 @@ impl InboundThinkingPipeline {
         // 7. 处理 requestType
         let mut request_type = body_obj.remove("requestType");
 
-        // 8. 规范化内部 request
-        if let Some(inner_req) = body_obj.get_mut("request") {
-            // [Issue / Defect 18] 若 requestId 仍未生成，根据 sessionId 与 contents 步数提前构建官方 requestId，
-            // 确保后续 align_google_request_prefix_topology_with_model 解析出的 labels.trajectory_id
-            // 与顶层 requestId 中的 trajectory_id 保持 100% 严格同步一致
-            if request_id
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .map_or(true, |s| s.is_empty())
-            {
-                let sid = inner_req
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
-                let step = inner_req
-                    .get("contents")
-                    .and_then(|c| c.as_array())
-                    .map_or(0, |a| a.len() as u64);
-                request_id = Some(json!(
-                    crate::proxy::mappers::common_utils::build_official_request_id(sid, step)
-                ));
-            }
-
-            let top_rid_str = request_id
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            Self::align_google_request_prefix_topology_with_model(
-                inner_req,
-                &model_str,
-                top_rid_str.as_deref(),
-            )?;
-
-            // 若 requestType 缺失，根据 tools 或 contents 判定是否为 agent 请求
-            if request_type.is_none() {
-                let has_tools = inner_req
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map_or(false, |a| !a.is_empty());
-                let has_tool_interactions = inner_req
-                    .get("contents")
-                    .map(crate::proxy::mappers::common_utils::contents_has_tool_interactions)
-                    .unwrap_or(false);
-                if has_tools || has_tool_interactions {
-                    request_type = Some(json!("agent"));
-                }
-            }
+        // 8. 规范化内部 request（若无顶层 request 包装，直接将剩余字段封装为内部 request 对象）
+        let mut inner_req = if let Some(req) = body_obj.remove("request") {
+            req
         } else {
-            // 如果顶层没有 request 包装，直接规范化 body 自身
-            if request_id
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .map_or(true, |s| s.is_empty())
-            {
-                let sid = body
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
-                let step = body
-                    .get("contents")
-                    .and_then(|c| c.as_array())
-                    .map_or(0, |a| a.len() as u64);
-                request_id = Some(json!(
-                    crate::proxy::mappers::common_utils::build_official_request_id(sid, step)
-                ));
-            }
+            Value::Object(std::mem::take(body_obj))
+        };
 
-            let top_rid_str = request_id
-                .as_ref()
+        // [Issue / Defect 18] 若 requestId 仍未生成，根据 sessionId 与 contents 步数提前构建官方 requestId，
+        // 确保后续 align_google_request_prefix_topology_with_model 解析出的 labels.trajectory_id
+        // 与顶层 requestId 中的 trajectory_id 保持 100% 严格同步一致
+        if request_id
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.is_empty())
+        {
+            let sid = inner_req
+                .get("sessionId")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            Self::align_google_request_prefix_topology_with_model(
-                body,
-                &model_str,
-                top_rid_str.as_deref(),
-            )?;
-            return Ok(());
+                .unwrap_or("default");
+            let step = inner_req
+                .get("contents")
+                .and_then(|c| c.as_array())
+                .map_or(0, |a| a.len() as u64);
+            request_id = Some(json!(
+                crate::proxy::mappers::common_utils::build_official_request_id(sid, step)
+            ));
         }
 
-        let inner_request = body_obj.remove("request");
+        let top_rid_str = request_id
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Self::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            &model_str,
+            top_rid_str.as_deref(),
+        )?;
+
+        // 若 requestType 缺失，根据 tools 或 contents 判定是否为 agent 请求
+        if request_type.is_none() {
+            let has_tools = inner_req
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .is_some_and(|a| !a.is_empty());
+            let has_tool_interactions = inner_req
+                .get("contents")
+                .map(crate::proxy::mappers::common_utils::contents_has_tool_interactions)
+                .unwrap_or(false);
+            if has_tools || has_tool_interactions {
+                request_type = Some(json!("agent"));
+            }
+        }
 
         // 9. 顶层严格键序重排:
         // project -> requestId -> request -> model -> userAgent -> requestType -> 其余
@@ -2993,9 +3114,7 @@ impl InboundThinkingPipeline {
         if let Some(rid) = request_id {
             reordered.insert("requestId".to_string(), rid);
         }
-        if let Some(req) = inner_request {
-            reordered.insert("request".to_string(), req);
-        }
+        reordered.insert("request".to_string(), inner_req);
         if let Some(m) = model {
             reordered.insert("model".to_string(), m);
         }
@@ -3026,18 +3145,6 @@ impl InboundThinkingPipeline {
         }
         if let Some(obj) = body.as_object_mut() {
             obj.retain(|k, _| k == "request");
-        }
-    }
-
-    /// 剥离遗留思考块的前缀标记 (**Thinking**)
-    fn strip_thinking_prefix(text: &str) -> String {
-        let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("**Thinking**") {
-            let rest = rest.trim_start_matches(':');
-            rest.trim_start_matches(|c| c == '\r' || c == '\n' || c == ' ' || c == '\t')
-                .to_string()
-        } else {
-            text.to_string()
         }
     }
 }
@@ -3281,6 +3388,25 @@ mod tests {
             &mut body6
         ));
         assert_eq!(body6["model"], "gemini-3.8-flash-medium");
+
+        // Case 7: thinkingLevel == 100 / "XHIGH" 且 -xhigh 模型 -> 降级为 "HIGH" 与 -high
+        let mut body7 = json!({
+            "model": "gemini-4-hydrogen-xhigh",
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingLevel": 100
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body7
+        ));
+        assert_eq!(body7["model"], "gemini-4-hydrogen-high");
+        assert_eq!(
+            body7["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
     }
 
     #[test]
@@ -3351,34 +3477,42 @@ mod tests {
     }
 
     #[test]
-    fn test_heals_legacy_thinking_prefix_without_corrupting_prose() {
-        let mut contents = vec![json!({
-            "role": "model",
-            "parts": [
-                { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
-                { "text": "正在执行检查。" },
-                {
-                    "functionCall": {
-                        "name": "inspect",
-                        "args": {}
-                    }
-                }
-            ]
-        })];
+    fn r30_markdown_thinking_headings_remain_plain_text_for_every_target() {
+        for model in ["claude-sonnet-4-6", "gemini-2.5-pro"] {
+            for enabled in [false, true] {
+                let mut contents = vec![json!({
+                    "role": "model",
+                    "parts": [
+                        { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
+                        { "text": "正在执行检查。" },
+                        {
+                            "functionCall": {
+                                "name": "inspect",
+                                "args": {}
+                            }
+                        }
+                    ]
+                })];
 
-        InboundThinkingPipeline::process_contents(
-            &mut contents,
-            "claude-sonnet-4-6",
-            true,
-            None,
-            false,
-        );
+                InboundThinkingPipeline::process_contents(
+                    &mut contents,
+                    model,
+                    enabled,
+                    None,
+                    false,
+                );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：无签名思考块被丢弃，仅保留可见正文与工具调用
-        assert!(parts.iter().all(|p| p.get("thought").is_none()));
-        assert_eq!(parts[0]["text"], "正在执行检查。");
-        assert!(parts[1].get("functionCall").is_some());
+                let parts = contents[0]["parts"].as_array().expect("parts array");
+                assert!(parts.iter().all(|p| p.get("thought").is_none()));
+                assert_eq!(parts.len(), 3);
+                assert_eq!(
+                    parts[0]["text"],
+                    "**Thinking**\n\n分析了案例数据，准备调用工具。"
+                );
+                assert_eq!(parts[1]["text"], "正在执行检查。");
+                assert!(parts[2].get("functionCall").is_some());
+            }
+        }
     }
 
     #[test]
@@ -3667,17 +3801,23 @@ mod tests {
 
     #[test]
     fn test_inbound_pipeline_empty_tool_result_sanitizes_to_default_output() {
-        let mut contents = vec![json!({
-            "role": "user",
-            "parts": [{
-                "functionResponse": {
-                    "name": "edit_file",
-                    "response": {
-                        "output": "   "
+        let mut contents = vec![
+            json!({
+                "role":"model",
+                "parts":[{"functionCall":{"name":"edit_file","args":{}}}]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "edit_file",
+                        "response": {
+                            "output": "   "
+                        }
                     }
-                }
-            }]
-        })];
+                }]
+            }),
+        ];
 
         InboundThinkingPipeline::process_contents(
             &mut contents,
@@ -3687,10 +3827,12 @@ mod tests {
             false,
         );
 
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        let output_text = parts[0]["functionResponse"]["response"]["output"]
-            .as_str()
-            .unwrap();
+        let output_text = contents
+            .iter()
+            .filter_map(|content| content["parts"].as_array())
+            .flatten()
+            .find_map(|part| part["functionResponse"]["response"]["output"].as_str())
+            .expect("matched tool result output");
         assert_eq!(output_text, "Command executed successfully.");
     }
 
@@ -3854,50 +3996,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_family_think_tag_extraction_and_elevation_for_gemini() {
-        let thought_text = "Analyzing user code structure and determining route.";
-        let visible_answer = "The issue has been identified and isolated.";
-        let wrapped_text = format!("<think>\n{}\n</think>\n\n{}", thought_text, visible_answer);
-
-        let mut contents = vec![json!({
-            "role": "model",
-            "parts": [
-                { "text": wrapped_text }
-            ]
-        })];
-
-        // 1. 测试 Claude 目标：成功提升为 thought: true 思考块并保留正文回答
-        let mut claude_contents = contents.clone();
-        InboundThinkingPipeline::process_contents(
-            &mut claude_contents,
+    fn r32_plain_think_tags_remain_visible_across_model_families() {
+        let wrapped = "<think>Business XML, not protocol metadata.</think>Visible answer.";
+        for model in [
             "claude-sonnet-4-6",
-            true,
-            None,
-            false,
-        );
-        let c_parts = claude_contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：思考块被丢弃，仅保留可见正文（具体文本随协议归一化而变）
-        assert!(c_parts.iter().all(|p| p.get("thought").is_none()));
-        assert!(!c_parts.is_empty());
-
-        // 2. 测试 Gemini 目标：历史模型轮次存在可见正文时依规剥离思考块，保留纯净回答
-        InboundThinkingPipeline::process_contents(
-            &mut contents,
             "gemini-3.8-flash-tiered",
-            true,
-            None,
-            false,
-        );
-
-        let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 新规则：思考块被剥离，但可见正文必须保留（位置随归一化而变）
-        assert!(
-            parts
-                .iter()
-                .any(|p| p["text"].as_str() == Some(visible_answer)),
-            "可见正文必须保留"
-        );
-        assert!(parts.iter().all(|p| p.get("thought").is_none()));
+            "gemini-2.5-flash",
+        ] {
+            for thinking in [false, true] {
+                let mut contents = vec![json!({"role":"model","parts":[{"text":wrapped}]})];
+                InboundThinkingPipeline::process_contents(
+                    &mut contents,
+                    model,
+                    thinking,
+                    None,
+                    false,
+                );
+                let parts = contents[0]["parts"].as_array().unwrap();
+                assert!(parts.iter().any(|part| part["text"] == wrapped));
+                assert!(parts.iter().all(|part| part.get("thought").is_none()));
+            }
+        }
     }
 
     // ============ 工具回执（functionResponse）role 归一化 ============
@@ -5956,6 +6075,300 @@ mod tests {
         assert!(parts2[2].get("thoughtSignature").is_none());
         assert_eq!(parts2[3]["thoughtSignature"], claude_sig);
         assert!(parts2[4].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn test_configure_inbound_thinking_preserves_token_model_limit_and_xhigh_level() {
+        let mut token = crate::proxy::token_manager::ProxyToken {
+            account_id: "g4_limit_test".to_string(),
+            priority: crate::models::account::default_priority(),
+            model_priorities: std::collections::HashMap::new(),
+            access_token: "atk".to_string(),
+            refresh_token: "rtk".to_string(),
+            expires_in: 3600,
+            timestamp: chrono::Utc::now().timestamp() + 3600,
+            email: "g4@test.com".to_string(),
+            account_path: std::path::PathBuf::from("/tmp/g4"),
+            project_id: None,
+            subscription_tier: Some("PRO".to_string()),
+            remaining_quota: Some(100),
+            protected_models: std::collections::HashSet::new(),
+            forbidden_models: std::collections::HashSet::new(),
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: std::collections::HashMap::new(),
+            model_limits: std::collections::HashMap::from([(
+                "gemini-4-helium-xhigh".to_string(),
+                262144u64,
+            )]),
+            available_models: std::collections::HashSet::new(),
+            model_metadata: std::collections::HashMap::new(),
+            model_reset_times: std::collections::HashMap::new(),
+            model_weekly_reset_times: std::collections::HashMap::new(),
+            model_quota_windows: std::collections::HashMap::new(),
+        };
+
+        let mut gen_cfg = json!({"maxOutputTokens": 200000});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-4-helium-xhigh",
+            &mut gen_cfg,
+            ClientThinkingSwitch::Default,
+            None,
+            None,
+            Some(&token),
+        );
+        // Must preserve upstream 262144 ceiling rather than clamping down to default 65536
+        assert_eq!(gen_cfg["maxOutputTokens"], 200000);
+
+        // Bare model without catalog entry falls back cleanly via base limit in token.model_limits
+        token
+            .model_limits
+            .insert("gemini-4-helium".to_string(), 262144u64);
+        let mut bare_cfg = json!({"maxOutputTokens": 300000});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-4-helium",
+            &mut bare_cfg,
+            ClientThinkingSwitch::Default,
+            Some("xhigh"),
+            None,
+            Some(&token),
+        );
+        assert_eq!(bare_cfg["maxOutputTokens"], 262144);
+
+        // Cataloged -xhigh model (official thinkingLevel=100) emits numeric 100 and respects token.model_limits
+        token
+            .model_limits
+            .insert("gemini-4-hydrogen-xhigh".to_string(), 262144u64);
+        let mut xhigh_cfg = json!({"maxOutputTokens": 262144});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-4-hydrogen-xhigh",
+            &mut xhigh_cfg,
+            ClientThinkingSwitch::Default,
+            None,
+            None,
+            Some(&token),
+        );
+        assert_eq!(xhigh_cfg["maxOutputTokens"], 262144);
+        assert_eq!(xhigh_cfg["thinkingConfig"]["thinkingLevel"], json!(100));
+
+        // Cataloged 1/2/3 Hydrogen variants map to LOW / MEDIUM / HIGH
+        for (model_id, expected_level) in [
+            ("gemini-4-hydrogen-low", "LOW"),
+            ("gemini-4-hydrogen-medium", "MEDIUM"),
+            ("gemini-4-hydrogen-high", "HIGH"),
+        ] {
+            let mut tier_cfg = json!({"maxOutputTokens": 262144});
+            InboundThinkingPipeline::configure_inbound_thinking(
+                model_id,
+                &mut tier_cfg,
+                ClientThinkingSwitch::Default,
+                None,
+                None,
+                Some(&token),
+            );
+            assert_eq!(
+                tier_cfg["thinkingConfig"]["thinkingLevel"],
+                json!(expected_level)
+            );
+        }
+
+        // Dynamic catalog entry with numeric thinkingLevel=100 (live upstream xhigh format) resolves bare model to 100
+        let mut helium_info = crate::models::OfficialModelCatalog::default_model();
+        helium_info.display_name = Some("Gemini 4 Helium (XHigh)".to_string());
+        helium_info.model = "MODEL_HELIUM".to_string();
+        helium_info.max_output_tokens = Some(262144);
+        helium_info.thinking_level = Some("100".to_string());
+        crate::models::OfficialModelCatalog::update(std::collections::HashMap::from([(
+            "gemini-4-helium-xhigh".to_string(),
+            helium_info,
+        )]));
+        let mut live_xhigh_bare_cfg = json!({"maxOutputTokens": 300000});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-4-helium",
+            &mut live_xhigh_bare_cfg,
+            ClientThinkingSwitch::Default,
+            Some("100"),
+            None,
+            Some(&token),
+        );
+        assert_eq!(live_xhigh_bare_cfg["maxOutputTokens"], 262144);
+        assert_eq!(
+            live_xhigh_bare_cfg["thinkingConfig"]["thinkingLevel"],
+            json!(100)
+        );
+
+        // Numeric & string extraction helper handles both wire formats cleanly
+        assert_eq!(
+            extract_thinking_level_str(&json!(100)).as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            extract_thinking_level_str(&json!("XHIGH")).as_deref(),
+            Some("XHIGH")
+        );
+
+        // Explicit "xhigh" catalog/client field preserves "XHIGH" instead of merging into "HIGH",
+        // while 3-tier capped models (e.g. gemini-3.8-flash-tiered = "3") stay safely at "HIGH".
+        let mut future_xhigh = crate::models::OfficialModelCatalog::default_model();
+        future_xhigh.model = "MODEL_FUTURE_XHIGH".to_string();
+        future_xhigh.thinking_level = Some("XHIGH".to_string());
+        crate::models::OfficialModelCatalog::update(std::collections::HashMap::from([(
+            "gemini-5-test-xhigh".to_string(),
+            future_xhigh,
+        )]));
+        let mut future_cfg = json!({});
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-5-test-xhigh",
+            &mut future_cfg,
+            ClientThinkingSwitch::Default,
+            Some("xhigh"),
+            None,
+            None,
+        );
+        assert_eq!(
+            future_cfg["thinkingConfig"]["thinkingLevel"],
+            json!("XHIGH")
+        );
+    }
+
+    #[test]
+    fn test_pure_text_turns_after_function_responses_keep_distinct_signatures_on_gemini() {
+        let session_id = format!("t:inbound-fr-plaintext-{}", uuid::Uuid::new_v4());
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&session_id);
+
+        let tool_sig_1 = format!("EsID{}", "a".repeat(56));
+        let text_sig_1 = format!("EtgD{}", "b".repeat(56));
+        let tool_sig_2 = format!("EuID{}", "c".repeat(56));
+        let text_sig_2 = format!("EvID{}", "d".repeat(56));
+
+        // Cycle 1: tool call -> tool response #1 -> outbound pure-text allow #1
+        let mut req1_contents = vec![
+            json!({ "role": "user", "parts": [{ "text": "Check cmd 1" }] }),
+            json!({
+                "role": "model",
+                "parts": [
+                    { "functionCall": { "id": "call_1", "name": "bash", "args": { "cmd": "ls" } }, "thoughtSignature": tool_sig_1 }
+                ]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "id": "call_1", "name": "bash", "response": { "output": "file1" } } }]
+            }),
+        ];
+        InboundThinkingPipeline::process_contents(
+            &mut req1_contents,
+            "gemini-4-hydrogen-low",
+            true,
+            Some(&session_id),
+            false,
+        );
+        // Gemini normalizes functionResponse role from "user" to "model"
+        assert_eq!(req1_contents[2]["role"], "model");
+        crate::proxy::thinking_store::capture_gemini_response_with_preceding(
+            &session_id,
+            &json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": r#"{"outcome":"allow"}"#, "thoughtSignature": text_sig_1 }]
+                    }
+                }]
+            }),
+            req1_contents.last(),
+        );
+
+        // Cycle 2: tool call -> tool response #2 -> outbound pure-text allow #2
+        let mut req2_contents = vec![
+            json!({ "role": "user", "parts": [{ "text": "Check cmd 1" }] }),
+            json!({
+                "role": "model",
+                "parts": [{ "functionCall": { "id": "call_1", "name": "bash", "args": { "cmd": "ls" } } }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "id": "call_1", "name": "bash", "response": { "output": "file1" } } }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{ "text": r#"{"outcome":"allow"}"# }]
+            }),
+            json!({ "role": "user", "parts": [{ "text": "Check cmd 2" }] }),
+            json!({
+                "role": "model",
+                "parts": [
+                    { "functionCall": { "id": "call_2", "name": "bash", "args": { "cmd": "pwd" } }, "thoughtSignature": tool_sig_2 }
+                ]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "id": "call_2", "name": "bash", "response": { "output": "/tmp" } } }]
+            }),
+        ];
+        InboundThinkingPipeline::process_contents(
+            &mut req2_contents,
+            "gemini-4-hydrogen-low",
+            true,
+            Some(&session_id),
+            false,
+        );
+        assert_eq!(req2_contents[3]["parts"][0]["thoughtSignature"], text_sig_1);
+        assert_eq!(req2_contents[6]["role"], "model");
+        crate::proxy::thinking_store::capture_gemini_response_with_preceding(
+            &session_id,
+            &json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": r#"{"outcome":"allow"}"#, "thoughtSignature": text_sig_2 }]
+                    }
+                }]
+            }),
+            req2_contents.last(),
+        );
+
+        // Cycle 3: both pure-text turns following distinct functionResponses must restore their own signatures
+        let mut req3_contents = vec![
+            json!({ "role": "user", "parts": [{ "text": "Check cmd 1" }] }),
+            json!({
+                "role": "model",
+                "parts": [{ "functionCall": { "id": "call_1", "name": "bash", "args": { "cmd": "ls" } } }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "id": "call_1", "name": "bash", "response": { "output": "file1" } } }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{ "text": r#"{"outcome":"allow"}"# }]
+            }),
+            json!({ "role": "user", "parts": [{ "text": "Check cmd 2" }] }),
+            json!({
+                "role": "model",
+                "parts": [{ "functionCall": { "id": "call_2", "name": "bash", "args": { "cmd": "pwd" } } }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "id": "call_2", "name": "bash", "response": { "output": "/tmp" } } }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{ "text": r#"{"outcome":"allow"}"# }]
+            }),
+            json!({ "role": "user", "parts": [{ "text": "Next" }] }),
+        ];
+        InboundThinkingPipeline::process_contents(
+            &mut req3_contents,
+            "gemini-4-hydrogen-low",
+            true,
+            Some(&session_id),
+            false,
+        );
+        assert_eq!(req3_contents[3]["parts"][0]["thoughtSignature"], text_sig_1);
+        assert_eq!(req3_contents[7]["parts"][0]["thoughtSignature"], text_sig_2);
+
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&session_id);
+        crate::proxy::thinking_store::ThinkingStore::global().end_session(&session_id);
     }
 }
 

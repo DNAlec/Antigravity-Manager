@@ -2,7 +2,6 @@
 // 对应 transformClaudeRequestIn
 
 use super::models::*;
-use crate::proxy::mappers::signature_store::get_thought_signature; // Deprecated, kept for fallback
 use crate::proxy::session_manager::SessionManager;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -277,8 +276,6 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Message>) {
     *messages = merged;
 }
 
-/// 转换 Claude 请求为 Gemini v1internal 格式
-
 /// [FIX #709] Reorder serialized Gemini parts to ensure thinking blocks are first,
 /// deduplicate multiple thinking blocks to at most ONE per model turn, and clean out raw dot placeholders.
 fn reorder_gemini_parts(parts: &mut Vec<Value>) {
@@ -454,15 +451,7 @@ pub fn transform_claude_request_in_timed(
     let has_web_search_tool = claude_req
         .tools
         .as_ref()
-        .map(|tools| {
-            tools.iter().any(|t| {
-                t.is_web_search()
-                    || t.name.as_deref() == Some("google_search")
-                    || t.name.as_deref() == Some("builtin_web_search")
-                    || t.type_.as_deref() == Some("web_search_20250305")
-                    || t.type_.as_deref() == Some("builtin_web_search")
-            })
-        })
+        .map(|tools| tools.iter().any(Tool::is_web_search))
         .unwrap_or(false);
 
     // 用于存储 tool_use id -> name 映射
@@ -479,9 +468,6 @@ pub fn transform_claude_request_in_timed(
     }
 
     //  Map model name (Use standard mapping)
-    // [IMPROVED] 提取 web search 模型为常量，便于维护
-    const WEB_SEARCH_FALLBACK_MODEL: &str = "gemini-2.5-flash";
-
     let mapped_model =
         crate::proxy::common::model_mapping::map_claude_model_to_gemini(&claude_req.model);
 
@@ -539,8 +525,6 @@ pub fn transform_claude_request_in_timed(
 
     // Check signature requirements for function calls
     if is_thinking_enabled {
-        let _global_sig = get_thought_signature();
-
         // Check if there are function calls in the request
         let has_function_calls = claude_req.messages.iter().any(|m| {
             if let MessageContent::Array(blocks) = &m.content {
@@ -567,7 +551,7 @@ pub fn transform_claude_request_in_timed(
         has_web_search_tool,
         is_thinking_enabled,
         token, // [NEW] 传递 token 用于动态限额
-    );
+    )?;
 
     // 2. Contents (Messages)
     let contents = build_google_contents(
@@ -1000,6 +984,72 @@ fn append_claude_content_parts(
     Ok(())
 }
 
+/// Server tools already ran in the historical provider session. Keep their
+/// readable results without manufacturing a client function call to replay.
+fn append_server_tool_result_parts(
+    content: &Value,
+    parts: &mut Vec<Value>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_MEDIA_CONTENT_DEPTH {
+        return Err("Server tool result exceeds the maximum nesting depth".into());
+    }
+    if let Some(items) = content.as_array() {
+        for item in items {
+            append_server_tool_result_parts(item, parts, depth + 1)?;
+        }
+        return Ok(());
+    }
+    match content.get("type").and_then(Value::as_str) {
+        Some("web_search_result") => {
+            // Search bodies are opaque, but page names and links are useful history.
+            for (field, label) in [("title", "Search result"), ("url", "URL")] {
+                if let Some(text) = content
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    parts.push(json!({"text": format!("{label}: {text}")}));
+                }
+            }
+        }
+        Some("web_search_tool_result_error") => {
+            let error = json!({
+                "type": "web_search_tool_result_error",
+                "error_code": content.get("error_code").and_then(Value::as_str)
+            });
+            parts.push(json!({"text": error.to_string()}));
+        }
+        Some("web_fetch_result") => {
+            if let Some(url) = content.get("url").and_then(Value::as_str) {
+                parts.push(json!({"text": format!("Fetched URL: {url}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        Some("code_execution_result" | "bash_code_execution_result") => {
+            for key in ["stdout", "stderr"] {
+                if let Some(text) = content
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    parts.push(json!({"text": format!("{key}:\n{text}")}));
+                }
+            }
+            if let Some(code) = content.get("return_code") {
+                parts.push(json!({"text": format!("Exit code: {code}")}));
+            }
+            if let Some(body) = content.get("content") {
+                append_server_tool_result_parts(body, parts, depth + 1)?;
+            }
+        }
+        _ => append_claude_content_parts(content, parts, depth + 1)?,
+    }
+    Ok(())
+}
+
 /// 构建 Contents (Messages)
 fn build_contents(
     content: &MessageContent,
@@ -1015,8 +1065,6 @@ fn build_contents(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     _existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
@@ -1064,12 +1112,10 @@ fn build_contents(
     match content {
         MessageContent::String(text) => {
             if text != "(no content)" {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
+                if !text.trim().is_empty() {
+                    // Leading indentation can make Markdown literal code.
                     parts.extend(
-                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
-                            trimmed,
-                        ),
+                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text),
                     );
                 }
             }
@@ -1077,7 +1123,10 @@ fn build_contents(
         MessageContent::Array(blocks) => {
             for item in blocks {
                 match item {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text }
+                    | ContentBlock::Compaction {
+                        content: Some(text),
+                    } => {
                         if text != "(no content)" && !text.trim().is_empty() {
                             // [2026-09-27] 如果 assistant 消息同时包含 tool_use，且该文本仅为占位符（如 "..."、"·" 等），
                             // 丢弃无实质意义的占位文本，避免在 Gemini 格式转换中被误选为签名锚点，
@@ -1095,36 +1144,18 @@ fn build_contents(
                                 continue;
                             }
 
-                            // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
-                            // 检查该文本是否与上一轮任务描述完全一致。
-                            if !is_assistant && *previous_was_tool_result {
-                                if let Some(last_task) = last_user_task_text_normalized {
-                                    let current_normalized =
-                                        text.replace(|c: char| c.is_whitespace(), "");
-                                    if !current_normalized.is_empty()
-                                        && current_normalized == *last_task
-                                    {
-                                        tracing::info!("[Claude-Request] Dropping duplicated task text echo (len: {})", text.len());
-                                        continue;
-                                    }
-                                }
-                            }
-
                             parts.extend(
                                 crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
                                     text,
                                 ),
                             );
                             saw_non_thinking = true;
-
-                            // 记录最近一次 User 任务文本用于后续比对
-                            if !is_assistant {
-                                *last_user_task_text_normalized =
-                                    Some(text.replace(|c: char| c.is_whitespace(), ""));
-                            }
-                            *previous_was_tool_result = false;
                         }
                     }
+                    // A null compaction summary is a documented failed-compaction no-op.
+                    ContentBlock::Compaction { content: None } => {}
+                    // The provider's fallback boundary is not conversational content.
+                    ContentBlock::Fallback {} => {}
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -1431,14 +1462,126 @@ fn build_contents(
                             response["parts"] = Value::Array(extra_parts);
                         }
                         parts.push(json!({ "functionResponse": response }));
-
-                        // 标记状态，用于下一条 User 消息的去重判断
-                        *previous_was_tool_result = true;
                     }
-                    // ContentBlock::RedactedThinking handled above at line 583
-                    ContentBlock::ServerToolUse { .. }
-                    | ContentBlock::WebSearchToolResult { .. } => {
-                        // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
+                    ContentBlock::AdvisorToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        match content {
+                            AdvisorResultContent::Result { text } => {
+                                if !text.is_empty() {
+                                    parts.push(json!({"text":text}));
+                                }
+                            }
+                            AdvisorResultContent::Error { error_code } => {
+                                parts.push(json!({"text":format!(
+                                    "Advisor tool error (call {tool_use_id}): {error_code}"
+                                )}));
+                            }
+                            AdvisorResultContent::Redacted {} => {
+                                parts.push(json!({"text":format!(
+                                    "Advisor result (call {tool_use_id}) is provider-encrypted; readable content is unavailable."
+                                )}));
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::WebFetchToolResult { content, .. }
+                    | ContentBlock::CodeExecutionToolResult { content, .. } => {
+                        append_server_tool_result_parts(content, &mut parts, 0)?;
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::ToolSearchToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Tool search result (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            ToolSearchResultContent::Found { tool_references } => {
+                                for ToolReference::Tool { tool_name } in tool_references {
+                                    parts.push(
+                                        json!({"text":format!("Discovered tool: {tool_name}")}),
+                                    );
+                                }
+                            }
+                            ToolSearchResultContent::Error {
+                                error_code,
+                                error_message,
+                            } => {
+                                parts.push(
+                                    json!({"text":format!("Tool search failed: {error_code}")}),
+                                );
+                                if let Some(message) = error_message {
+                                    parts.push(json!({"text":message}));
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::SearchResult {
+                        source,
+                        title,
+                        content,
+                    } => {
+                        parts.push(
+                            json!({"text":format!("Search result: {title}\nSource: {source}")}),
+                        );
+                        for McpTextBlock::Text { text } in content {
+                            parts.push(json!({"text":text}));
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::McpToolUse {
+                        id,
+                        name,
+                        server_name,
+                        input,
+                    } => {
+                        parts.push(json!({"text": format!(
+                            "MCP tool {server_name}/{name} (call {id})\nInput: {}", json!(input)
+                        )}));
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::McpToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let status = if *is_error { "error" } else { "result" };
+                        parts.push(
+                            json!({"text": format!("MCP tool {status} (call {tool_use_id}):")}),
+                        );
+                        match content {
+                            McpToolResultContent::Text(text) => parts.push(json!({"text":text})),
+                            McpToolResultContent::Blocks(blocks) => {
+                                for McpTextBlock::Text { text } in blocks {
+                                    parts.push(json!({"text":text}));
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
+                    }
+                    ContentBlock::WebSearchToolResult { content, .. } => {
+                        let previous_len = parts.len();
+                        let results = content
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_else(|| std::slice::from_ref(content));
+                        for result in results {
+                            if matches!(
+                                result.get("type").and_then(Value::as_str),
+                                Some("web_search_result" | "web_search_tool_result_error")
+                            ) {
+                                append_server_tool_result_parts(result, &mut parts, 0)?;
+                            }
+                        }
+                        saw_non_thinking |= parts.len() > previous_len;
+                    }
+                    ContentBlock::ServerToolUse { .. } => {
+                        // Historical server calls have already executed; their results above
+                        // remain readable without replaying a client function call.
                         continue;
                     }
                 }
@@ -1521,8 +1664,6 @@ fn build_google_content(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
-    last_user_task_text_normalized: &mut Option<String>,
-    previous_was_tool_result: &mut bool,
     existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Value, String> {
     let role = if msg.role == "assistant" {
@@ -1582,8 +1723,6 @@ fn build_google_content(
         mapped_model,
         last_thought_signature,
         pending_tool_use_ids,
-        last_user_task_text_normalized,
-        previous_was_tool_result,
         existing_tool_result_ids,
     )?;
 
@@ -1624,10 +1763,6 @@ fn build_google_contents(
     // Track pending tool_use IDs for recovery
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
 
-    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
-    let mut last_user_task_text_normalized: Option<String> = None;
-    let mut previous_was_tool_result = false;
-
     let _msg_count = messages.len();
 
     // [FIX #632] Pre-scan all messages to identify all tool_result IDs that ALREADY exist in the conversation.
@@ -1663,8 +1798,6 @@ fn build_google_contents(
             mapped_model,
             &mut last_thought_signature,
             &mut pending_tool_use_ids,
-            &mut last_user_task_text_normalized,
-            &mut previous_was_tool_result,
             &existing_tool_result_ids,
         )?;
 
@@ -1694,41 +1827,6 @@ fn build_google_contents(
     Ok(json!(contents))
 }
 
-/// Merge adjacent messages with the same role
-fn merge_adjacent_roles(mut contents: Vec<Value>) -> Vec<Value> {
-    if contents.is_empty() {
-        return contents;
-    }
-
-    let mut merged = Vec::new();
-    let mut current_msg = contents.remove(0);
-
-    for msg in contents {
-        let current_role = current_msg["role"].as_str().unwrap_or_default();
-        let next_role = msg["role"].as_str().unwrap_or_default();
-
-        if current_role == next_role {
-            // Merge parts
-            if let Some(current_parts) = current_msg.get_mut("parts").and_then(|p| p.as_array_mut())
-            {
-                if let Some(next_parts) = msg.get("parts").and_then(|p| p.as_array()) {
-                    current_parts.extend(next_parts.clone());
-
-                    // [FIX #709] Core Fix: After merging parts from adjacent messages,
-                    // we must RE-SORT them to ensure any thinking blocks from the
-                    // second message are moved to the very front of the combined array.
-                    reorder_gemini_parts(current_parts);
-                }
-            }
-        } else {
-            merged.push(current_msg);
-            current_msg = msg;
-        }
-    }
-    merged.push(current_msg);
-    merged
-}
-
 /// 构建 Tools
 fn build_tools(
     tools: &Option<Vec<Tool>>,
@@ -1739,19 +1837,12 @@ fn build_tools(
         let mut function_declarations: Vec<Value> = Vec::new();
         let has_google_search = has_web_search;
 
-        let is_search_tool = |tool: &Tool| {
-            tool.is_web_search()
-                || tool.name.as_deref() == Some("google_search")
-                || tool.name.as_deref() == Some("builtin_web_search")
-                || tool.type_.as_deref() == Some("builtin_web_search")
-        };
         // 只有搜索工具时，改映射为上游 googleSearch，不进客户端函数列表。
         // 旁边还有 Bash/Read 等函数工具时，web_search 与其他协议一样留在 functionDeclarations。
-        let search_only =
-            !tools_list.is_empty() && tools_list.iter().all(|tool| is_search_tool(tool));
+        let search_only = !tools_list.is_empty() && tools_list.iter().all(Tool::is_web_search);
 
         for tool in tools_list {
-            if search_only && is_search_tool(tool) {
+            if search_only && tool.is_web_search() {
                 continue;
             }
             let name = tool
@@ -1829,7 +1920,7 @@ fn build_generation_config(
     _has_web_search: bool,
     is_thinking_enabled: bool,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW]
-) -> Value {
+) -> Result<Value, String> {
     let mut config = json!({});
 
     // Thinking 配置
@@ -1893,7 +1984,18 @@ fn build_generation_config(
     // max_tokens 映射与「maxOutputTokens > thinkingBudget」不变量、官方硬顶
     // 已由 `configure_inbound_thinking` 统一处理，适配器不再二次协商。
 
-    config
+    if let Some(OutputFormat::JsonSchema { schema }) = claude_req
+        .output_config
+        .as_ref()
+        .and_then(|output| output.format.as_ref())
+    {
+        let mut schema = schema.clone();
+        crate::proxy::common::json_schema::clean_response_schema(&mut schema)?;
+        config["responseMimeType"] = json!("application/json");
+        config["responseSchema"] = schema;
+    }
+
+    Ok(config)
 }
 
 /// Recursively remove 'thought' and 'thoughtSignature' fields
@@ -4334,5 +4436,192 @@ mod tests {
             }),
             "Raw tool_use_id must never leak as functionResponse name"
         );
+    }
+}
+
+#[cfg(test)]
+mod r24_server_history_tests {
+    use super::*;
+
+    fn mapped(block: Value) -> Value {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-5", "max_tokens":100,
+            "messages":[
+                {"role":"user","content":"Find the answer"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Before the result"},
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_fetch","input":{}},
+                    block,
+                    {"type":"text","text":"After the result"}
+                ]},
+                {"role":"user","content":"Explain that answer"}
+            ]
+        }))
+        .unwrap();
+        transform_claude_request_in(&request, "project", false, None, "r24-history", None).unwrap()
+    }
+
+    fn visible_text(body: &Value) -> String {
+        body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn r24_web_fetch_history_keeps_document_body_and_message_order() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_result","url":"https://example.com/report",
+            "content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Full document body\nSecond line"}}}}),
+        );
+        let text = visible_text(&body);
+        let ordered = [
+            "Before the result",
+            "https://example.com/report",
+            "Full document body\nSecond line",
+            "After the result",
+            "Explain that answer",
+        ];
+        let mut offset = 0;
+        for fragment in ordered {
+            offset += text[offset..].find(fragment).expect(fragment) + fragment.len();
+        }
+        assert!(!body.to_string().contains("functionCall"));
+    }
+
+    #[test]
+    fn r24_code_execution_history_keeps_stdout_stderr_and_nested_text() {
+        for kind in [
+            "code_execution_tool_result",
+            "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result",
+        ] {
+            let body = mapped(json!({"type":kind,"tool_use_id":"srvtoolu_1","content":{
+                "type":"code_execution_result","stdout":"42\nline two\n","stderr":"Warning: example\n",
+                "return_code":1,"content":[{"type":"text","text":"Readable tool summary"},
+                {"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document"}]}}]
+            }}));
+            let text = visible_text(&body);
+            for expected in [
+                "42\nline two\n",
+                "Warning: example\n",
+                "Exit code: 1",
+                "Readable tool summary",
+                "Nested document",
+                "After the result",
+            ] {
+                assert!(text.contains(expected), "missing {expected} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn r24_server_errors_stay_readable_and_unknown_client_blocks_are_rejected() {
+        let body = mapped(
+            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
+            "content":{"type":"web_fetch_tool_result_error","error_code":"unavailable","message":"Fetch failed"}}),
+        );
+        assert!(visible_text(&body).contains("Fetch failed"));
+        let unknown = json!({"model":"claude-sonnet-4-5","messages":[{"role":"assistant","content":[
+            {"type":"unknown_client_tool_call","name":"execute","input":{"cmd":"keep me explicit"}}
+        ]}]});
+        assert!(serde_json::from_value::<ClaudeRequest>(unknown).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r26_mcp_history_tests {
+    use super::*;
+
+    fn request(blocks: Value) -> Result<ClaudeRequest, serde_json::Error> {
+        serde_json::from_value(
+            json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
+                {"role":"user","content":"Fetch the report"},
+                {"role":"assistant","content":blocks},
+                {"role":"user","content":"Explain that result"}
+            ]}),
+        )
+    }
+    fn mapped_text(request: &ClaudeRequest) -> (Value, String) {
+        let mapped =
+            transform_claude_request_in(request, "r26-project", false, None, "r26-mcp", None)
+                .unwrap();
+        let text = mapped["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (mapped, text)
+    }
+
+    #[test]
+    fn r26_mcp_history_degrades_to_readable_context_in_order() {
+        let request = request(json!([
+            {"type":"text","text":"BEFORE_MCP"},
+            {"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":{"needle":"[undefined]"}},
+            {"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":false,"content":[{"type":"text","text":"REPORT_42\nSecond line"}]},
+            {"type":"text","text":"AFTER_MCP"}
+        ])).unwrap();
+        let (mapped, text) = mapped_text(&request);
+        let mut position = 0;
+        for fragment in [
+            "BEFORE_MCP",
+            "docs/lookup",
+            "[undefined]",
+            "REPORT_42\nSecond line",
+            "AFTER_MCP",
+            "Explain that result",
+        ] {
+            position += text[position..]
+                .find(fragment)
+                .unwrap_or_else(|| panic!("Missing {fragment} in {text}"))
+                + fragment.len();
+        }
+        assert!(!mapped.to_string().contains("functionCall"));
+        assert!(!mapped.to_string().contains("functionResponse"));
+    }
+
+    #[test]
+    fn r26_mcp_results_without_adjacent_text_keep_strings_and_errors() {
+        for (error, content) in [
+            (false, json!("SERVER_BODY")),
+            (true, json!([{"type":"text","text":"SERVER_BODY"}])),
+        ] {
+            let request = request(json!([{"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":error,"content":content}])).unwrap();
+            let (_, text) = mapped_text(&request);
+            assert!(text.contains("SERVER_BODY"));
+            assert!(text.contains(if error {
+                "MCP tool error"
+            } else {
+                "MCP tool result"
+            }));
+        }
+        let control = request(json!([{"type":"text","text":"SERVER_BODY"}])).unwrap();
+        assert!(mapped_text(&control).1.contains("SERVER_BODY"));
+    }
+
+    #[test]
+    fn r26_mcp_degradation_keeps_malformed_and_local_tool_envelopes_strict() {
+        for invalid in [
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs"}),
+            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":[]}),
+            json!({"type":"mcp_tool_result","content":"result"}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"text"}]}),
+            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"unknown_local_tool","input":{}}]}),
+            json!({"type":"tool_use","id":"toolu_42","input":{}}),
+            json!({"type":"unknown_client_tool_call","name":"execute","input":{}}),
+        ] {
+            assert!(
+                request(json!([{"type":"text","text":"valid adjacent text"},invalid])).is_err()
+            );
+        }
     }
 }

@@ -65,6 +65,8 @@ where
     let mut grouped: BTreeMap<u64, (Value, Vec<Value>)> = BTreeMap::new();
     let mut media_positions =
         BTreeMap::<u64, std::collections::HashMap<(bool, [u8; 32]), Vec<usize>>>::new();
+    let mut tool_calls = crate::proxy::common::response_tools::ToolCallTracker::default();
+    let mut tool_positions = std::collections::HashMap::<usize, usize>::new();
     let mut usage_metadata: Option<Value> = None;
     let mut stream_error: Option<Value> = None;
     let mut line_buffer = bytes::BytesMut::new();
@@ -131,6 +133,7 @@ where
                     }
 
                     // Capture Content & Signature
+                    tool_calls.begin_frame();
                     if let Some(candidates) =
                         actual_data.get("candidates").and_then(|c| c.as_array())
                     {
@@ -172,6 +175,35 @@ where
                                 let prior_media = media_positions.entry(index).or_default();
                                 let mut frame_media = std::collections::HashMap::new();
                                 for part in parts {
+                                    if let Some(call) = part.get("functionCall") {
+                                        let tracked = tool_calls.track(index, call);
+                                        if let Some(&position) = tool_positions.get(&tracked.index)
+                                        {
+                                            if let (Some(existing), Some(update)) = (
+                                                content_parts[position].as_object_mut(),
+                                                part.as_object(),
+                                            ) {
+                                                for (key, value) in update {
+                                                    if key == "functionCall" {
+                                                        if let (Some(call), Some(fields)) = (
+                                                            existing
+                                                                .get_mut(key)
+                                                                .and_then(Value::as_object_mut),
+                                                            value.as_object(),
+                                                        ) {
+                                                            // Omitted call fields are metadata trailers;
+                                                            // supplied args replace the previous snapshot.
+                                                            call.extend(fields.clone());
+                                                            continue;
+                                                        }
+                                                    }
+                                                    existing.insert(key.clone(), value.clone());
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        tool_positions.insert(tracked.index, content_parts.len());
+                                    }
                                     if super::has_media(part) {
                                         let key = media_identity(part);
                                         let count = frame_media.entry(key).or_insert(0usize);
@@ -550,6 +582,70 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn r26_collect_tool_metadata_preserves_omitted_args_and_replaces_new_snapshots() {
+        let frames = [
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","name":"inspect","args":{"path":"first","stale":true}}}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same","args":{"path":"updated"}}}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"same"},"thoughtSignature":"late"}]},"finishReason":"STOP"}]}),
+        ];
+        let source = stream::iter(
+            frames
+                .into_iter()
+                .map(|frame| Ok::<_, io::Error>(Bytes::from(format!("data: {frame}\n\n")))),
+        );
+        let response = collect_stream_to_json(source, "r26-tool-metadata")
+            .await
+            .unwrap();
+        assert_eq!(
+            response["candidates"][0]["content"]["parts"],
+            json!([
+                {"functionCall":{"id":"same","name":"inspect","args":{"path":"updated"}},"thoughtSignature":"late"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn r26_collect_cumulative_tools_preserves_multiplicity_candidates_and_metadata() {
+        let anonymous = json!({"functionCall":{"name":"inspect","args":{"path":"src"}}});
+        let first_id = json!({"functionCall":{"id":"first","name":"inspect","args":{}}});
+        let second_id = json!({"functionCall":{"id":"second","name":"inspect","args":{}}});
+        let mut signed = first_id.clone();
+        signed["thoughtSignature"] = json!("late-signature");
+        let frames = [
+            json!({"candidates":[
+                {"index":2,"content":{"parts":[anonymous.clone(),anonymous.clone(),first_id.clone(),second_id.clone()]}},
+                {"index":5,"content":{"parts":[first_id.clone()]}}
+            ]}),
+            json!({"candidates":[
+                {"index":5,"content":{"parts":[first_id]},"finishReason":"STOP"},
+                {"index":2,"content":{"parts":[anonymous.clone(),anonymous,signed,second_id]},"finishReason":"STOP"}
+            ]}),
+        ];
+        let source = stream::iter(
+            frames
+                .into_iter()
+                .map(|frame| Ok::<_, io::Error>(Bytes::from(format!("data: {frame}\n\n")))),
+        );
+        let response = collect_stream_to_json(source, "r26-tool-collector")
+            .await
+            .unwrap();
+        let candidates = response["candidates"].as_array().unwrap();
+        let parts = candidates[0]["content"]["parts"].as_array().unwrap();
+        assert_eq!(candidates[0]["index"], 2);
+        assert_eq!(parts.len(), 4, "same-frame independent calls must survive");
+        assert!(parts[0]["functionCall"].get("id").is_none());
+        assert!(parts[1]["functionCall"].get("id").is_none());
+        assert_eq!(parts[2]["functionCall"]["id"], "first");
+        assert_eq!(parts[2]["thoughtSignature"], "late-signature");
+        assert_eq!(parts[3]["functionCall"]["id"], "second");
+        assert_eq!(candidates[1]["index"], 5);
+        assert_eq!(
+            candidates[1]["content"]["parts"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

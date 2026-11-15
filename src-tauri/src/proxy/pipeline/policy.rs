@@ -117,6 +117,7 @@ impl UpstreamClassification {
                 || lower.contains("exhausted")
                 || lower.contains("suspended")))
             || lower.contains("no accounts available")
+            || lower.contains("no available accounts")
             || lower.contains("token pool is empty")
             || lower.contains("no quota accounts")
     }
@@ -454,6 +455,12 @@ mod tests {
         assert_eq!(no_quota, UpstreamClassification::InternalGatewayMessage);
         assert!(!no_quota.should_lock_account());
         assert!(!no_quota.abandons_sticky_account());
+
+        // 503 no available accounts：第一道门禁自答，绝不能解绑粘性或连坐任何账号/模型
+        let no_available = UpstreamClassification::classify(503, "no available accounts", None);
+        assert_eq!(no_available, UpstreamClassification::InternalGatewayMessage);
+        assert!(!no_available.should_lock_account());
+        assert!(!no_available.abandons_sticky_account());
     }
 
     #[test]
@@ -525,7 +532,7 @@ mod tests {
             404,
             raw_404,
             Some(
-                "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)",
+                "antigravity/hub/2.32.1 (aidev_client; os_type=windows; arch=amd64; cl=1021296516)",
             ),
             0,
             3,

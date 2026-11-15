@@ -182,7 +182,7 @@ impl QuotaSnapshot {
 /// 配额写入入口的中立输入：load / 实时刷新都先归一化为该结构。
 #[derive(Debug, Clone, PartialEq)]
 struct QuotaBucketInput {
-    family: &'static str,
+    family: String,
     is_weekly: bool,
     remaining_fraction: Option<f64>,
     reset_at: Option<i64>,
@@ -204,7 +204,6 @@ pub struct ProxyToken {
     pub remaining_quota: Option<i32>,      // [FIX #563] Remaining quota for priority sorting
     pub protected_models: HashSet<String>, // [NEW #621]
     pub forbidden_models: HashSet<String>, // [NEW] 模型级 403 冻结（只影响对应模型）
-    pub health_score: f32,                 // [NEW] 健康分数 (0.0 - 1.0)
     pub reset_time: Option<i64>,           // [NEW] 配额刷新时间戳（用于排序优化）
     pub weekly_reset_time: Option<i64>, // [NEW] 周配额刷新时间戳（用于临期优先调度 EDF，防止周期重置作废配额）
     pub validation_blocked: bool, // [NEW] Check for validation block (VALIDATION_REQUIRED temporary block)
@@ -313,10 +312,10 @@ impl ProxyToken {
     /// Release 构建不包含该方法，不会影响线上行为。
     #[cfg(debug_assertions)]
     pub fn assert_quota_state_consistent(&self) {
-        for family in ["argon", "3p", "gemini"] {
-            let Some(windows) = self.model_quota_windows.get(family) else {
+        for (family, windows) in &self.model_quota_windows {
+            if windows.is_empty() {
                 continue;
-            };
+            }
             let short_min = windows
                 .iter()
                 .filter(|w| !w.is_weekly)
@@ -372,7 +371,6 @@ pub struct TokenManager {
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
     session_accounts: Arc<SessionBindings>,    // Versioned session/account bindings
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
-    health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
 
     // [NEW] 按账号分配的同步刷新锁。
@@ -435,7 +433,6 @@ impl TokenManager {
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
             session_accounts: Arc::new(SessionBindings::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
-            health_scores: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
                 crate::models::CircuitBreakerConfig::default(),
             )),
@@ -1042,6 +1039,60 @@ impl TokenManager {
         Ok(())
     }
 
+    /// 读取 `accounts.json` 索引，返回 `(全部注册账号 ID, disabled/proxy_disabled 账号 ID)`。
+    fn read_accounts_index_sets(
+        data_dir: &std::path::Path,
+    ) -> (Option<HashSet<String>>, HashSet<String>) {
+        let index_file = data_dir.join("accounts.json");
+        if !index_file.exists() {
+            return (None, HashSet::new());
+        }
+        let Ok(content) = std::fs::read_to_string(&index_file) else {
+            return (None, HashSet::new());
+        };
+        let Ok(index_val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return (None, HashSet::new());
+        };
+        let Some(accs) = index_val.get("accounts").and_then(|a| a.as_array()) else {
+            return (None, HashSet::new());
+        };
+        let mut all_ids = HashSet::new();
+        let mut disabled_ids = HashSet::new();
+        for acc in accs {
+            if let Some(id) = acc.get("id").and_then(|v| v.as_str()) {
+                all_ids.insert(id.to_string());
+                let is_disabled = acc
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let is_proxy_disabled = acc
+                    .get("proxy_disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_disabled || is_proxy_disabled {
+                    disabled_ids.insert(id.to_string());
+                }
+            }
+        }
+        (Some(all_ids), disabled_ids)
+    }
+
+    /// 校验账号文件是否属于有效索引（兼容 `stem != id` 的文件）。
+    fn is_account_file_in_index(path: &PathBuf, valid_ids: &HashSet<String>) -> bool {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if valid_ids.contains(stem) {
+            return true;
+        }
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+            .is_some_and(|internal_id| valid_ids.contains(&internal_id))
+    }
+
     /// 从主应用账号目录加载所有账号
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let _reload = self.reload_lock.lock().await;
@@ -1052,45 +1103,8 @@ impl TokenManager {
         }
 
         // 读取 accounts.json 索引，过滤掉用户在索引中标记为 disabled 或 proxy_disabled 的账号，防止实体文件残留导致已停用账号渗入代理池
-        let index_file = self.resolved_data_dir().join("accounts.json");
-        let (valid_in_index, disabled_in_index): (
-            Option<std::collections::HashSet<String>>,
-            std::collections::HashSet<String>,
-        ) = if index_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&index_file) {
-                if let Ok(index_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(accs) = index_val.get("accounts").and_then(|a| a.as_array()) {
-                        let mut all_ids = std::collections::HashSet::new();
-                        let mut disabled_ids = std::collections::HashSet::new();
-                        for acc in accs {
-                            if let Some(id) = acc.get("id").and_then(|v| v.as_str()) {
-                                all_ids.insert(id.to_string());
-                                let is_disabled = acc
-                                    .get("disabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                let is_proxy_disabled = acc
-                                    .get("proxy_disabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if is_disabled || is_proxy_disabled {
-                                    disabled_ids.insert(id.to_string());
-                                }
-                            }
-                        }
-                        (Some(all_ids), disabled_ids)
-                    } else {
-                        (None, std::collections::HashSet::new())
-                    }
-                } else {
-                    (None, std::collections::HashSet::new())
-                }
-            } else {
-                (None, std::collections::HashSet::new())
-            }
-        } else {
-            (None, std::collections::HashSet::new())
-        };
+        let (valid_in_index, disabled_in_index) =
+            Self::read_accounts_index_sets(&self.resolved_data_dir());
 
         let entries =
             std::fs::read_dir(&accounts_dir).map_err(|e| format!("读取账号目录失败: {}", e))?;
@@ -1278,8 +1292,44 @@ impl TokenManager {
         // 清空内存中的模型级 900s 临时熔断，避免新导入或已恢复配额的账号
         // 继续被历史冷却卡住 15 分钟。
         self.unsupported_models.clear();
+        let _ = self.get_all_available_models();
 
         Ok(count)
+    }
+
+    /// 彻底卸载账号并异步清理需要 `.await` 写锁的粘性/优先/末次选中缓存
+    pub async fn remove_account_and_clear_locks(&self, account_id: &str) {
+        self.remove_account(account_id);
+        {
+            let mut preferred = self.preferred_account_id.write().await;
+            if preferred.as_deref() == Some(account_id) {
+                *preferred = None;
+                tracing::info!(
+                    "[Proxy] Cleared preferred account status for {}",
+                    account_id
+                );
+            }
+        }
+        {
+            let mut last_used = self.last_used_account.lock().await;
+            if matches!(&*last_used, Some((ref id, _)) if id == account_id) {
+                *last_used = None;
+            }
+        }
+    }
+
+    /// 手动重新启用账号反代时清理运行期拦截态（QoS 隔离、401/project_id 失败计数、模型临时熔断、内存限流锁定）
+    pub fn prepare_manual_enable(&self, account_id: &str) {
+        self.qos_guardian.release_from_jail(account_id);
+        self.invalid_grant_failures.remove(account_id);
+        self.project_id_failures.remove(account_id);
+        self.clear_unsupported_models_for_account(account_id);
+        self.clear_rate_limit_memory(account_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_token_for_test(&self, token: ProxyToken) {
+        self.tokens.insert(token.account_id.clone(), token);
     }
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
@@ -1321,7 +1371,7 @@ impl TokenManager {
                             .any(|acc| acc.get("id").and_then(|v| v.as_str()) == Some(account_id));
                         // [FIX #3806, #3808] 若 accounts.json 存在但该账号已被删除，仅从内存调度池卸载，不删物理文件，并返回 Ok(())
                         if !in_index {
-                            self.remove_account(account_id);
+                            self.remove_account_and_clear_locks(account_id).await;
                             tracing::info!(
                                 "[Proxy] Account {} is not in accounts.json index, removed from proxy pool",
                                 account_id
@@ -1351,7 +1401,7 @@ impl TokenManager {
                         && Self::get_account_state_on_disk(&path).await
                             == OnDiskAccountState::Disabled
                     {
-                        self.remove_account(account_id);
+                        self.remove_account_and_clear_locks(account_id).await;
                         return Ok(());
                     }
                 }
@@ -1372,13 +1422,14 @@ impl TokenManager {
                 self.unreadable_accounts.remove(account_id);
 
                 self.sync_image_scheduler_accounts();
+                let _ = self.get_all_available_models();
                 Ok(())
             }
             Ok(None) => {
                 // [FIX] 账号被禁用或不可用时，从内存池中彻底移除 (Issue #1565)
                 // load_single_account returning None means the account should be skipped in its
                 // current state (disabled / proxy_disabled / quota_protection / validation_blocked...).
-                self.remove_account(account_id);
+                self.remove_account_and_clear_locks(account_id).await;
                 Ok(())
             }
             Err(e) => {
@@ -1398,6 +1449,7 @@ impl TokenManager {
         for entry in self.tokens.iter() {
             self.reconcile_recovered_quota_locks(entry.key(), entry.value());
         }
+        let _ = self.get_all_available_models();
 
         Ok(count)
     }
@@ -1496,13 +1548,14 @@ impl TokenManager {
         self.qos_guardian
             .session_watermarks
             .retain(|(account, _), _| account != account_id);
-        self.health_scores.remove(account_id);
         self.rate_limit_tracker.clear(account_id);
         self.refresh_locks.remove(account_id);
         self.invalid_grant_failures.remove(account_id);
         self.project_id_locks.remove(account_id);
         self.project_id_failures.remove(account_id);
+        self.invalid_grant_failures.remove(account_id);
         self.in_flight_requests.remove(account_id);
+        self.clear_unsupported_models_for_account(account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -1513,6 +1566,7 @@ impl TokenManager {
             }
         }
         self.sync_image_scheduler_accounts();
+        let _ = self.get_all_available_models();
     }
 
     /// 根据账号 ID 获取完整的 ProxyToken 对象 (v4.1.29)
@@ -1627,18 +1681,49 @@ impl TokenManager {
         OnDiskAccountState::Unknown
     }
 
-    /// 加载单个账号
-    fn quota_family_key(display_name_lower: &str, bucket_id_lower: &str) -> &'static str {
-        if display_name_lower.contains("argon") || bucket_id_lower.contains("argon") {
-            "argon"
+    /// 从模型名称集合中动态提取 Gemini 4+ 专属代号（零硬编码，自动覆盖未来新代号）。
+    fn collect_known_g4_codenames<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut codenames = Vec::new();
+        for name in names {
+            let nl = name.trim().to_lowercase();
+            if nl.contains("-disabled") || nl.ends_with("_disabled") {
+                continue;
+            }
+            if let Some(code) = crate::proxy::common::model_mapping::extract_gemini4_codename(&nl) {
+                if !codenames.iter().any(|c| c == &code) {
+                    codenames.push(code);
+                }
+            }
+        }
+        codenames
+    }
+
+    fn quota_family_key_with_codenames(
+        display_name_lower: &str,
+        bucket_id_lower: &str,
+        known_codenames: &[String],
+    ) -> String {
+        if let Some(code) =
+            crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+                display_name_lower,
+                bucket_id_lower,
+                known_codenames,
+            )
+        {
+            code
         } else if display_name_lower.contains("claude")
             || display_name_lower.contains("gpt")
             || bucket_id_lower.contains("3p")
         {
-            "3p"
+            "3p".to_string()
         } else {
-            "gemini"
+            "gemini".to_string()
         }
+    }
+
+    /// 组级配额族 Key 解析（无模型上下文时的兼容入口）。
+    fn quota_family_key(display_name_lower: &str, bucket_id_lower: &str) -> String {
+        Self::quota_family_key_with_codenames(display_name_lower, bucket_id_lower, &[])
     }
 
     fn quota_bucket_is_weekly(window_lower: &str, bucket_id_lower: &str) -> bool {
@@ -1648,8 +1733,11 @@ impl TokenManager {
             || bucket_id_lower.contains("7d")
     }
 
-    /// 将账号 JSON 中的 `quota_groups` 归一化为中立输入。
-    fn quota_bucket_inputs_from_json(groups: &[serde_json::Value]) -> Vec<QuotaBucketInput> {
+    /// 将账号 JSON 中的 `quota_groups` 归一化为中立输入（结合动态代号上下文）。
+    fn quota_bucket_inputs_from_json_with_codenames(
+        groups: &[serde_json::Value],
+        known_codenames: &[String],
+    ) -> Vec<QuotaBucketInput> {
         let mut inputs = Vec::new();
         for group in groups {
             let display_name_lower = group
@@ -1673,6 +1761,17 @@ impl TokenManager {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_lowercase();
+                let b_name_lower = bucket
+                    .get("display_name")
+                    .or_else(|| bucket.get("displayName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let group_or_bucket_name = if !b_name_lower.is_empty() {
+                    format!("{} {}", display_name_lower, b_name_lower)
+                } else {
+                    display_name_lower.clone()
+                };
                 let remaining_fraction = bucket
                     .get("remaining_fraction")
                     .or_else(|| bucket.get("remainingFraction"))
@@ -1685,7 +1784,11 @@ impl TokenManager {
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.timestamp());
                 inputs.push(QuotaBucketInput {
-                    family: Self::quota_family_key(&display_name_lower, &bucket_id_lower),
+                    family: Self::quota_family_key_with_codenames(
+                        &group_or_bucket_name,
+                        &bucket_id_lower,
+                        known_codenames,
+                    ),
                     is_weekly: Self::quota_bucket_is_weekly(&window_lower, &bucket_id_lower),
                     remaining_fraction,
                     reset_at,
@@ -1695,9 +1798,15 @@ impl TokenManager {
         inputs
     }
 
-    /// 将强类型 `QuotaGroup` 归一化为同一份中立输入。
-    fn quota_bucket_inputs_from_typed(
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn quota_bucket_inputs_from_json(groups: &[serde_json::Value]) -> Vec<QuotaBucketInput> {
+        Self::quota_bucket_inputs_from_json_with_codenames(groups, &[])
+    }
+
+    /// 将强类型 `QuotaGroup` 归一化为同一份中立输入（结合动态代号上下文）。
+    fn quota_bucket_inputs_from_typed_with_codenames(
         groups: &[crate::models::quota::QuotaGroup],
+        known_codenames: &[String],
     ) -> Vec<QuotaBucketInput> {
         let mut inputs = Vec::new();
         for group in groups {
@@ -1705,6 +1814,12 @@ impl TokenManager {
             for bucket in &group.buckets {
                 let window_lower = bucket.window.to_lowercase();
                 let bucket_id_lower = bucket.bucket_id.to_lowercase();
+                let b_name_lower = bucket.display_name.as_deref().unwrap_or("").to_lowercase();
+                let group_or_bucket_name = if !b_name_lower.is_empty() {
+                    format!("{} {}", display_name_lower, b_name_lower)
+                } else {
+                    display_name_lower.clone()
+                };
                 let reset_at = if bucket.reset_time.is_empty() {
                     None
                 } else {
@@ -1713,7 +1828,11 @@ impl TokenManager {
                         .map(|dt| dt.timestamp())
                 };
                 inputs.push(QuotaBucketInput {
-                    family: Self::quota_family_key(&display_name_lower, &bucket_id_lower),
+                    family: Self::quota_family_key_with_codenames(
+                        &group_or_bucket_name,
+                        &bucket_id_lower,
+                        known_codenames,
+                    ),
                     is_weekly: Self::quota_bucket_is_weekly(&window_lower, &bucket_id_lower),
                     remaining_fraction: Some(bucket.remaining_fraction),
                     reset_at,
@@ -1721,6 +1840,13 @@ impl TokenManager {
             }
         }
         inputs
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn quota_bucket_inputs_from_typed(
+        groups: &[crate::models::quota::QuotaGroup],
+    ) -> Vec<QuotaBucketInput> {
+        Self::quota_bucket_inputs_from_typed_with_codenames(groups, &[])
     }
 
     /// 统一写入三套既有 map：窗口快照 + 短期 reset + 周 reset。
@@ -1733,7 +1859,7 @@ impl TokenManager {
     ) {
         for input in inputs {
             model_quota_windows
-                .entry(input.family.to_string())
+                .entry(input.family.clone())
                 .or_default()
                 .push(QuotaWindowStatus {
                     is_weekly: input.is_weekly,
@@ -1750,14 +1876,110 @@ impl TokenManager {
                 &mut *model_reset_times
             };
             target_map
-                .entry(input.family.to_string())
+                .entry(input.family.clone())
                 .and_modify(|existing| *existing = (*existing).min(ts))
                 .or_insert(ts);
-            if input.family == "argon" {
+            if input.family != "3p" && input.family != "gemini" {
                 target_map
-                    .entry("gemini-4-argon".to_string())
+                    .entry(format!("gemini-4-{}", input.family))
                     .and_modify(|existing| *existing = (*existing).min(ts))
                     .or_insert(ts);
+            }
+        }
+    }
+
+    /// load_single_account 与实时 429 刷新共用的 Gemini 4+ 分组额度对齐入口：
+    /// 1. 对历史 `argon` 维持 #3745 专属组/Ultra 准入门禁与默认档位注入；
+    /// 2. 对其余动态代号（如 hydrogen/carbon 或未来任何代号），仅当 quota_groups 恰好拆分了对应专属桶时
+    ///    同步账号已解锁变体的配额，绝不凭空注入或覆盖上游 `model_limits`。
+    fn reconcile_g4_group_quotas(
+        is_ultra: bool,
+        bucket_inputs: &[QuotaBucketInput],
+        model_quotas: &mut HashMap<String, i32>,
+        available_models: &mut HashSet<String>,
+        model_limits: &mut HashMap<String, u64>,
+    ) {
+        const ARGON_DEFAULT_MODELS: [&str; 5] = [
+            "gemini-4-argon",
+            "gemini-4-argon-high",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-low",
+            "gemini-pro-orchestrator-g1-pro",
+        ];
+
+        let primary_fraction_for = |family: &str| -> Option<f64> {
+            bucket_inputs
+                .iter()
+                .filter(|b| b.family == family)
+                .filter_map(|b| b.remaining_fraction)
+                .fold(None, |acc: Option<f64>, f| {
+                    Some(acc.map_or(f, |cur| cur.min(f)))
+                })
+        };
+
+        // 1. Argon 保持既有独立桶 / Ultra 兜底与防呆清理语义 (#3745)
+        let argon_frac = primary_fraction_for("argon").or_else(|| {
+            if is_ultra {
+                Some(primary_fraction_for("gemini").unwrap_or(1.0))
+            } else {
+                None
+            }
+        });
+
+        if let Some(frac) = argon_frac {
+            let pct = (frac * 100.0).round() as i32;
+            for m in ARGON_DEFAULT_MODELS {
+                model_quotas.insert(m.to_string(), pct);
+                available_models.insert(m.to_string());
+                model_limits.entry(m.to_string()).or_insert(65536);
+            }
+            if available_models.contains("gemini-4-argon-xhigh") {
+                model_quotas.insert("gemini-4-argon-xhigh".to_string(), pct);
+                model_limits
+                    .entry("gemini-4-argon-xhigh".to_string())
+                    .or_insert(65536);
+            }
+        } else {
+            for m in [
+                "gemini-4-argon",
+                "gemini-4-argon-xhigh",
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-argon-low",
+                "gemini-pro-orchestrator-g1-pro",
+            ] {
+                model_quotas.remove(m);
+                available_models.remove(m);
+                model_limits.remove(m);
+            }
+        }
+
+        // 2. 其他 Gemini 4+ 动态代号：若上游为此代号拆出了专属桶，则仅对其已授权变体同步额度
+        let mut dedicated_codes: Vec<String> = Vec::new();
+        for b in bucket_inputs {
+            if b.family != "argon"
+                && b.family != "3p"
+                && b.family != "gemini"
+                && !dedicated_codes.iter().any(|c| c == &b.family)
+            {
+                dedicated_codes.push(b.family.clone());
+            }
+        }
+        for code in dedicated_codes {
+            let Some(frac) = primary_fraction_for(&code) else {
+                continue;
+            };
+            let pct = (frac * 100.0).round() as i32;
+            let matched_models: Vec<String> = available_models
+                .iter()
+                .filter(|m| {
+                    crate::proxy::common::model_mapping::extract_gemini4_codename(m).as_deref()
+                        == Some(code.as_str())
+                })
+                .cloned()
+                .collect();
+            for m in matched_models {
+                model_quotas.insert(m, pct);
             }
         }
     }
@@ -2316,12 +2538,6 @@ impl TokenManager {
             })
             .unwrap_or_default();
 
-        let health_score = self
-            .health_scores
-            .get(&account_id)
-            .map(|v| *v)
-            .unwrap_or(1.0);
-
         // [NEW] 提取最近的配额刷新时间（用于排序优化：刷新时间越近优先级越高）
         let reset_time = self.extract_earliest_reset_time(&account);
         // [NEW] 提取周配额刷新时间（来自 retrieveUserQuotaSummary 的 weekly/7d 窗口，用于临期优先消耗）
@@ -2351,7 +2567,10 @@ impl TokenManager {
                 }
                 let raw_name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let raw_name_lower = raw_name.trim().to_lowercase();
-                if raw_name_lower.contains("-disabled") || raw_name_lower.ends_with("_disabled") {
+                if raw_name_lower.contains("-disabled")
+                    || raw_name_lower.ends_with("_disabled")
+                    || raw_name_lower == "gemini-flash-worker-agy"
+                {
                     continue;
                 }
 
@@ -2401,12 +2620,24 @@ impl TokenManager {
                         }
                     }
                 }
-                // [NEW] 解析并缓存 max_output_tokens (按原始 model name，不归一化)
+                // [NEW] 解析并缓存 max_output_tokens (动态优先，同时同步小写与剥离档位后缀的派生裸模型)
                 if let (Some(name), Some(limit)) = (
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("max_output_tokens").and_then(|v| v.as_u64()),
                 ) {
                     model_limits.insert(name.to_string(), limit);
+                    let name_lower = name.trim().to_lowercase();
+                    if name_lower != name {
+                        model_limits.entry(name_lower.clone()).or_insert(limit);
+                    }
+                    let base_name =
+                        crate::proxy::common::model_mapping::strip_tier_suffix(&name_lower);
+                    if base_name != name_lower {
+                        model_limits
+                            .entry(base_name)
+                            .and_modify(|existing| *existing = (*existing).max(limit))
+                            .or_insert(limit);
+                    }
                 }
                 // [NEW #3677] 提取模型元数据并缓存 (按原始 model name 小写存储)
                 if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
@@ -2423,153 +2654,48 @@ impl TokenManager {
             }
         }
 
-        // [NEW] 检查 quota_groups 是否存在 Argon 专属分组，为该账号注入 Argon 授权、配额与限额
         let quota_val = account.get("quota");
         let groups_val = quota_val
             .and_then(|q| q.get("quota_groups").or_else(|| q.get("quotaGroups")))
             .and_then(|g| g.as_array());
 
-        if let Some(groups) = groups_val {
-            let argon_bucket = groups.iter().find_map(|g| {
-                let name = g
-                    .get("display_name")
-                    .or_else(|| g.get("displayName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let buckets = g.get("buckets").and_then(|b| b.as_array())?;
-                if name.contains("argon") {
-                    return buckets.first();
-                }
-                buckets.iter().find(|b| {
-                    let b_id = b
-                        .get("bucket_id")
-                        .or_else(|| b.get("bucketId"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let b_name = b
-                        .get("display_name")
-                        .or_else(|| b.get("displayName"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    b_id.contains("argon") || b_name.contains("argon")
-                })
-            });
+        let known_codenames =
+            Self::collect_known_g4_codenames(available_models.iter().map(String::as_str));
+        let parsed_bucket_inputs = groups_val.map(|groups| {
+            Self::quota_bucket_inputs_from_json_with_codenames(groups, &known_codenames)
+        });
 
+        if let Some(ref inputs) = parsed_bucket_inputs {
             let is_ultra = subscription_tier
                 .as_deref()
                 .map(|s| s.to_uppercase() == "ULTRA")
                 .unwrap_or(false);
-
-            if let Some(bucket) = argon_bucket {
-                let frac = bucket
-                    .get("remaining_fraction")
-                    .or_else(|| bucket.get("remainingFraction"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
-                let pct = (frac * 100.0) as i32;
-                model_quotas.insert("gemini-4-argon".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-high".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-medium".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-low".to_string(), pct);
-
-                available_models.insert("gemini-4-argon".to_string());
-                available_models.insert("gemini-4-argon-high".to_string());
-                available_models.insert("gemini-4-argon-medium".to_string());
-                available_models.insert("gemini-4-argon-low".to_string());
-
-                model_limits.insert("gemini-4-argon".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-high".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-medium".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-low".to_string(), 65536);
-            } else if is_ultra {
-                // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
-                let gemini_bucket = groups.iter().find_map(|g| {
-                    let name = g
-                        .get("display_name")
-                        .or_else(|| g.get("displayName"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if !name.contains("claude") && !name.contains("gpt") && !name.contains("3p") {
-                        g.get("buckets")
-                            .and_then(|b| b.as_array())
-                            .and_then(|bs| bs.first())
-                    } else {
-                        None
-                    }
-                });
-                let frac = gemini_bucket
-                    .and_then(|b| {
-                        b.get("remaining_fraction")
-                            .or_else(|| b.get("remainingFraction"))
-                    })
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
-                let pct = (frac * 100.0) as i32;
-                model_quotas.insert("gemini-4-argon".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-high".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-medium".to_string(), pct);
-                model_quotas.insert("gemini-4-argon-low".to_string(), pct);
-
-                available_models.insert("gemini-4-argon".to_string());
-                available_models.insert("gemini-4-argon-high".to_string());
-                available_models.insert("gemini-4-argon-medium".to_string());
-                available_models.insert("gemini-4-argon-low".to_string());
-
-                model_limits.insert("gemini-4-argon".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-high".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-medium".to_string(), 65536);
-                model_limits.insert("gemini-4-argon-low".to_string(), 65536);
-            } else {
-                // 配额组中明确不存在 Argon 分组且非 Ultra 账号，防呆清理（防止历史残存虚假配额注入调度器）
-                model_quotas.remove("gemini-4-argon");
-                model_quotas.remove("gemini-4-argon-high");
-                model_quotas.remove("gemini-4-argon-medium");
-                model_quotas.remove("gemini-4-argon-low");
-
-                available_models.remove("gemini-4-argon");
-                available_models.remove("gemini-4-argon-high");
-                available_models.remove("gemini-4-argon-medium");
-                available_models.remove("gemini-4-argon-low");
-
-                model_limits.remove("gemini-4-argon");
-                model_limits.remove("gemini-4-argon-high");
-                model_limits.remove("gemini-4-argon-medium");
-                model_limits.remove("gemini-4-argon-low");
-            }
+            Self::reconcile_g4_group_quotas(
+                is_ultra,
+                inputs,
+                &mut model_quotas,
+                &mut available_models,
+                &mut model_limits,
+            );
         }
 
         // 若 model_quotas 中已有 gemini-4-argon（例如通过 models 列表或上游配额注入），确保同步到 available_models 与 limits
         if model_quotas.contains_key("gemini-4-argon") {
-            available_models.insert("gemini-4-argon".to_string());
-            available_models.insert("gemini-4-argon-high".to_string());
-            available_models.insert("gemini-4-argon-medium".to_string());
-            available_models.insert("gemini-4-argon-low".to_string());
-            model_limits
-                .entry("gemini-4-argon".to_string())
-                .or_insert(65536);
-            model_limits
-                .entry("gemini-4-argon-high".to_string())
-                .or_insert(65536);
-            model_limits
-                .entry("gemini-4-argon-medium".to_string())
-                .or_insert(65536);
-            model_limits
-                .entry("gemini-4-argon-low".to_string())
-                .or_insert(65536);
+            for m in [
+                "gemini-4-argon",
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-argon-low",
+                "gemini-pro-orchestrator-g1-pro",
+            ] {
+                available_models.insert(m.to_string());
+                model_limits.entry(m.to_string()).or_insert(65536);
+            }
         }
 
         // [NEW] 从配额桶分组精确提取周周期与短期周期重置时间及窗口快照（模型大类组级隔离，P1-2, P1-3）
         // 写入入口统一收敛到 apply_quota_bucket_inputs，避免 load / 实时刷新各写一套逻辑。
-        if let Some(groups) = account
-            .get("quota")
-            .and_then(|q| q.get("quota_groups").or_else(|| q.get("quotaGroups")))
-            .and_then(|g| g.as_array())
-        {
-            let inputs = Self::quota_bucket_inputs_from_json(groups);
+        if let Some(inputs) = parsed_bucket_inputs {
             Self::apply_quota_bucket_inputs(
                 &mut model_quota_windows,
                 &mut model_reset_times,
@@ -2657,7 +2783,6 @@ impl TokenManager {
             remaining_quota,
             protected_models,
             forbidden_models,
-            health_score,
             reset_time,
             weekly_reset_time,
             validation_blocked: account
@@ -2944,7 +3069,10 @@ impl TokenManager {
                 }
                 if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
                     let normalized = name.trim().to_lowercase();
-                    if normalized.contains("-disabled") || normalized.ends_with("_disabled") {
+                    if normalized.contains("-disabled")
+                        || normalized.ends_with("_disabled")
+                        || normalized == "gemini-flash-worker-agy"
+                    {
                         continue;
                     }
                     if !normalized.is_empty() {
@@ -3001,11 +3129,13 @@ impl TokenManager {
                 result.insert("gemini-4-argon-high".to_string());
                 result.insert("gemini-4-argon-medium".to_string());
                 result.insert("gemini-4-argon-low".to_string());
+                result.insert("gemini-pro-orchestrator-g1-pro".to_string());
             } else {
                 result.remove("gemini-4-argon");
                 result.remove("gemini-4-argon-high");
                 result.remove("gemini-4-argon-medium");
                 result.remove("gemini-4-argon-low");
+                result.remove("gemini-pro-orchestrator-g1-pro");
             }
         }
         Some(result)
@@ -3123,7 +3253,7 @@ impl TokenManager {
 
         // 若传入的是无后缀派生裸模型（如 claude-opus-5-5, gemini-4-argon, claude-opus-4-6 等），
         // 严格在该账号实际支持的同基底档位变体中选择（绝不跨代串池）
-        for suffix in ["tiered", "medium", "high", "low", "thinking"] {
+        for suffix in ["tiered", "xhigh", "medium", "high", "low", "thinking"] {
             let candidate = format!("{}-{}", mapped_lower, suffix);
             if available_models.contains(&candidate) {
                 tracing::info!(
@@ -3398,19 +3528,27 @@ impl TokenManager {
     /// 短期（5小时滚动）配额临期检测窗口（秒）：2小时
     pub const SHORT_IMMINENT_HORIZON_SECS: i64 = 7200;
 
-    /// 模型族分组 Key 解析
-    pub fn resolve_model_group_key(model: &str) -> &'static str {
+    /// 模型族分组 Key 解析（支持未来任意 Gemini 4+ 代号动态分组）
+    pub fn resolve_model_group_key(model: &str) -> String {
         let m_lower = model.trim().to_lowercase();
-        if m_lower.contains("argon") {
-            "argon"
+        if let Some(code) = crate::proxy::common::model_mapping::extract_gemini4_codename(&m_lower)
+        {
+            code
         } else if m_lower.starts_with("claude")
             || m_lower.starts_with("gpt")
             || m_lower.contains("3p")
         {
-            "3p"
+            "3p".to_string()
         } else {
-            "gemini"
+            "gemini".to_string()
         }
+    }
+
+    /// 检查非 Argon 的 Gemini 4+ 代号在当前账号上是否拆分出了专属配额组（避免误落通用池或错失回退）。
+    fn has_dedicated_codename_bucket(t: &ProxyToken, codename: &str) -> bool {
+        t.model_quota_windows.contains_key(codename)
+            || t.model_reset_times.contains_key(codename)
+            || t.model_weekly_reset_times.contains_key(codename)
     }
 
     /// 解析指定模型的重置时间戳（支持短期滚动与周周期窗口）
@@ -3418,6 +3556,7 @@ impl TokenManager {
     /// 核心契约（防跨模型时间污染，Ref #3840, #3845）：
     /// 1. 两个 per-model map 任一非空时，严格在对应 map 中按「具体模型名 -> 小写 -> 基名 -> 标准 ID -> 族群 Key」匹配；
     ///    若未检索到，绝对不回退全局兜底 reset_time（防止如 Argon 到期污染 Gemini 模型）；
+    ///    仅对**未拆分专属桶**的非 Argon Gemini 4+ 模型允许回退到共享的 `gemini` 大桶。
     /// 2. 仅当两个 map 都为空时（旧版数据或无多模型隔离），才允许回退全局兜底时间。
     pub fn resolve_model_reset_time(t: &ProxyToken, model: &str, is_weekly: bool) -> Option<i64> {
         let map = if is_weekly {
@@ -3444,7 +3583,18 @@ impl TokenManager {
                 }
             })
             .or_else(|| standard_id.as_deref().and_then(|sid| map.get(sid)))
-            .or_else(|| map.get(group_key))
+            .or_else(|| map.get(group_key.as_str()))
+            .or_else(|| {
+                if group_key != "argon"
+                    && group_key != "3p"
+                    && group_key != "gemini"
+                    && !Self::has_dedicated_codename_bucket(t, &group_key)
+                {
+                    map.get("gemini")
+                } else {
+                    None
+                }
+            })
             .copied();
 
         if matched.is_some() {
@@ -3496,7 +3646,18 @@ impl TokenManager {
                     .as_deref()
                     .and_then(|sid| t.model_quota_windows.get(sid))
             })
-            .or_else(|| t.model_quota_windows.get(group_key))
+            .or_else(|| t.model_quota_windows.get(group_key.as_str()))
+            .or_else(|| {
+                if group_key != "argon"
+                    && group_key != "3p"
+                    && group_key != "gemini"
+                    && !Self::has_dedicated_codename_bucket(t, &group_key)
+                {
+                    t.model_quota_windows.get("gemini")
+                } else {
+                    None
+                }
+            })
     }
 
     /// 检查指定模型的配额耗尽 (0%) 状态是否已经过期（上游已重置进入新周期）
@@ -4191,6 +4352,82 @@ impl TokenManager {
             .await
     }
 
+    /// 扫描磁盘上的账号文件，统计封禁/禁用/可用数量（用于池空诊断）
+    /// 返回 (banned, disabled, available)
+    fn scan_pool_disk_state(&self) -> (usize, usize, usize) {
+        let accounts_dir = self.resolved_data_dir().join("accounts");
+        let mut banned = 0usize;
+        let mut disabled = 0usize;
+        let mut available = 0usize;
+
+        let Ok(entries) = std::fs::read_dir(&accounts_dir) else {
+            return (0, 0, 0);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(account) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            // 封禁账号：上游 403 (TOS_VIOLATION 等) 由 mark_account_forbidden 标记 quota.is_forbidden=true
+            let is_banned = account
+                .pointer("/quota/is_forbidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let reason = account
+                .get("proxy_disabled_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_disabled = account
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || (account
+                    .get("proxy_disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                    && reason != "quota_protection");
+            if is_banned {
+                banned += 1;
+            } else if is_disabled {
+                disabled += 1;
+            } else {
+                available += 1;
+            }
+        }
+        (banned, disabled, available)
+    }
+
+    /// 池空时返回可区分原因的诊断错误，避免误导用户"等待冷却"
+    /// (#3919: 全池 banned 后应明确提示封禁而非 429 "Token pool is empty")
+    fn empty_pool_error(&self) -> String {
+        let (banned, disabled, available) = self.scan_pool_disk_state();
+        if banned > 0 {
+            format!(
+                "No available accounts: all pool accounts are banned or disabled (available: {}, banned: {}, disabled: {}). Banned accounts (upstream 403, e.g. TOS_VIOLATION) will NOT recover by waiting for cooldown - check the Accounts page and submit an appeal.",
+                available, banned, disabled
+            )
+        } else if available == 0 && disabled > 0 {
+            format!(
+                "No available accounts: all {} account(s) are disabled (banned: 0, disabled: {}). Re-enable accounts in the Accounts page.",
+                disabled, disabled
+            )
+        } else if available > 0 {
+            format!(
+                "Token pool is empty: {} usable account(s) exist on disk but none are loaded into the proxy pool - refresh the account pool.",
+                available
+            )
+        } else {
+            "Token pool is empty: no accounts configured. Add accounts in the Accounts page."
+                .to_string()
+        }
+    }
+
     /// 内部实现：获取 Token 的核心逻辑
     async fn get_token_internal(
         &self,
@@ -4261,7 +4498,7 @@ impl TokenManager {
         tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
         let mut total = tokens_snapshot.len();
         if total == 0 {
-            return Err("Token pool is empty".to_string());
+            return Err(self.empty_pool_error());
         }
 
         // [NEW] 1. 动态能力过滤 (Capability-First Dynamic Discovery)
@@ -4338,7 +4575,7 @@ impl TokenManager {
                             target_model
                         ));
                     }
-                    return Err("Token pool is empty".to_string());
+                    return Err(self.empty_pool_error());
                 }
 
                 // 排除处于该模型临时熔断期的账号
@@ -4449,7 +4686,7 @@ impl TokenManager {
                     target_model
                 ));
             }
-            return Err("Token pool is empty".to_string());
+            return Err(self.empty_pool_error());
         }
 
         tokens_snapshot.sort_by(|a, b| {
@@ -4523,16 +4760,7 @@ impl TokenManager {
                 return quota_cmp;
             }
 
-            // Priority 2: Health score (higher is better)
-            let health_cmp = b
-                .health_score
-                .partial_cmp(&a.health_score)
-                .unwrap_or(std::cmp::Ordering::Equal);
-            if health_cmp != std::cmp::Ordering::Equal {
-                return health_cmp;
-            }
-
-            // Priority 3: Reset time (earlier is better) [Fix #3570]
+            // Priority 2: Reset time (earlier is better) [Fix #3570]
             let reset_a = a.reset_time.unwrap_or(i64::MAX);
             let reset_b = b.reset_time.unwrap_or(i64::MAX);
             let reset_cmp = reset_a.cmp(&reset_b);
@@ -4540,7 +4768,7 @@ impl TokenManager {
                 return reset_cmp;
             }
 
-            // Priority 4: Deterministic fallback (Tie-breaker for strict total order)
+            // Priority 3: Deterministic fallback (Tie-breaker for strict total order)
             a.account_id.cmp(&b.account_id)
         });
 
@@ -4551,7 +4779,7 @@ impl TokenManager {
             tokens_snapshot
                 .iter()
                 .map(|t| format!(
-                    "{}(quota={}%, reset={:?}, health={:.2})",
+                    "{}(quota={}%, reset={:?})",
                     t.email,
                     t.model_quotas.get(&normalized_target).copied().unwrap_or(0),
                     t.reset_time.map(|ts| {
@@ -4563,7 +4791,6 @@ impl TokenManager {
                             "now".to_string()
                         }
                     }),
-                    t.health_score
                 ))
                 .collect::<Vec<_>>()
         );
@@ -4977,10 +5204,10 @@ impl TokenManager {
                                 }
                             }
                         } else if reset_sec > 0 {
-                            if scheduling.mode == SchedulingMode::CacheFirst
+                            if scheduling.max_wait_seconds > 0
                                 && reset_sec <= scheduling.max_wait_seconds
                             {
-                                // CacheFirst（缓存优先）：当限流冷却时长 <= max_wait_seconds 时原地精准等待，绝不解绑换号丢失缓存
+                                // 当限流冷却时长 <= max_wait_seconds 时原地精准等待（支持 Balance 与 CacheFirst），绝不解绑换号丢失缓存
                                 let wait_secs =
                                     match crate::proxy::pipeline::budget::remaining_secs() {
                                         Some(rem_budget) => {
@@ -4990,7 +5217,7 @@ impl TokenManager {
                                     };
                                 if wait_secs > 0 {
                                     tracing::info!(
-                                        "Sticky Session (CacheFirst): Bound account {} is rate-limited for {} ({}s <= max_wait {}s), waiting {}s in-place to preserve session binding and KV cache...",
+                                        "Sticky Session: Bound account {} is rate-limited for {} ({}s <= max_wait {}s), waiting {}s in-place to preserve session binding and KV cache...",
                                         bound_token.email,
                                         normalized_target,
                                         reset_sec,
@@ -5085,8 +5312,6 @@ impl TokenManager {
                                     .unwrap_or(100);
                                 let last_zero_quota = last_quota <= 0;
 
-                                let found_eff_priority =
-                                    found.effective_priority(target_model, &normalized_target);
                                 let has_healthy_alt = tokens_snapshot.iter().any(|t| {
                                     &t.account_id != account_id
                                         && !attempted.contains(&t.account_id)
@@ -5109,24 +5334,6 @@ impl TokenManager {
                                             > 0
                                 });
 
-                                let has_higher_priority_alt = tokens_snapshot.iter().any(|t| {
-                                    &t.account_id != account_id
-                                        && !attempted.contains(&t.account_id)
-                                        && !self.qos_guardian.is_jailed_or_probing(&t.account_id)
-                                        && !self.rate_limit_tracker.is_rate_limited(
-                                            &t.account_id,
-                                            Some(&normalized_target),
-                                        )
-                                        && !(quota_protection_enabled
-                                            && t.protected_models.contains(&normalized_target))
-                                        && Self::has_candidate_quota_admission(
-                                            t,
-                                            &normalized_target,
-                                        )
-                                        && t.effective_priority(target_model, &normalized_target)
-                                            < found_eff_priority
-                                });
-
                                 let is_qos_jailed =
                                     self.qos_guardian.is_jailed_or_probing(&found.account_id);
                                 if is_qos_jailed {
@@ -5140,11 +5347,6 @@ impl TokenManager {
                                         found.email, normalized_target
                                     );
                                     attempted.insert(account_id.clone());
-                                } else if has_higher_priority_alt {
-                                    tracing::debug!(
-                                        "60s Window: Last account {} has lower effective priority ({}) for model {}, yielding to higher-priority account",
-                                        found.email, found_eff_priority, normalized_target
-                                    );
                                 } else if !self
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
                                     .await
@@ -5992,9 +6194,24 @@ impl TokenManager {
 
     /// 统计「对目标模型拥有正配额（或已授权可用）」的账号数量。
     ///
-    /// 用于入站模型的配额闸门：返回 0 表示整池都没有该模型额度，
-    /// 应当由网关直接 502 拒答，而不是把请求发往上游换回一个 429。
+    /// 用于入站模型的配额闸门：返回 0 且池中确实存在支持该模型的活跃账号时，
+    /// 应当由网关直接 502 拒答；若当前活跃池中没有任何支持该模型的账号，则由门禁返回 503。
     pub fn accounts_with_positive_quota(&self, model: &str) -> usize {
+        self.count_matching_accounts(model, true)
+    }
+
+    /// 检查当前活跃代理池（`self.tokens`）中是否存在至少一个“具备该模型资格（含 0% 配额）”的可用账号。
+    ///
+    /// 排除模型级 403 冻结与验证锁定账号，但不要求当前剩余配额 > 0%，
+    /// 以便模型门禁精确区分：
+    /// - 503 `no available accounts`（活跃池中没有支持/未禁用此模型的账号）
+    /// - 502 `no quota accounts`（活跃池里有支持此模型的账号，但全部剩余配额归零）
+    pub fn has_any_capable_account_in_pool(&self, model: &str) -> bool {
+        self.count_matching_accounts(model, false) > 0
+    }
+
+    /// 共享账号能力/正配额判定 helper：避免双套族判规则漂移。
+    fn count_matching_accounts(&self, model: &str, require_positive_quota: bool) -> usize {
         let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
             .unwrap_or_else(|| model.to_string());
         // 生图基底：若账号只上报了尺寸变体（-4k / -2k / -preview …），同族变体配额即代表基底可用
@@ -6005,8 +6222,10 @@ impl TokenManager {
         // 极简两道判定，0 启发式：
         // 1. 名字含 claude 或 gpt -> 3P 第三方大池
         let is_3p = model_lower.contains("claude") || model_lower.contains("gpt");
-        // 2. 名字含 argon -> Argon 模型
-        let is_argon = model_lower.contains("argon");
+        // 2. Gemini 4+ 专属代号（如 argon 或未来任意新代号）
+        let g4_codename =
+            crate::proxy::common::model_mapping::extract_gemini4_codename(&model_lower);
+        let is_argon = g4_codename.as_deref() == Some("argon");
         let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&model_lower);
         let now = chrono::Utc::now().timestamp();
 
@@ -6014,7 +6233,7 @@ impl TokenManager {
             .iter()
             .filter(|entry| {
                 let token = entry.value();
-                // 模型级 403 冻结：该模型不计入可用配额
+                // 模型级 403 冻结：该模型不计入可用账号/可用配额
                 if token.is_model_forbidden(model) {
                     return false;
                 }
@@ -6028,7 +6247,7 @@ impl TokenManager {
                 // 生图独立大池判定
                 if is_image {
                     if token.model_quotas.iter().any(|(known, quota)| {
-                        *quota > 0
+                        (!require_positive_quota || *quota > 0)
                             && crate::proxy::common::model_mapping::strip_image_variant_suffix(
                                 known,
                             ) == image_base
@@ -6042,6 +6261,20 @@ impl TokenManager {
 
                 // 3P 第三方大池判定（Claude / GPT）
                 if is_3p {
+                    if !require_positive_quota {
+                        let has_3p_bucket = token.model_quotas.contains_key(model)
+                            || token.model_quotas.contains_key(&model_lower)
+                            || token.model_quotas.contains_key("claude")
+                            || token.model_quotas.keys().any(|k| {
+                                let kl = k.to_lowercase();
+                                kl.contains("claude") || kl.contains("gpt")
+                            });
+                        let has_3p_available = token.available_models.contains(model)
+                            || token.available_models.contains(&model_lower)
+                            || token.available_models.contains(&normalized);
+                        return has_3p_bucket || has_3p_available;
+                    }
+
                     let has_3p_positive = token
                         .model_quotas
                         .get(model)
@@ -6090,21 +6323,27 @@ impl TokenManager {
                     return false;
                 }
 
-                // Argon 判定（数据驱动：看账号是否含有独立 Argon 桶，有就走独立桶，没有就落入通用大池）
+                // Argon 判定（数据驱动：看账号是否含有独立 Argon 桶或 Ultra 共享大池，#3745）
                 if is_argon {
-                    // 检查该账号是否拥有 Argon 能力（available_models 中包含 argon，或 model_quotas 包含 argon）
-                    let has_argon_cap = token.available_models.iter().any(|m| m.contains("argon"))
-                        || token.model_quotas.keys().any(|k| k.contains("argon"));
+                    let has_argon_cap = token.available_models.iter().any(|m| {
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(m).as_deref()
+                            == Some("argon")
+                    }) || token.model_quotas.keys().any(|k| {
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(k).as_deref()
+                            == Some("argon")
+                    });
                     if !has_argon_cap {
-                        // 无 Argon 权限的账号（如无 Argon 的 Pro 账号）坚决排除，绝不连累它，也绝不派发 Argon
                         return false;
                     }
-                    // 有 Argon 能力的账号（有独立桶的 Pro，或 Ultra 共享通用大池）：
-                    // 无论是从独立桶注入的配额还是 Ultra 共享大池注入的配额，只要其 Argon 或通用大池配额 > 0 即通过
-                    let has_argon_positive = token
-                        .model_quotas
-                        .iter()
-                        .any(|(k, v)| *v > 0 && k.contains("argon"));
+                    if !require_positive_quota {
+                        return true;
+                    }
+                    let has_argon_positive = token.model_quotas.iter().any(|(k, v)| {
+                        *v > 0
+                            && crate::proxy::common::model_mapping::extract_gemini4_codename(k)
+                                .as_deref()
+                                == Some("argon")
+                    });
                     if has_argon_positive {
                         return true;
                     }
@@ -6113,8 +6352,73 @@ impl TokenManager {
                         .is_rate_limited(&token.account_id, Some(model));
                 }
 
-                // 除 3P 和独立 Argon 外的所有模型：一律直接落入 Gemini 通用配额大池！
-                // （无需启发式判断 3.8/3.5/Pro/Flash，只要账号的 Gemini 通用大池有任何正配额即放行）
+                // 非 Argon 的 Gemini 4+ 代号模型（如 hydrogen/carbon 或未来任何代号）：
+                // 1. 若账号已加载 available_models 且不包含该代号能力（例如灰度 -disabled），直接排除；
+                // 2. 若账号拆分了该代号的专属桶，仅认专属桶配额与冷却状态，不与 Gemini 通用大池串池；
+                // 3. 若未拆分专属桶（共享 Gemini 通用池），继续走下方的 Gemini 通用大池判定。
+                if let Some(code) = g4_codename.as_deref() {
+                    let has_codename_cap = token.available_models.iter().any(|m| {
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(m).as_deref()
+                            == Some(code)
+                    }) || token.model_quotas.keys().any(|k| {
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(k).as_deref()
+                            == Some(code)
+                    });
+                    if !token.available_models.is_empty() && !has_codename_cap {
+                        return false;
+                    }
+                    if Self::has_dedicated_codename_bucket(token, code) {
+                        if !require_positive_quota {
+                            return true;
+                        }
+                        let has_dedicated_positive = token.model_quotas.iter().any(|(k, v)| {
+                            *v > 0
+                                && crate::proxy::common::model_mapping::extract_gemini4_codename(k)
+                                    .as_deref()
+                                    == Some(code)
+                        });
+                        if has_dedicated_positive {
+                            return true;
+                        }
+                        return Self::is_model_quota_depleted_expired(token, model)
+                            && !self
+                                .rate_limit_tracker
+                                .is_rate_limited(&token.account_id, Some(model));
+                    }
+                }
+
+                // 除 3P 与专属独立代号桶外的所有 Gemini 模型：一律直接落入 Gemini 通用配额大池！
+                let matches_general_gemini_bucket = |k: &str| {
+                    let kl = k.to_lowercase();
+                    let k_dedicated_g4 =
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(&kl)
+                            .map(|c| c == "argon" || Self::has_dedicated_codename_bucket(token, &c))
+                            .unwrap_or(false);
+                    !kl.contains("claude")
+                        && !kl.contains("gpt")
+                        && !kl.contains("3p")
+                        && !k_dedicated_g4
+                };
+
+                if !require_positive_quota {
+                    let has_gemini_bucket = token.model_quotas.contains_key(model)
+                        || token.model_quotas.contains_key(&model_lower)
+                        || token.model_quotas.contains_key(&base_name)
+                        || token
+                            .model_quotas
+                            .contains_key(&format!("{}-tiered", base_name))
+                        || token.model_quotas.contains_key(&normalized)
+                        || token
+                            .model_quotas
+                            .keys()
+                            .any(|k| matches_general_gemini_bucket(k));
+                    let has_gemini_available = token.available_models.contains(model)
+                        || token.available_models.contains(&model_lower)
+                        || (!base_name.is_empty() && token.available_models.contains(&base_name))
+                        || token.available_models.contains(&normalized);
+                    return has_gemini_bucket || has_gemini_available;
+                }
+
                 let has_gemini_positive = token
                     .model_quotas
                     .get(model)
@@ -6145,14 +6449,7 @@ impl TokenManager {
                         token
                             .model_quotas
                             .iter()
-                            .find(|(k, v)| {
-                                let kl = k.to_lowercase();
-                                **v > 0
-                                    && !kl.contains("claude")
-                                    && !kl.contains("gpt")
-                                    && !kl.contains("3p")
-                                    && !kl.contains("argon")
-                            })
+                            .find(|(k, v)| **v > 0 && matches_general_gemini_bucket(k))
                             .map(|(_, v)| *v)
                     })
                     .or_else(|| {
@@ -6559,133 +6856,34 @@ impl TokenManager {
                 // [NEW] 实时刷新成功后，立即同步最新配额数据与 available_models 至内存缓存
                 if let Some(mut token) = self.tokens.get_mut(&account_id) {
                     Self::refresh_advertised_models(&mut token, &quota_data.models);
-                    // [NEW] 同步 Argon 配额组能力
-                    let argon_bucket = quota_data.quota_groups.as_ref().and_then(|groups| {
-                        groups.iter().find_map(|g| {
-                            let name = g.display_name.to_lowercase();
-                            if name.contains("argon") {
-                                return g.buckets.first();
-                            }
-                            g.buckets.iter().find(|b| {
-                                let bid = b.bucket_id.to_lowercase();
-                                let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
-                                bid.contains("argon") || bname.contains("argon")
-                            })
-                        })
-                    });
+                    // 实时刷新时复用统一 Gemini 4+ 分组同步与三套配额窗口快照写入入口，
+                    // 确保 Argon 门禁、未来新代号专属桶（若上游拆分）以及重置时间戳与冷启动加载完全一致。
                     let is_ultra = token
                         .subscription_tier
                         .as_deref()
                         .map(|s| s.to_uppercase() == "ULTRA")
                         .unwrap_or(false);
-
-                    if let Some(bucket) = argon_bucket {
-                        let pct = (bucket.remaining_fraction * 100.0) as i32;
-                        token.model_quotas.insert("gemini-4-argon".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-high".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-medium".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-low".to_string(), pct);
-                        token.available_models.insert("gemini-4-argon".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-high".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-medium".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-low".to_string());
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-high".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-medium".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-low".to_string(), 65536);
-                    } else if is_ultra {
-                        // Ultra 账号在官方架构下未拆分专属 Argon 分组，其 Argon 额度共享 Gemini 通用配额池
-                        let gemini_bucket = quota_data.quota_groups.as_ref().and_then(|groups| {
-                            groups.iter().find_map(|g| {
-                                let name = g.display_name.to_lowercase();
-                                if !name.contains("claude")
-                                    && !name.contains("gpt")
-                                    && !name.contains("3p")
-                                {
-                                    g.buckets.first()
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                        let pct = gemini_bucket
-                            .map(|b| (b.remaining_fraction * 100.0) as i32)
-                            .unwrap_or(100);
-                        token.model_quotas.insert("gemini-4-argon".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-high".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-medium".to_string(), pct);
-                        token
-                            .model_quotas
-                            .insert("gemini-4-argon-low".to_string(), pct);
-                        token.available_models.insert("gemini-4-argon".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-high".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-medium".to_string());
-                        token
-                            .available_models
-                            .insert("gemini-4-argon-low".to_string());
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-high".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-medium".to_string(), 65536);
-                        token
-                            .model_limits
-                            .insert("gemini-4-argon-low".to_string(), 65536);
-                    } else {
-                        // 若刷新后无 Argon 专属分组且非 Ultra，清理该账号在内存中的 Argon 缓存
-                        token.model_quotas.remove("gemini-4-argon");
-                        token.model_quotas.remove("gemini-4-argon-high");
-                        token.model_quotas.remove("gemini-4-argon-medium");
-                        token.model_quotas.remove("gemini-4-argon-low");
-                        token.available_models.remove("gemini-4-argon");
-                        token.available_models.remove("gemini-4-argon-high");
-                        token.available_models.remove("gemini-4-argon-medium");
-                        token.available_models.remove("gemini-4-argon-low");
-                        token.model_limits.remove("gemini-4-argon");
-                        token.model_limits.remove("gemini-4-argon-high");
-                        token.model_limits.remove("gemini-4-argon-medium");
-                        token.model_limits.remove("gemini-4-argon-low");
-                    }
-
-                    // [NEW P1-2] 实时刷新时同步各模型/各组专属重置时间与配额窗口快照
-                    // 与 load_single_account 共用同一个写入入口，避免两条路径漂移。
+                    let known_codenames = Self::collect_known_g4_codenames(
+                        token.available_models.iter().map(String::as_str),
+                    );
                     if let Some(groups) = quota_data.quota_groups.as_ref() {
+                        let inputs = Self::quota_bucket_inputs_from_typed_with_codenames(
+                            groups,
+                            &known_codenames,
+                        );
+                        {
+                            let token_ref = &mut *token;
+                            Self::reconcile_g4_group_quotas(
+                                is_ultra,
+                                &inputs,
+                                &mut token_ref.model_quotas,
+                                &mut token_ref.available_models,
+                                &mut token_ref.model_limits,
+                            );
+                        }
                         token.model_quota_windows.clear();
                         token.model_reset_times.clear();
                         token.model_weekly_reset_times.clear();
-                        let inputs = Self::quota_bucket_inputs_from_typed(groups);
                         token.apply_quota_bucket_inputs(inputs);
                     }
 
@@ -6755,49 +6953,58 @@ impl TokenManager {
                                 .unwrap_or(false)
                         })
                         .unwrap_or(false);
-                    let target_is_argon = target.contains("argon");
+                    let known_codenames = Self::collect_known_g4_codenames(
+                        quota_data.models.iter().map(|m| m.name.as_str()),
+                    );
+                    let target_codename =
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(target);
+                    let l3_group_family = |g: &crate::models::quota::QuotaGroup| -> String {
+                        let gname = g.display_name.to_lowercase();
+                        for b in &g.buckets {
+                            let bid = b.bucket_id.to_lowercase();
+                            let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
+                            let combined = if !bname.is_empty() {
+                                format!("{} {}", gname, bname)
+                            } else {
+                                gname.clone()
+                            };
+                            let fam = Self::quota_family_key_with_codenames(
+                                &combined,
+                                &bid,
+                                &known_codenames,
+                            );
+                            if fam != "gemini" {
+                                return fam;
+                            }
+                        }
+                        Self::quota_family_key_with_codenames(&gname, "", &known_codenames)
+                    };
+                    let l3_group_matches = |g: &crate::models::quota::QuotaGroup,
+                                            groups: &[crate::models::quota::QuotaGroup]|
+                     -> bool {
+                        let fam = l3_group_family(g);
+                        if target_codename.is_none()
+                            && (target.contains("claude") || target.contains("gpt"))
+                        {
+                            return fam == "3p";
+                        }
+                        if let Some(code) = target_codename.as_deref() {
+                            if groups.iter().any(|cand| l3_group_family(cand) == code) {
+                                return fam == code;
+                            }
+                            return if code == "argon" {
+                                is_ultra && fam == "gemini"
+                            } else {
+                                fam == "gemini"
+                            };
+                        }
+                        fam == "gemini"
+                    };
 
                     is_weekly_depleted = quota_data.quota_groups.as_ref().map_or(false, |groups| {
-                        let is_gemini_group = |g: &crate::models::quota::QuotaGroup| {
-                            let n = g.display_name.to_lowercase();
-                            !n.contains("claude")
-                                && !n.contains("gpt")
-                                && !n.contains("3p")
-                                && !n.contains("argon")
-                        };
-                        let is_argon_group = |g: &crate::models::quota::QuotaGroup| {
-                            let n = g.display_name.to_lowercase();
-                            n.contains("argon")
-                                || g.buckets.iter().any(|b| {
-                                    let bid = b.bucket_id.to_lowercase();
-                                    let bname =
-                                        b.display_name.as_deref().unwrap_or("").to_lowercase();
-                                    bid.contains("argon") || bname.contains("argon")
-                                })
-                        };
-
                         groups.iter().any(|g| {
-                            let g_name = g.display_name.to_lowercase();
-                            let is_match = if target.contains("claude") || target.contains("gpt") {
-                                g_name.contains("claude")
-                                    || g_name.contains("gpt")
-                                    || g_name.contains("3p")
-                            } else if target_is_argon {
-                                // 有专属 Argon 分组时只看它；Ultra 账号未拆分专属分组时
-                                // Argon 额度共享 Gemini 通用池，必须回退到通用分组
-                                if groups.iter().any(is_argon_group) {
-                                    is_argon_group(g)
-                                } else {
-                                    is_ultra && is_gemini_group(g)
-                                }
-                            } else {
-                                is_gemini_group(g)
-                            };
-                            if !is_match {
-                                return false;
-                            }
-                            // 分组内任意窗口（5h / weekly / 专属桶）低于 1.5% 即视为事实耗尽
-                            g.buckets.iter().any(|b| b.remaining_fraction <= 0.015)
+                            l3_group_matches(g, groups)
+                                && g.buckets.iter().any(|b| b.remaining_fraction <= 0.015)
                         })
                     });
 
@@ -6825,51 +7032,14 @@ impl TokenManager {
                         .or_else(|| {
                             // 回退：上游对已耗尽模型可能直接省略 quotaInfo.remainingFraction，
                             // 导致上面的 models 匹配拿不到 reset_time。此时直接从命中的
-                            // 配额分组中提取“已耗尽桶”的官方 reset_time（覆盖 Argon 三档共用
-                            // gemini-argon-wtu-weekly 的场景）。
+                            // 配额分组中提取“已耗尽桶”的官方 reset_time（覆盖 Argon/G4 专属桶及共享大池）。
                             if !is_weekly_depleted {
                                 return None;
                             }
                             quota_data.quota_groups.as_ref().and_then(|groups| {
-                                let is_gemini_group = |g: &crate::models::quota::QuotaGroup| {
-                                    let n = g.display_name.to_lowercase();
-                                    !n.contains("claude")
-                                        && !n.contains("gpt")
-                                        && !n.contains("3p")
-                                        && !n.contains("argon")
-                                };
-                                let is_argon_group = |g: &crate::models::quota::QuotaGroup| {
-                                    let n = g.display_name.to_lowercase();
-                                    n.contains("argon")
-                                        || g.buckets.iter().any(|b| {
-                                            let bid = b.bucket_id.to_lowercase();
-                                            let bname = b
-                                                .display_name
-                                                .as_deref()
-                                                .unwrap_or("")
-                                                .to_lowercase();
-                                            bid.contains("argon") || bname.contains("argon")
-                                        })
-                                };
-
                                 groups
                                     .iter()
-                                    .filter(|g| {
-                                        let g_name = g.display_name.to_lowercase();
-                                        if target.contains("claude") || target.contains("gpt") {
-                                            g_name.contains("claude")
-                                                || g_name.contains("gpt")
-                                                || g_name.contains("3p")
-                                        } else if target_is_argon {
-                                            if groups.iter().any(is_argon_group) {
-                                                is_argon_group(g)
-                                            } else {
-                                                is_ultra && is_gemini_group(g)
-                                            }
-                                        } else {
-                                            is_gemini_group(g)
-                                        }
-                                    })
+                                    .filter(|g| l3_group_matches(g, groups))
                                     // 【锁定源优先级：硬配额优先于滚动窗口】
                                     // weekly 是硬配额，归零后只有到 reset 才恢复；若此时取
                                     // 更早的 5h reset（例如 30 分钟后）就会造成「反复调度」：
@@ -7817,24 +7987,6 @@ impl TokenManager {
         self.reload_all_accounts().await.map(|_| ())
     }
 
-    /// 记录请求成功，增加健康分
-    pub fn record_success(&self, account_id: &str) {
-        self.health_scores
-            .entry(account_id.to_string())
-            .and_modify(|s| *s = (*s + 0.05).min(1.0))
-            .or_insert(1.0);
-        tracing::debug!("📈 Health score increased for account {}", account_id);
-    }
-
-    /// 记录请求失败，降低健康分
-    pub fn record_failure(&self, account_id: &str) {
-        self.health_scores
-            .entry(account_id.to_string())
-            .and_modify(|s| *s = (*s - 0.2).max(0.0))
-            .or_insert(0.8);
-        tracing::warn!("📉 Health score decreased for account {}", account_id);
-    }
-
     /// 获取当前 QoS 守卫实例
     pub fn get_qos_guardian(&self) -> Arc<crate::proxy::qos_guardian::QoSGuardian> {
         self.qos_guardian.clone()
@@ -7857,35 +8009,13 @@ impl TokenManager {
         }
     }
 
-    /// 评估单次请求的 TTFT 并驱动 QoS 状态机流转
-    pub fn record_qos_ttft(
+    fn handle_qos_action(
         &self,
         account_id: &str,
         session_id: Option<&str>,
-        tier: &str,
-        ttft_ms: f64,
-        is_deep_thinking: bool,
-        input_tokens: Option<u32>,
+        action: crate::proxy::qos_guardian::QoSAction,
         session_lease: Option<&SessionLease>,
     ) {
-        let all_tokens: Vec<ProxyToken> = self
-            .tokens
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
-        let rate_limiter = self.rate_limit_tracker.clone();
-
-        let action = self.qos_guardian.record_and_evaluate(
-            account_id,
-            session_id,
-            tier,
-            ttft_ms,
-            is_deep_thinking,
-            input_tokens,
-            &all_tokens,
-            |acc_id| rate_limiter.is_rate_limited(acc_id, None),
-        );
-
         let unbind_sessions = self.penalty_may_unbind_sessions();
 
         match action {
@@ -7927,12 +8057,154 @@ impl TokenManager {
         }
     }
 
+    /// 评估单次请求的 TTFT 并驱动 QoS 状态机流转
+    pub fn record_qos_ttft(
+        &self,
+        account_id: &str,
+        session_id: Option<&str>,
+        tier: &str,
+        ttft_ms: f64,
+        is_deep_thinking: bool,
+        input_tokens: Option<u32>,
+        session_lease: Option<&SessionLease>,
+    ) {
+        let all_tokens: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let rate_limiter = self.rate_limit_tracker.clone();
+
+        let action = self.qos_guardian.record_and_evaluate(
+            account_id,
+            session_id,
+            tier,
+            ttft_ms,
+            is_deep_thinking,
+            input_tokens,
+            &all_tokens,
+            |acc_id| rate_limiter.is_rate_limited(acc_id, None),
+        );
+        self.handle_qos_action(account_id, session_id, action, session_lease);
+    }
+
     /// 让后台探针共享业务请求的账号代理及热更新后的客户端。
     pub(crate) fn register_qos_upstream(
         &self,
         upstream: &Arc<crate::proxy::upstream::client::UpstreamClient>,
     ) {
         *self.qos_upstream.write().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(upstream);
+    }
+
+    /// 两阶段 QoS 评估 Phase 1（首包到达）：返回 `true` 表示已当场落锤（无需 Phase 2 重复裁决）
+    pub fn record_qos_phase1_ttft(
+        &self,
+        account_id: &str,
+        session_id: Option<&str>,
+        tier: &str,
+        ttft_ms: f64,
+        is_deep_thinking: bool,
+        input_tokens: Option<u32>,
+        session_lease: Option<&SessionLease>,
+    ) -> bool {
+        let all_tokens: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let rate_limiter = self.rate_limit_tracker.clone();
+
+        match self.qos_guardian.evaluate_pre_usage(
+            account_id,
+            session_id,
+            tier,
+            ttft_ms,
+            is_deep_thinking,
+            input_tokens,
+            &all_tokens,
+            |acc_id| rate_limiter.is_rate_limited(acc_id, None),
+        ) {
+            crate::proxy::qos_guardian::PreUsageQoSOutcome::Evaluated(action) => {
+                self.handle_qos_action(account_id, session_id, action, session_lease);
+                true
+            }
+            crate::proxy::qos_guardian::PreUsageQoSOutcome::Deferred => false,
+        }
+    }
+
+    /// 两阶段 QoS 评估 Phase 2：使用上游 `usageMetadata` 真实缓存实数完成核销
+    pub fn record_qos_with_usage(
+        &self,
+        account_id: &str,
+        session_id: Option<&str>,
+        tier: &str,
+        ttft_ms: f64,
+        is_deep_thinking: bool,
+        total_input_tokens: u32,
+        uncached_tokens: u32,
+        session_lease: Option<&SessionLease>,
+    ) {
+        let all_tokens: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let rate_limiter = self.rate_limit_tracker.clone();
+
+        let action = self.qos_guardian.reconcile_with_usage(
+            account_id,
+            session_id,
+            tier,
+            ttft_ms,
+            is_deep_thinking,
+            total_input_tokens,
+            uncached_tokens,
+            &all_tokens,
+            |acc_id| rate_limiter.is_rate_limited(acc_id, None),
+        );
+        self.handle_qos_action(account_id, session_id, action, session_lease);
+    }
+
+    /// 两阶段 QoS 评估 Phase 2 兜底（流结束前未收到 `usageMetadata`）
+    pub fn record_qos_without_usage(
+        &self,
+        account_id: &str,
+        session_id: Option<&str>,
+        tier: &str,
+        ttft_ms: f64,
+        is_deep_thinking: bool,
+        input_tokens: Option<u32>,
+        session_lease: Option<&SessionLease>,
+    ) {
+        let all_tokens: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let rate_limiter = self.rate_limit_tracker.clone();
+
+        let action = self.qos_guardian.reconcile_without_usage(
+            account_id,
+            session_id,
+            tier,
+            ttft_ms,
+            is_deep_thinking,
+            input_tokens,
+            &all_tokens,
+            |acc_id| rate_limiter.is_rate_limited(acc_id, None),
+        );
+        self.handle_qos_action(account_id, session_id, action, session_lease);
+    }
+
+    /// 刷新会话上下文水位（Phase 1 已裁决后补充权威 total_input_tokens）
+    pub fn update_qos_watermark(
+        &self,
+        account_id: &str,
+        session_id: Option<&str>,
+        total_input_tokens: u32,
+    ) {
+        self.qos_guardian
+            .update_watermark(account_id, session_id, Some(total_input_tokens));
     }
 
     /// 启动 QoS 自动阶梯探针巡检协程（每 5 秒扫描一次）
@@ -8104,6 +8376,9 @@ impl TokenManager {
             .min_by_key(|model| {
                 let lower = model.to_ascii_lowercase();
                 (
+                    crate::proxy::common::model_mapping::extract_gemini4_codename(&lower)
+                        .as_deref()
+                        == Some("argon"),
                     !lower.contains("flash"),
                     !token
                         .model_quotas
@@ -8429,6 +8704,66 @@ impl TokenManager {
             .or_else(|| quota.get("quotaGroups"))
             .and_then(|g| g.as_array())
         {
+            let known_codenames = Self::collect_known_g4_codenames(
+                quota
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m.get("name").and_then(|v| v.as_str())),
+            );
+            // Collect all Gemini 4+ codenames that actually own a dedicated group in this payload
+            // so the general Gemini group automatically excludes them without hardcoding names.
+            let mut dedicated_codenames: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for group in groups {
+                let gname = group
+                    .get("display_name")
+                    .or_else(|| group.get("displayName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if let Some(code) =
+                    crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+                        &gname,
+                        "",
+                        &known_codenames,
+                    )
+                {
+                    dedicated_codenames.insert(code);
+                }
+                if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                    for b in buckets {
+                        let bid = b
+                            .get("bucket_id")
+                            .or_else(|| b.get("bucketId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let bname = b
+                            .get("display_name")
+                            .or_else(|| b.get("displayName"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let combined = if !bname.is_empty() {
+                            format!("{} {}", gname, bname)
+                        } else {
+                            gname.clone()
+                        };
+                        if let Some(code) =
+                            crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+                                &combined,
+                                &bid,
+                                &known_codenames,
+                            )
+                        {
+                            dedicated_codenames.insert(code);
+                        }
+                    }
+                }
+            }
+
             for group in groups {
                 let group_name = group
                     .get("display_name")
@@ -8436,12 +8771,17 @@ impl TokenManager {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let group_name_lower = group_name.to_lowercase();
-                let is_argon_group = group_name_lower.contains("argon");
-                let is_claude_group = !is_argon_group
+                let group_codename =
+                    crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+                        &group_name_lower,
+                        "",
+                        &known_codenames,
+                    );
+                let is_claude_group = group_codename.is_none()
                     && (group_name_lower.contains("claude")
                         || group_name_lower.contains("gpt")
                         || group_name_lower.contains("3p"));
-                let is_gemini_group = !is_argon_group
+                let is_gemini_group = group_codename.is_none()
                     && !is_claude_group
                     && (group_name_lower.contains("gemini")
                         || (!group_name_lower.contains("claude")
@@ -8492,20 +8832,42 @@ impl TokenManager {
                             None
                         };
                         let bucket_id_lower = bucket_id.to_lowercase();
-                        let is_argon_bucket = is_argon_group || bucket_id_lower.contains("argon");
-                        let third_party =
-                            !is_argon_bucket && (is_claude_group || bucket_id_lower.contains("3p"));
-                        let gemini = !is_argon_bucket
+                        let bucket_display_lower = bucket
+                            .get("display_name")
+                            .or_else(|| bucket.get("displayName"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let bucket_name_ctx = if !bucket_display_lower.is_empty() {
+                            format!("{} {}", group_name_lower, bucket_display_lower)
+                        } else {
+                            group_name_lower.clone()
+                        };
+                        let bucket_codename = group_codename.clone().or_else(|| {
+                            crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+                                &bucket_name_ctx,
+                                &bucket_id_lower,
+                                &known_codenames,
+                            )
+                        });
+                        let third_party = bucket_codename.is_none()
+                            && (is_claude_group || bucket_id_lower.contains("3p"));
+                        let gemini = bucket_codename.is_none()
                             && !third_party
                             && (is_gemini_group || bucket_id_lower.contains("gemini"));
 
-                        let mut models: Vec<&str> = if is_argon_bucket {
-                            vec![
-                                "gemini-4-argon",
-                                "gemini-4-argon-high",
-                                "gemini-4-argon-medium",
-                                "gemini-4-argon-low",
-                            ]
+                        let mut models: Vec<String> = if let Some(ref code) = bucket_codename {
+                            if code == "argon" {
+                                vec![
+                                    "gemini-4-argon".to_string(),
+                                    "gemini-4-argon-high".to_string(),
+                                    "gemini-4-argon-medium".to_string(),
+                                    "gemini-4-argon-low".to_string(),
+                                    "gemini-pro-orchestrator-g1-pro".to_string(),
+                                ]
+                            } else {
+                                vec![format!("gemini-4-{}", code)]
+                            }
                         } else if third_party {
                             let has_3p = quota
                                 .get("models")
@@ -8524,16 +8886,16 @@ impl TokenManager {
                                 })
                                 .unwrap_or(true);
                             if has_3p {
-                                vec!["claude"]
+                                vec!["claude".to_string()]
                             } else {
                                 Vec::new()
                             }
                         } else if gemini {
                             vec![
-                                "gemini-3-flash",
-                                "gemini-3.1-pro-high",
-                                "gemini-3.1-flash-image",
-                                "gemini-3-pro-image",
+                                "gemini-3-flash".to_string(),
+                                "gemini-3.1-pro-high".to_string(),
+                                "gemini-3.1-flash-image".to_string(),
+                                "gemini-3-pro-image".to_string(),
                             ]
                         } else {
                             Vec::new()
@@ -8545,26 +8907,42 @@ impl TokenManager {
                                     .filter_map(|m| m.get("name")?.as_str())
                                     .filter(|name| {
                                         let n_lower = name.to_lowercase();
-                                        if is_argon_bucket {
-                                            n_lower.contains("argon")
+                                        if n_lower.contains("-disabled")
+                                            || n_lower.ends_with("_disabled")
+                                        {
+                                            return false;
+                                        }
+                                        let m_code =
+                                            crate::proxy::common::model_mapping::extract_gemini4_codename(
+                                                &n_lower,
+                                            );
+                                        if let Some(ref code) = bucket_codename {
+                                            m_code.as_deref() == Some(code.as_str())
                                         } else if third_party {
-                                            !n_lower.contains("argon")
-                                                && (name.starts_with("claude")
-                                                    || name.starts_with("gpt"))
+                                            m_code.is_none()
+                                                && (n_lower.starts_with("claude")
+                                                    || n_lower.starts_with("gpt"))
                                         } else {
                                             gemini
-                                                && name.starts_with("gemini")
-                                                && !n_lower.contains("argon")
+                                                && n_lower.starts_with("gemini")
+                                                && match m_code {
+                                                    None => true,
+                                                    Some(ref c) => {
+                                                        c != "argon"
+                                                            && !dedicated_codenames.contains(c)
+                                                    }
+                                                }
                                         }
-                                    }),
+                                    })
+                                    .map(str::to_string),
                             );
                         }
                         for model in models {
                             let normalized =
                                 crate::proxy::common::model_mapping::normalize_to_standard_id(
-                                    model,
+                                    &model,
                                 )
-                                .unwrap_or_else(|| model.to_string());
+                                .unwrap_or(model);
                             self.rate_limit_tracker.sync_quota_bucket(
                                 account_id,
                                 &normalized,
@@ -8680,6 +9058,40 @@ impl TokenManager {
             }
         }
         all_models
+    }
+
+    /// 扫描磁盘 `accounts/*.json` 中所有有效（非孤儿）账号曾上报过的模型并集，
+    /// **包含**当前被标记为 `disabled` / `proxy_disabled` 的已导入账号，用于模型门禁判定
+    /// “该模型确实在号池/目录生态中被识别过，只是当前没有启用/可用的配额账号 (503)”。
+    ///
+    /// 注意：严格复用 `ACCOUNT_MODEL_FILE_CACHE` 缓存与 `accounts.json` 索引校验，
+    /// 避免在请求路径引入重复磁盘解析或渗入已删除孤儿文件。
+    pub fn get_all_disk_discovered_models(&self) -> std::collections::HashSet<String> {
+        let mut discovered = std::collections::HashSet::new();
+        let data_dir = self.resolved_data_dir();
+        let accounts_dir = data_dir.join("accounts");
+        if !accounts_dir.exists() {
+            return discovered;
+        }
+        let (valid_in_index, _) = Self::read_accounts_index_sets(&data_dir);
+        let Ok(entries) = std::fs::read_dir(&accounts_dir) else {
+            return discovered;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(ref valid_ids) = valid_in_index {
+                if !Self::is_account_file_in_index(&path, valid_ids) {
+                    continue;
+                }
+            }
+            if let Some(raw_models) = Self::get_available_models_from_json(&path) {
+                discovered.extend(raw_models);
+            }
+        }
+        discovered
     }
 
     /// [NEW #3677] 获取当前所有可用账号中收集到的官方动态模型能力与元数据集合
@@ -9656,6 +10068,11 @@ mod tests {
                     let port = port_reservation.local_addr().unwrap().port();
                     let mut initial = crate::models::AppConfig::default();
                     initial.proxy.port = port;
+                    initial.proxy.thinking_budget.flash_high_legacy_migrated = true;
+                    initial
+                        .proxy
+                        .thinking_budget
+                        .thinking_budget_32k_legacy_migrated = true;
                     initial.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
                     initial.proxy.api_key = "qos-stale-start-test".into();
                     initial.proxy.admin_password = None;
@@ -9720,7 +10137,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    assert!(!status.running);
+                    assert!(
+                        status.running,
+                        "upstream now starts an empty pool so accounts can be enabled later"
+                    );
                     assert_eq!(status.active_accounts, 0);
                     let reused_manager = state
                         .admin_server
@@ -10019,6 +10439,177 @@ mod tests {
                 });
                 runtime.shutdown_timeout(Duration::from_secs(2));
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_pool_error_reports_banned_accounts_instead_of_generic_429() {
+        // Issue #3919: 全池 banned 后应返回明确的封禁诊断，而非误导性的 "Token pool is empty"
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-empty-pool-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // 2 banned (403 TOS_VIOLATION), 1 disabled (manual), 0 available.
+        let banned_json = serde_json::json!({
+            "id": "acc1",
+            "email": "a@test.com",
+            "token": {
+                "access_token": "atk",
+                "refresh_token": "rtk",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "disabled": false,
+            "proxy_disabled": true,
+            "proxy_disabled_reason": "Forbidden (403): TOS_VIOLATION",
+            "quota": { "is_forbidden": true, "forbidden_reason": "TOS_VIOLATION" },
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            accounts_dir.join("acc1.json"),
+            serde_json::to_string_pretty(&banned_json).unwrap(),
+        )
+        .unwrap();
+        let banned2 = {
+            let mut j = banned_json.clone();
+            j["id"] = serde_json::Value::String("acc2".into());
+            j["email"] = serde_json::Value::String("b@test.com".into());
+            j
+        };
+        std::fs::write(
+            accounts_dir.join("acc2.json"),
+            serde_json::to_string_pretty(&banned2).unwrap(),
+        )
+        .unwrap();
+        let disabled_json = serde_json::json!({
+            "id": "acc3",
+            "email": "c@test.com",
+            "token": {
+                "access_token": "atk3",
+                "refresh_token": "rtk3",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "disabled": false,
+            "proxy_disabled": true,
+            "proxy_disabled_reason": "manual",
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            accounts_dir.join("acc3.json"),
+            serde_json::to_string_pretty(&disabled_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        // All accounts are banned/disabled on disk, so nothing loads into the pool.
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 0);
+
+        let err = manager
+            .get_token("gemini", false, None, "gemini-1.5-flash")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("No available accounts"),
+            "error should classify the pool state, got: {}",
+            err
+        );
+        assert!(
+            err.contains("banned: 2"),
+            "error should report banned count, got: {}",
+            err
+        );
+        assert!(
+            err.contains("disabled: 1"),
+            "error should report disabled count, got: {}",
+            err
+        );
+        assert!(
+            err.contains("will NOT recover by waiting"),
+            "error should warn that cooldown will not help, got: {}",
+            err
+        );
+        assert!(
+            !err.starts_with("Token pool is empty"),
+            "banned-pool error must not be the generic empty message, got: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_empty_pool_error_reports_disabled_only_pool() {
+        // Pool with only manually disabled accounts: should point to re-enabling, not cooldown.
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-disabled-pool-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let disabled_json = serde_json::json!({
+            "id": "acc1",
+            "email": "a@test.com",
+            "token": {
+                "access_token": "atk",
+                "refresh_token": "rtk",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "disabled": false,
+            "proxy_disabled": true,
+            "proxy_disabled_reason": "manual",
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            accounts_dir.join("acc1.json"),
+            serde_json::to_string_pretty(&disabled_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        let err = manager
+            .get_token("gemini", false, None, "gemini-1.5-flash")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("all 1 account(s) are disabled"),
+            "error should report disabled-only pool, got: {}",
+            err
+        );
+        assert!(
+            err.contains("banned: 0"),
+            "disabled-only pool must not be reported as banned, got: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_internal_gateway_exhaustion_classifier_recognizes_new_banned_pool_error() {
+        // 防递归自锁门禁必须识别新的池空诊断文案（policy.rs 同步扩展）
+        let lower = "no available accounts: all pool accounts are banned or disabled (banned: 3)"
+            .to_lowercase();
+        assert!(
+            crate::proxy::pipeline::UpstreamClassification::is_internal_gateway_exhaustion(&lower)
+        );
+        assert!(
+            !crate::proxy::pipeline::UpstreamClassification::is_internal_gateway_exhaustion(
+                "some totally unrelated upstream error"
+            )
         );
     }
 
@@ -10967,7 +11558,7 @@ mod tests {
     fn create_test_token(
         email: &str,
         tier: Option<&str>,
-        health_score: f32,
+        _health_score: f32,
         reset_time: Option<i64>,
         remaining_quota: Option<i32>,
     ) -> ProxyToken {
@@ -10986,7 +11577,6 @@ mod tests {
             remaining_quota,
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score,
             reset_time,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -11027,16 +11617,7 @@ mod tests {
             return tier_cmp;
         }
 
-        // Second: compare by health score (higher is better)
-        let health_cmp = b
-            .health_score
-            .partial_cmp(&a.health_score)
-            .unwrap_or(Ordering::Equal);
-        if health_cmp != Ordering::Equal {
-            return health_cmp;
-        }
-
-        // Third: compare by reset time (earlier/closer is better) [Fix #3570]
+        // Second: compare by reset time (earlier/closer is better) [Fix #3570]
         let reset_a = a.reset_time.unwrap_or(i64::MAX);
         let reset_b = b.reset_time.unwrap_or(i64::MAX);
         let reset_cmp = reset_a.cmp(&reset_b);
@@ -11044,7 +11625,7 @@ mod tests {
             return reset_cmp;
         }
 
-        // Fourth: compare by remaining quota percentage (higher is better)
+        // Third: compare by remaining quota percentage (higher is better)
         let quota_a = a.remaining_quota.unwrap_or(0);
         let quota_b = b.remaining_quota.unwrap_or(0);
         let quota_cmp = quota_b.cmp(&quota_a);
@@ -11084,16 +11665,6 @@ mod tests {
         assert_eq!(compare_tokens(&advanced, &free), Ordering::Less);
         assert_eq!(compare_tokens(&ultra, &free), Ordering::Less);
         assert_eq!(compare_tokens(&free, &ultra), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_sorting_health_score_priority() {
-        // 同等级下，健康分高的优先
-        let high_health = create_test_token("high@test.com", Some("PRO"), 1.0, None, Some(50));
-        let low_health = create_test_token("low@test.com", Some("PRO"), 0.5, None, Some(50));
-
-        assert_eq!(compare_tokens(&high_health, &low_health), Ordering::Less);
-        assert_eq!(compare_tokens(&low_health, &high_health), Ordering::Greater);
     }
 
     #[test]
@@ -11228,7 +11799,7 @@ mod tests {
     fn test_full_sorting_integration() {
         let now = chrono::Utc::now().timestamp();
 
-        let mut tokens = vec![
+        let mut tokens = [
             create_test_token(
                 "free_high@test.com",
                 Some("FREE"),
@@ -11237,9 +11808,9 @@ mod tests {
                 Some(90),
             ),
             create_test_token(
-                "pro_low_health@test.com",
+                "pro_high_quota_soon@test.com",
                 Some("PRO"),
-                0.5,
+                1.0,
                 Some(now + 1800),
                 Some(90),
             ),
@@ -11270,14 +11841,14 @@ mod tests {
 
         // 预期顺序:
         // 1. ULTRA (最高等级，即使刷新时间最远)
-        // 2. PRO + 高健康分 + 30分钟后刷新
-        // 3. PRO + 高健康分 + 5小时后刷新
-        // 4. PRO + 低健康分
+        // 2. PRO + 30分钟后刷新 + 高配额 (90%)
+        // 3. PRO + 30分钟后刷新 + 低配额 (50%)
+        // 4. PRO + 5小时后刷新 (90%)
         // 5. FREE (最低等级，即使配额最高)
         assert_eq!(tokens[0].email, "ultra@test.com");
-        assert_eq!(tokens[1].email, "pro_soon@test.com");
-        assert_eq!(tokens[2].email, "pro_late@test.com");
-        assert_eq!(tokens[3].email, "pro_low_health@test.com");
+        assert_eq!(tokens[1].email, "pro_high_quota_soon@test.com");
+        assert_eq!(tokens[2].email, "pro_soon@test.com");
+        assert_eq!(tokens[3].email, "pro_late@test.com");
         assert_eq!(tokens[4].email, "free_high@test.com");
     }
 
@@ -11397,7 +11968,6 @@ mod tests {
             remaining_quota,
             protected_models,
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -11690,16 +12260,7 @@ mod tests {
                 return quota_cmp;
             }
 
-            // Priority 2: Health score
-            let health_cmp = b
-                .health_score
-                .partial_cmp(&a.health_score)
-                .unwrap_or(Ordering::Equal);
-            if health_cmp != Ordering::Equal {
-                return health_cmp;
-            }
-
-            // Priority 3: Tier (for non-high-end models)
+            // Priority 2: Tier (for non-high-end models)
             if !requires_ultra {
                 let tier_cmp =
                     tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
@@ -12036,7 +12597,6 @@ mod tests {
             model_priorities: HashMap::new(),
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -12071,7 +12631,6 @@ mod tests {
             model_priorities: HashMap::new(),
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -12294,7 +12853,6 @@ mod tests {
             model_priorities: HashMap::new(),
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -12371,7 +12929,6 @@ mod tests {
             model_priorities: HashMap::new(),
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -13502,6 +14059,20 @@ mod tests {
         );
         assert!(manager.session_accounts.get(session_id).is_none());
 
+        // 未解绑时调用 commit_session 不得覆写既有绑定（如强制轮换/生图换号）
+        manager.commit_session(session_id, acc1);
+        let claimed = manager
+            .session_accounts
+            .claim(&manager.session_accounts.snapshot(session_id), acc2, 0)
+            .unwrap();
+        manager.session_accounts.commit(&claimed, || true).unwrap();
+        assert_eq!(
+            manager.session_accounts.get(session_id).unwrap().as_str(),
+            acc1,
+            "commit_session must not overwrite existing bound account without prior unbind"
+        );
+        assert!(manager.abandon_session(session_id, acc1));
+
         // 故障转移到 acc2 成功后 commit
         manager.commit_session(session_id, acc2);
         assert_eq!(
@@ -14298,6 +14869,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_balance_mode_waits_in_place_for_transient_rate_limit() {
+        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let accounts_dir = temp_dir.path().join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let acc1_id = "acc_balance_bound_rl";
+        let acc2_id = "acc_balance_alt_free";
+
+        let acc1_path = accounts_dir.join(format!("{}.json", acc1_id));
+        let acc2_path = accounts_dir.join(format!("{}.json", acc2_id));
+
+        std::fs::write(&acc1_path, r#"{"disabled":false}"#).unwrap();
+        std::fs::write(&acc2_path, r#"{"disabled":false}"#).unwrap();
+
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        manager
+            .update_sticky_config(StickySessionConfig {
+                mode: SchedulingMode::Balance,
+                max_wait_seconds: 2,
+                max_spillover_accounts: 0,
+                affinity_scope: crate::proxy::sticky_config::AffinityScope::Session,
+                ..Default::default()
+            })
+            .await;
+
+        let target_model = "gemini-4-argon";
+        let norm_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let mut quotas1 = HashMap::new();
+        quotas1.insert(norm_target.clone(), 70);
+
+        let mut quotas2 = HashMap::new();
+        quotas2.insert(norm_target.clone(), 100);
+
+        let mut token1 = create_test_token("acc1@test.com", Some("PRO"), 1.0, None, Some(70));
+        token1.account_id = acc1_id.to_string();
+        token1.account_path = acc1_path;
+        token1.model_quotas = quotas1;
+
+        let mut token2 = create_test_token("acc2@test.com", Some("PRO"), 1.0, None, Some(100));
+        token2.account_id = acc2_id.to_string();
+        token2.account_path = acc2_path;
+        token2.model_quotas = quotas2;
+
+        manager.tokens.insert(acc1_id.to_string(), token1);
+        manager.tokens.insert(acc2_id.to_string(), token2);
+
+        let session_id = "test-session-balance-in-place-wait";
+        manager.commit_session(session_id, acc1_id);
+
+        // 1. 设置短期限流 (1秒)，reset_sec (1s) <= max_wait_seconds (2s)
+        // 无论 Balance 还是 CacheFirst，只要 reset_sec <= max_wait_seconds，必须原地精准等待并复用绑定账号，保住 KV 缓存
+        manager.rate_limit_tracker.set_lockout_until(
+            acc1_id,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(1),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            Some(norm_target.clone()),
+        );
+
+        let excluded = HashSet::new();
+        let (_token, _project_id, email, selected_id, _wait) = manager
+            .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
+            .await
+            .expect("Balance mode must wait in-place and reuse bound account when reset_sec <= max_wait_seconds");
+
+        assert_eq!(
+            selected_id, acc1_id,
+            "Balance 模式下当限流冷却时长 <= max_wait_seconds 时必须原地等待并复用绑定账号，绝不得解绑切号"
+        );
+        assert_eq!(email, "acc1@test.com");
+        assert_eq!(
+            manager.session_accounts.get(session_id).unwrap().as_str(),
+            acc1_id,
+            "会话绑定必须被保留"
+        );
+
+        // 2. 当限流冷却时长 > max_wait_seconds 时，必须解绑并切换到池中健康账号
+        manager.rate_limit_tracker.set_lockout_until(
+            acc1_id,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            Some(norm_target.clone()),
+        );
+
+        let (_token_switched, _, email_switched, selected_switched, _) = manager
+            .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
+            .await
+            .expect("Balance mode should switch when reset_sec > max_wait_seconds");
+
+        assert_eq!(
+            selected_switched, acc2_id,
+            "限流冷却时长 (10s) 超过 max_wait_seconds (2s) 时应解绑并切换到 acc2"
+        );
+        assert_eq!(email_switched, "acc2@test.com");
+        assert!(
+            manager
+                .session_accounts
+                .get(session_id)
+                .map(|v| v.clone())
+                .as_deref()
+                != Some(acc1_id),
+            "原账号绑定应已被解除"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_60s_window_retains_account_even_if_higher_priority_alt_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let accounts_dir = temp_dir.path().join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let acc1_id = "acc_mode_b_p1";
+        let acc2_id = "acc_mode_b_p0";
+
+        let acc1_path = accounts_dir.join(format!("{}.json", acc1_id));
+        let acc2_path = accounts_dir.join(format!("{}.json", acc2_id));
+
+        std::fs::write(&acc1_path, r#"{"disabled":false}"#).unwrap();
+        std::fs::write(&acc2_path, r#"{"disabled":false}"#).unwrap();
+
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let target_model = "gemini-4-argon";
+        let norm_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let mut quotas1 = HashMap::new();
+        quotas1.insert(norm_target.clone(), 80);
+
+        let mut quotas2 = HashMap::new();
+        quotas2.insert(norm_target.clone(), 100);
+
+        // acc1: priority 1 (静态优先级低)
+        let mut token1 = create_test_token("acc1@test.com", Some("PRO"), 1.0, None, Some(80));
+        token1.account_id = acc1_id.to_string();
+        token1.account_path = acc1_path;
+        token1.priority = 1;
+        token1.model_quotas = quotas1;
+
+        // acc2: priority 0 (静态优先级更高)
+        let mut token2 = create_test_token("acc2@test.com", Some("PRO"), 1.0, None, Some(100));
+        token2.account_id = acc2_id.to_string();
+        token2.account_path = acc2_path;
+        token2.priority = 0;
+        token2.model_quotas = quotas2;
+
+        manager.tokens.insert(acc1_id.to_string(), token1);
+        manager.tokens.insert(acc2_id.to_string(), token2);
+
+        // 模拟 60s 窗口内上一请求使用了 acc1
+        {
+            let mut last_used = manager.last_used_account.lock().await;
+            *last_used = Some((acc1_id.to_string(), std::time::Instant::now()));
+        }
+
+        // 无 session_id 请求（模式 B 60s 全局锁定）
+        // 即使号池存在静态优先级更高 (priority 0) 的 acc2，
+        // 只要 acc1 额度 > 0% 且未限流，60s 窗口内必须坚决复用 acc1，杜绝静态优先级抢占破坏 KV 缓存
+        let excluded = HashSet::new();
+        let (_token, _project_id, email, selected_id, _wait) = manager
+            .get_token_filtered("chat", false, None, target_model, &excluded)
+            .await
+            .expect(
+                "60s window should retain last used account even if higher priority account exists",
+            );
+
+        assert_eq!(
+            selected_id, acc1_id,
+            "Mode B 60s 窗口内必须复用最近账号以保住 KV 缓存，严禁因池中存在静态高优先级账号而发生抢占切换"
+        );
+        assert_eq!(email, "acc1@test.com");
+    }
+
+    #[tokio::test]
     async fn test_preferred_account_auto_failover_when_zero_quota_issue_3639() {
         let temp_dir = tempfile::tempdir().unwrap();
         let accounts_dir = temp_dir.path().join("accounts");
@@ -15061,7 +15811,6 @@ mod tests {
             remaining_quota: Some(100),
             protected_models: HashSet::new(),
             forbidden_models: std::collections::HashSet::new(),
-            health_score: 1.0,
             reset_time: None,
             weekly_reset_time: None,
             validation_blocked: false,
@@ -16153,25 +16902,25 @@ mod tests {
         let mut weekly = HashMap::new();
         let inputs = vec![
             QuotaBucketInput {
-                family: "gemini",
+                family: "gemini".to_string(),
                 is_weekly: true,
                 remaining_fraction: Some(0.0),
                 reset_at: Some(300),
             },
             QuotaBucketInput {
-                family: "gemini",
+                family: "gemini".to_string(),
                 is_weekly: true,
                 remaining_fraction: Some(0.0),
                 reset_at: Some(200),
             },
             QuotaBucketInput {
-                family: "gemini",
+                family: "gemini".to_string(),
                 is_weekly: false,
                 remaining_fraction: Some(0.5),
                 reset_at: Some(100),
             },
             QuotaBucketInput {
-                family: "argon",
+                family: "argon".to_string(),
                 is_weekly: true,
                 remaining_fraction: Some(0.8),
                 reset_at: Some(400),
@@ -16271,8 +17020,24 @@ mod tests {
         assert_eq!(id_claude, "acc_personal");
         assert_eq!(tok_claude, "tok_personal");
 
-        // 2. Immediately requesting Gemini (even within the 60s stateless window) yields to `acc_pool`
+        // 2. Immediately requesting Gemini (within the 60s stateless window) retains `acc_personal`
+        // even though `acc_pool` has higher priority (50 < 80), to preserve KV cache!
+        let (tok_gemini_retained, _, _, id_gemini_retained, _) = manager
+            .get_token("gemini", false, None, gemini_model)
+            .await
+            .unwrap();
+        assert_eq!(
+            id_gemini_retained, "acc_personal",
+            "Mode B 60s window must retain last used account even if another account has higher priority"
+        );
+        assert_eq!(tok_gemini_retained, "tok_personal");
+
+        // 3. When outside the 60s window (or window reset), requesting Gemini yields to `acc_pool`
         // because `acc_personal` has effective Gemini priority 80 > `acc_pool` priority 50.
+        {
+            let mut last_used = manager.last_used_account.lock().await;
+            *last_used = None;
+        }
         let (tok_gemini, _, _, id_gemini, _) = manager
             .get_token("gemini", false, None, gemini_model)
             .await
@@ -16280,7 +17045,11 @@ mod tests {
         assert_eq!(id_gemini, "acc_pool");
         assert_eq!(tok_gemini, "tok_pool");
 
-        // 3. Hot-updating model priorities via TokenManager flips Gemini priority to 1 on `acc_personal`
+        // 4. Hot-updating model priorities via TokenManager flips Gemini priority to 1 on `acc_personal`
+        {
+            let mut last_used = manager.last_used_account.lock().await;
+            *last_used = None;
+        }
         let mut updated_map = HashMap::new();
         updated_map.insert("claude".to_string(), 1);
         updated_map.insert("gemini".to_string(), 1);
@@ -16308,5 +17077,774 @@ mod tests {
         );
         token.model_reset_times.insert("gemini".to_string(), 999);
         token.assert_quota_state_consistent();
+    }
+
+    #[tokio::test]
+    async fn test_load_accounts_preserves_hydrogen_and_dynamic_limits_for_non_ultra() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-hydrogen-pro-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let future_reset = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        let pro_json = serde_json::json!({
+            "id": "acc_pro_hydrogen",
+            "email": "pro_hydrogen@test.com",
+            "token": {
+                "access_token": "atk_h",
+                "refresh_token": "rtk_h",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "quota": {
+                "subscription_tier": "PRO",
+                "models": [
+                    {
+                        "name": "gemini-4-hydrogen-high",
+                        "percentage": 85,
+                        "reset_time": future_reset,
+                        "max_output_tokens": 262144
+                    },
+                    {
+                        "name": "gemini-4-argon-high",
+                        "percentage": 85,
+                        "reset_time": future_reset,
+                        "max_output_tokens": 65536
+                    }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini",
+                        "buckets": [
+                            {
+                                "bucket_id": "gemini-5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.85,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    }
+                ]
+            },
+            "created_at": now,
+            "last_used": now
+        });
+
+        std::fs::write(
+            accounts_dir.join("acc_pro_hydrogen.json"),
+            serde_json::to_string_pretty(&pro_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        let token = manager
+            .tokens
+            .get("acc_pro_hydrogen")
+            .expect("pro account should load");
+        assert!(
+            token.available_models.contains("gemini-4-hydrogen-high"),
+            "hydrogen-high returned by upstream must not be wiped for non-Ultra accounts"
+        );
+        assert!(
+            token.available_models.contains("gemini-4-hydrogen"),
+            "derived bare gemini-4-hydrogen must be preserved"
+        );
+        assert_eq!(
+            token.model_quotas.get("gemini-4-hydrogen-high").copied(),
+            Some(85)
+        );
+        assert_eq!(
+            token.model_quotas.get("gemini-4-hydrogen").copied(),
+            Some(85)
+        );
+        assert_eq!(
+            token.model_limits.get("gemini-4-hydrogen-high").copied(),
+            Some(262144)
+        );
+        assert_eq!(
+            token.model_limits.get("gemini-4-hydrogen").copied(),
+            Some(262144)
+        );
+
+        // Legacy Argon still cleans up on non-Ultra accounts without an Argon bucket (#3745).
+        assert!(
+            !token.available_models.contains("gemini-4-argon-high"),
+            "argon without argon bucket must still be excluded on non-Ultra accounts"
+        );
+        assert!(!token.available_models.contains("gemini-4-argon"));
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_load_accounts_ultra_does_not_fabricate_ungranted_hydrogen_or_carbon() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-ultra-no-fab-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let future_reset = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        let ultra_json = serde_json::json!({
+            "id": "acc_ultra_only_3x",
+            "email": "ultra@test.com",
+            "token": {
+                "access_token": "atk_u",
+                "refresh_token": "rtk_u",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "quota": {
+                "subscription_tier": "ULTRA",
+                "models": [
+                    {
+                        "name": "gemini-3.8-flash-high",
+                        "percentage": 90,
+                        "reset_time": future_reset,
+                        "max_output_tokens": 65536
+                    }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini",
+                        "buckets": [
+                            {
+                                "bucket_id": "gemini-5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.90,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    }
+                ]
+            },
+            "created_at": now,
+            "last_used": now
+        });
+
+        std::fs::write(
+            accounts_dir.join("acc_ultra_only_3x.json"),
+            serde_json::to_string_pretty(&ultra_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        let token = manager
+            .tokens
+            .get("acc_ultra_only_3x")
+            .expect("ultra account should load");
+        // Ultra keeps Argon fallback compatibility...
+        assert!(token.available_models.contains("gemini-4-argon"));
+        // ...without fabricating ungranted hydrogen/carbon models not in quota.models.
+        assert!(!token.available_models.contains("gemini-4-hydrogen"));
+        assert!(!token.available_models.contains("gemini-4-carbon"));
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_dynamic_g4_codename_quota_window_isolation_and_shared_fallback() {
+        let now_ts = chrono::Utc::now().timestamp();
+        let mut token = create_test_token("g4_isolation@test.com", Some("PRO"), 1.0, None, Some(0));
+
+        // Shared Gemini pool is healthy/expired, while dedicated Helium bucket is depleted and unreset.
+        token.model_quota_windows.insert(
+            "gemini".to_string(),
+            vec![QuotaWindowStatus {
+                is_weekly: true,
+                remaining_fraction: Some(0.0),
+                reset_time: Some(now_ts - 60),
+            }],
+        );
+        token.model_quota_windows.insert(
+            "helium".to_string(),
+            vec![QuotaWindowStatus {
+                is_weekly: true,
+                remaining_fraction: Some(0.0),
+                reset_time: Some(now_ts + 86400),
+            }],
+        );
+        token
+            .model_weekly_reset_times
+            .insert("gemini".to_string(), now_ts - 60);
+        token
+            .model_weekly_reset_times
+            .insert("helium".to_string(), now_ts + 86400);
+        token
+            .model_quotas
+            .insert("gemini-4-helium-xhigh".to_string(), 0);
+        token
+            .model_quotas
+            .insert("gemini-4-hydrogen-xhigh".to_string(), 0);
+
+        // Dedicated Helium must strictly consult its own bucket and block expiry self-heal.
+        assert!(
+            !TokenManager::is_model_quota_depleted_expired(&token, "gemini-4-helium-xhigh"),
+            "dedicated codename bucket depletion must stay isolated from expired Gemini pool"
+        );
+        assert_eq!(
+            TokenManager::resolve_model_reset_time(&token, "gemini-4-helium-xhigh", true),
+            Some(now_ts + 86400)
+        );
+
+        // Hydrogen without a dedicated bucket shares the general Gemini pool.
+        assert!(
+            TokenManager::is_model_quota_depleted_expired(&token, "gemini-4-hydrogen-xhigh"),
+            "non-dedicated G4 codename without a dedicated bucket should fall back to Gemini windows"
+        );
+        assert_eq!(
+            TokenManager::resolve_model_reset_time(&token, "gemini-4-hydrogen-xhigh", true),
+            Some(now_ts - 60)
+        );
+    }
+
+    #[test]
+    fn test_accounts_with_positive_quota_filters_canary_g4_and_isolates_dedicated_groups() {
+        let now_ts = chrono::Utc::now().timestamp();
+        let manager = TokenManager::new(std::path::PathBuf::from("/tmp/test_g4_positive"));
+
+        // Account A: Pro without Hydrogen capability, healthy Gemini pool
+        let mut acc_no_cap = create_test_token("nocap@test.com", Some("PRO"), 1.0, None, Some(100));
+        acc_no_cap
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        acc_no_cap
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 90);
+
+        // Account B: Pro with Hydrogen sharing Gemini pool (no dedicated hydrogen bucket)
+        let mut acc_shared =
+            create_test_token("shared@test.com", Some("PRO"), 1.0, None, Some(100));
+        acc_shared
+            .available_models
+            .insert("gemini-4-hydrogen-xhigh".to_string());
+        acc_shared
+            .model_quotas
+            .insert("gemini-4-hydrogen-xhigh".to_string(), 80);
+
+        // Account C: Dedicated Helium bucket depleted (0%), Gemini pool healthy (90%)
+        let mut acc_dedicated_zero =
+            create_test_token("ded_zero@test.com", Some("PRO"), 1.0, None, Some(100));
+        acc_dedicated_zero
+            .available_models
+            .insert("gemini-4-helium-xhigh".to_string());
+        acc_dedicated_zero
+            .available_models
+            .insert("gemini-3.8-flash-high".to_string());
+        acc_dedicated_zero
+            .model_quotas
+            .insert("gemini-4-helium-xhigh".to_string(), 0);
+        acc_dedicated_zero
+            .model_quotas
+            .insert("gemini-3.8-flash-high".to_string(), 90);
+        acc_dedicated_zero.model_quota_windows.insert(
+            "helium".to_string(),
+            vec![QuotaWindowStatus {
+                is_weekly: true,
+                remaining_fraction: Some(0.0),
+                reset_time: Some(now_ts + 3600),
+            }],
+        );
+
+        manager.tokens.insert("nocap".to_string(), acc_no_cap);
+        manager.tokens.insert("shared".to_string(), acc_shared);
+        manager
+            .tokens
+            .insert("ded_zero".to_string(), acc_dedicated_zero);
+
+        // Only acc_shared holds Hydrogen capability.
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-4-hydrogen-xhigh"),
+            1
+        );
+        // Dedicated Helium is 0% despite positive Gemini 3.8 pool.
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-4-helium-xhigh"),
+            0
+        );
+        // Standard Gemini sees acc_no_cap + acc_dedicated_zero (+ acc_shared non-3p non-dedicated key).
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.8-flash-high"),
+            3
+        );
+    }
+
+    #[test]
+    fn test_sync_zero_quota_circuit_breaker_isolates_dynamic_g4_groups() {
+        let now_ts = chrono::Utc::now().timestamp();
+        let future_reset = chrono::DateTime::from_timestamp(now_ts + 7200, 0)
+            .unwrap()
+            .to_rfc3339();
+        let manager = TokenManager::new(std::path::PathBuf::from("/tmp/test_g4_cb"));
+
+        // Scenario 1: Helium has its own depleted group while Gemini is healthy;
+        // Hydrogen is in models with NO dedicated Hydrogen group (shares Gemini).
+        let account_json = serde_json::json!({
+            "quota": {
+                "last_updated": now_ts,
+                "models": [
+                    { "name": "gemini-4-helium-xhigh", "percentage": 0 },
+                    { "name": "gemini-4-hydrogen-xhigh", "percentage": 90 },
+                    { "name": "gemini-3.8-flash-high", "percentage": 90 }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucket_id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.90,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    },
+                    {
+                        "display_name": "Helium",
+                        "buckets": [
+                            {
+                                "bucket_id": "helium-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.0,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        manager.sync_zero_quota_circuit_breaker("acc1", &account_json);
+
+        assert!(
+            manager
+                .rate_limit_tracker
+                .is_rate_limited("acc1", Some("gemini-4-helium-xhigh")),
+            "dedicated exhausted G4 group must lock its codename models"
+        );
+        assert!(
+            !manager
+                .rate_limit_tracker
+                .is_rate_limited("acc1", Some("gemini-4-hydrogen-xhigh")),
+            "shared non-dedicated G4 model must stay unlocked when Gemini is positive"
+        );
+        assert!(
+            !manager
+                .rate_limit_tracker
+                .is_rate_limited("acc1", Some("gemini-3.8-flash-high")),
+            "dedicated G4 exhaustion must not lock general Gemini models"
+        );
+
+        // Scenario 2: When general Gemini weekly bucket hits 0%, shared Hydrogen locks with Gemini.
+        let gemini_exhausted_json = serde_json::json!({
+            "quota": {
+                "last_updated": now_ts + 10,
+                "models": [
+                    { "name": "gemini-4-hydrogen-xhigh", "percentage": 0 },
+                    { "name": "gemini-3.8-flash-high", "percentage": 0 }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucket_id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.0,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        manager.sync_zero_quota_circuit_breaker("acc2", &gemini_exhausted_json);
+        assert!(manager
+            .rate_limit_tracker
+            .is_rate_limited("acc2", Some("gemini-4-hydrogen-xhigh")));
+        assert!(manager
+            .rate_limit_tracker
+            .is_rate_limited("acc2", Some("gemini-3.8-flash-high")));
+    }
+
+    #[tokio::test]
+    async fn test_capable_account_vs_positive_quota_and_disk_discovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let accounts_dir = data_dir.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        // Disk account 1: proxy_disabled = true, carries gemini-4-hydrogen-high
+        let acc_disabled = serde_json::json!({
+            "id": "acc-disabled-h2",
+            "email": "h2-disabled@example.com",
+            "proxy_disabled": true,
+            "token": {
+                "access_token": "ya29.test",
+                "refresh_token": "1//test",
+                "expires_in": 3600,
+                "expiry_timestamp": chrono::Utc::now().timestamp() + 3600
+            },
+            "quota": {
+                "models": [
+                    { "name": "gemini-4-hydrogen-high", "percentage": 100 }
+                ]
+            }
+        });
+        std::fs::write(
+            accounts_dir.join("acc-disabled-h2.json"),
+            acc_disabled.to_string(),
+        )
+        .unwrap();
+
+        // Disk account 2: orphan (not in accounts.json), carries fake-orphan-model
+        let acc_orphan = serde_json::json!({
+            "id": "acc-orphan",
+            "email": "orphan@example.com",
+            "quota": {
+                "models": [
+                    { "name": "fake-orphan-model", "percentage": 100 }
+                ]
+            }
+        });
+        std::fs::write(accounts_dir.join("acc-orphan.json"), acc_orphan.to_string()).unwrap();
+
+        std::fs::write(
+            data_dir.join("accounts.json"),
+            serde_json::json!({
+                "version": "2.0",
+                "accounts": [
+                    {
+                        "id": "acc-disabled-h2",
+                        "email": "h2-disabled@example.com",
+                        "disabled": false,
+                        "proxy_disabled": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(data_dir.clone());
+        let disk_models = manager.get_all_disk_discovered_models();
+        assert!(
+            disk_models.contains("gemini-4-hydrogen-high"),
+            "proxy_disabled valid account models must remain discoverable on disk"
+        );
+        assert!(
+            !disk_models.contains("fake-orphan-model"),
+            "orphan files outside accounts.json must not leak into disk discovery"
+        );
+
+        // Pool token without hydrogen capability -> neither capable nor positive for hydrogen,
+        // while capable for its own 0%-quota gemini-3.8-flash-high.
+        let mut quotas = HashMap::new();
+        quotas.insert("gemini-3.8-flash-high".to_string(), 0);
+        let mut available = HashSet::new();
+        available.insert("gemini-3.8-flash-high".to_string());
+        let tok = ProxyToken {
+            account_id: "acc-active".to_string(),
+            priority: 0,
+            model_priorities: HashMap::new(),
+            access_token: "ya29.active".to_string(),
+            refresh_token: "1//active".to_string(),
+            expires_in: 3600,
+            timestamp: chrono::Utc::now().timestamp() + 3600,
+            email: "active@example.com".to_string(),
+            account_path: accounts_dir.join("acc-active.json"),
+            project_id: None,
+            subscription_tier: None,
+            remaining_quota: Some(0),
+            protected_models: HashSet::new(),
+            forbidden_models: HashSet::new(),
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: quotas,
+            model_limits: HashMap::new(),
+            available_models: available,
+            model_metadata: HashMap::new(),
+            model_reset_times: HashMap::new(),
+            model_weekly_reset_times: HashMap::new(),
+            model_quota_windows: HashMap::new(),
+        };
+        manager.tokens.insert("acc-active".to_string(), tok);
+        let future_reset =
+            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 3600, 0)
+                .unwrap()
+                .to_rfc3339();
+        let active_quota_json = serde_json::json!({
+            "quota": {
+                "last_updated": chrono::Utc::now().timestamp(),
+                "models": [
+                    { "name": "gemini-3.8-flash-high", "percentage": 0, "reset_time": future_reset }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucket_id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.0,
+                                "reset_time": future_reset
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        manager.sync_zero_quota_circuit_breaker("acc-active", &active_quota_json);
+
+        assert!(
+            !manager.has_any_capable_account_in_pool("gemini-4-hydrogen-high"),
+            "pool lacking hydrogen authorization must report no capable account (503)"
+        );
+        assert!(
+            manager.has_any_capable_account_in_pool("gemini-3.8-flash-high"),
+            "pool with 0%-quota authorized model still has capable account (502)"
+        );
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3.8-flash-high"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disable_and_manual_enable_clear_locks_and_jail() {
+        let data_dir =
+            std::env::temp_dir().join(format!("abv_tm_toggle_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let manager = TokenManager::new(data_dir.clone());
+
+        let mut available = HashSet::new();
+        available.insert("gemini-4-hydrogen-high".to_string());
+        let tok = ProxyToken {
+            account_id: "acc-toggle".to_string(),
+            priority: 0,
+            model_priorities: HashMap::new(),
+            access_token: "ya29.toggle".to_string(),
+            refresh_token: "1//toggle".to_string(),
+            expires_in: 3600,
+            timestamp: chrono::Utc::now().timestamp() + 3600,
+            email: "toggle@example.com".to_string(),
+            account_path: data_dir.join("acc-toggle.json"),
+            project_id: Some("proj-toggle".to_string()),
+            subscription_tier: None,
+            remaining_quota: Some(100),
+            protected_models: HashSet::new(),
+            forbidden_models: HashSet::new(),
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: HashMap::new(),
+            model_limits: HashMap::new(),
+            available_models: available,
+            model_metadata: HashMap::new(),
+            model_reset_times: HashMap::new(),
+            model_weekly_reset_times: HashMap::new(),
+            model_quota_windows: HashMap::new(),
+        };
+        manager.tokens.insert("acc-toggle".to_string(), tok);
+        manager
+            .set_preferred_account(Some("acc-toggle".to_string()))
+            .await;
+        {
+            let mut last_used = manager.last_used_account.lock().await;
+            *last_used = Some(("acc-toggle".to_string(), std::time::Instant::now()));
+        }
+        manager
+            .session_accounts
+            .insert("sess-1".to_string(), "acc-toggle".to_string());
+        manager.mark_model_unsupported("acc-toggle", "gemini-4-hydrogen-high", Some(900));
+        manager
+            .invalid_grant_failures
+            .insert("acc-toggle".to_string(), 1);
+        manager
+            .project_id_failures
+            .insert("acc-toggle".to_string(), std::time::Instant::now());
+
+        // Async removal must clear tokens, last_used_account, preferred_account_id,
+        // session_accounts, and unsupported breakers cleanly.
+        manager.remove_account_and_clear_locks("acc-toggle").await;
+        assert!(!manager.tokens.contains_key("acc-toggle"));
+        assert!(manager.get_preferred_account().await.is_none());
+        assert!(manager.last_used_account.lock().await.is_none());
+        assert!(!manager.session_accounts.bound_lease("sess-1").is_some());
+        assert!(!manager.is_model_unsupported("acc-toggle", "gemini-4-hydrogen-high"));
+        assert!(!manager.invalid_grant_failures.contains_key("acc-toggle"));
+        assert!(!manager.project_id_failures.contains_key("acc-toggle"));
+
+        // Manual re-enable must immediately release QoS jail, transient rate limits, failure counters, and model breakers.
+        manager.qos_guardian.set_auto_jail_enabled(true);
+        manager.qos_guardian.states.insert(
+            "acc-toggle".to_string(),
+            crate::proxy::qos_guardian::AccountQoSState::Jailed {
+                level: 1,
+                jailed_at: std::time::Instant::now(),
+                current_wait: std::time::Duration::from_secs(600),
+            },
+        );
+        manager.mark_model_unsupported("acc-toggle", "gemini-4-hydrogen-high", Some(900));
+        manager.rate_limit_tracker.set_lockout_until(
+            "acc-toggle",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+            crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+            Some("gemini-4-hydrogen-high".to_string()),
+        );
+        manager
+            .invalid_grant_failures
+            .insert("acc-toggle".to_string(), 2);
+        manager
+            .project_id_failures
+            .insert("acc-toggle".to_string(), std::time::Instant::now());
+
+        assert!(manager.qos_guardian.is_jailed_or_probing("acc-toggle"));
+        manager.prepare_manual_enable("acc-toggle");
+        assert!(!manager.qos_guardian.is_jailed_or_probing("acc-toggle"));
+        assert!(!manager.is_model_unsupported("acc-toggle", "gemini-4-hydrogen-high"));
+        assert!(!manager
+            .rate_limit_tracker
+            .is_rate_limited("acc-toggle", Some("gemini-4-hydrogen-high")));
+        assert!(!manager.invalid_grant_failures.contains_key("acc-toggle"));
+        assert!(!manager.project_id_failures.contains_key("acc-toggle"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_argon_g1_pro_isolation_and_worker_exclusion() {
+        // 1. select_probe_model must NOT treat gemini-pro-orchestrator-g1-pro as general gemini_text
+        let mut probe_tok =
+            create_test_token("probe_orch@test.com", Some("ULTRA"), 1.0, None, Some(100));
+        probe_tok
+            .available_models
+            .insert("gemini-pro-orchestrator-g1-pro".to_string());
+        probe_tok
+            .model_quotas
+            .insert("gemini-pro-orchestrator-g1-pro".to_string(), 100);
+        probe_tok
+            .available_models
+            .insert("gemini-3.1-pro-high".to_string());
+        probe_tok
+            .model_quotas
+            .insert("gemini-3.1-pro-high".to_string(), 100);
+        assert_eq!(
+            TokenManager::select_probe_model(&probe_tok).as_deref(),
+            Some("gemini-3.1-pro-high"),
+            "probe selector must not prioritize Argon orchestrator over standard gemini_text"
+        );
+
+        // 2. load_accounts must preserve gemini-pro-orchestrator-g1-pro for Ultra / Argon-group Pro,
+        //    strip it for non-Argon Pro, and always strip internal gemini-flash-worker-agy.
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-orch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let future_reset = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        let ultra_json = serde_json::json!({
+            "id": "acc_ultra_orch",
+            "email": "ultra_orch@test.com",
+            "token": {
+                "access_token": "atk_uo",
+                "refresh_token": "rtk_uo",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "quota": {
+                "subscription_tier": "ULTRA",
+                "models": [
+                    { "name": "gemini-3.8-flash-high", "percentage": 90, "reset_time": future_reset },
+                    { "name": "gemini-flash-worker-agy", "percentage": 100, "reset_time": future_reset }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini",
+                        "buckets": [{ "bucket_id": "gemini-5h", "window": "5h", "remaining_fraction": 0.90, "reset_time": future_reset }]
+                    }
+                ]
+            },
+            "created_at": now,
+            "last_used": now
+        });
+        let non_argon_pro_json = serde_json::json!({
+            "id": "acc_pro_no_orch",
+            "email": "pro_no_orch@test.com",
+            "token": {
+                "access_token": "atk_pn",
+                "refresh_token": "rtk_pn",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "quota": {
+                "subscription_tier": "PRO",
+                "models": [
+                    { "name": "gemini-pro-orchestrator-g1-pro", "percentage": 80, "reset_time": future_reset },
+                    { "name": "gemini-flash-worker-agy", "percentage": 100, "reset_time": future_reset }
+                ],
+                "quota_groups": [
+                    {
+                        "display_name": "Gemini",
+                        "buckets": [{ "bucket_id": "gemini-5h", "window": "5h", "remaining_fraction": 0.80, "reset_time": future_reset }]
+                    }
+                ]
+            },
+            "created_at": now,
+            "last_used": now
+        });
+
+        std::fs::write(
+            accounts_dir.join("acc_ultra_orch.json"),
+            serde_json::to_string_pretty(&ultra_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            accounts_dir.join("acc_pro_no_orch.json"),
+            serde_json::to_string_pretty(&non_argon_pro_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        let ultra_tok = manager.tokens.get("acc_ultra_orch").unwrap();
+        assert!(ultra_tok
+            .available_models
+            .contains("gemini-pro-orchestrator-g1-pro"));
+        assert!(!ultra_tok
+            .available_models
+            .contains("gemini-flash-worker-agy"));
+
+        let pro_tok = manager.tokens.get("acc_pro_no_orch").unwrap();
+        assert!(!pro_tok
+            .available_models
+            .contains("gemini-pro-orchestrator-g1-pro"));
+        assert!(!pro_tok.available_models.contains("gemini-flash-worker-agy"));
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

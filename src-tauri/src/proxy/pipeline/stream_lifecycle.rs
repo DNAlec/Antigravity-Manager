@@ -47,6 +47,12 @@ pub trait ProtocolStreamHandler: Send + 'static {
         false
     }
 
+    /// Whether every rendered candidate received an upstream terminal reason.
+    /// None leaves completion validation to adapters with their own terminal format.
+    fn upstream_completion(&self) -> Option<bool> {
+        None
+    }
+
     /// A protocol may defer its terminal frame briefly to collect trailing usage.
     /// The driver fixes the deadline on first observation; subsequent frames do not extend it.
     fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
@@ -57,14 +63,8 @@ pub trait ProtocolStreamHandler: Send + 'static {
     /// （Claude 下发 message_delta(end_turn) + message_stop，OpenAI 下发 [DONE] 及可选 usage chunk）
     fn emit_finalize(&mut self) -> Vec<Bytes>;
 
-    /// [黄金三元组异常截断收尾契约] 上游异常中断/超时且已有正文/工具调用输出（has_content == true）时调用：
-    /// 此时为了避免客户端抛出 StreamTruncatedError 丢弃已生成的成千上万 token，必须优雅收尾；
-    /// 但与正常 EOF (emit_finalize) 不同，异常收尾遵循零正文篡改原则：
-    /// 1. 绝不向模型正文注入任何假横幅或篡改已有文本；
-    /// 2. 若存在工具调用，严格优先保持 tool_use (Claude) / tool_calls (OpenAI) / STOP (Gemini)；
-    /// 3. 仅当纯文本生成中途断流时，设置截断型终止原因（Claude 下发 max_tokens，OpenAI 下发 length，Gemini 下发 MAX_TOKENS）。
-    ///
-    /// 默认实现回退至普通 emit_finalize()。
+    /// Preserve partial output with a distinct truncation or error terminal.
+    /// An interruption must not authorize executing unfinished tool calls.
     fn emit_abnormal_finalize(&mut self, _error_report: &StreamErrorReport) -> Vec<Bytes> {
         self.emit_finalize()
     }
@@ -288,6 +288,15 @@ where
                                                 .map(|wait| tokio::time::Instant::now() + wait);
                                         }
 
+                                        // DONE ends transport, but does not prove the model
+                                        // completed. Finalize below using the candidate state.
+                                        if line.strip_prefix("data:")
+                                            .is_some_and(|data| data.trim() == "[DONE]")
+                                        {
+                                            buffer.clear();
+                                            break 'upstream;
+                                        }
+
                                         // [关键终结状态机感知]
                                         // 若当前处理的数据行促使协议发射了终端终结帧（如 Claude 的 message_stop），
                                         // 立即终止解析并跳出生命周期循环，彻底断开下游响应体，阻止客户端因等待上游 TCP EOF 而悬挂计时。
@@ -347,9 +356,29 @@ where
                                     }
                                 }
                                 Err(e) => {
+                                    // A reset can follow a complete final JSON event without
+                                    // its newline, including an empty provider refusal.
+                                    if !buffer.is_empty() {
+                                        let line_str = String::from_utf8_lossy(&buffer);
+                                        let line = line_str.trim();
+                                        if !line.is_empty() {
+                                            let (chunks, failure) = process_upstream_line(&mut handler, &mut error_detector, line, &config);
+                                            let emitted_error_frame = !chunks.is_empty();
+                                            for out_chunk in chunks { yield Ok(out_chunk); }
+                                            if let Some(error) = failure {
+                                                if !emitted_error_frame { yield Err(error); }
+                                                error_emitted = true;
+                                                break 'upstream;
+                                            }
+                                        }
+                                        buffer.clear();
+                                    }
                                     // A completed model response is only waiting for optional
                                     // usage trailers. A transport close cannot revoke its finish.
-                                    if completion_deadline.is_some() {
+                                    if handler.is_terminal()
+                                        || completion_deadline.is_some()
+                                        || handler.upstream_completion() == Some(true)
+                                    {
                                         break;
                                     }
                                     let report = crate::proxy::mappers::error_classifier::report_stream_error(
@@ -488,7 +517,10 @@ where
                             );
                             phase = StreamPhase::Transition;
                             last_activity = tokio::time::Instant::now();
-                            yield Ok(handler.heartbeat_frame());
+                            let frame = handler.heartbeat_frame();
+                            if !frame.is_empty() {
+                                yield Ok(frame);
+                            }
                             continue;
                         }
 
@@ -545,7 +577,12 @@ where
                         }
                         break;
                     }
-                    yield Ok(handler.heartbeat_frame());
+                    // [FIX #3952] 协议可选择返回空帧以禁用注入式心跳
+                    // （Gemini/Antigravity CLI 无法解析 SSE 注释帧 `: ping`）
+                    let frame = handler.heartbeat_frame();
+                    if !frame.is_empty() {
+                        yield Ok(frame);
+                    }
                 }
             }
         }
@@ -602,6 +639,24 @@ where
             );
             yield Err(report.client_message());
             return;
+        }
+
+        // The final complete JSON event may only become visible while flushing
+        // an unterminated line after a transport reset.
+        if handler.upstream_completion() == Some(true) {
+            abnormal_error_report = None;
+        }
+
+        if !handler.is_terminal()
+            && handler.upstream_completion() == Some(false)
+            && abnormal_error_report.is_none()
+        {
+            abnormal_error_report = Some(crate::proxy::mappers::error_classifier::report_stream_error(
+                config.adapter_name,
+                config.function_name,
+                &"upstream stream ended without finishReason",
+                &config.trace_info,
+            ));
         }
 
         // [Double-Finalization Guard]
