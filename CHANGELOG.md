@@ -3,6 +3,15 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.8 (2026-11-16)**:
+        -   **[思考预算与协议终态] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
+            -   纯思考或空输出到达 MAX_TOKENS 后保留真实终态与用量，不再以相同预算自动续接并误报 502；Gemini、Chat、Responses、Claude 分别输出对应的长度限制终态，不改变客户输出上限或思考强度。
+            -   修复根级终态及中断标记丢失、多候选提前收尾、未完成工具流伪造 STOP、Claude 空预算补假正文及工具调用覆盖预算终态；无可交付内容仍不写入可重放思考历史或签名。
+        -   **[错误归因与验证] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
+            -   重复错误包装保留真实类别和状态，不再把源码路径、诊断参数或生成正文里的关键词当作网络错误证据。
+            -   274 项定向 Rust 回归通过，覆盖四协议、尾部用量、候选隔离、工具终态及历史缓存保护；独立复审发现的相关缺口已修复。
+        -   **部署边界**: 无配置或数据库迁移，不提示清理思考缓存。270 秒全局超时与 15 秒首字阶段超时的实际归因仍需另查；不据此认定全部历史非 429 错误已解决。
+
     *   **v5.0.7 (2026-11-15)**:
         -   **[协议可用性与多轮工具历史] (PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), Thanks to @DNAlec)**:
             -   保留可读服务端工具记录、文档和媒体，支持自定义与命名空间工具、工具选择限制和跨轮关联；隔离多候选，防止串接回答、重复调用和错误终态。

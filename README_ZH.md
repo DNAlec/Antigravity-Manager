@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.7)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.8)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.7-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.8-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.7**（2026-11-15）：改善多轮工具与历史兼容性和候选隔离，合入上游 beta.11 及 PR #3959 的 Hub 指纹与扁平请求封装修复。上游更新保持仅检查。详见[完整更新日志](CHANGELOG.md)（PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), [#12](https://github.com/DNAlec/Antigravity-Manager/pull/12)，Thanks to @DNAlec 及日志所列上游贡献者）。
+> 最新版本 **v5.0.8**（2026-11-16）：四协议保留真实输出预算终态与用量，避免纯思考的无效续接，修复候选／工具终结和错误归因缺口。无需数据库迁移或清理思考缓存。详见[完整更新日志](CHANGELOG.md)（PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14)，Thanks to @DNAlec）。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

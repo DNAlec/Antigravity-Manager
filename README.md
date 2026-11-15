@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.7)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.8)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.7-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.8-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -528,7 +528,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.7** (2026-11-15): Improves multi-turn tool/history compatibility and candidate isolation; integrates upstream beta.11 and PR #3959 for Hub fingerprints and flat request envelopes. Upstream updates remain check-only. See the [full release notes](CHANGELOG_EN.md) (PR [#11](https://github.com/DNAlec/Antigravity-Manager/pull/11), [#12](https://github.com/DNAlec/Antigravity-Manager/pull/12), Thanks to @DNAlec and the credited upstream contributors).
+> Latest version **v5.0.8** (2026-11-16): Preserves output-limit terminals and usage across four protocols, prevents unnecessary thought-only continuation, and fixes candidate/tool completion and error-attribution gaps. No database migration or cache cleanup is required. See the [full release notes](CHANGELOG_EN.md) (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 
