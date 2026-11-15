@@ -583,12 +583,20 @@ async fn check_thinking_only_completion(proto: &str) {
                 .filter_map(|chunk| chunk.as_ref().ok())
                 .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
                 .collect::<String>();
-            if matches!(proto, "claude" | "chat" | "gemini") {
+            if matches!(proto, "claude" | "chat" | "gemini") && reason == "STOP" {
                 assert!(
                     chunks.iter().any(Result::is_err),
                     "{proto} {reason} split={split}: expected incomplete stream: {wire}"
                 );
                 assert!(!wire.contains("message_stop") && !wire.contains("data: [DONE]"));
+            } else if matches!(proto, "claude" | "chat" | "gemini") {
+                assert!(chunks.iter().all(Result::is_ok), "{proto}: {wire}");
+                let terminal = match proto {
+                    "claude" => "\"stop_reason\":\"max_tokens\"",
+                    "chat" => "\"finish_reason\":\"length\"",
+                    _ => "\"finishReason\":\"MAX_TOKENS\"",
+                };
+                assert!(wire.contains(terminal), "{proto}: {wire}");
             } else if proto == "responses" {
                 assert!(wire.contains("response.incomplete"), "{reason}: {wire}");
             } else {
@@ -620,12 +628,12 @@ async fn check_thinking_only_completion(proto: &str) {
 }
 
 #[tokio::test]
-async fn thinking_only_claude_failure_does_not_publish_history() {
+async fn thinking_only_claude_terminal_does_not_publish_history() {
     check_thinking_only_completion("claude").await;
 }
 
 #[tokio::test]
-async fn thinking_only_chat_failure_does_not_publish_history() {
+async fn thinking_only_chat_terminal_does_not_publish_history() {
     check_thinking_only_completion("chat").await;
 }
 
@@ -640,7 +648,7 @@ async fn thinking_only_legacy_success_retains_visible_reasoning_history() {
 }
 
 #[tokio::test]
-async fn thinking_only_gemini_failure_does_not_publish_history() {
+async fn thinking_only_gemini_terminal_does_not_publish_history() {
     check_thinking_only_completion("gemini").await;
 }
 

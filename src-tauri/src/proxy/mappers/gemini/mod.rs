@@ -56,12 +56,7 @@ pub(crate) fn normalize_candidate_indices(response: &mut serde_json::Value) -> O
 /// A synthetic interruption or the protobuf default did not complete a
 /// model generation and cannot authorize storing its history.
 pub(crate) fn has_candidate_finish(candidate: &serde_json::Value) -> bool {
-    candidate["gatewayInterrupted"] != true
-        && candidate
-            .get("finishReason")
-            .or_else(|| candidate.get("finish_reason"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| !s.is_empty() && s != "FINISH_REASON_UNSPECIFIED")
+    crate::proxy::pipeline::stream_error::model_finish_reason(candidate).is_some()
 }
 
 /// Both inline media and provider-hosted files are visible Gemini output.

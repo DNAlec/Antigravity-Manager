@@ -450,21 +450,18 @@ fn process_sse_line(
     }
     */
 
-    // 检查是否结束（兼容候选集与根级的 finishReason / finish_reason 命名）
-    let finish_reason = raw_json
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|cand| {
-            cand.get("finishReason")
-                .or_else(|| cand.get("finish_reason"))
+    // Candidate terminals take precedence over legacy root fields, including
+    // invalid sentinels. Synthetic interruptions never prove model completion.
+    let candidate = raw_json.get("candidates").and_then(|c| c.get(0));
+    let finish_source = candidate
+        .filter(|candidate| {
+            candidate.get("finishReason").is_some() || candidate.get("finish_reason").is_some()
         })
-        .and_then(|f| f.as_str())
-        .or_else(|| {
-            raw_json
-                .get("finishReason")
-                .or_else(|| raw_json.get("finish_reason"))
-                .and_then(|f| f.as_str())
-        })
+        .unwrap_or(raw_json);
+    let finish_reason = Some(finish_source)
+        .filter(|_| raw_json["gatewayInterrupted"] != true)
+        .filter(|_| candidate.is_none_or(|candidate| candidate["gatewayInterrupted"] != true))
+        .and_then(crate::proxy::pipeline::stream_error::model_finish_reason)
         .or_else(|| {
             crate::proxy::pipeline::stream_error::response_has_prompt_refusal(raw_json)
                 .then_some("SAFETY")
@@ -473,7 +470,7 @@ fn process_sse_line(
     if let Some(finish_reason) = finish_reason {
         if state.has_thinking
             && !state.has_content
-            && !crate::proxy::pipeline::stream_error::is_refusal_finish_reason(finish_reason)
+            && !crate::proxy::pipeline::stream_error::allows_empty_completion(finish_reason)
             && !crate::proxy::pipeline::stream_error::is_failure_finish_reason(finish_reason)
         {
             tracing::warn!(
@@ -482,12 +479,11 @@ fn process_sse_line(
                 finish_reason
             );
         } else {
-            // A thinking-only candidate is rejected by the lifecycle below.
-            // Its upstream STOP must not authorize publishing retry history.
-            state.upstream_finished |= raw_json
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
+            // A real output limit can finish an empty response, but only visible
+            // output may publish replayable thinking history.
+            state.upstream_finished |= state.has_content
+                && candidate
+                    .is_some_and(crate::proxy::mappers::gemini::has_successful_candidate_finish);
             let usage = state.last_usage.clone();
 
             if let Some(ref u) = usage {
@@ -826,6 +822,87 @@ mod usage_tail_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn empty_output_limit_preserves_terminal_and_trailing_usage() {
+        for thinking in [false, true] {
+            for root_finish in [false, true] {
+                for ending in ["eof", "done", "reset"] {
+                    let parts = if thinking {
+                        json!([{"thought":true,"text":"reasoning"}])
+                    } else {
+                        json!([])
+                    };
+                    let mut response = json!({
+                        "candidates":[{"content":{"parts":parts}}],
+                        "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":7}
+                    });
+                    if root_finish {
+                        response["finish_reason"] = json!("MAX_TOKENS");
+                    } else {
+                        response["candidates"][0]["finishReason"] = json!("MAX_TOKENS");
+                    }
+                    let mut raw = vec![
+                        frame(response),
+                        frame(json!({"usageMetadata":{"candidatesTokenCount":9}})),
+                    ];
+                    match ending {
+                        "done" => raw.push(Ok(Bytes::from("data: [DONE]\n\n"))),
+                        "reset" => raw.push(Err("connection reset after output limit".into())),
+                        _ => {}
+                    }
+
+                    let output = events(Box::pin(futures::stream::iter(raw))).await;
+                    assert!(!output.iter().any(|event| event["type"] == "error"));
+                    let terminal = output
+                        .iter()
+                        .find(|event| event["type"] == "message_delta")
+                        .unwrap();
+                    assert_eq!(terminal["delta"]["stop_reason"], "max_tokens");
+                    assert_eq!(terminal["usage"]["input_tokens"], 10);
+                    assert_eq!(terminal["usage"]["output_tokens"], 9);
+                    assert!(!output.iter().any(|event| {
+                        event["type"] == "content_block_start"
+                            && event["content_block"]["type"] == "text"
+                    }));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_terminal_keeps_partial_text_without_claiming_end_turn() {
+        for root_finish in [false, true] {
+            for (reason, interrupted) in [
+                ("", false),
+                ("FINISH_REASON_UNSPECIFIED", false),
+                ("STOP", true),
+            ] {
+                let mut response = json!({
+                    "candidates":[{"content":{"parts":[{"text":"partial answer"}]}}]
+                });
+                let terminal = if root_finish {
+                    &mut response
+                } else {
+                    &mut response["candidates"][0]
+                };
+                terminal["finishReason"] = json!(reason);
+                if interrupted {
+                    terminal["gatewayInterrupted"] = json!(true);
+                }
+                let output = events(Box::pin(futures::stream::iter([frame(response)]))).await;
+                assert!(output
+                    .iter()
+                    .any(|event| event["delta"]["text"] == "partial answer"));
+                assert!(output
+                    .iter()
+                    .any(|event| event["delta"]["stop_reason"] == "max_tokens"));
+                assert!(!output
+                    .iter()
+                    .any(|event| event["delta"]["stop_reason"] == "end_turn"));
+            }
+        }
+    }
 }
 
 /// 发送强制结束事件
@@ -1009,6 +1086,63 @@ fn process_grounding_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_output_limit_does_not_publish_thinking_history() {
+        let mut state = StreamingState::new();
+        state.defer_finish_for_usage = true;
+        process_sse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"reasoning"}]},"finishReason":"MAX_TOKENS"}]}"#,
+            &mut state,
+            "empty_limit",
+            "test@example.test",
+        );
+        assert_eq!(state.pending_finish_reason.as_deref(), Some("MAX_TOKENS"));
+        assert!(!state.upstream_finished);
+    }
+
+    #[test]
+    fn invalid_candidate_or_root_terminal_cannot_authorize_completion() {
+        use serde_json::json;
+
+        for field in ["finishReason", "finish_reason"] {
+            for root_finish in [false, true] {
+                for (reason, synthetic_location) in [
+                    ("", None),
+                    ("FINISH_REASON_UNSPECIFIED", None),
+                    ("STOP", Some("root")),
+                    ("MAX_TOKENS", Some("candidate")),
+                ] {
+                    let mut response = json!({
+                        "candidates":[{"content":{"parts":[{"text":"partial answer"}]}}]
+                    });
+                    if root_finish {
+                        response[field] = json!(reason);
+                    } else {
+                        response["candidates"][0][field] = json!(reason);
+                    }
+                    match synthetic_location {
+                        Some("root") => response["gatewayInterrupted"] = json!(true),
+                        Some("candidate") => {
+                            response["candidates"][0]["gatewayInterrupted"] = json!(true)
+                        }
+                        _ => {}
+                    }
+                    let mut state = StreamingState::new();
+                    state.defer_finish_for_usage = true;
+                    process_sse_line(
+                        &format!("data: {response}"),
+                        &mut state,
+                        "invalid_terminal",
+                        "test@example.test",
+                    );
+                    assert!(state.pending_finish_reason.is_none(), "{response}");
+                    assert!(!state.upstream_finished, "{response}");
+                    assert!(!state.message_stop_sent, "{response}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_sparse_cumulative_usage_emits_preserved_cache_and_honors_zero() {

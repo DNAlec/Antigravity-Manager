@@ -441,10 +441,10 @@ impl NonStreamingProcessor {
             .and_then(|c| c.get(0))
             .and_then(|candidate| candidate.finish_reason.as_deref());
 
-        let stop_reason = if self.has_tool_call {
-            "tool_use"
-        } else if finish_reason == Some("MAX_TOKENS") {
+        let stop_reason = if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"
+        } else if self.has_tool_call {
+            "tool_use"
         } else {
             "end_turn"
         };
@@ -542,6 +542,37 @@ pub fn transform_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_output_preserves_output_limit_instead_of_claiming_tool_completion() {
+        for (finish, expected) in [("MAX_TOKENS", "max_tokens"), ("STOP", "tool_use")] {
+            let gemini: GeminiResponse = serde_json::from_value(serde_json::json!({
+                "candidates":[{
+                    "content":{"role":"model","parts":[{
+                        "functionCall":{"name":"inspect","args":{"path":"src"},"id":"call_limit"}
+                    }]},
+                    "finishReason":finish
+                }],
+                "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":8}
+            }))
+            .unwrap();
+            let response = transform_response(
+                &gemini,
+                false,
+                1_000_000,
+                None,
+                "gemini-flash".into(),
+                1,
+                vec!["inspect".into()],
+            )
+            .unwrap();
+            assert_eq!(response.stop_reason, expected);
+            assert!(
+                matches!(&response.content[0], ContentBlock::ToolUse { name, .. } if name == "inspect")
+            );
+            assert_eq!(response.usage.output_tokens, 8);
+        }
+    }
 
     #[test]
     fn test_simple_text_response() {

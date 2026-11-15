@@ -3520,6 +3520,7 @@ pub async fn handle_chat_completions(
                     response_text_context.clone(),
                     Some(chat_tool_kinds.clone()),
                     is_request_structured_output(&openai_req),
+                    openai_req.n.unwrap_or(1) as usize,
                 );
 
                 let mut first_data_chunk = None;

@@ -16,6 +16,8 @@ pub mod image;
 pub mod inbound;
 #[cfg(test)]
 mod official_alignment_tests;
+#[cfg(test)]
+mod output_limit_tests;
 pub mod policy;
 pub mod qos;
 pub mod rotation;
