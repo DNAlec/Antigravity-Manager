@@ -379,6 +379,9 @@ pub async fn refresh_all_quotas_internal(
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_all_quotas_logic().await?;
 
+    // 记录刷新完成时间戳，供后台自动刷新调度器对齐周期 (Fixes #3958)
+    modules::auto_refresh::record_refresh_timestamp(chrono::Utc::now().timestamp());
+
     // 同步到运行中的反代服务（如果已启动，覆盖 instance 与 admin_server）
     for tm in proxy_state.active_token_managers().await {
         let _ = tm.reload_all_accounts().await;
@@ -406,6 +409,12 @@ pub async fn refresh_all_quotas(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     app_handle: tauri::AppHandle,
 ) -> Result<RefreshStats, String> {
+    let _guard = match modules::auto_refresh::try_acquire_refresh_lock() {
+        Some(guard) => guard,
+        None => {
+            return Err("A quota refresh task is already in progress, please wait.".to_string());
+        }
+    };
     refresh_all_quotas_internal(&proxy_state, Some(app_handle)).await
 }
 /// 获取设备指纹（当前 storage.json + 账号绑定）
