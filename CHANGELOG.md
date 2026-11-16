@@ -3,6 +3,16 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.9 (2026-11-16)**:
+        -   **[后台配额自动刷新] (上游 PR [#3964](https://github.com/lbjlaq/Antigravity-Manager/pull/3964), Fixes #3958, Thanks to @cubelikeplayDaniel)**:
+            -   将定时全量刷新下沉至 Rust 后台，支持 GUI 与 Headless；加入刷新互斥守卫、休眠后轮询延迟与时钟回拨处理，减少重复刷新。
+        -   **[模型家族统计与配额分离] (上游 PR [#3963](https://github.com/lbjlaq/Antigravity-Manager/pull/3963)、[#3967](https://github.com/lbjlaq/Antigravity-Manager/pull/3967), Fixes #3965, Thanks to @cubelikeplayDaniel)**:
+            -   Token 统计支持按模型家族汇总和展开变体；分离 Flash/Pro 配额归一化，更新默认监控与预热模型，并中和可能触发上游伪 429 的 Agent 工具指令特征。
+        -   **[Fork 集成与回归验证] (PR [#16](https://github.com/DNAlec/Antigravity-Manager/pull/16), Thanks to @DNAlec)**:
+            -   合入上游 v5.0.4-beta.13，保留现有四协议、缓存连续性及请求校验修复；对齐 QoS 探针测试的新配额分组。144 项定向 Rust 测试、5 项模型家族前端测试和 TypeScript 检查通过。
+            -   上游提交历史保留原作者及 Claude Fable 5 的 Co-authored-by 元数据；先前已集成的 PR #3959 指纹修复继续保留。
+        -   **生产升级注意**: 启用配额保护且仍选择旧 `gemini-3-pro-high` / `gemini-3-flash` 分组的用户，应在设置中重新选择 `gemini-3.1-pro-high` / `gemini-3.8-flash`；Headless 修改 `quota_protection.monitored_models` 后刷新账号配额。本版本不自动迁移已有选择，不需要数据库迁移或清理思考缓存。真实 Google 请求与跨平台运行仍需部署后验证。
+
     *   **v5.0.8 (2026-11-16)**:
         -   **[思考预算与协议终态] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
             -   纯思考或空输出到达 MAX_TOKENS 后保留真实终态与用量，不再以相同预算自动续接并误报 502；Gemini、Chat、Responses、Claude 分别输出对应的长度限制终态，不改变客户输出上限或思考强度。

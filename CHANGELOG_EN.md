@@ -3,6 +3,16 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.9 (2026-11-16)**:
+        -   **[Background quota refresh] (upstream PR [#3964](https://github.com/lbjlaq/Antigravity-Manager/pull/3964), Fixes #3958, Thanks to @cubelikeplayDaniel)**:
+            -   Move periodic full refreshes into the Rust backend for GUI and headless operation, with a refresh guard, delayed polling after sleep, and backward-clock handling to reduce duplicate refreshes.
+        -   **[Model-family statistics and separate quota groups] (upstream PR [#3963](https://github.com/lbjlaq/Antigravity-Manager/pull/3963), [#3967](https://github.com/lbjlaq/Antigravity-Manager/pull/3967), Fixes #3965, Thanks to @cubelikeplayDaniel)**:
+            -   Aggregate token statistics by model family with expandable variants. Separate Flash/Pro quota normalization, update default monitored/warmup models, and neutralize agent tool directives associated with upstream false 429 responses.
+        -   **[Fork integration and regression validation] (PR [#16](https://github.com/DNAlec/Antigravity-Manager/pull/16), Thanks to @DNAlec)**:
+            -   Integrate upstream v5.0.4-beta.13 while preserving existing four-protocol, cache-continuity and request-validation fixes. Align QoS probe fixtures with independent quota groups. All 144 focused Rust tests, five frontend model-family tests and TypeScript checks pass.
+            -   Upstream history retains original authorship and Claude Fable 5 Co-authored-by metadata; the previously integrated PR #3959 fingerprint fix remains intact.
+        -   **Production upgrade note**: Users with quota protection enabled and old `gemini-3-pro-high` / `gemini-3-flash` selections should select `gemini-3.1-pro-high` / `gemini-3.8-flash` in settings; headless users should update `quota_protection.monitored_models`, then refresh account quotas. Existing selections are not migrated automatically. No database migration or thinking-cache cleanup is required. Live Google requests and cross-platform runtime behavior still require deployment validation.
+
     *   **v5.0.8 (2026-11-16)**:
         -   **[Thinking budgets and protocol terminals] (PR [#14](https://github.com/DNAlec/Antigravity-Manager/pull/14), Thanks to @DNAlec)**:
             -   Preserve real MAX_TOKENS terminals and usage for thought-only or empty output instead of continuing with the same budget and reporting a misleading 502. Gemini, Chat, Responses and Claude emit their respective output-limit terminals without changing client output limits or thinking levels.
