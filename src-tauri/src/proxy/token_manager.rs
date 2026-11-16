@@ -9667,9 +9667,13 @@ mod tests {
             Some("gemini-3.1-flash-lite")
         );
 
-        // Flash Lite is protected through its shared quota bucket, even though
-        // that bucket's name differs from the authorized model ID.
-        token.protected_models.insert("gemini-3-flash".into());
+        // Flash Lite has its own quota bucket; Pro protection must not block it.
+        token.protected_models.insert("gemini-3-pro-high".into());
+        assert_eq!(
+            TokenManager::select_probe_model(&token),
+            Some("gemini-3.1-flash-lite")
+        );
+        token.protected_models.insert("gemini-3.1-flash-lite".into());
         assert_eq!(
             TokenManager::select_probe_model(&token),
             Some("gemini-3.8-flash-low")
@@ -9690,8 +9694,8 @@ mod tests {
             (vec![], vec![]),
             (vec!["gemini-3-pro-image"], vec![]),
             (vec!["claude-sonnet-4-6", "gpt-oss-120b"], vec![]),
-            (vec!["gemini-3.1-flash-lite"], vec!["gemini-3-flash"]),
-            (vec!["gemini-3.8-flash-low"], vec!["gemini-3-pro-high"]),
+            (vec!["gemini-3.1-flash-lite"], vec!["gemini-3.1-flash-lite"]),
+            (vec!["gemini-3.8-flash-low"], vec!["gemini-3.8-flash"]),
         ] {
             let manager = TokenManager::new(PathBuf::new());
             manager.set_qos_auto_jail(true);

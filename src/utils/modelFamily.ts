@@ -352,4 +352,3 @@ export function aggregateModelTrendsByFamily(
 
     return { transformedTrend, displayModelKeys };
 }
-
