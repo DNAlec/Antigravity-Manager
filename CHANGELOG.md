@@ -3,6 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.10 (2026-11-17)**:
+        -   **[失败诊断] (PR [#19](https://github.com/DNAlec/Antigravity-Manager/pull/19), Ref 上游 #3975, Thanks to @DNAlec)**: 在统一出站层保留失败请求的端点类别、状态和耗时，仅写本地日志，不改变客户端响应或重试策略。
+        -   **[提示词兼容实验] (上游 PR [#3976](https://github.com/lbjlaq/Antigravity-Manager/pull/3976), Ref #3972, Thanks to @cubelikeplayDaniel)**: 接入交互式 Agent 前导句和行内规则处理，收窄匹配以保留后续指令。复审剔除缺少执行映射的 session-move 改名；未纳入已关闭的 #3977。
+        -   **[Responses MCP] (上游 PR [#3980](https://github.com/lbjlaq/Antigravity-Manager/pull/3980), Ref #3979, Thanks to @Lucas-Qh-Lai)**: 恢复 MCP name/namespace，保留本仓库自定义工具和媒体行为。
+        -   **[Docker Compose 发布] (PR [#18](https://github.com/DNAlec/Antigravity-Manager/pull/18), Ref #17, Thanks to @DNAlec)**: 发布仅保留容器与 Compose 附件。
+        -   **验证与升级边界**: 诊断/监控 16 项、最终提示清洗 89 项、OpenAI 280 项通过；另 3 项 reasoning/截断历史测试在改动前基线同样失败。无数据库迁移或思考缓存清理；现有自定义规则现在可命中行内代码，围栏仍受保护。429 改善需生产对照，不能据此宣称已解决所有限流问题。
+
     *   **v5.0.9 (2026-11-16)**:
         -   **[后台配额自动刷新] (上游 PR [#3964](https://github.com/lbjlaq/Antigravity-Manager/pull/3964), Fixes #3958, Thanks to @cubelikeplayDaniel)**:
             -   将定时全量刷新下沉至 Rust 后台，支持 GUI 与 Headless；加入刷新互斥守卫、休眠后轮询延迟与时钟回拨处理，减少重复刷新。

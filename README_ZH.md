@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.9)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.10)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.9-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.10-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -530,7 +530,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.9**（2026-11-16）：合入上游 beta.13，新增后端配额刷新、模型家族统计与独立 Flash/Pro 配额分组。切换生产前请检查旧配额保护选项，详见[升级说明](CHANGELOG.md)。PR [#16](https://github.com/DNAlec/Antigravity-Manager/pull/16)，上游 PR #3963/#3964/#3967（Thanks to @DNAlec, @cubelikeplayDaniel）。
+> 最新版本 **v5.0.10**（2026-11-17）：补齐失败尝试诊断，集成提示词与 MCP 兼容实验修复。复审已剔除会破坏工具调用的改名，429 改善仍待生产验证。详见[发布说明](CHANGELOG.md)。PR #19，上游 #3976/#3980（Thanks to @DNAlec, @cubelikeplayDaniel, @Lucas-Qh-Lai）。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

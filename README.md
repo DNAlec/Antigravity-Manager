@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.9)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.10)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.9-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.10-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.9** (2026-11-16): Integrates upstream beta.13 with backend quota refresh, model-family statistics and independent Flash/Pro quota groups. Existing quota-protection selections may need updating before production use; see the [upgrade notes](CHANGELOG_EN.md). PR [#16](https://github.com/DNAlec/Antigravity-Manager/pull/16), upstream PRs #3963/#3964/#3967 (Thanks to @DNAlec, @cubelikeplayDaniel).
+> Latest version **v5.0.10** (2026-11-17): Adds failed-attempt diagnostics and experimental prompt/MCP compatibility fixes. Session tool renaming was excluded after review; production 429 improvement remains unverified. See [release notes](CHANGELOG_EN.md). PR #19, upstream #3976/#3980 (Thanks to @DNAlec, @cubelikeplayDaniel, @Lucas-Qh-Lai).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

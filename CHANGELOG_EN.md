@@ -3,6 +3,13 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.10 (2026-11-17)**:
+        -   **[Failure diagnostics] (PR [#19](https://github.com/DNAlec/Antigravity-Manager/pull/19), Ref upstream #3975, Thanks to @DNAlec)**: Persist bounded endpoint categories, status and timing at the shared transport boundary, only in local logs; client responses and retry policy remain unchanged.
+        -   **[Experimental prompt compatibility] (upstream PR [#3976](https://github.com/lbjlaq/Antigravity-Manager/pull/3976), Ref #3972, Thanks to @cubelikeplayDaniel)**: Integrate the interactive-agent preamble and inline rule handling with bounded matching that retains following instructions. Peer review excluded session-move renaming without execution mapping. Closed PR #3977 is excluded.
+        -   **[Responses MCP] (upstream PR [#3980](https://github.com/lbjlaq/Antigravity-Manager/pull/3980), Ref #3979, Thanks to @Lucas-Qh-Lai)**: Restore MCP name/namespace fields while preserving fork custom tools and media.
+        -   **[Docker Compose releases] (PR [#18](https://github.com/DNAlec/Antigravity-Manager/pull/18), Ref #17, Thanks to @DNAlec)**: Publish containers and Compose assets only.
+        -   **Validation and upgrade scope**: 16 diagnostic/monitor, 89 final sanitizer and 280 OpenAI tests pass; three reasoning/truncated-history tests also fail on the pre-change baseline. No database migration or thinking-cache cleanup. Existing custom rules now match inline code; fences remain protected. Production comparison is needed to establish any 429 improvement.
+
     *   **v5.0.9 (2026-11-16)**:
         -   **[Background quota refresh] (upstream PR [#3964](https://github.com/lbjlaq/Antigravity-Manager/pull/3964), Fixes #3958, Thanks to @cubelikeplayDaniel)**:
             -   Move periodic full refreshes into the Rust backend for GUI and headless operation, with a refresh guard, delayed polling after sleep, and backward-clock handling to reduce duplicate refreshes.
