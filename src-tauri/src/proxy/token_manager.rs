@@ -9673,7 +9673,9 @@ mod tests {
             TokenManager::select_probe_model(&token),
             Some("gemini-3.1-flash-lite")
         );
-        token.protected_models.insert("gemini-3.1-flash-lite".into());
+        token
+            .protected_models
+            .insert("gemini-3.1-flash-lite".into());
         assert_eq!(
             TokenManager::select_probe_model(&token),
             Some("gemini-3.8-flash-low")
