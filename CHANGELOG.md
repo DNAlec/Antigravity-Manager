@@ -62,6 +62,24 @@
             -   移除仅因账号配额差异造成的粘性迁移；新增模型族优先级、账号标签与操作面板，修复蹬额度模式重入和 Windows 文件锁竞争。
         -   **[客户端与平台支持] (PR [lbjlaq/Antigravity-Manager#3844](https://github.com/lbjlaq/Antigravity-Manager/pull/3844), [#3854](https://github.com/lbjlaq/Antigravity-Manager/pull/3854), Ref [#3818](https://github.com/lbjlaq/Antigravity-Manager/issues/3818), Thanks to @Al-Taie, @cubelikeplayDaniel, @lbjlaq)**:
             -   支持 Antigravity ACP 插件账号切换与状态检测，补齐 CLI／Headless 路径；增加 Termux ARM64 部署支持，完善 Docker 有界健康检查、Tini 进程回收与 macOS universal 打包。
+
+    *   **v5.0.4-beta.13 (2026-11-15)**:
+        -   **[上游 WAF 特征提示词中和与模型配额归一化修复] (Fixes #3965)**:
+            -   **中和第三方 Agent 工具指令特征防伪 429**: 针对 Google Cloud Code 上游 WAF 针对特定第三方 Agent 模板（如 Kelivo、Hermes Agent 等）的启发式指令拦截（`Prefer read_file, edit_file, and write_file over cat/sed` 等模式），在单趟保护代码块的前提下对非代码区域进行高精度中和，彻底杜绝上游秒级返回伪造的 429 RESOURCE_EXHAUSTED 报错。(Fixes #3965)
+            -   **Flash 与 Pro 配额归一化解耦**: 废除将高阶 Flash 模型（如 `gemini-3.8-flash-high`）历史错配至 `gemini-3-pro-high` 的旧规则，按基底模型分别独立归一化，根除 429 发生时配额查找错位触发全账号 30 秒级联冷却降级的严重隐患。(Fixes #3965)
+            -   **默认监控与预热模型现代化**: 将默认预热、配额保护与经典自动切号的过时默认模型从 `gemini-3-flash` / `gemini-3-pro-high` 现代化升级为 `gemini-3.8-flash` 与 `gemini-3.1-pro-high`。(Fixes #3965)
+
+    *   **v5.0.4-beta.12 (2026-11-15)**:
+        -   **[后台配额自动刷新全面加固与单飞锁防重护航] (Fixes #3958, PR #3964, Thanks to @mclinyeshi)**:
+            -   **单飞调度与 RAII 自动解锁**: 引入 `RefreshLockGuard`，在手动触发与后台定时刷新之间建立全生命周期单飞锁，Drop 保证 `IS_REFRESHING` 标志位归零，彻底消灭未捕获 panic 或协程取消导致的死锁隐患。(Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+            -   **Tokio 漏跳补偿与时钟跳变自适应**: 配置 `MissedTickBehavior::Delay`，根除休眠唤醒后的密集突发轮询风暴；检测并自适应校正 NTP 时钟回拨；针对网络瞬态失败引入 60 秒轻量退避机制，不再直接延迟整个轮询周期。(Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+            -   **前端刷新事件去重**: 根组件 `App.tsx` 全局监听并以静默同步方式更新，移除 MiniView 冗余监听与挂载竞争。(Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+        -   **[Token 统计分析重构：按模型家族层级聚合与单价表收敛] (PR #3963, Thanks to @cubelikeplayDaniel)**:
+            -   **模型变体家族化聚合**: 提取跨端公用的模型家族归一化与分组工具（`modelFamilyUtils.ts`），按标准代号（如 Claude 3.5 Sonnet、Gemini 2.5 Flash 等）将繁复的日期后缀、联网变体进行家族级聚合展示。(PR #3963, Thanks to @cubelikeplayDaniel)
+            -   **树状下钻与紧凑单价表**: 支持点击家族整行展开或折叠子版本明细；将庞大的单价参考表收敛至家族顶层，精简界面高度与视觉噪音。(PR #3963, Thanks to @cubelikeplayDaniel)
+        -   **[Hub 官方指纹协同步长校准与 Flat Envelope 结构加固防封] (Fixes #3956, PR #3959, Thanks to @hazerwin, @koeria)**:
+            -   **客户端指纹与平铺 Envelope 结构校准**: 升级 Hub 指纹至官方最新基准，补齐平铺封装体上下文参数，防止因包头缺失触发上游 Google 服务条款 (TOS) 封禁与 400 校验拦截。(Fixes #3956, PR #3959, Thanks to @hazerwin, @koeria)
+
     *   **v5.0.4-beta.11 (2026-11-15)**:
         -   **[Gemini 原生流禁用 SSE ': ping' 注释心跳，修复 Antigravity CLI 解析崩溃] (Fixes #3952, PR #3953, Thanks to @koeria)**:
             -   **Antigravity CLI (agy) 流式解析兼容**: 对 Gemini 原生流重写 `heartbeat_frame` 返回空字节，并在 `run_stream_lifecycle` 中跳过空心跳帧下发，彻底根除 Google GenAI Go SDK 因遇到非数据包 `: ping\n\n` 抛出 `iterateResponseStream: invalid stream chunk: : ping` 致命异常打崩生成的问题。(Fixes #3952, PR #3953, Thanks to @koeria)

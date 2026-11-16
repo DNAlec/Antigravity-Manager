@@ -62,6 +62,24 @@
             -   Removes sticky-session migration based solely on quota disparity; adds model-family priorities, account tags, and contextual action panels; fixes pedal-mode reentry and Windows file-lock contention.
         -   **[Client and platform support] (PR [lbjlaq/Antigravity-Manager#3844](https://github.com/lbjlaq/Antigravity-Manager/pull/3844), [#3854](https://github.com/lbjlaq/Antigravity-Manager/pull/3854), Ref [#3818](https://github.com/lbjlaq/Antigravity-Manager/issues/3818), Thanks to @Al-Taie, @cubelikeplayDaniel, @lbjlaq)**:
             -   Adds account switching and status detection for the Antigravity ACP plugin with CLI/headless support, Termux ARM64 deployment, bounded Docker health checks, Tini process reaping, and macOS universal packaging improvements.
+
+    *   **v5.0.4-beta.13 (2026-11-15)**:
+        -   **[Neutralize Upstream WAF Prompt Triggers & Decouple Model Quota Normalization] (Fixes #3965)**:
+            -   **Neutralize Agent Tool Directives Against Fake 429**: High-precision neutralization for Google Cloud Code upstream WAF heuristic triggers targeting third-party agent templates (e.g. Kelivo, Hermes Agent) with tool guidelines (`Prefer read_file, edit_file, and write_file over cat/sed`), preserving fenced code blocks while completely eliminating fake 429 RESOURCE_EXHAUSTED upstream responses. (Fixes #3965)
+            -   **Decouple Flash and Pro Quota Normalization**: Deprecated obsolete mapping of high-tier Flash models (e.g. `gemini-3.8-flash-high`) to `gemini-3-pro-high`, ensuring granular base model normalization and preventing 429 quota lookup mismatches from triggering cascading 30-second cooldowns across all accounts. (Fixes #3965)
+            -   **Modernize Default Monitored and Warmup Models**: Upgraded default warmup, quota protection, and classic auto-switch configurations from legacy `gemini-3-flash` / `gemini-3-pro-high` to `gemini-3.8-flash` and `gemini-3.1-pro-high`. (Fixes #3965)
+
+    *   **v5.0.4-beta.12 (2026-11-15)**:
+        -   **[Harden Background Quota Auto-Refresh with Single-Flight RAII Locking] (Fixes #3958, PR #3964, Thanks to @mclinyeshi)**:
+            -   **Single-Flight Scheduling & RAII Unlock**: Introduced `RefreshLockGuard` establishing a full-lifecycle single-flight lock across manual triggers and periodic background refreshes; RAII drop guarantees resetting `IS_REFRESHING` atomic flag to zero, eliminating deadlocks caused by unhandled panics or async task cancellations. (Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+            -   **Tokio Missed Tick Delay & Clock Skew Self-Healing**: Configured `MissedTickBehavior::Delay` to eliminate burst polling storms upon host resume from sleep; detected and auto-corrected backward NTP clock drift; added a 60-second backoff upon transient network failure rather than delaying by the full polling interval. (Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+            -   **Frontend Refresh Event Deduplication**: Centralized refresh listening in root `App.tsx` via silent sync (`fetchAccounts(true)`), removing redundant MiniView listeners and unmount races. (Fixes #3958, PR #3964, Thanks to @mclinyeshi)
+        -   **[Token Statistics Analytics: Model Family Hierarchy Aggregation & Condensed Pricing] (PR #3963, Thanks to @cubelikeplayDaniel)**:
+            -   **Model Family Aggregation**: Extracted reusable model family normalization and grouping utilities (`modelFamilyUtils.ts`), aggregating date-stamped variants and online models under standard family codes (e.g. Claude 3.5 Sonnet, Gemini 2.5 Flash). (PR #3963, Thanks to @cubelikeplayDaniel)
+            -   **Expandable Tree Drill-Down & Compact Pricing**: Supported expanding and collapsing sub-model variants by clicking anywhere on the family row; condensed lengthy pricing tables to the family level, reducing UI clutter. (PR #3963, Thanks to @cubelikeplayDaniel)
+        -   **[Co-Calibrate Hub Fingerprint & Wrap Flat Envelope Bodies] (Fixes #3956, PR #3959, Thanks to @hazerwin, @koeria)**:
+            -   **Client Fingerprint & Flat Envelope Wrapping**: Upgraded official Hub fingerprint baseline and wrapped flat envelope payload contexts to prevent upstream Google Terms of Service (TOS) bans and 400 validation failures. (Fixes #3956, PR #3959, Thanks to @hazerwin, @koeria)
+
     *   **v5.0.4-beta.11 (2026-11-15)**:
         -   **[Disable SSE ': ping' Comment Heartbeat for Gemini Streams to Fix Antigravity CLI Crashes] (Fixes #3952, PR #3953, Thanks to @koeria)**:
             -   **Antigravity CLI (agy) Streaming Compatibility**: Overrode `heartbeat_frame` to return empty bytes for native Gemini streams and skipped yielding empty heartbeat frames in `run_stream_lifecycle`, eliminating crashes where the Google GenAI Go SDK terminates with `iterateResponseStream: invalid stream chunk: : ping` upon encountering non-data SSE comment pings. (Fixes #3952, PR #3953, Thanks to @koeria)

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import {
     Maximize2, RefreshCw, ShieldAlert, Tag, Users,
     Laptop, Code2, Terminal, Blocks, Mail, Gem, Diamond, Circle, HelpCircle,
@@ -253,22 +253,9 @@ export default function MiniView() {
         }
     };
 
-    const handleRefreshRef = useRef(handleRefresh);
-    handleRefreshRef.current = handleRefresh;
-
-    useEffect(() => {
-        if (!config?.auto_refresh || !config?.refresh_interval || config.refresh_interval <= 0) return;
-
-        const intervalId = setInterval(() => {
-            // [Fix #3757] 当悬浮窗收起或处于后台隐藏态时跳过定时刷新，避免 500 个账号下的 IPC 数据颠簸
-            if (typeof document !== 'undefined' && document.hidden) {
-                return;
-            }
-            handleRefreshRef.current();
-        }, config.refresh_interval * 60 * 1000);
-
-        return () => clearInterval(intervalId);
-    }, [config?.auto_refresh, config?.refresh_interval]);
+    // [Fix #3958] 定时全量刷新已完全下沉至后端调度器 (modules::auto_refresh)；
+    // 全局 accounts://refreshed 广播事件由 App.tsx 根级统一监听并调用 fetchAccounts(true)，
+    // 悬浮窗无需额外绑定重复监听器，彻底杜绝多窗口并发与卸载内存泄漏。
 
     useEffect(() => {
         if (isTauri()) {
