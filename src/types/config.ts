@@ -184,6 +184,12 @@ export const RECOMMENDED_PROMPT_REWRITE_PRESETS: PromptRewriteRule[] = [
         enabled: true,
     },
     {
+        id: "preset-claude-code-agent",
+        pattern: "You are an interactive agent that helps users with software engineering tasks.",
+        replacement: "",
+        enabled: true,
+    },
+    {
         id: "preset-dsh-identity",
         pattern: "You are an AI agent powered by DeepSeek Harness*",
         replacement: "",

@@ -8,7 +8,7 @@
 //! 进而导致全局账号池 503 级联封锁。
 //!
 //! 核心设计与防误杀铁律：
-//! 1. 深度保护代码块：自动提取并保护所有围栏代码块（```）与行内代码（`），代码内容 100% 豁免；
+//! 1. 深度保护代码块：自动提取并保护所有围栏代码块（```）与行内代码（`），Header 清洗保护全部代码；工具指令和自定义重写仅保护围栏代码；
 //! 2. 严禁碰触会话唯一性（Zero Session Touch）：绝不清洗或过滤任何 session 相关字段（包括
 //!    `x-jeikcode-session-id`, `x-session-id` 等）；会话唯一性由
 //!    `SessionScope` 按照严格优先级链条独立处理，本模块对所有 session 标识保持 100% 原样透传；
@@ -64,6 +64,9 @@ static RE_BILLING_METADATA_LINE: Lazy<Regex> = Lazy::new(|| {
     r"(?im)^[ \t]*(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):[^\r\n]*(?:\r?\n)?"
 ).unwrap()
 });
+/// 多行围栏代码块保护正则：仅隔离 ```...``` 围栏代码块（行内反引号由清理规则与 WAF 规则正常匹配脱敏）
+static RE_FENCED_CODE_BLOCK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?ms)```[\s\S]*?```").unwrap());
 
 /// 触发上游 Google WAF 拦截的高危客户端伪 Header 与特征声明正则（仅在非代码区域生效）：
 /// 1) 通用泛化匹配各类客户端注入的 `*-billing*` 伪 Header 行（如 `x-anthropic-billing-header:`, `x-billing:`, `x-client-billing:`, `anthropic-billing-header:` 等）
@@ -77,12 +80,13 @@ static RE_WAF_TRIGGER_HEADERS: Lazy<Regex> = Lazy::new(|| {
         r"|^\s*x-[a-z0-9_-]+:\s*[^\r\n]*(?:cc_version|cc_entrypoint|cc_workload|cc_is_subagent|cc_prev_req|cc_prompt_id|cc_turn_origin|cch=)[^\r\n]*(\r?\n)?",
         r"|(?i)x-anthropic-billing-header:\s*[^\r\n]*",
         r"|(?i)You are a Claude agent, built on Anthropic's Claude Agent SDK\.(\r?\n)?",
-        r"|(?i)You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK\.(\r?\n)?"
+        r"|(?i)You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK\.(\r?\n)?",
+        r"|(?i)You are an interactive agent that helps users with software engineering tasks\.(?:[ \t]+Use the instructions below and the tools available to you to assist the user\.)?"
     ))
     .unwrap()
 });
 
-/// 触发上游 Google WAF 伪 429 拦截的第三方 Agent 特征指令与规范特征正则（Issue #3965，仅在非代码区域生效）
+/// 触发上游 Google WAF 伪 429 拦截的第三方 Agent 特征指令与规范特征正则（Issue #3965, #3969，仅在非多行围栏代码区域生效）
 /// Google Cloud Code WAF 会对特定 Agent 模板中的高频特征指令进行启发式拦截，返回伪造的 429 RESOURCE_EXHAUSTED：
 /// 1) `Prefer read_file, edit_file, and write_file over cat/sed`
 /// 2) `Always read_file before edit_file`
@@ -336,6 +340,7 @@ static RE_KNOWN_CLIENT_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?i)\b(?:you\s+are|you're)\s+(?:",
         r"claude\s+code[\s,，]+(?:anthropic's\s+)?official\s+cli\s+for\s+claude(?:[\s,，]+running\s+within\s+(?:the\s+)?claude\s+agent\s+sdk)?",
+        r"|(?:an?\s+)?interactive\s+(?:agent|cli\s+tool)(?:\s+that\s+helps\s+users\s+with\s+software\s+engineering\s+tasks)?",
         r"|opencode(?:\s*,\s*an?\s+interactive\s+cli\s+tool(?:\s+that\s+helps\s+users\s+with\s+software\s+engineering\s+tasks)?)?",
         r"|(?:an?\s+)?personal\s+assistant\s+running\s+(?:inside|in|within)\s+openclaw",
         r"|openclaw",
@@ -471,6 +476,8 @@ const IDENTITY_FAST_MARKERS: &[&str] = &[
     // 知名第三方客户端与平台特征指纹
     "claude code",
     "claude agent",
+    "interactive agent",
+    "software engineering",
     "opencode",
     "openclaw",
     "cursor",
@@ -538,6 +545,9 @@ const CLAUDE_CODE_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's officia
 /// Claude Code CLI 在 Claude Agent SDK 运行时注入的身份声明（整串等值匹配）
 const CLAUDE_AGENT_SDK_CLI_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+/// Claude Code 最新独立版注入的交互式 Agent 声明
+const CLAUDE_INTERACTIVE_AGENT_IDENTITY: &str =
+    "You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.";
 
 /// Claude Desktop 注入的单行计费元数据前缀（issue #3452：与大量工具组合会触发上游 429）。
 /// 判定**不区分 model** —— 任何客户端注入的风险元数据都必须清洗。
@@ -643,13 +653,13 @@ impl PromptSanitizer {
         compiled
     }
 
-    /// 在代码块占位保护下按顺序应用规则；无命中返回 None，保持原文零改动。
+    /// 在多行围栏代码块占位保护下按顺序应用规则（行内反引号可被正常匹配重写）；无命中返回 None，保持原文零改动。
     fn rewrite_text_with_rules(text: &str, rules: &[CompiledPromptRewriteRule]) -> Option<String> {
         if rules.is_empty() {
             return None;
         }
         let mut placeholders: Vec<String> = Vec::new();
-        let protected = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
+        let protected = RE_FENCED_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
             let idx = placeholders.len();
             placeholders.push(caps[0].to_string());
             format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
@@ -695,10 +705,10 @@ impl PromptSanitizer {
     }
 
     /// 对单段提示词文本进行通用、高精度的净化：
-    /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`），未包含直接原样返回；
-    /// 2. 提取并保护所有代码块，使其免受任何正则影响；
+    /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`, `session-move` 等），未包含直接原样返回；
+    /// 2. 提取并保护多行围栏代码块（```...```），使其免受任何正则误伤；行内反引号中的敏感指令照常中和；
     /// 3. 仅剥离触发 WAF 的客户端计费伪 Header，绝不修改任何会话 ID、XML 标签或 `=== ... ===` 分隔符；
-    /// 4. 完整恢复受保护的代码块；
+    /// 4. 完整恢复受保护的多行代码块；
     /// 5. 规范化换行，保留所有多行正文排版。
     pub fn clean_text(text: &str) -> String {
         // 快速前置检查：若文本不包含高危特征，直接原样返回，零开销
@@ -718,13 +728,18 @@ impl PromptSanitizer {
             || lower.contains("read_file")
             || lower.contains("edit_file")
             || lower.contains("operational directives")
-            || lower.contains("operational guidelines");
+            || lower.contains("operational guidelines")
+            || lower.contains("opencode")
+            || lower.contains("session-move")
+            || lower.contains("session_move")
+            || lower.contains("interactive agent")
+            || lower.contains("software engineering tasks");
 
         if !has_suspect {
             return text.to_string();
         }
 
-        // 步骤 1：保护代码块
+        // Header 清洗继续保护行内代码，避免吞掉计费字段示例之后的指令。
         let mut placeholders: Vec<String> = Vec::new();
         let protected_text = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
             let idx = placeholders.len();
@@ -745,9 +760,28 @@ impl PromptSanitizer {
             }
         });
 
-        // 步骤 3.5：中和触发上游 WAF 伪 429 拦截的第三方 Agent 工具指令特征（Issue #3965）
-        let pass2_5 =
-            RE_WAF_TRIGGER_AGENT_TOOL_GUIDELINES.replace_all(&pass2, |caps: &regex::Captures| {
+        let headers_cleaned =
+            RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass2, |caps: &regex::Captures| {
+                caps[1]
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| placeholders.get(idx))
+                    .cloned()
+                    .unwrap_or_else(|| caps[0].to_string())
+            });
+        // 已知工具指令允许位于行内反引号中，围栏示例仍保持原样。
+        let mut placeholders: Vec<String> = Vec::new();
+        let tools_text =
+            RE_FENCED_CODE_BLOCK.replace_all(&headers_cleaned, |caps: &regex::Captures| {
+                let idx = placeholders.len();
+                placeholders.push(caps[0].to_string());
+                format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
+            });
+
+        // 步骤 3.5：中和触发上游 WAF 伪 429 拦截的第三方 Agent 工具指令特征（Issue #3965, #3969）
+        let pass2_5 = RE_WAF_TRIGGER_AGENT_TOOL_GUIDELINES.replace_all(
+            &tools_text,
+            |caps: &regex::Captures| {
                 let matched = &caps[0];
                 let lower = matched.to_lowercase();
                 if lower.contains("prefer") {
@@ -761,7 +795,8 @@ impl PromptSanitizer {
                 } else {
                     matched.to_string()
                 }
-            });
+            },
+        );
 
         // 步骤 4：单趟无递归还原受保护的代码块
         let restored = RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass2_5, |caps: &regex::Captures| {
@@ -1121,6 +1156,7 @@ impl PromptSanitizer {
     /// 2. 物理剔除清洗后产生的纯空文本 Part（避免上游 400/429 报错）；
     /// 3. 清洗后若存在思考块，强制保序确保思考块严格位于首位 (Index 0)；
     /// 4. `scope_of` 按 part 下标裁定清洗强度（System / Anchored / Content）。
+    ///
     /// 客户端身份归一化：已知客户端身份（Claude Agent SDK / Claude Code CLI）对齐为官方 Antigravity 身份。
     pub fn normalize_client_identity(text: &str) -> &str {
         if !Self::normalize_identity_enabled() {
@@ -1129,6 +1165,7 @@ impl PromptSanitizer {
         if text == CLAUDE_AGENT_SDK_IDENTITY
             || text == CLAUDE_CODE_CLI_IDENTITY
             || text == CLAUDE_AGENT_SDK_CLI_IDENTITY
+            || text == CLAUDE_INTERACTIVE_AGENT_IDENTITY
         {
             OFFICIAL_ANTIGRAVITY_IDENTITY
         } else {
@@ -4242,6 +4279,14 @@ mod tests {
             .unwrap_or_else(|| billing_raw.to_string());
         assert!(!rewritten_billing.contains("x-anthropic-billing-header"));
         assert!(rewritten_billing.contains("System prompt."));
+
+        // 6. Claude Code 独立版 interactive agent 预设规则整行清除
+        let cc_raw = "You are an interactive agent that helps users with software engineering tasks. Use the instructions below.\nNext line.";
+        let rewritten_cc = PromptSanitizer::rewrite_text_with_rules(cc_raw, &compiled)
+            .unwrap_or_else(|| cc_raw.to_string());
+        assert!(!rewritten_cc
+            .contains("interactive agent that helps users with software engineering tasks"));
+        assert!(rewritten_cc.contains("Next line."));
     }
 
     // ============================ issue #3965：中和触发上游 WAF 伪 429 拦截的第三方 Agent 特征指令 ============================
@@ -4283,6 +4328,114 @@ mod tests {
         assert!(cleaned.contains("def read_file(path):"));
         assert!(cleaned.contains(
             "# In-code comment: Prefer read_file, edit_file, and write_file over cat/sed."
+        ));
+    }
+
+    // ============================ issue #3969 / #3975：中和 OpenCode 工具指令 (tools.opencode.session-move / session_move) ============================
+
+    #[test]
+    fn experimental_rules_preserve_surrounding_instructions() {
+        let config = crate::proxy::config::PromptRewriteConfig {
+            enabled: true,
+            normalize_identity: true,
+            rules: crate::proxy::config::PromptRewriteConfig::recommended_preset_rules(),
+        };
+        let compiled = PromptSanitizer::compile_prompt_rewrite_rules(&config);
+        let identity = "You are an interactive agent that helps users with software engineering tasks. Preserve this important instruction.";
+        assert_eq!(
+            PromptSanitizer::normalize_client_identity(identity),
+            identity
+        );
+        assert!(
+            PromptSanitizer::clean_text(identity).contains("Preserve this important instruction.")
+        );
+        assert!(
+            PromptSanitizer::rewrite_text_with_rules(identity, &compiled)
+                .unwrap()
+                .contains("Preserve this important instruction.")
+        );
+    }
+
+    #[test]
+    fn billing_inline_examples_remain_protected_with_tool_rewrites() {
+        let input =
+            "Example `cc_version=1.0` keep this instruction; Always read_file before edit_file.";
+        assert_eq!(
+            PromptSanitizer::clean_text(input),
+            "Example `cc_version=1.0` keep this instruction; Always read file before edit file."
+        );
+    }
+
+    #[test]
+    fn session_tool_names_remain_consistent_across_payload() {
+        for name in ["tools.opencode.session-move", "tools.opencode.session_move"] {
+            let instruction = format!("Use execute to call `{name}`.");
+            let mut payload = json!({
+                "systemInstruction": {"parts": [{"text": instruction}]},
+                "tools": [{"functionDeclarations": [{"name": name, "description": instruction, "parameters": {"type": "OBJECT"}}]}],
+                "contents": [
+                    {"role": "user", "parts": [{"text": "Proceed."}]},
+                    {"role": "model", "parts": [{"functionCall": {"name": name, "args": {}}}]}
+                ]
+            });
+            let before = payload.clone();
+            PromptSanitizer::sanitize_gemini_payload(&mut payload);
+            assert!(system_instruction_text(&payload).contains(&instruction));
+            assert_eq!(payload["tools"], before["tools"]);
+            assert_eq!(payload["contents"][1], before["contents"][1]);
+            assert!(!payload.to_string().contains("session_relocate"));
+        }
+    }
+
+    #[test]
+    fn test_issue_3969_prompt_rewrite_rules_cover_inline_backticks() {
+        let input = "call `tools.opencode.session-move` now\n```\n`tools.opencode.session-move` in code\n```";
+        let out = apply_rules_for_test(
+            input,
+            &[(
+                "tools.opencode.session-move",
+                "tools.opencode.session_relocate",
+            )],
+        );
+
+        // 行内反引号内的敏感字符串必须能被用户规则正常替换
+        assert!(out.contains("call `tools.opencode.session_relocate` now"));
+        // 围栏代码块内的内容不受任何影响
+        assert!(out.contains("```\n`tools.opencode.session-move` in code\n```"));
+    }
+
+    // ============================ issue #3972：中和 Claude Code 独立版 interactive agent 触发 WAF 伪 429 ============================
+
+    #[test]
+    fn test_issue_3972_claude_code_interactive_agent_normalized_and_sanitized() {
+        let raw = concat!(
+            "You are an interactive agent that helps users with software engineering tasks. ",
+            "Use the instructions below and the tools available to you to assist the user.\n\n",
+            "# Rules\n",
+            "Rule 1: Always check tests."
+        );
+
+        // 1. 验证身份归一化管线将其对齐为官方 Antigravity 身份
+        let normalized = PromptSanitizer::normalize_system_identity(raw);
+        assert!(normalized.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(!normalized.contains(
+            "You are an interactive agent that helps users with software engineering tasks"
+        ));
+        assert!(normalized.contains(
+            "Use the instructions below and the tools available to you to assist the user."
+        ));
+
+        // 2. 验证单独传入作为 client identity 块时也能被归一化
+        let standalone = "You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.";
+        assert_eq!(
+            PromptSanitizer::normalize_client_identity(standalone),
+            OFFICIAL_ANTIGRAVITY_IDENTITY
+        );
+
+        // 3. 验证 clean_text 在仅有 Header 轨时能够剔除该行
+        let cleaned = PromptSanitizer::clean_text(raw);
+        assert!(!cleaned.contains(
+            "You are an interactive agent that helps users with software engineering tasks"
         ));
     }
 }
