@@ -1957,15 +1957,18 @@ impl UpstreamClient {
                                     status
                                 );
                             }
-                            fallback_attempts.push(FallbackAttemptLog {
-                                endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                endpoint_url: url.clone(),
-                                status: Some(status.as_u16()),
-                                duration_s,
-                                switch_delay_s,
-                                error: String::new(),
-                                is_effective: true,
-                            });
+                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
+                                &mut fallback_attempts,
+                                FallbackAttemptLog {
+                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                    endpoint_url: url.clone(),
+                                    status: Some(status.as_u16()),
+                                    duration_s,
+                                    switch_delay_s,
+                                    error: String::new(),
+                                    is_effective: true,
+                                },
+                            );
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
@@ -1989,15 +1992,18 @@ impl UpstreamClient {
                             } else {
                                 sanitized.trim().to_string()
                             };
-                            fallback_attempts.push(FallbackAttemptLog {
-                                endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                endpoint_url: url.clone(),
-                                status: Some(status.as_u16()),
-                                duration_s,
-                                switch_delay_s,
-                                error: err_detail,
-                                is_effective: false,
-                            });
+                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
+                                &mut fallback_attempts,
+                                FallbackAttemptLog {
+                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                    endpoint_url: url.clone(),
+                                    status: Some(status.as_u16()),
+                                    duration_s,
+                                    switch_delay_s,
+                                    error: err_detail,
+                                    is_effective: false,
+                                },
+                            );
                             tracing::warn!(
                                 "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
                                 account_id
@@ -2034,15 +2040,18 @@ impl UpstreamClient {
                                 err_msg
                             );
                             // [NEW] 记录降级尝试
-                            fallback_attempts.push(FallbackAttemptLog {
-                                endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                endpoint_url: url.clone(),
-                                status: Some(status.as_u16()),
-                                duration_s,
-                                switch_delay_s,
-                                error: err_msg.clone(),
-                                is_effective: false,
-                            });
+                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
+                                &mut fallback_attempts,
+                                FallbackAttemptLog {
+                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                    endpoint_url: url.clone(),
+                                    status: Some(status.as_u16()),
+                                    duration_s,
+                                    switch_delay_s,
+                                    error: err_msg.clone(),
+                                    is_effective: false,
+                                },
+                            );
                             last_err = Some(err_msg);
                             continue;
                         }
@@ -2053,15 +2062,18 @@ impl UpstreamClient {
                         {
                             self.endpoint_health.mark_failure(base_url);
                         }
-                        fallback_attempts.push(FallbackAttemptLog {
-                            endpoint_name: parse_endpoint_name(base_url).to_string(),
-                            endpoint_url: url.clone(),
-                            status: Some(status.as_u16()),
-                            duration_s,
-                            switch_delay_s,
-                            error: format!("HTTP {}", status),
-                            is_effective: false,
-                        });
+                        crate::proxy::pipeline::attempt_diagnostics::record_attempt(
+                            &mut fallback_attempts,
+                            FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: format!("HTTP {}", status),
+                                is_effective: false,
+                            },
+                        );
                         return Ok(UpstreamCallResult {
                             response: resp,
                             fallback_attempts,
@@ -2146,15 +2158,18 @@ impl UpstreamClient {
                             ),
                         );
                         // [NEW] 记录网络错误的降级尝试
-                        fallback_attempts.push(FallbackAttemptLog {
-                            endpoint_name: parse_endpoint_name(base_url).to_string(),
-                            endpoint_url: url.clone(),
-                            status: None,
-                            duration_s,
-                            switch_delay_s,
-                            error: msg.clone(),
-                            is_effective: false,
-                        });
+                        crate::proxy::pipeline::attempt_diagnostics::record_attempt(
+                            &mut fallback_attempts,
+                            FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: None,
+                                duration_s,
+                                switch_delay_s,
+                                error: msg.clone(),
+                                is_effective: false,
+                            },
+                        );
                         last_err = Some(msg);
 
                         // 终态：不再换端点、也不再换账号重放同一份 body。
