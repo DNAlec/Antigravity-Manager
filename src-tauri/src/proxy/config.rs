@@ -530,6 +530,12 @@ impl PromptRewriteConfig {
                 true,
             ),
             PromptRewriteRule::new(
+                "preset-claude-code-agent",
+                "You are an interactive agent that helps users with software engineering tasks.",
+                "",
+                true,
+            ),
+            PromptRewriteRule::new(
                 "preset-dsh-identity",
                 "You are an AI agent powered by DeepSeek Harness*",
                 "",

@@ -2055,6 +2055,48 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
     }
 
     #[test]
+    fn responses_compat_restores_mcp_namespace_fields() {
+        let chat_response = serde_json::from_value(json!({
+            "id": "chatcmpl_mcp",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gemini-4-hydrogen-high",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_mcp",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp__node_repl__js",
+                            "arguments": "{\"code\":\"1+1\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .expect("valid OpenAI response fixture");
+
+        let response = convert_chat_response_to_responses(&chat_response, false);
+        let function_call = response["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+            .expect("function call output");
+
+        assert_eq!(function_call["name"], "js");
+        assert_eq!(function_call["namespace"], "mcp__node_repl");
+        assert!(!function_call.to_string().contains("mcp__node_repl__js"));
+    }
+
+    #[test]
     fn test_unwrap_outer_code_fence_safety() {
         use super::unwrap_outer_code_fence_if_structured;
 
