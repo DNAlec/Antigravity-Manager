@@ -2,6 +2,37 @@
 
 本目錄包含 Antigravity Manager 的原生 Headless Docker 部署方案。該方案支持完整的 Web 管理界面、API 反代以及數據持久化，無需複雜的 VNC 或桌面環境。
 
+## 本 fork：预构建镜像与 Compose 发布
+
+本自用仓库只自动发布 `ghcr.io/dnalec/antigravity-manager` 的 Linux AMD64 / ARM64 镜像，以及 GitHub Release 附件 `compose.yml`、`.env.example`。正式版同时更新 `latest`；Beta 只发布版本标签，不覆盖 `latest`。不再自动构建桌面、Android 安装包或桌面更新清单。
+
+生产部署无需本地编译：
+
+1. 从本仓库 [Releases](https://github.com/DNAlec/Antigravity-Manager/releases) 下载同一版本的 `compose.yml` 和 `.env.example` 到部署目录。
+2. `cp .env.example .env`，填入现有 `API_KEY`、`WEB_PASSWORD` 和 `ABV_HOST_DATA_DIR`。升级时沿用原账号/配置目录并先备份；不要换成空目录。附件中的 `AM_IMAGE` 已固定为该版本。
+3. 默认仅在宿主机 `127.0.0.1:8045` 暴露服务；需要远程访问时设置 `BIND_ADDRESS`。容器内监听所有地址，以支持 Docker 端口映射。
+4. GHCR 包若为私有，先执行 `docker login ghcr.io`，使用有 `read:packages` 权限的凭据。仓库 Actions 使用自带 `GITHUB_TOKEN` 发布，无需 Docker Hub secrets。
+5. 执行：
+
+```bash
+docker compose pull
+docker compose up -d --wait --wait-timeout 120
+docker compose logs --tail=100
+```
+
+已有容器升级时，在原 Compose 项目目录执行并保持原项目名，避免生成第二套服务。回滚时将 `AM_IMAGE` 改成已发布的旧镜像版本，再执行 `pull` / `up`。首次迁移到 GHCR 前的版本未必存在镜像，保留原容器镜像和备份作为首次切换的回退路径。
+
+从源码使用同一部署模板：
+
+```bash
+cp docker/release.env.example docker/.env
+# 编辑 docker/.env，填写凭据、数据目录和 AM_IMAGE 版本
+# 以下模板仅拉取镜像，不执行源码构建。
+docker compose --env-file docker/.env -f docker/compose.release.yml up -d --wait --wait-timeout 120
+```
+
+下面保留上游及本地源码构建方式，供开发时使用。
+
 ## 🆕 本版本部署方案（本地前端構建復用）
 適用於「前端近期不改、後端經常調整」的場景。思路是先在本地生成 `dist/`，Docker 只編譯後端並直接拷貝 `dist/`，大幅縮短構建時間並降低前端構建風險。
 

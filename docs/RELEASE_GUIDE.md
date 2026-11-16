@@ -2,6 +2,16 @@
 
 发版详细规程。提交门禁与发版红线以根目录 `AGENTS.md` 为准。
 
+## 本自用 fork 的发布流程（优先于下方上游说明）
+
+- 自动发布仅包含 Linux AMD64 / ARM64 Docker 镜像和 Compose 附件，镜像地址为 `ghcr.io/dnalec/antigravity-manager`。两个架构均通过 Compose 启动与健康检查后，才生成版本 manifest 和 GitHub Release。
+- 发布准备、版本同步、双语说明和 main/beta 通道隔离仍遵循 AGENTS.md。推送 `v*` 标签触发 Release；手动运行时可指定已有标签，构建的代码严格来自该标签，版本必须匹配 package.json。
+- Actions 用 `GITHUB_TOKEN`（`packages: write`）推送 GHCR，不再依赖 Docker Hub secrets。私有镜像的生产拉取需 `read:packages` 凭据，或由仓库所有者将 GHCR 包设为公开。
+- 稳定版本更新版本镜像及 `latest`；Beta 不更新 `latest`。补发旧版本不会回退已有最新版本。相同版本可重跑，源码标签保持不变。
+- Release 附件为固定版本的 `compose.yml`、`.env.example`；部署与回退见 [docker/README.md](../docker/README.md)。首次 GHCR 发布前的旧版本可能没有镜像，应保留原生产镜像以便回退。
+- 日常 CI 仅运行 Linux Rust 检查、前端构建及 Compose 校验。Windows 和 Pages 工作流仅允许手动运行。
+- 下方桌面安装包、Android、Docker Hub 与 updater.json 的说明属于上游原流程，本 fork 自动发布不再执行这些步骤。
+
 ---
 
 ## 一、流程概览

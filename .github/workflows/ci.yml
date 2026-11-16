@@ -35,6 +35,12 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      - name: Validate release Compose
+        env:
+          API_KEY: ci-placeholder
+          WEB_PASSWORD: ci-placeholder
+        run: docker compose -f docker/compose.release.yml config --quiet
+
       - name: Build frontend
         run: npm run build
 
@@ -46,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-latest, windows-2025, macos-latest]
+        platform: [ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -82,109 +88,3 @@ jobs:
         run: |
           cd src-tauri
           cargo clippy --all-targets --all-features
-
-      - name: Check Rust compilation
-        run: |
-          cd src-tauri
-          cargo check
-
-  # Tauri 构建测试（不打包）
-  build-tauri:
-    name: Build Tauri App
-    runs-on: ${{ matrix.platform }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [ubuntu-latest, windows-2025, macos-latest]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies (Linux)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev
-          sudo apt-get install -y --no-install-recommends libnm-dev xdg-utils
-
-      - name: Rust setup
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "src-tauri"
-          save-if: ${{ github.event_name == 'push' }}
-
-      - name: Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: "npm"
-
-      - name: Install frontend dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Disable updater artifacts in unsigned CI builds
-        shell: pwsh
-        run: |
-          $configPath = "src-tauri/tauri.conf.json"
-          $config = Get-Content -Raw $configPath | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
-          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
-          Write-Host "Disabled updater artifacts for unsigned CI build."
-
-      - name: Build Tauri app (debug)
-        run: npm run tauri build -- --debug --no-bundle
-        env:
-          # CI 环境不需要签名
-          TAURI_SIGNING_PRIVATE_KEY: ""
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-
-  # Android ARM64 原生 Termux Headless 构建
-  build-android-arm64:
-    name: Build Android ARM64 Server (Termux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Rust setup
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
-          add-to-path: true
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
-
-      - name: Build frontend
-        run: |
-          npm install --legacy-peer-deps
-          npm run build
-
-      - name: Build Android ARM64 headless server binary
-        run: |
-          cd src-tauri
-          cargo ndk -t arm64-v8a build --release --bin antigravity-server
-
-      - name: Package Android ARM64 artifact
-        run: |
-          mkdir -p dist-android
-          cp src-tauri/target/aarch64-linux-android/release/antigravity-server dist-android/
-          cp -r dist dist-android/dist
-          tar -czvf antigravity-server-android-arm64.tar.gz -C dist-android antigravity-server dist
-
-      - name: Upload Android ARM64 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: antigravity-server-android-arm64
-          path: antigravity-server-android-arm64.tar.gz
-          if-no-files-found: error
