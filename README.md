@@ -255,11 +255,12 @@ If you are upgrading from v4.0.1 or earlier, your installation won't have a `WEB
 > - **Fallback**: If neither is set, it falls back to `API_KEY`; if even `API_KEY` is missing, a random one is generated.
 
 #### Option 2: Use Docker Compose
-1. Enter the `docker` directory and start the service:
+This fork publishes prebuilt Linux AMD64/ARM64 images to `ghcr.io/dnalec/antigravity-manager`. Download `compose.yml` and `.env.example` from this repository's [Releases](https://github.com/DNAlec/Antigravity-Manager/releases), copy `.env.example` to `.env`, and set your credentials and existing data directory. Release assets pin the image version. Then run:
 ```bash
-cd docker
-docker compose up -d
+docker compose pull
+docker compose up -d --wait --wait-timeout 120
 ```
+Private GHCR packages require `docker login ghcr.io`. Desktop and Android packages are no longer automatically published by this fork. See the [fork deployment instructions](docker/README.md).
 > **Log rotation**: Compose limits JSON logs to `100m` per file and keeps `3` files by default to prevent unbounded growth.
 > **Access URL**: `http://localhost:8045` (Admin Console) | `http://localhost:8045/v1` (API Base)
 > **System Requirements**:

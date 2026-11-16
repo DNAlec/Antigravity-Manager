@@ -1,0 +1,22 @@
+services:
+  antigravity-manager:
+    image: ${AM_IMAGE:-ghcr.io/dnalec/antigravity-manager:latest}
+    init: true
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8045}:8045"
+    volumes:
+      - ${ABV_HOST_DATA_DIR:-~/.antigravity_tools}:/root/.antigravity_tools
+    environment:
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      WEB_PASSWORD: ${WEB_PASSWORD:?Set WEB_PASSWORD in .env}
+      ABV_BIND_LOCAL_ONLY: "false"
+      ABV_DATA_DIR: /root/.antigravity_tools
+      ABV_MAX_BODY_SIZE: ${ABV_MAX_BODY_SIZE:-104857600}
+      RUST_LOG: ${RUST_LOG:-info}
+      PORT: "8045"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"

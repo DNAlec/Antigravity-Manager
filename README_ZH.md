@@ -255,11 +255,12 @@ antigravity-server --no-web
 > - **保底回退 (向后兼容)**: 若上述均未设置，则回退使用 `API_KEY` 作为登录密码。
 
 #### 方式 2: 使用 Docker Compose
-1. 进入项目的 `docker` 目录并启动服务：
+本 fork 发布 `ghcr.io/dnalec/antigravity-manager` 的 Linux AMD64/ARM64 镜像。从本仓库 [Releases](https://github.com/DNAlec/Antigravity-Manager/releases) 下载 `compose.yml` 和 `.env.example`，将后者复制为 `.env`，填写凭据与原数据目录。发布附件已固定镜像版本，然后执行：
 ```bash
-cd docker
-docker compose up -d
+docker compose pull
+docker compose up -d --wait --wait-timeout 120
 ```
+私有 GHCR 包需先 `docker login ghcr.io`。本 fork 不再自动发布桌面和 Android 安装包，详见 [fork 部署说明](docker/README.md)。
 > **日志轮转**: Compose 默认将 JSON 日志限制为单文件 `100m`、保留 `3` 个文件，避免日志无限增长。
 > **访问地址**: `http://localhost:8045` (管理后台) | `http://localhost:8045/v1` (API Base)
 > **系统要求**:
