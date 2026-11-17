@@ -80,3 +80,10 @@ parent 1 for a future code rollback; avoid resetting published shared history.
   src/utils/modelFamily.ts; it is retained to keep upstream source identical.
 - No release-only preflight, model probes, production config changes or
   deployment were performed. These tests cannot establish reduced 429 rates.
+
+## Release gate follow-up (v5.0.11)
+
+Clippy rejected the upstream redundant boolean expression in
+mark_rate_limited_fast. The release simplifies it using absorption
+(A || B) && B = B, retaining the record_rate_limit_atomic call and its side
+effects. This is a behavior-preserving exception to source identity.
