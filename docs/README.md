@@ -2,6 +2,10 @@
 
 This folder contains developer-focused documentation (architecture, implementation details, and validation steps).
 
+## Current baseline
+
+Application code now follows upstream v5.0.4-beta.14. See [migration scope and compatibility](testing/upstream_v5.0.4-beta.14_migration.md). Earlier fork diagnostics, QoS, protocol and cache documents describe historical implementations and are not guarantees of current behavior.
+
 ## Proxy
 - [AM / sub2api cache continuity handoff (2026-11-14)](plans/cache-continuity-handoff-20261114.md) — verified fixes, outstanding release blockers, and steps to resume development on another machine.
 - [`docs/proxy/auth.md`](proxy/auth.md) — proxy authorization modes, expected client behavior, and implementation pointers.

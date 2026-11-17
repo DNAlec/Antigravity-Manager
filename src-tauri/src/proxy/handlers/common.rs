@@ -403,17 +403,6 @@ pub fn build_token_error_response(
     account_email: Option<&str>,
     error_text: &str,
 ) -> axum::response::Response {
-    build_token_error_response_with_usage(protocol, mapped_model, account_email, error_text, None)
-}
-
-/// A retry-selection stop must preserve measurements from earlier attempts.
-pub fn build_token_error_response_with_usage(
-    protocol: &str,
-    mapped_model: &str,
-    account_email: Option<&str>,
-    error_text: &str,
-    usage: Option<&serde_json::Value>,
-) -> axum::response::Response {
     use axum::response::IntoResponse;
     let status = resolve_token_error_status(error_text);
     let headers = build_token_error_headers_for_protocol(
@@ -422,8 +411,7 @@ pub fn build_token_error_response_with_usage(
         account_email,
         error_text,
     );
-    let mut dual_err = build_dual_track_error(protocol, status.as_u16(), mapped_model, error_text);
-    crate::proxy::pipeline::stream_error::attach_error_usage(&mut dual_err, protocol, usage);
+    let dual_err = build_dual_track_error(protocol, status.as_u16(), mapped_model, error_text);
     (status, headers, axum::Json(dual_err)).into_response()
 }
 
@@ -644,24 +632,6 @@ pub fn build_dual_track_error_with_ua_and_lang(
     // [Fixes #3763] 剔除内部链路控制标记，避免大体积上传终态标记泄漏到客户端报文
     let sanitized_error_text = crate::proxy::upstream::client::strip_internal_markers(error_text);
     let error_text = sanitized_error_text.as_str();
-    // Generation failures include partial output. Do not scan that output
-    // for transport/quota keywords or parse HTTP prefixes inside quoted text.
-    if let Ok(mut failure) = serde_json::from_str::<serde_json::Value>(error_text) {
-        if failure
-            .get("error")
-            .is_some_and(crate::proxy::pipeline::stream_error::is_partial_response_error)
-        {
-            if protocol == "claude" {
-                failure["type"] = serde_json::json!("error");
-                failure["error"]["type"] = serde_json::json!("api_error");
-            } else if protocol == "gemini" {
-                failure["error"]["code"] = serde_json::json!(status_code);
-                failure["error"]["status"] =
-                    serde_json::json!(map_status_code_to_gemini_status(status_code));
-            }
-            return failure;
-        }
-    }
     let lower = error_text.to_lowercase();
     let is_internal_limited =
         crate::proxy::pipeline::policy::UpstreamClassification::is_internal_gateway_exhaustion(
@@ -1248,60 +1218,6 @@ mod retry_after_tests {
             resolve_token_error_status("No accounts available"),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
-    }
-
-    #[tokio::test]
-    async fn stale_retry_selection_returns_503_with_affinity_and_measured_usage() {
-        let usage = serde_json::json!({"promptTokenCount":100,"cachedContentTokenCount":80});
-        for protocol in ["claude", "gemini", "openai", "responses"] {
-            let error = crate::proxy::session_bindings::SESSION_BINDING_CHANGED;
-            let mut retry = crate::proxy::pipeline::rotation::RequestRetryState::default();
-            retry.preserve_token_error(error);
-            let response = retry.finish_error_response(build_token_error_response_with_usage(
-                protocol,
-                "gemini-flash",
-                None,
-                error,
-                Some(&usage),
-            ));
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::SERVICE_UNAVAILABLE
-            );
-            assert_eq!(
-                response
-                    .headers()
-                    .get("x-am-cache-affinity")
-                    .and_then(|v| v.to_str().ok()),
-                Some("preserve")
-            );
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["usageMetadata"], usage);
-            match protocol {
-                "claude" => {
-                    assert_eq!(body["usage"]["input_tokens"], 20);
-                    assert_eq!(body["usage"]["cache_read_input_tokens"], 80);
-                }
-                "openai" => {
-                    assert_eq!(body["usage"]["prompt_tokens"], 100);
-                    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 80);
-                }
-                "responses" => {
-                    assert_eq!(body["usage"]["input_tokens"], 100);
-                    assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 80);
-                }
-                _ => {}
-            }
-            if protocol == "gemini" {
-                assert_eq!(body["error"]["status"], "UNAVAILABLE");
-            } else {
-                assert_eq!(body["error"]["type"], "api_error");
-                assert_eq!(body["error"]["code"], "upstream_error");
-            }
-        }
     }
 
     #[test]

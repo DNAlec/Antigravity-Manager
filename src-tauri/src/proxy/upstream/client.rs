@@ -1293,29 +1293,13 @@ impl UpstreamClient {
         cfg: &crate::proxy::config::UploadTimeoutConfig,
         observed_bps: Option<u64>,
     ) -> UpstreamTimeoutPlan {
-        Self::plan_upstream_timeouts_with_policy(
-            media_kind,
-            body_len,
-            cfg,
-            observed_bps,
-            super::request_policy::request_policy(),
-        )
-    }
-
-    fn plan_upstream_timeouts_with_policy(
-        media_kind: PayloadMediaKind,
-        body_len: usize,
-        cfg: &crate::proxy::config::UploadTimeoutConfig,
-        observed_bps: Option<u64>,
-        policy: &super::request_policy::UpstreamRequestPolicy,
-    ) -> UpstreamTimeoutPlan {
         let (upload_budget_secs, budget_source) =
             Self::calculate_upload_budget_secs(body_len, cfg, observed_bps);
 
         // 上传重传成本只由 body 字节数决定；token 数属于 prefill/首字预算，
         // 不应把 642KB/155k tokens 的 agent 请求误判为“大 body”而禁用端点回退。
         let large_body = body_len >= cfg.large_body_threshold_bytes();
-        let max_endpoints = policy.account_attempt_limit(V1_INTERNAL_BASE_URL_FALLBACKS.len());
+        let max_endpoints = V1_INTERNAL_BASE_URL_FALLBACKS.len();
         let endpoint_attempt_limit = if large_body {
             cfg.large_body_endpoint_attempts.clamp(1, max_endpoints)
         } else {
@@ -1509,7 +1493,7 @@ impl UpstreamClient {
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
         }
 
         // [Pipeline First] 在**统一的转出报文**（Gemini Canonical IR）上估一次 token：
@@ -1546,14 +1530,20 @@ impl UpstreamClient {
             }),
         );
 
-        // Keep body.project for content requests, but omit the quota-project header.
+        // [Issue #3960] x-goog-user-project 治理:
+        // - 消费级 aicode-consumers: 严禁在 content 请求中携带 x-goog-user-project，避免 403 (User is not permitted to use project aicode-consumers)
+        // - 企业 / 自费 GCP 账号: 必须保留 x-goog-user-project: <project_id>，否则 Google Cloud 校验项目归属失败并返回 403 PERMISSION_DENIED
         let is_content_request = matches!(method, "generateContent" | "streamGenerateContent");
-        if !is_content_request {
-            if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
-                if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
-                    if let Ok(hv) = header::HeaderValue::from_str(proj) {
-                        headers.insert("x-goog-user-project", hv);
-                    }
+        let mut retain_user_project = false;
+        if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
+            if !proj.is_empty()
+                && proj != "aicode-consumers"
+                && proj != "test-project"
+                && proj != "project-id"
+            {
+                if let Ok(hv) = header::HeaderValue::from_str(proj) {
+                    headers.insert("x-goog-user-project", hv);
+                    retain_user_project = true;
                 }
             }
         }
@@ -1578,7 +1568,7 @@ impl UpstreamClient {
                 }
             }
         }
-        if is_content_request {
+        if is_content_request && !retain_user_project {
             headers.remove("x-goog-user-project");
         }
 
@@ -1693,14 +1683,10 @@ impl UpstreamClient {
             let prefer_healthy_sandbox =
                 matches!(method, "generateContent" | "streamGenerateContent")
                     && body_bytes.len() >= UPLOAD_HEAVY_BODY_BYTES;
-            let mut candidate_endpoints =
-                self.endpoint_health.get_ordered_endpoints_with_preference(
-                    &V1_INTERNAL_BASE_URL_FALLBACKS,
-                    prefer_healthy_sandbox,
-                );
-            if super::request_policy::request_policy().single_attempt {
-                candidate_endpoints.truncate(1);
-            }
+            let candidate_endpoints = self.endpoint_health.get_ordered_endpoints_with_preference(
+                &V1_INTERNAL_BASE_URL_FALLBACKS,
+                prefer_healthy_sandbox,
+            );
             let endpoints_snapshot = candidate_endpoints
                 .iter()
                 .map(|u| {
@@ -1957,18 +1943,15 @@ impl UpstreamClient {
                                     status
                                 );
                             }
-                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
-                                &mut fallback_attempts,
-                                FallbackAttemptLog {
-                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                    endpoint_url: url.clone(),
-                                    status: Some(status.as_u16()),
-                                    duration_s,
-                                    switch_delay_s,
-                                    error: String::new(),
-                                    is_effective: true,
-                                },
-                            );
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: String::new(),
+                                is_effective: true,
+                            });
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
@@ -1979,7 +1962,6 @@ impl UpstreamClient {
                         // [NEW] 检测 403 错误 (Issue #3074)
                         // 只要带有项目 Header 且返回 403，我们就尝试降级重试一次
                         if status == StatusCode::FORBIDDEN
-                            && !super::request_policy::request_policy().single_attempt
                             && !has_triggered_downgrade
                             && headers.contains_key("x-goog-user-project")
                         {
@@ -1992,18 +1974,15 @@ impl UpstreamClient {
                             } else {
                                 sanitized.trim().to_string()
                             };
-                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
-                                &mut fallback_attempts,
-                                FallbackAttemptLog {
-                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                    endpoint_url: url.clone(),
-                                    status: Some(status.as_u16()),
-                                    duration_s,
-                                    switch_delay_s,
-                                    error: err_detail,
-                                    is_effective: false,
-                                },
-                            );
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: err_detail,
+                                is_effective: false,
+                            });
                             tracing::warn!(
                                 "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
                                 account_id
@@ -2040,18 +2019,15 @@ impl UpstreamClient {
                                 err_msg
                             );
                             // [NEW] 记录降级尝试
-                            crate::proxy::pipeline::attempt_diagnostics::record_attempt(
-                                &mut fallback_attempts,
-                                FallbackAttemptLog {
-                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                    endpoint_url: url.clone(),
-                                    status: Some(status.as_u16()),
-                                    duration_s,
-                                    switch_delay_s,
-                                    error: err_msg.clone(),
-                                    is_effective: false,
-                                },
-                            );
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: err_msg.clone(),
+                                is_effective: false,
+                            });
                             last_err = Some(err_msg);
                             continue;
                         }
@@ -2062,18 +2038,15 @@ impl UpstreamClient {
                         {
                             self.endpoint_health.mark_failure(base_url);
                         }
-                        crate::proxy::pipeline::attempt_diagnostics::record_attempt(
-                            &mut fallback_attempts,
-                            FallbackAttemptLog {
-                                endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                endpoint_url: url.clone(),
-                                status: Some(status.as_u16()),
-                                duration_s,
-                                switch_delay_s,
-                                error: format!("HTTP {}", status),
-                                is_effective: false,
-                            },
-                        );
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url.clone(),
+                            status: Some(status.as_u16()),
+                            duration_s,
+                            switch_delay_s,
+                            error: format!("HTTP {}", status),
+                            is_effective: false,
+                        });
                         return Ok(UpstreamCallResult {
                             response: resp,
                             fallback_attempts,
@@ -2158,18 +2131,15 @@ impl UpstreamClient {
                             ),
                         );
                         // [NEW] 记录网络错误的降级尝试
-                        crate::proxy::pipeline::attempt_diagnostics::record_attempt(
-                            &mut fallback_attempts,
-                            FallbackAttemptLog {
-                                endpoint_name: parse_endpoint_name(base_url).to_string(),
-                                endpoint_url: url.clone(),
-                                status: None,
-                                duration_s,
-                                switch_delay_s,
-                                error: msg.clone(),
-                                is_effective: false,
-                            },
-                        );
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url.clone(),
+                            status: None,
+                            duration_s,
+                            switch_delay_s,
+                            error: msg.clone(),
+                            is_effective: false,
+                        });
                         last_err = Some(msg);
 
                         // 终态：不再换端点、也不再换账号重放同一份 body。
@@ -2271,7 +2241,7 @@ impl UpstreamClient {
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
         }
         let client = self.get_client(account_id).await;
         let mut last_error = String::new();
@@ -3072,30 +3042,6 @@ mod tests {
             text_1mb.endpoint_attempt_limit,
             V1_INTERNAL_BASE_URL_FALLBACKS.len()
         );
-    }
-
-    #[test]
-    fn single_attempt_only_budgets_one_endpoint_upload() {
-        use crate::proxy::upstream::request_policy::UpstreamRequestPolicy;
-        let config = default_upload_cfg();
-        for (single_attempt, expected_endpoints) in
-            [(true, 1), (false, V1_INTERNAL_BASE_URL_FALLBACKS.len())]
-        {
-            let policy = UpstreamRequestPolicy { single_attempt };
-            let plan = UpstreamClient::plan_upstream_timeouts_with_policy(
-                PayloadMediaKind::TextChat,
-                1024,
-                &config,
-                None,
-                &policy,
-            );
-            assert_eq!(plan.endpoint_attempt_limit, expected_endpoints);
-            assert_eq!(
-                plan.total_budget_secs,
-                (plan.first_byte_total_secs + plan.upload_budget_secs * expected_endpoints as u64)
-                    .min(MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS)
-            );
-        }
     }
 
     #[test]

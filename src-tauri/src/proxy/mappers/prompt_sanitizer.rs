@@ -8,7 +8,7 @@
 //! 进而导致全局账号池 503 级联封锁。
 //!
 //! 核心设计与防误杀铁律：
-//! 1. 深度保护代码块：自动提取并保护所有围栏代码块（```）与行内代码（`），Header 清洗保护全部代码；工具指令和自定义重写仅保护围栏代码；
+//! 1. 深度保护代码块：自动提取并保护所有围栏代码块（```）与行内代码（`），代码内容 100% 豁免；
 //! 2. 严禁碰触会话唯一性（Zero Session Touch）：绝不清洗或过滤任何 session 相关字段（包括
 //!    `x-jeikcode-session-id`, `x-session-id` 等）；会话唯一性由
 //!    `SessionScope` 按照严格优先级链条独立处理，本模块对所有 session 标识保持 100% 原样透传；
@@ -56,14 +56,6 @@ use std::sync::{Arc, RwLock};
 static RE_CODE_BLOCK: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?ms)(```[\s\S]*?```|`[^`\r\n]+`)").unwrap());
 
-// Fingerprints ignore injected billing lines, but must preserve quoted/code
-// examples and ordinary prose mentioning billing. Keep this narrower than the
-// outbound WAF sanitizer and never match across a line boundary.
-static RE_BILLING_METADATA_LINE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-    r"(?im)^[ \t]*(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):[^\r\n]*(?:\r?\n)?"
-).unwrap()
-});
 /// 多行围栏代码块保护正则：仅隔离 ```...``` 围栏代码块（行内反引号由清理规则与 WAF 规则正常匹配脱敏）
 static RE_FENCED_CODE_BLOCK: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?ms)```[\s\S]*?```").unwrap());
@@ -81,7 +73,7 @@ static RE_WAF_TRIGGER_HEADERS: Lazy<Regex> = Lazy::new(|| {
         r"|(?i)x-anthropic-billing-header:\s*[^\r\n]*",
         r"|(?i)You are a Claude agent, built on Anthropic's Claude Agent SDK\.(\r?\n)?",
         r"|(?i)You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK\.(\r?\n)?",
-        r"|(?i)You are an interactive agent that helps users with software engineering tasks\.(?:[ \t]+Use the instructions below and the tools available to you to assist the user\.)?"
+        r"|(?i)You are an interactive agent that helps users with software engineering tasks\.[^\r\n]*(\r?\n)?"
     ))
     .unwrap()
 });
@@ -92,14 +84,49 @@ static RE_WAF_TRIGGER_HEADERS: Lazy<Regex> = Lazy::new(|| {
 /// 2) `Always read_file before edit_file`
 /// 3) `call read_file on its SKILL.md`
 /// 4) `Google model operational directives / guidelines`
+/// 5) `tools.opencode.session-move` / `tools.opencode.session_move` (Issue #3969, #3975)
 static RE_WAF_TRIGGER_AGENT_TOOL_GUIDELINES: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?i)\bprefer\s+(?:the\s+)?read_file,\s*edit_file,?\s+and\s+write_file\s+over\s+cat/sed\b",
         r"|(?i)\balways\s+read_file\s+before\s+edit_file\b",
         r"|(?i)\bcall\s+read_file\s+on\s+(?:its\s+)?SKILL\.md\b",
-        r"|(?i)\bGoogle\s+model\s+operational\s+(?:directives|guidelines)\b"
+        r"|(?i)\bGoogle\s+model\s+operational\s+(?:directives|guidelines)\b",
+        r"|(?i)\btools\.opencode\.session[-_]move\b"
     ))
     .unwrap()
+});
+
+/// Pi agent 内置 `codemode` 工具提示词扫描字符上限：仅扫描每个请求前 20,000 个字符。
+/// 超出前 20,000 字符的后续对话正文不参与 `codemode` -> `codem0de` 替换。
+const PI_CODEMODE_SCAN_MAX_CHARS: usize = 20_000;
+
+/// 匹配 Pi agent 提示词中触发 Google Cloud Code WAF 伪 429 拦截的 `codemode` 关键字
+/// （保留原始大小写前缀/后缀，将 `o` 替换为 `0`：`codemode` -> `codem0de`）。
+static RE_PI_CODEMODE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(codem)o(de)\b").unwrap());
+
+/// 触发上游 Google WAF 伪 429 拦截的 WorkBuddy 模型声明首行正则（Issue #3982）
+/// 示例: `This conversation is powered by gemini-4-hydrogen`
+/// 严谨捕获末尾的 `\r?$`，确保 Windows CRLF 换行环境 100% 命中，并保留原换行格式。
+static RE_WORKBUDDY_POWERED_BY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?im)^[ \t]*this\s+conversation\s+is\s+powered\s+by\s+([A-Za-z0-9_.:/-]+)[ \t]*(\r?)$",
+    )
+    .unwrap()
+});
+
+/// 触发上游 Google WAF 伪 429 拦截的 Codex 桌面端特定上下文与角色前缀正则（Issue #3982）
+/// 1) `# Codex desktop context` -> `# Desktop application context`
+/// 2) `as Codex:` -> `as an assistant:`
+static RE_CODEX_DESKTOP_CONTEXT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?im)^[ \t]*#[ \t]*codex\s+desktop\s+context[ \t]*(\r?)$").unwrap());
+
+static RE_CODEX_ROLE_PREFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bas\s+codex:").unwrap());
+
+/// 触发上游 Google WAF 伪 429 拦截的 DSH（DeepSeek Harness）浏览器上下文声明正则（Issue #3983）
+/// Google Cloud Code WAF 针对该字面串触发启发式拦截，返回伪造的 429 RESOURCE_EXHAUSTED。
+/// 改写为语义等价的变体 `The browser exposes no DOM tree, route list, or page screenshot context.`
+static RE_DSH_BROWSER_CONTEXT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\bthe\s+browser\s+provides\s+no\s+implicit\s+dom,\s*route,?\s+or\s+screenshot\s+context\b").unwrap()
 });
 
 /// 连续多余空行收拢正则（剥离元数据后若产生 3 个及以上连续换行，收拢为 2 个换行以保持自然段落）
@@ -119,6 +146,7 @@ const MAX_PROMPT_REWRITE_REPLACEMENT_CHARS: usize = 16384;
 struct CompiledPromptRewriteRule {
     regex: Regex,
     replacement: String,
+    scope: crate::proxy::config::PromptRewriteScope,
 }
 
 /// 用户自定义清理规则运行时表（配置热更新时整体替换，读路径克隆 Arc）。
@@ -127,6 +155,11 @@ static PROMPT_REWRITE_RUNTIME: Lazy<RwLock<Arc<Vec<CompiledPromptRewriteRule>>>>
 
 /// 内置身份归一化总开关（默认开启，可在“风控提示词清理方案”中关闭）。
 static NORMALIZE_IDENTITY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 系统提示词隐身侧载模式原子存储 (0: Auto, 1: Always, 2: Off)
+static PROMPT_SIDELOAD_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 工具描述清洗开关原子存储
+static SANITIZE_TOOLS_DESCRIPTION: AtomicBool = AtomicBool::new(true);
 
 /// 解析身份归一化总开关：配置值 && 未被环境变量关闭。
 /// 环境变量 `ABV_NORMALIZE_IDENTITY=off|0|false|no` 作为 headless/CLI 的强制关闭开关。
@@ -578,22 +611,47 @@ impl PromptSanitizer {
         NORMALIZE_IDENTITY_ENABLED.load(Ordering::Relaxed)
     }
 
+    /// 当前系统提示词隐身侧载模式
+    pub fn sideload_mode() -> crate::proxy::config::PromptSideloadMode {
+        match PROMPT_SIDELOAD_MODE.load(Ordering::Relaxed) {
+            1 => crate::proxy::config::PromptSideloadMode::Always,
+            2 => crate::proxy::config::PromptSideloadMode::Off,
+            _ => crate::proxy::config::PromptSideloadMode::Auto,
+        }
+    }
+
+    /// 是否对工具声明执行清洗与自定义规则
+    pub fn sanitize_tools_description_enabled() -> bool {
+        SANITIZE_TOOLS_DESCRIPTION.load(Ordering::Relaxed)
+    }
+
     /// 热更新风控提示词清理规则（配置保存/启动时调用）。
     pub fn update_prompt_rewrite_config(config: &PromptRewriteConfig) {
         let env_value = std::env::var("ABV_NORMALIZE_IDENTITY").ok();
         let effective =
             normalize_identity_effective(config.normalize_identity, env_value.as_deref());
         NORMALIZE_IDENTITY_ENABLED.store(effective, Ordering::Relaxed);
+
+        let sideload_val = match config.sideload_mode {
+            crate::proxy::config::PromptSideloadMode::Always => 1,
+            crate::proxy::config::PromptSideloadMode::Off => 2,
+            crate::proxy::config::PromptSideloadMode::Auto => 0,
+        };
+        PROMPT_SIDELOAD_MODE.store(sideload_val, Ordering::Relaxed);
+        SANITIZE_TOOLS_DESCRIPTION.store(config.sanitize_tools_description, Ordering::Relaxed);
+
         let compiled = Self::compile_prompt_rewrite_rules(config);
         let count = compiled.len();
         if let Ok(mut guard) = PROMPT_REWRITE_RUNTIME.write() {
             *guard = Arc::new(compiled);
         }
         tracing::info!(
-            "[Prompt-Sanitizer] Prompt rewrite rules loaded: enabled={}, active={}, normalize_identity={}",
+            "[Prompt-Sanitizer] Prompt rewrite rules loaded: enabled={}, active={}, normalize_identity={}, sideload_mode={:?}, sanitize_tools={}",
             config.enabled,
             count,
-            effective
+            effective,
+            config.sideload_mode,
+            config.sanitize_tools_description
         );
     }
 
@@ -633,6 +691,7 @@ impl PromptSanitizer {
                 Ok(regex) => compiled.push(CompiledPromptRewriteRule {
                     regex,
                     replacement: decode_rewrite_replacement(&rule.replacement),
+                    scope: rule.scope,
                 }),
                 Err(err) => {
                     tracing::warn!(
@@ -692,8 +751,26 @@ impl PromptSanitizer {
         Some(restored)
     }
 
-    /// System 轨：身份归一化之前应用用户清理规则。
+    /// System 轨：身份归一化之前应用用户清理规则（过滤出 Prompt 或 All 作用域规则）。
     fn apply_prompt_rewrite_rules(text: &str) -> String {
+        Self::apply_prompt_rewrite_rules_with_scope(
+            text,
+            crate::proxy::config::PromptRewriteScope::Prompt,
+        )
+    }
+
+    /// Tools 轨：工具描述清洗时应用用户清理规则（过滤出 Tools 或 All 作用域规则）。
+    fn apply_tools_rewrite_rules(text: &str) -> String {
+        Self::apply_prompt_rewrite_rules_with_scope(
+            text,
+            crate::proxy::config::PromptRewriteScope::Tools,
+        )
+    }
+
+    fn apply_prompt_rewrite_rules_with_scope(
+        text: &str,
+        target_scope: crate::proxy::config::PromptRewriteScope,
+    ) -> String {
         let rules = PROMPT_REWRITE_RUNTIME
             .read()
             .map(|guard| Arc::clone(&*guard))
@@ -701,19 +778,111 @@ impl PromptSanitizer {
         if rules.is_empty() {
             return text.to_string();
         }
-        Self::rewrite_text_with_rules(text, &rules).unwrap_or_else(|| text.to_string())
+        let filtered: Vec<CompiledPromptRewriteRule> = rules
+            .iter()
+            .filter(|r| {
+                r.scope == crate::proxy::config::PromptRewriteScope::All || r.scope == target_scope
+            })
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            return text.to_string();
+        }
+        Self::rewrite_text_with_rules(text, &filtered).unwrap_or_else(|| text.to_string())
+    }
+
+    fn byte_index_after_n_chars(s: &str, max_chars: usize) -> usize {
+        if max_chars == 0 {
+            return 0;
+        }
+        match s.char_indices().nth(max_chars) {
+            Some((idx, _)) => idx,
+            None => s.len(),
+        }
+    }
+
+    fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &[u8]) -> bool {
+        if needle_lower.is_empty() || haystack.len() < needle_lower.len() {
+            return false;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_lower.len())
+            .any(|w| w.eq_ignore_ascii_case(needle_lower))
+    }
+
+    fn byte_limit_accounting_for_placeholders(
+        s: &str,
+        placeholders: &[String],
+        max_orig_chars: usize,
+    ) -> usize {
+        if max_orig_chars == 0 {
+            return 0;
+        }
+        let mut orig_chars = 0usize;
+        let mut pos = 0usize;
+        for m in RE_CODE_BLOCK_PLACEHOLDER.find_iter(s) {
+            let between = &s[pos..m.start()];
+            for (rel_idx, _) in between.char_indices() {
+                if orig_chars >= max_orig_chars {
+                    return pos + rel_idx;
+                }
+                orig_chars += 1;
+            }
+            let block_chars = m
+                .as_str()
+                .strip_prefix("__PROMPT_SANITIZER_CODE_BLOCK_")
+                .and_then(|rest| rest.strip_suffix("__"))
+                .and_then(|num| num.parse::<usize>().ok())
+                .and_then(|idx| placeholders.get(idx))
+                .map(|code| code.chars().count())
+                .unwrap_or_else(|| m.as_str().chars().count());
+            orig_chars = orig_chars.saturating_add(block_chars);
+            pos = m.end();
+            if orig_chars >= max_orig_chars {
+                return pos;
+            }
+        }
+        let tail = &s[pos..];
+        for (rel_idx, _) in tail.char_indices() {
+            if orig_chars >= max_orig_chars {
+                return pos + rel_idx;
+            }
+            orig_chars += 1;
+        }
+        s.len()
     }
 
     /// 对单段提示词文本进行通用、高精度的净化：
-    /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`, `session-move` 等），未包含直接原样返回；
+    /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`, `session-move`, 前 20k 内 `codemode` 等），未包含直接原样返回；
     /// 2. 提取并保护多行围栏代码块（```...```），使其免受任何正则误伤；行内反引号中的敏感指令照常中和；
     /// 3. 仅剥离触发 WAF 的客户端计费伪 Header，绝不修改任何会话 ID、XML 标签或 `=== ... ===` 分隔符；
     /// 4. 完整恢复受保护的多行代码块；
     /// 5. 规范化换行，保留所有多行正文排版。
     pub fn clean_text(text: &str) -> String {
+        let mut codemode_budget = PI_CODEMODE_SCAN_MAX_CHARS;
+        Self::clean_text_with_codemode_limit(text, &mut codemode_budget)
+    }
+
+    fn clean_text_with_codemode_limit(text: &str, codemode_remaining_chars: &mut usize) -> String {
+        let codemode_budget = *codemode_remaining_chars;
+        if codemode_budget > 0 {
+            let consumed = text.chars().take(codemode_budget).count();
+            *codemode_remaining_chars = codemode_budget.saturating_sub(consumed);
+        }
+
+        let codemode_prefix_bytes = if codemode_budget == 0 {
+            0
+        } else {
+            Self::byte_index_after_n_chars(text, codemode_budget.saturating_add(8))
+        };
+        let has_codemode_in_budget = codemode_prefix_bytes > 0
+            && Self::contains_ascii_case_insensitive(&text[..codemode_prefix_bytes], b"codemode");
+
         // 快速前置检查：若文本不包含高危特征，直接原样返回，零开销
         let lower = text.to_lowercase();
-        let has_suspect = lower.contains("billing")
+        let has_suspect = has_codemode_in_budget
+            || lower.contains("billing")
             || lower.contains("cc_version")
             || lower.contains("cc_entrypoint")
             || lower.contains("cc_workload")
@@ -733,15 +902,19 @@ impl PromptSanitizer {
             || lower.contains("session-move")
             || lower.contains("session_move")
             || lower.contains("interactive agent")
-            || lower.contains("software engineering tasks");
+            || lower.contains("software engineering tasks")
+            || lower.contains("powered by")
+            || lower.contains("codex desktop context")
+            || lower.contains("as codex:")
+            || lower.contains("no implicit dom");
 
         if !has_suspect {
             return text.to_string();
         }
 
-        // Header 清洗继续保护行内代码，避免吞掉计费字段示例之后的指令。
+        // 步骤 1：保护多行围栏代码块（行内反引号指令如 `tools.opencode.session-move`、`codemode` 允许被后续规则正常中和）
         let mut placeholders: Vec<String> = Vec::new();
-        let protected_text = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
+        let protected_text = RE_FENCED_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
             let idx = placeholders.len();
             placeholders.push(caps[0].to_string());
             format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
@@ -760,28 +933,9 @@ impl PromptSanitizer {
             }
         });
 
-        let headers_cleaned =
-            RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass2, |caps: &regex::Captures| {
-                caps[1]
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|idx| placeholders.get(idx))
-                    .cloned()
-                    .unwrap_or_else(|| caps[0].to_string())
-            });
-        // 已知工具指令允许位于行内反引号中，围栏示例仍保持原样。
-        let mut placeholders: Vec<String> = Vec::new();
-        let tools_text =
-            RE_FENCED_CODE_BLOCK.replace_all(&headers_cleaned, |caps: &regex::Captures| {
-                let idx = placeholders.len();
-                placeholders.push(caps[0].to_string());
-                format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
-            });
-
         // 步骤 3.5：中和触发上游 WAF 伪 429 拦截的第三方 Agent 工具指令特征（Issue #3965, #3969）
-        let pass2_5 = RE_WAF_TRIGGER_AGENT_TOOL_GUIDELINES.replace_all(
-            &tools_text,
-            |caps: &regex::Captures| {
+        let pass2_5 =
+            RE_WAF_TRIGGER_AGENT_TOOL_GUIDELINES.replace_all(&pass2, |caps: &regex::Captures| {
                 let matched = &caps[0];
                 let lower = matched.to_lowercase();
                 if lower.contains("prefer") {
@@ -792,14 +946,52 @@ impl PromptSanitizer {
                     "call read file on its SKILL.md".to_string()
                 } else if lower.contains("operational") {
                     "Model operational guidelines".to_string()
+                } else if lower.contains("session") {
+                    "tools.opencode.session_relocate".to_string()
                 } else {
                     matched.to_string()
                 }
-            },
+            });
+
+        // 步骤 3.55：中和 WorkBuddy / Codex 引发 WAF 伪 429 的特定声明与上下文标记（Issue #3982）
+        let pass2_55 = RE_WORKBUDDY_POWERED_BY.replace_all(&pass2_5, "Selected model: $1$2");
+        let pass2_56 =
+            RE_CODEX_DESKTOP_CONTEXT.replace_all(&pass2_55, "# Desktop application context$1");
+        let pass2_57 = RE_CODEX_ROLE_PREFIX.replace_all(&pass2_56, "as an assistant:");
+        let pass2_58 = RE_DSH_BROWSER_CONTEXT.replace_all(
+            &pass2_57,
+            "The browser exposes no DOM tree, route list, or page screenshot context",
         );
 
+        // 步骤 3.6：仅在当前请求前 20,000 字符窗口内将 Pi agent `codemode` 中和为 `codem0de`
+        let pass2_6: std::borrow::Cow<'_, str> = if has_codemode_in_budget {
+            let codemode_byte_limit = Self::byte_limit_accounting_for_placeholders(
+                &pass2_58,
+                &placeholders,
+                codemode_budget,
+            );
+            let scan_end = codemode_byte_limit
+                + Self::byte_index_after_n_chars(&pass2_58[codemode_byte_limit..], 16);
+            let prefix_replaced =
+                RE_PI_CODEMODE.replace_all(&pass2_58[..scan_end], |caps: &regex::Captures| {
+                    let m = caps.get(0).unwrap();
+                    if m.start() < codemode_byte_limit {
+                        format!("{}0{}", &caps[1], &caps[2])
+                    } else {
+                        m.as_str().to_string()
+                    }
+                });
+            if scan_end < pass2_58.len() {
+                std::borrow::Cow::Owned(format!("{}{}", prefix_replaced, &pass2_58[scan_end..]))
+            } else {
+                std::borrow::Cow::Owned(prefix_replaced.into_owned())
+            }
+        } else {
+            std::borrow::Cow::Borrowed(pass2_58.as_ref())
+        };
+
         // 步骤 4：单趟无递归还原受保护的代码块
-        let restored = RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass2_5, |caps: &regex::Captures| {
+        let restored = RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass2_6, |caps: &regex::Captures| {
             if let Ok(idx) = caps[1].parse::<usize>() {
                 if let Some(code) = placeholders.get(idx) {
                     return code.clone();
@@ -812,60 +1004,6 @@ impl PromptSanitizer {
         let normalized = RE_MULTI_NEWLINE.replace_all(&restored, "\n\n");
 
         normalized.trim().to_string()
-    }
-
-    /// Canonical metadata projection shared by protocol-independent session
-    /// fingerprints. Only whole billing-header lines outside code are ignored.
-    pub fn strip_billing_header_lines(text: &str) -> String {
-        if !text.to_ascii_lowercase().contains("billing") {
-            return text.to_string();
-        }
-        let mut result = String::with_capacity(text.len());
-        let mut fence: Option<(char, usize)> = None;
-        let mut trailing_metadata = false;
-        for line in text.split_inclusive('\n') {
-            trailing_metadata = false;
-            let trimmed = line.trim();
-            if let Some((marker, width)) = fence {
-                let markers = trimmed.chars().take_while(|&c| c == marker).count();
-                if markers >= width
-                    && !line.starts_with("    ")
-                    && !line.starts_with('\t')
-                    && trimmed[markers..].trim().is_empty()
-                {
-                    fence = None;
-                }
-                result.push_str(line);
-                continue;
-            }
-            // Markdown indented code is business content too. A fenced block
-            // remains protected to EOF when its closing fence is absent.
-            if line.starts_with("    ") || line.starts_with('\t') {
-                result.push_str(line);
-                continue;
-            }
-            if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
-                let width = trimmed.chars().take_while(|&c| c == marker).count();
-                if width >= 3 {
-                    fence = Some((marker, width));
-                }
-            }
-            if fence.is_some() || !RE_BILLING_METADATA_LINE.is_match(line) {
-                result.push_str(line);
-            } else {
-                trailing_metadata = !line.ends_with('\n');
-            }
-        }
-        // A final injected header without a line ending borrowed the separator
-        // from the preceding text. Drop exactly that LF/CRLF; any earlier blank
-        // lines and a genuine terminal newline remain part of the fingerprint.
-        if trailing_metadata && result.ends_with('\n') {
-            result.pop();
-            if result.ends_with('\r') {
-                result.pop();
-            }
-        }
-        result
     }
 
     /// System 轨：把系统提示词全量文本中的「身份归属声明句」与已知客户端开场白归一化为官方 Antigravity 身份。
@@ -1166,6 +1304,9 @@ impl PromptSanitizer {
             || text == CLAUDE_CODE_CLI_IDENTITY
             || text == CLAUDE_AGENT_SDK_CLI_IDENTITY
             || text == CLAUDE_INTERACTIVE_AGENT_IDENTITY
+            || text.starts_with(
+                "You are an interactive agent that helps users with software engineering tasks",
+            )
         {
             OFFICIAL_ANTIGRAVITY_IDENTITY
         } else {
@@ -1746,7 +1887,11 @@ impl PromptSanitizer {
         changed
     }
 
-    fn sanitize_parts_core(parts: &mut Vec<Value>, scope_of: impl Fn(usize) -> PartScope) -> usize {
+    fn sanitize_parts_core_with_budget(
+        parts: &mut Vec<Value>,
+        codemode_remaining_chars: &mut usize,
+        scope_of: impl Fn(usize) -> PartScope,
+    ) -> usize {
         // 0. 物理剔除客户端注入的计费元数据 Part（下标必须在选轨道之前定格）
         let mut cleaned_count = Self::drop_billing_parts(parts);
 
@@ -1768,7 +1913,8 @@ impl PromptSanitizer {
                         text_val
                     };
                     // Header 轨（全文本生效）：风控伪 Header 与高危客户端指纹声明
-                    let cleaned = Self::clean_text(mapped);
+                    let cleaned =
+                        Self::clean_text_with_codemode_limit(mapped, codemode_remaining_chars);
                     // 轨道叠加：System 全量 / Anchored 仅锚点内全量 / Content 仅 Header
                     let cleaned = match scope {
                         PartScope::System => {
@@ -1815,12 +1961,14 @@ impl PromptSanitizer {
     /// 内容轨清洗：仅执行 Header 轨（风控伪 Header 与高危客户端指纹声明），**不做**身份归一化。
     /// 用于 `contents`（user / model 轮次）—— 遵循 AGENTS.md「不得剥离用户提问」。
     pub fn sanitize_parts(parts: &mut Vec<Value>) -> usize {
-        Self::sanitize_parts_core(parts, |_| PartScope::Content)
+        let mut codemode_budget = PI_CODEMODE_SCAN_MAX_CHARS;
+        Self::sanitize_parts_core_with_budget(parts, &mut codemode_budget, |_| PartScope::Content)
     }
 
     /// 系统轨清洗：Header 轨 + System 轨（身份归属声明与竞品厂牌归一化），仅用于 `systemInstruction` 与注入区。
     pub fn sanitize_system_parts(parts: &mut Vec<Value>) -> usize {
-        Self::sanitize_parts_core(parts, |_| PartScope::System)
+        let mut codemode_budget = PI_CODEMODE_SCAN_MAX_CHARS;
+        Self::sanitize_parts_core_with_budget(parts, &mut codemode_budget, |_| PartScope::System)
     }
 
     /// 注入区终点裁定：在首个 `role:model` 之前的开场切片（`leading_contents = &contents[..first_model]`）内，
@@ -1895,7 +2043,9 @@ impl PromptSanitizer {
     pub fn sanitize_gemini_payload(body: &mut Value) -> usize {
         let mut total_cleaned = 0;
 
-        crate::proxy::mappers::common_utils::clean_undefined_control_fields(body);
+        // 0. 深度清理 "[undefined]" 占位串（Cherry Studio 等客户端常见注入）
+        //    统一在此执行，不分协议 —— 任何客户端注入的脏数据都必须清洗。
+        crate::proxy::mappers::common_utils::deep_clean_undefined(body, 0);
 
         // 兼容处理：若存在包装层 "request"，清洗包装内部
         if let Some(inner) = body.get_mut("request").and_then(Value::as_object_mut) {
@@ -1914,6 +2064,8 @@ impl PromptSanitizer {
 
     fn sanitize_gemini_payload_inner(body: &mut Value) -> usize {
         let mut cleaned_count = 0;
+        // 请求级前 20,000 字符窗口预算（覆盖 systemInstruction + contents 头部提示词；tools 描述单独分配 20,000 字符预算）
+        let mut prompt_codemode_budget = PI_CODEMODE_SCAN_MAX_CHARS;
 
         // 0. 文本内嵌 data URL：有效媒体提升为 inlineData，其余折叠（须早于轨道划分与 token 估算）
         cleaned_count += Self::process_text_data_urls(body);
@@ -1925,7 +2077,11 @@ impl PromptSanitizer {
             .and_then(Value::as_object_mut)
         {
             if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
-                cleaned_count += Self::sanitize_system_parts(parts);
+                cleaned_count += Self::sanitize_parts_core_with_budget(
+                    parts,
+                    &mut prompt_codemode_budget,
+                    |_| PartScope::System,
+                );
                 if Self::normalize_identity_enabled() {
                     cleaned_count += Self::dedupe_official_identity(parts);
                 }
@@ -1963,23 +2119,27 @@ impl PromptSanitizer {
             for (turn_idx, turn) in contents.iter_mut().enumerate() {
                 let is_user = turn.get("role").and_then(Value::as_str) == Some("user");
                 if let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) {
-                    cleaned_count += Self::sanitize_parts_core(parts, |part_idx| {
-                        if !is_user || turn_idx >= first_model {
-                            return PartScope::Content;
-                        }
-                        if turn_idx < cur_turn {
-                            return PartScope::System;
-                        }
-                        match cur_text_part {
-                            Some(cur) if turn_idx == cur_turn && part_idx < cur => {
-                                PartScope::System
+                    cleaned_count += Self::sanitize_parts_core_with_budget(
+                        parts,
+                        &mut prompt_codemode_budget,
+                        |part_idx| {
+                            if !is_user || turn_idx >= first_model {
+                                return PartScope::Content;
                             }
-                            Some(cur) if turn_idx == cur_turn && part_idx == cur => {
-                                PartScope::Anchored
+                            if turn_idx < cur_turn {
+                                return PartScope::System;
                             }
-                            _ => PartScope::Content,
-                        }
-                    });
+                            match cur_text_part {
+                                Some(cur) if turn_idx == cur_turn && part_idx < cur => {
+                                    PartScope::System
+                                }
+                                Some(cur) if turn_idx == cur_turn && part_idx == cur => {
+                                    PartScope::Anchored
+                                }
+                                _ => PartScope::Content,
+                            }
+                        },
+                    );
                 }
             }
 
@@ -1994,23 +2154,34 @@ impl PromptSanitizer {
 
         // 3. 清洗工具声明 (tools 中的 functionDeclarations 描述文本)
         //    防御性剥离伪 Header 与独立指纹声明，严禁触碰工具名称 (name) 与参数 Schema (parameters)
-        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-            for tool in tools.iter_mut() {
-                if let Some(decls) = tool
-                    .get_mut("functionDeclarations")
-                    .and_then(Value::as_array_mut)
-                {
-                    for decl in decls.iter_mut() {
-                        let desc_opt = decl
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .map(|s| s.to_string());
-                        if let Some(desc) = desc_opt {
-                            let cleaned = Self::clean_text(&desc);
-                            if cleaned != desc {
-                                if let Some(obj) = decl.as_object_mut() {
-                                    obj.insert("description".to_string(), Value::String(cleaned));
-                                    cleaned_count += 1;
+        if Self::sanitize_tools_description_enabled() {
+            if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+                let mut tools_codemode_budget = PI_CODEMODE_SCAN_MAX_CHARS;
+                for tool in tools.iter_mut() {
+                    if let Some(decls) = tool
+                        .get_mut("functionDeclarations")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for decl in decls.iter_mut() {
+                            let desc_opt = decl
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_string());
+                            if let Some(desc) = desc_opt {
+                                let cleaned = Self::clean_text_with_codemode_limit(
+                                    &desc,
+                                    &mut tools_codemode_budget,
+                                );
+                                // 同时在工具描述中叠加应用用户自定义 PromptRewriteRules (过滤 tools / all 范围)
+                                let rewritten = Self::apply_tools_rewrite_rules(&cleaned);
+                                if rewritten != desc {
+                                    if let Some(obj) = decl.as_object_mut() {
+                                        obj.insert(
+                                            "description".to_string(),
+                                            Value::String(rewritten),
+                                        );
+                                        cleaned_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -2205,7 +2376,7 @@ mod tests {
                 { "text": "x-anthropic-billing-header: cc_version=2.1.270.ffc;" },
                 { "text": "You are an expert coder." }
             ]},
-            "generationConfig": { "temperature": "[undefined]" }
+            "generationConfig": { "foo": "[undefined]" }
         });
         PromptSanitizer::sanitize_gemini_payload(&mut payload);
 
@@ -2213,7 +2384,7 @@ mod tests {
         assert_eq!(parts.len(), 1, "计费元数据 part 必须被剔除: {payload}");
         assert_eq!(parts[0]["text"], "You are an expert coder.");
         assert!(
-            payload["generationConfig"].get("temperature").is_none(),
+            payload["generationConfig"].get("foo").is_none(),
             "[undefined] 占位串必须被清理: {payload}"
         );
     }
@@ -4038,6 +4209,8 @@ mod tests {
         PromptRewriteConfig {
             enabled: true,
             normalize_identity: true,
+            sideload_mode: crate::proxy::config::PromptSideloadMode::Off,
+            sanitize_tools_description: true,
             rules: rules
                 .into_iter()
                 .enumerate()
@@ -4046,6 +4219,7 @@ mod tests {
                         id: format!("test-{index}"),
                         pattern: pattern.to_string(),
                         replacement: replacement.to_string(),
+                        scope: crate::proxy::config::PromptRewriteScope::All,
                         enabled: true,
                     },
                 )
@@ -4245,6 +4419,8 @@ mod tests {
         let preset_config = PromptRewriteConfig {
             enabled: true,
             normalize_identity: true,
+            sideload_mode: crate::proxy::config::PromptSideloadMode::Off,
+            sanitize_tools_description: true,
             rules: PromptRewriteConfig::recommended_preset_rules(),
         };
 
@@ -4279,6 +4455,13 @@ mod tests {
             .unwrap_or_else(|| billing_raw.to_string());
         assert!(!rewritten_billing.contains("x-anthropic-billing-header"));
         assert!(rewritten_billing.contains("System prompt."));
+
+        // 5. OpenCode session-move 预设规则重写验证
+        let session_raw = "Use `tools.opencode.session-move` to transfer session.";
+        let rewritten_session = PromptSanitizer::rewrite_text_with_rules(session_raw, &compiled)
+            .unwrap_or_else(|| session_raw.to_string());
+        assert!(!rewritten_session.contains("tools.opencode.session-move"));
+        assert!(rewritten_session.contains("tools.opencode.session_relocate"));
 
         // 6. Claude Code 独立版 interactive agent 预设规则整行清除
         let cc_raw = "You are an interactive agent that helps users with software engineering tasks. Use the instructions below.\nNext line.";
@@ -4334,57 +4517,40 @@ mod tests {
     // ============================ issue #3969 / #3975：中和 OpenCode 工具指令 (tools.opencode.session-move / session_move) ============================
 
     #[test]
-    fn experimental_rules_preserve_surrounding_instructions() {
-        let config = crate::proxy::config::PromptRewriteConfig {
-            enabled: true,
-            normalize_identity: true,
-            rules: crate::proxy::config::PromptRewriteConfig::recommended_preset_rules(),
-        };
-        let compiled = PromptSanitizer::compile_prompt_rewrite_rules(&config);
-        let identity = "You are an interactive agent that helps users with software engineering tasks. Preserve this important instruction.";
-        assert_eq!(
-            PromptSanitizer::normalize_client_identity(identity),
-            identity
+    fn test_issue_3969_opencode_waf_trigger_session_move_neutralized() {
+        let raw = concat!(
+            "# Code Mode\n\n",
+            "You have access to the following tools:\n",
+            "- tools.opencode.session-move({ destination: string }): move session\n",
+            "- tools.opencode.session_move({ destination: string }): move session alternate\n\n",
+            "When you create a worktree outside the current working directory and intend to use it as your primary working directory, ",
+            "consider using `execute` to call `tools.opencode.session-move` and make the worktree the session's working directory.\n\n",
+            "Also consider `tools.opencode.session_move`.\n\n",
+            "```json\n",
+            "{\n",
+            "  \"sample\": \"tools.opencode.session-move in fenced code block must stay untouched\"\n",
+            "}\n",
+            "```\n"
+        );
+
+        let cleaned = PromptSanitizer::clean_text(raw);
+
+        // 1. 验证不论是纯文本还是行内反引号中的 tools.opencode.session-move / session_move 均已被彻底脱敏中和
+        let outside_code = cleaned.split("```json").next().unwrap();
+        assert!(
+            !outside_code.contains("tools.opencode.session-move"),
+            "纯文本与行内反引号中的 tools.opencode.session-move 必须被中和: {outside_code}"
         );
         assert!(
-            PromptSanitizer::clean_text(identity).contains("Preserve this important instruction.")
+            !outside_code.contains("tools.opencode.session_move"),
+            "纯文本与行内反引号中的 tools.opencode.session_move 必须被中和: {outside_code}"
         );
-        assert!(
-            PromptSanitizer::rewrite_text_with_rules(identity, &compiled)
-                .unwrap()
-                .contains("Preserve this important instruction.")
-        );
-    }
+        assert!(outside_code.contains("tools.opencode.session_relocate"));
+        assert!(outside_code.contains("`tools.opencode.session_relocate`"));
 
-    #[test]
-    fn billing_inline_examples_remain_protected_with_tool_rewrites() {
-        let input =
-            "Example `cc_version=1.0` keep this instruction; Always read_file before edit_file.";
-        assert_eq!(
-            PromptSanitizer::clean_text(input),
-            "Example `cc_version=1.0` keep this instruction; Always read file before edit file."
-        );
-    }
-
-    #[test]
-    fn session_tool_names_remain_consistent_across_payload() {
-        for name in ["tools.opencode.session-move", "tools.opencode.session_move"] {
-            let instruction = format!("Use execute to call `{name}`.");
-            let mut payload = json!({
-                "systemInstruction": {"parts": [{"text": instruction}]},
-                "tools": [{"functionDeclarations": [{"name": name, "description": instruction, "parameters": {"type": "OBJECT"}}]}],
-                "contents": [
-                    {"role": "user", "parts": [{"text": "Proceed."}]},
-                    {"role": "model", "parts": [{"functionCall": {"name": name, "args": {}}}]}
-                ]
-            });
-            let before = payload.clone();
-            PromptSanitizer::sanitize_gemini_payload(&mut payload);
-            assert!(system_instruction_text(&payload).contains(&instruction));
-            assert_eq!(payload["tools"], before["tools"]);
-            assert_eq!(payload["contents"][1], before["contents"][1]);
-            assert!(!payload.to_string().contains("session_relocate"));
-        }
+        // 2. 验证多行围栏代码块中的示例依然 100% 原样保留
+        assert!(cleaned
+            .contains("tools.opencode.session-move in fenced code block must stay untouched"));
     }
 
     #[test]
@@ -4402,6 +4568,23 @@ mod tests {
         assert!(out.contains("call `tools.opencode.session_relocate` now"));
         // 围栏代码块内的内容不受任何影响
         assert!(out.contains("```\n`tools.opencode.session-move` in code\n```"));
+    }
+
+    #[test]
+    fn test_issue_3969_edge_cases_mixed_case_and_unclosed_backticks() {
+        // 1. 测试大小写混写与多种分隔符
+        let mixed =
+            "Call `Tools.OpenCode.Session-Move` and `TOOLS.OPENCODE.SESSION_MOVE` on same line.";
+        let cleaned_mixed = PromptSanitizer::clean_text(mixed);
+        assert!(!cleaned_mixed.to_lowercase().contains("session-move"));
+        assert!(!cleaned_mixed.to_lowercase().contains("session_move"));
+        assert!(cleaned_mixed.contains("tools.opencode.session_relocate"));
+
+        // 2. 测试单侧未闭合的反引号（防退化与防崩）
+        let unclosed = "Notice: `tools.opencode.session-move without closing backtick";
+        let cleaned_unclosed = PromptSanitizer::clean_text(unclosed);
+        assert!(!cleaned_unclosed.contains("tools.opencode.session-move"));
+        assert!(cleaned_unclosed.contains("tools.opencode.session_relocate"));
     }
 
     // ============================ issue #3972：中和 Claude Code 独立版 interactive agent 触发 WAF 伪 429 ============================
@@ -4438,58 +4621,314 @@ mod tests {
             "You are an interactive agent that helps users with software engineering tasks"
         ));
     }
-}
 
-#[cfg(test)]
-mod r26_undefined_scope_tests {
-    use super::*;
-    use serde_json::json;
+    // ============================ Pi agent `codemode` 触发 WAF 伪 429 脱敏测试 ============================
 
     #[test]
-    fn r26_placeholder_cleanup_is_confined_to_protocol_controls() {
-        let business = json!({"needle":"[undefined]","temperature":"[undefined]","generationConfig":{"maxOutputTokens":"[undefined]"}});
-        let schema = json!({"type":"object","properties":{"needle":{"type":"string","description":"[undefined]","default":"[undefined]","enum":["[undefined]"]}}});
-        for wrapped in [false, true] {
-            let request = json!({
-                "contents":[{"role":"user","parts":[{"text":"[undefined]"},{"functionResponse":{"id":"call_literal","name":"lookup","response":business}}]},
-                    {"role":"model","parts":[{"functionCall":{"id":"call_literal","name":"lookup","args":business}}]}],
-                "tools":[{"functionDeclarations":[{"name":"lookup","parameters":schema}]}],
-                "generationConfig":{"temperature":"[undefined]","topP":0.7,"responseJsonSchema":schema,"stopSequences":["[undefined]"],"thinkingConfig":{"thinkingBudget":"[undefined]"}}
-            });
-            let mut payload = if wrapped {
-                json!({"request":request})
-            } else {
-                request
-            };
-            PromptSanitizer::sanitize_gemini_payload(&mut payload);
-            let body = if wrapped {
-                &payload["request"]
-            } else {
-                &payload
-            };
-            assert_eq!(body["contents"][0]["parts"][0]["text"], "[undefined]");
-            assert_eq!(
-                body["contents"][0]["parts"][1]["functionResponse"]["response"],
-                business
-            );
-            assert_eq!(
-                body["contents"][1]["parts"][0]["functionCall"]["args"],
-                business
-            );
-            assert_eq!(
-                body["tools"][0]["functionDeclarations"][0]["parameters"],
-                schema
-            );
-            assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
-            assert_eq!(
-                body["generationConfig"]["stopSequences"],
-                json!(["[undefined]"])
-            );
-            assert_eq!(body["generationConfig"]["topP"], 0.7);
-            assert!(body["generationConfig"].get("temperature").is_none());
-            assert!(body["generationConfig"]["thinkingConfig"]
-                .get("thinkingBudget")
-                .is_none());
-        }
+    fn test_pi_codemode_minimal_repro_and_inline_variants_neutralized() {
+        // 1. 最短复现句子：单独发送直接触发 429，替换 codemode -> codem0de 后正常 200
+        let minimal = "codemode scripts and non-LLM models such as classifiers and image models";
+        let cleaned = PromptSanitizer::clean_text(minimal);
+        assert_eq!(
+            cleaned,
+            "codem0de scripts and non-LLM models such as classifiers and image models"
+        );
+
+        // 2. 行内反引号、路径、大小写变体及下划线边界保护
+        let mixed = concat!(
+            "- codemode: Run JavaScript that calls other tools\n",
+            "- Use `codemode` to batch calls, or read `docs/codemode.md` and `builtin:codemode`.\n",
+            "- Case variants: Codemode, CodeMode, CODEMODE.\n",
+            "- Underscore identifier must stay untouched: my_codemode_helper.\n",
+            "```js\n",
+            "// Fenced code block must stay untouched\n",
+            "await tools.codemode({ code: \"codemode\" });\n",
+            "```\n"
+        );
+        let cleaned_mixed = PromptSanitizer::clean_text(mixed);
+        let outside = cleaned_mixed.split("```js").next().unwrap();
+        assert!(!outside.contains("codemode\n"));
+        assert!(!outside.contains("`codemode`"));
+        assert!(!outside.contains("docs/codemode.md"));
+        assert!(!outside.contains("builtin:codemode"));
+        assert!(outside.contains("- codem0de:"));
+        assert!(outside.contains("`codem0de`"));
+        assert!(outside.contains("`docs/codem0de.md`"));
+        assert!(outside.contains("`builtin:codem0de`"));
+        assert!(outside.contains("Codem0de, CodeM0de, CODEM0DE"));
+        assert!(outside.contains("my_codemode_helper"));
+        assert!(cleaned_mixed.contains("await tools.codemode({ code: \"codemode\" });"));
+    }
+
+    #[test]
+    fn test_pi_codemode_20k_prefix_limit_across_payload_and_tools() {
+        // 1. 构造 ~18.5k 字符的 systemInstruction + 超过 20k 的后续对话轮次
+        let filler_sys = "x".repeat(18_500);
+        let filler_user = "y".repeat(2_000);
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [{
+                    "text": format!(
+                        "{filler_sys}\n- codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)"
+                    )
+                }]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{
+                        "text": format!("Early turn codemode check.\n{filler_user}")
+                    }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "text": "Model reply." }]
+                },
+                {
+                    "role": "user",
+                    "parts": [{
+                        "text": "Later turn beyond 20k chars should keep codemode untouched."
+                    }]
+                }
+            ],
+            "tools": [{
+                "functionDeclarations": [
+                    {
+                        "name": "codemode",
+                        "description": "Run JS across codemode calls. Read docs/codemode.md first.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "code": { "type": "string", "description": "codemode source" }
+                            }
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let cleaned = PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert!(cleaned >= 3);
+
+        // systemInstruction 在 20k 内命中脱敏
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys_text.contains("codem0de scripts and non-LLM models"));
+        assert!(sys_text.contains("docs/codem0de.md"));
+        assert!(!sys_text.contains("codemode"));
+
+        // 首轮 user 前半段落在 20k 预算内，也被脱敏
+        let first_user = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert!(first_user.starts_with("Early turn codem0de check."));
+
+        // 超过前 20k 的后续对话轮次完整保留原文 codemode
+        let later_user = payload["contents"][2]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            later_user,
+            "Later turn beyond 20k chars should keep codemode untouched."
+        );
+
+        // 工具声明：name 和 parameters 绝不被修改，description 独立享受 20k 扫描窗口被脱敏
+        let decl = &payload["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["name"].as_str().unwrap(), "codemode");
+        assert!(decl["description"]
+            .as_str()
+            .unwrap()
+            .contains("across codem0de calls. Read docs/codem0de.md first."));
+        assert_eq!(
+            decl["parameters"]["properties"]["code"]["description"]
+                .as_str()
+                .unwrap(),
+            "codemode source"
+        );
+
+        // 幂等性校验：二次执行不应产生额外变更
+        assert_eq!(PromptSanitizer::sanitize_gemini_payload(&mut payload), 0);
+    }
+
+    #[test]
+    fn test_pi_codemode_20k_boundary_respects_fenced_block_original_length() {
+        // 前面有 19,950 字符的围栏代码块，后续第 20,005 字符处出现 codemode 时不得因占位符缩短而误算进前 20k
+        let fenced = format!("```text\n{}\n```\n", "a".repeat(19_990));
+        let input = format!("{fenced}beyond_20k codemode should stay untouched");
+        let cleaned = PromptSanitizer::clean_text(&input);
+        assert!(cleaned.contains("beyond_20k codemode should stay untouched"));
+
+        // 单段文本在前 20k 内与 20k 后的分界验证
+        let prefix_with_hit = format!("within_20k codemode {}", "b".repeat(20_050));
+        let input2 = format!("{prefix_with_hit} tail_after_20k codemode");
+        let cleaned2 = PromptSanitizer::clean_text(&input2);
+        assert!(cleaned2.starts_with("within_20k codem0de "));
+        assert!(cleaned2.ends_with("tail_after_20k codemode"));
+    }
+
+    // ============================ Issue #3982: WorkBuddy / Codex 提示词脱敏与 CRLF 支持 ============================
+
+    #[test]
+    fn test_issue_3982_workbuddy_powered_by_lf_and_crlf_neutralized() {
+        // 1. Unix LF (\n)
+        let lf_input =
+            "This conversation is powered by gemini-4-hydrogen\n# Rules\nRule 1: Be helpful.";
+        let lf_cleaned = PromptSanitizer::clean_text(lf_input);
+        assert!(lf_cleaned.starts_with("Selected model: gemini-4-hydrogen\n# Rules"));
+        assert!(!lf_cleaned.contains("This conversation is powered by"));
+
+        // 2. Windows CRLF (\r\n)
+        let crlf_input =
+            "This conversation is powered by gemini-4-hydrogen\r\n# Rules\r\nRule 1: Be helpful.";
+        let crlf_cleaned = PromptSanitizer::clean_text(crlf_input);
+        assert!(crlf_cleaned.starts_with("Selected model: gemini-4-hydrogen\r\n# Rules"));
+        assert!(!crlf_cleaned.contains("This conversation is powered by"));
+
+        // 3. 模型带前缀/路径符号（如 gemini-3.8-flash-high / custom/model:1）
+        let complex_model =
+            "  this conversation is powered by custom.org/gemini-3.8-flash:latest  \r\nNext line";
+        let cleaned_complex = PromptSanitizer::clean_text(complex_model);
+        assert!(
+            cleaned_complex.starts_with("Selected model: custom.org/gemini-3.8-flash:latest\r\n")
+        );
+
+        // 4. 围栏代码块中的 powered by 绝对不被修改
+        let code_input = "This conversation is powered by gemini-4\n```text\nThis conversation is powered by gemini-4\n```";
+        let code_cleaned = PromptSanitizer::clean_text(code_input);
+        assert!(code_cleaned.contains("Selected model: gemini-4"));
+        assert!(code_cleaned.contains("```text\nThis conversation is powered by gemini-4\n```"));
+    }
+
+    #[test]
+    fn test_issue_3982_codex_desktop_context_and_role_neutralized() {
+        // 1. 测试 # Codex desktop context 在 LF 与 CRLF 下的替换
+        let lf_input = "# Codex desktop context\nInstructions here.";
+        let lf_cleaned = PromptSanitizer::clean_text(lf_input);
+        assert_eq!(
+            lf_cleaned,
+            "# Desktop application context\nInstructions here."
+        );
+
+        let crlf_input = "#   Codex desktop context  \r\nInstructions here.";
+        let crlf_cleaned = PromptSanitizer::clean_text(crlf_input);
+        assert_eq!(
+            crlf_cleaned,
+            "# Desktop application context\r\nInstructions here."
+        );
+
+        // 2. 测试 as Codex: 替换为 as an assistant:
+        let role_input = "When instructed as Codex: provide code immediately.";
+        let role_cleaned = PromptSanitizer::clean_text(role_input);
+        assert_eq!(
+            role_cleaned,
+            "When instructed as an assistant: provide code immediately."
+        );
+
+        // 3. 围栏代码块内保护
+        let fenced_input = "# Codex desktop context\n```\n# Codex desktop context\nas Codex:\n```";
+        let fenced_cleaned = PromptSanitizer::clean_text(fenced_input);
+        assert!(fenced_cleaned.starts_with(
+            "# Desktop application context\n```\n# Codex desktop context\nas Codex:\n```"
+        ));
+    }
+
+    #[test]
+    fn test_issue_3983_dsh_browser_context_neutralized() {
+        let input = "System directive:\nThe browser provides no implicit DOM, route, or screenshot context.\nPlease proceed.";
+        let cleaned = PromptSanitizer::clean_text(input);
+        assert_eq!(
+            cleaned,
+            "System directive:\nThe browser exposes no DOM tree, route list, or page screenshot context.\nPlease proceed."
+        );
+
+        // 围栏代码块保护
+        let fenced =
+            "Text\n```\nThe browser provides no implicit DOM, route, or screenshot context.\n```";
+        let cleaned_fenced = PromptSanitizer::clean_text(fenced);
+        assert_eq!(cleaned_fenced, fenced);
+    }
+
+    #[test]
+    fn test_prompt_rewrite_rule_scope_separation() {
+        use crate::proxy::config::PromptRewriteRule;
+        let config = PromptRewriteConfig {
+            enabled: true,
+            normalize_identity: false,
+            sideload_mode: crate::proxy::config::PromptSideloadMode::Off,
+            sanitize_tools_description: true,
+            rules: vec![
+                PromptRewriteRule::with_scope(
+                    "r-all",
+                    "sensitive_all",
+                    "clean_all",
+                    crate::proxy::config::PromptRewriteScope::All,
+                    true,
+                ),
+                PromptRewriteRule::with_scope(
+                    "r-prompt",
+                    "sensitive_prompt",
+                    "clean_prompt",
+                    crate::proxy::config::PromptRewriteScope::Prompt,
+                    true,
+                ),
+                PromptRewriteRule::with_scope(
+                    "r-tool",
+                    "sensitive_tool",
+                    "clean_tool",
+                    crate::proxy::config::PromptRewriteScope::Tools,
+                    true,
+                ),
+            ],
+        };
+        PromptSanitizer::update_prompt_rewrite_config(&config);
+
+        let mut body = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": "This has sensitive_all, sensitive_prompt, and sensitive_tool in prompt." }
+                ]
+            },
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "test_func",
+                            "description": "Tool has sensitive_all, sensitive_prompt, and sensitive_tool in desc."
+                        }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut body);
+
+        let sys_text = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            sys_text.contains("clean_all"),
+            "All scope should apply to prompt"
+        );
+        assert!(
+            sys_text.contains("clean_prompt"),
+            "Prompt scope should apply to prompt"
+        );
+        assert!(
+            sys_text.contains("sensitive_tool"),
+            "Tools scope must NOT apply to prompt"
+        );
+
+        let tool_desc = body["tools"][0]["functionDeclarations"][0]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tool_desc.contains("clean_all"),
+            "All scope should apply to tools"
+        );
+        assert!(
+            tool_desc.contains("clean_tool"),
+            "Tools scope should apply to tools"
+        );
+        assert!(
+            tool_desc.contains("sensitive_prompt"),
+            "Prompt scope must NOT apply to tools"
+        );
     }
 }

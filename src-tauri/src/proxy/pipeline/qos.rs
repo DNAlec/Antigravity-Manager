@@ -78,7 +78,6 @@ pub fn report_qos_ttft(
     ttft_ms: f64,
     is_deep_thinking: bool,
     input_tokens: Option<u32>,
-    session_lease: Option<&crate::proxy::session_bindings::SessionLease>,
 ) {
     let tier = token_manager
         .get_account_tier(account_id)
@@ -91,7 +90,6 @@ pub fn report_qos_ttft(
         ttft_ms,
         is_deep_thinking,
         unified_tokens,
-        session_lease,
     );
 }
 
@@ -102,7 +100,6 @@ struct QosAttemptState {
     stream_ended: bool,
     finalized: bool,
     latest_usage: Option<CanonicalUsage>,
-    raw_usage: Option<serde_json::Value>,
 }
 
 /// 协议无关的两阶段 QoS 尝试跟踪器（Pipeline First）：
@@ -115,7 +112,6 @@ pub struct QosAttemptTracker {
     account_id: String,
     session_id: Option<String>,
     tier: String,
-    session_lease: Option<crate::proxy::session_bindings::SessionLease>,
     is_deep_thinking: bool,
     estimated_input_tokens: Option<u32>,
     eval_lock: Mutex<()>,
@@ -129,7 +125,6 @@ impl QosAttemptTracker {
         session_id: Option<String>,
         is_deep_thinking: bool,
         fallback_input_tokens: Option<u32>,
-        session_lease: Option<crate::proxy::session_bindings::SessionLease>,
     ) -> Self {
         let tier = token_manager
             .get_account_tier(&account_id)
@@ -141,7 +136,6 @@ impl QosAttemptTracker {
             account_id,
             session_id,
             tier,
-            session_lease,
             is_deep_thinking,
             estimated_input_tokens,
             eval_lock: Mutex::new(()),
@@ -172,7 +166,6 @@ impl QosAttemptTracker {
             ttft_ms,
             self.is_deep_thinking,
             self.estimated_input_tokens,
-            self.session_lease.as_ref(),
         );
 
         let need_finalize = {
@@ -188,21 +181,36 @@ impl QosAttemptTracker {
         }
     }
 
-    #[cfg(test)]
     pub fn on_usage(&self, usage: CanonicalUsage) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .latest_usage = Some(usage);
-    }
-
-    fn on_usage_metadata(&self, update: &serde_json::Value) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        crate::proxy::pipeline::usage::merge_cumulative_usage(&mut guard.raw_usage, update);
-        if let Some(raw) = &guard.raw_usage {
-            let usage = CanonicalUsage::from_gemini(raw);
-            if usage.total_input_tokens > 0 {
-                guard.latest_usage = Some(usage);
+        match &mut guard.latest_usage {
+            Some(prev) => {
+                let total = if usage.total_input_tokens > 0 {
+                    usage.total_input_tokens
+                } else {
+                    prev.total_input_tokens
+                };
+                let cached = if usage.cached_tokens > 0 {
+                    usage.cached_tokens
+                } else {
+                    prev.cached_tokens
+                };
+                let out = if usage.output_tokens > 0 {
+                    usage.output_tokens
+                } else {
+                    prev.output_tokens
+                };
+                let reasoning = if usage.reasoning_tokens > 0 {
+                    usage.reasoning_tokens
+                } else {
+                    prev.reasoning_tokens
+                };
+                *prev = CanonicalUsage::new(total, cached, out, reasoning);
+            }
+            None => {
+                if usage.total_input_tokens > 0 {
+                    guard.latest_usage = Some(usage);
+                }
             }
         }
     }
@@ -246,7 +254,6 @@ impl QosAttemptTracker {
                 self.is_deep_thinking,
                 usage.total_input_tokens,
                 usage.uncached_input_tokens,
-                self.session_lease.as_ref(),
             );
         } else {
             self.token_manager.record_qos_without_usage(
@@ -256,7 +263,6 @@ impl QosAttemptTracker {
                 ttft_ms,
                 self.is_deep_thinking,
                 self.estimated_input_tokens,
-                self.session_lease.as_ref(),
             );
         }
     }
@@ -292,19 +298,6 @@ pub fn extract_gemini_sse_usage(line: &str) -> Option<CanonicalUsage> {
     }
 }
 
-fn extract_gemini_sse_usage_metadata(line: &str) -> Option<serde_json::Value> {
-    let json = line.trim().strip_prefix("data:")?.trim();
-    if !json.contains("usageMetadata") {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    value
-        .get("response")
-        .unwrap_or(&value)
-        .get("usageMetadata")
-        .cloned()
-}
-
 /// 在上游 Gemini SSE 流出口处旁路嗅探 `usageMetadata`，并在流结束或提前 Drop 时自动核销 QoS 评估。
 /// 原始 `Bytes` 分片原封不动透传，零改动、零协议耦合。
 pub fn wrap_gemini_stream_with_qos_usage<S, E>(
@@ -327,8 +320,8 @@ where
                     while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
                         let line_raw = line_buf.split_to(pos + 1);
                         if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                            if let Some(usage) = extract_gemini_sse_usage_metadata(line_str) {
-                                tracker.on_usage_metadata(&usage);
+                            if let Some(usage) = extract_gemini_sse_usage(line_str) {
+                                tracker.on_usage(usage);
                             }
                         }
                     }
@@ -342,8 +335,8 @@ where
 
         if !line_buf.is_empty() {
             if let Ok(line_str) = std::str::from_utf8(&line_buf) {
-                if let Some(usage) = extract_gemini_sse_usage_metadata(line_str) {
-                    tracker.on_usage_metadata(&usage);
+                if let Some(usage) = extract_gemini_sse_usage(line_str) {
+                    tracker.on_usage(usage);
                 }
             }
             line_buf.clear();
@@ -485,6 +478,8 @@ mod tests {
             model_reset_times: std::collections::HashMap::new(),
             model_weekly_reset_times: std::collections::HashMap::new(),
             model_quota_windows: std::collections::HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
         let mut acc_b = acc_a.clone();
         acc_b.account_id = "acc_b".to_string();
@@ -500,7 +495,6 @@ mod tests {
             Some("sess-reconcile".to_string()),
             true,
             Some(334_244),
-            None,
         ));
         tracker0.on_first_byte(6_300.0);
         tracker0.on_usage(CanonicalUsage::new(334_244, 330_775, 53, 0));
@@ -514,7 +508,6 @@ mod tests {
             Some("sess-reconcile".to_string()),
             true,
             Some(335_017),
-            None,
         ));
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
             Ok(Bytes::from(
@@ -548,55 +541,10 @@ mod tests {
             Some("sess-reconcile".to_string()),
             true,
             Some(336_000),
-            None,
         ));
         tracker2.on_usage(CanonicalUsage::new(336_000, 334_983, 80, 0));
         tracker2.finalize();
         tracker2.on_first_byte(58_390.0);
         assert!(tm.qos_guardian.is_suspicious("acc_a"));
-    }
-}
-
-#[cfg(test)]
-mod merge_usage_tests {
-    use super::*;
-    #[test]
-    fn merge_beta11_qos_sparse_usage_and_explicit_zero_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let tracker = QosAttemptTracker::new(
-            Arc::new(TokenManager::new(dir.path().to_owned())),
-            "a".into(),
-            Some("s".into()),
-            false,
-            Some(100),
-            None,
-        );
-        tracker.on_usage_metadata(
-            &serde_json::json!({"promptTokenCount":100,"cachedContentTokenCount":90}),
-        );
-        tracker.on_usage_metadata(&serde_json::json!({"candidatesTokenCount":10}));
-        assert_eq!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .latest_usage
-                .as_ref()
-                .unwrap()
-                .uncached_input_tokens,
-            10
-        );
-        tracker.on_usage_metadata(&serde_json::json!({"cachedContentTokenCount":0}));
-        assert_eq!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .latest_usage
-                .as_ref()
-                .unwrap()
-                .uncached_input_tokens,
-            100
-        );
     }
 }

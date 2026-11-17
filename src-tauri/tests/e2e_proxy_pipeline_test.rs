@@ -226,8 +226,7 @@ fn test_e2e_openai_request_transform_purity() {
         None,
         false,
         false,
-    )
-    .expect("OpenAI request should normalize successfully");
+    );
 
     let serialized = serde_json::to_string(&transformed).unwrap();
     assert!(!serialized.contains("<context-summary>"));

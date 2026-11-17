@@ -1,5 +1,7 @@
 # 429 experimental upstream integration
 
+> Historical fork behavior, superseded by the [beta14 migration](testing/upstream_v5.0.4-beta.14_migration.md).
+
 This change is separate from the confirmed failed-attempt diagnostics fix. It
 is not evidence that all production 429 responses have the same cause.
 

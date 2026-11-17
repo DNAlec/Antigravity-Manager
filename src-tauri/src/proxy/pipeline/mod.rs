@@ -7,29 +7,22 @@
 //! 架构设计规范：出站发散由各协议 mapper 适配器独立实现（Gemini -> 各协议线缆格式）。
 //! 出站不设统一流水线，保持协议发散的灵活性与流式稳定性。
 
-pub(crate) mod attempt_diagnostics;
 pub mod auto_heal;
 pub mod budget;
-pub mod candidate_selection;
 pub mod errors;
 pub mod estimator;
 pub mod image;
 pub mod inbound;
 #[cfg(test)]
 mod official_alignment_tests;
-#[cfg(test)]
-mod output_limit_tests;
 pub mod policy;
 pub mod qos;
 pub mod rotation;
-pub mod stream_error;
 pub mod stream_lifecycle;
 pub mod stream_peek;
 pub mod terminal;
 pub mod timing;
-pub(crate) mod token_budget;
 pub mod usage;
-pub mod usage_diagnostics;
 
 pub use auto_heal::{
     try_auto_heal, wrap_stream_with_empty_thinking_auto_heal, AutoHealFlags, AutoHealOutcome,

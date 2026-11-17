@@ -127,6 +127,22 @@ pub async fn release_account_qos_jail(
     Ok(())
 }
 
+/// 手动解除账号指定模型的 403 冻结
+#[tauri::command]
+pub async fn remove_account_forbidden_model(
+    app: tauri::AppHandle,
+    account_id: String,
+    model: Option<String>,
+) -> Result<bool, String> {
+    let res =
+        crate::modules::account::remove_account_forbidden_model(&account_id, model.as_deref())?;
+    let _ = crate::commands::proxy::reload_proxy_accounts(
+        app.state::<crate::commands::proxy::ProxyServiceState>(),
+    )
+    .await;
+    Ok(res)
+}
+
 /// 添加账号
 #[tauri::command]
 pub async fn add_account(
@@ -519,7 +535,6 @@ pub async fn save_config(
     mut config: AppConfig,
 ) -> Result<(), String> {
     // 确保保存的 User-Agent 满足最低版本要求 (>= 4.3.0) 避免上游拒绝
-    let _config_guard = modules::config::config_apply_guard().await;
     if let Some(ref ua) = config.proxy.user_agent_override {
         config.proxy.user_agent_override = Some(crate::constants::sanitize_egress_user_agent(ua));
     }
@@ -583,10 +598,6 @@ pub async fn save_config(
     // 热更新正在运行的服务
     let instance_lock = proxy_state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
-        instance
-            .token_manager
-            .qos_guardian
-            .update_config(config.proxy.qos)?;
         // 更新模型映射
         instance.axum_server.update_mapping(&config.proxy).await;
         // 更新仅暴露真实配额模型开关
@@ -653,11 +664,6 @@ pub async fn save_config(
     // [FIX #3280, #3285] 同步热更新管理服务 (Admin Server)，确保在仅运行管理端或服务未手动启动时配置立即生效
     let admin_lock = proxy_state.admin_server.read().await;
     if let Some(admin) = admin_lock.as_ref() {
-        admin
-            .axum_server
-            .token_manager
-            .qos_guardian
-            .update_config(config.proxy.qos)?;
         admin.axum_server.update_mapping(&config.proxy).await;
         admin
             .axum_server
@@ -1333,11 +1339,110 @@ pub async fn get_antigravity_args() -> Result<Vec<String>, String> {
 /// 检测更新响应结构
 pub use crate::modules::update_checker::UpdateInfo;
 
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUpdateMetadata {
+    pub rid: tauri::ResourceId,
+    pub current_version: String,
+    pub version: String,
+    pub date: Option<String>,
+    pub body: Option<String>,
+    pub raw_json: serde_json::Value,
+}
+
 /// 检测 GitHub releases 更新
 #[tauri::command]
 pub async fn check_for_updates() -> Result<UpdateInfo, String> {
     modules::logger::log_info("收到前端触发的更新检查请求");
     crate::modules::update_checker::check_for_updates().await
+}
+
+/// 基于动态通道和端点进行原生更新检查，支持预发布版 (Beta) 与正式版自动更新分离
+#[tauri::command]
+pub async fn check_native_update<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
+    endpoint: Option<String>,
+    proxy: Option<String>,
+) -> Result<Option<NativeUpdateMetadata>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    use url::Url;
+
+    let target_endpoint = if let Some(ep) = endpoint.filter(|s| !s.trim().is_empty()) {
+        ep
+    } else {
+        let settings = crate::modules::update_checker::load_update_settings().unwrap_or_default();
+        match settings.update_channel {
+            crate::modules::update_checker::UpdateChannel::Beta => {
+                crate::modules::update_checker::PREVIEW_UPDATER_JSON_URL.to_string()
+            }
+            crate::modules::update_checker::UpdateChannel::Stable => {
+                crate::modules::update_checker::STABLE_UPDATER_JSON_URL.to_string()
+            }
+        }
+    };
+
+    crate::modules::logger::log_info(&format!("原生更新器准备检查目标地址: {}", target_endpoint));
+
+    let mut builder = webview.updater_builder();
+
+    let url = Url::parse(&target_endpoint)
+        .map_err(|e| format!("无效的更新地址 '{}': {}", target_endpoint, e))?;
+    builder = builder.endpoints(vec![url]).map_err(|e| e.to_string())?;
+
+    let proxy_url = proxy.or_else(crate::modules::update_checker::get_upstream_proxy_url);
+    if let Some(proxy_str) = proxy_url {
+        if let Ok(proxy_parsed) = Url::parse(&proxy_str) {
+            crate::modules::logger::log_info(&format!("原生更新器应用代理配置: {}", proxy_str));
+            builder = builder.proxy(proxy_parsed);
+        }
+    }
+
+    builder = builder.version_comparator(|current, release| {
+        crate::modules::update_checker::compare_versions(
+            &release.version.to_string(),
+            &current.to_string(),
+        )
+    });
+
+    let updater = builder.build().map_err(|e| {
+        let msg = format!("构建原生更新器失败: {}", e);
+        crate::modules::logger::log_error(&msg);
+        msg
+    })?;
+
+    let update = updater.check().await.map_err(|e| {
+        let msg = format!("原生更新器检查失败: {}", e);
+        crate::modules::logger::log_error(&msg);
+        msg
+    })?;
+
+    if let Some(update) = update {
+        crate::modules::logger::log_info(&format!(
+            "原生更新器发现可用更新: {} (当前版本: {})",
+            update.version, update.current_version
+        ));
+        let current_version = update.current_version.clone();
+        let version = update.version.clone();
+        let body = update.body.clone();
+        let raw_json = update.raw_json.clone();
+        let formatted_date = update.date.and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+        let rid = webview.resources_table().add(update);
+        let metadata = NativeUpdateMetadata {
+            rid,
+            current_version,
+            version,
+            date: formatted_date,
+            body,
+            raw_json,
+        };
+        Ok(Some(metadata))
+    } else {
+        crate::modules::logger::log_info("原生更新器未检测到更新");
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -1365,6 +1470,13 @@ pub async fn check_homebrew_installation() -> Result<bool, String> {
 #[tauri::command]
 pub async fn check_appimage_installation() -> Result<bool, String> {
     Ok(crate::modules::update_checker::is_appimage_running())
+}
+
+/// 通过 Homebrew Cask 升级应用
+#[tauri::command]
+pub async fn brew_upgrade_cask() -> Result<String, String> {
+    modules::logger::log_info("收到前端触发的 Homebrew 升级请求");
+    crate::modules::update_checker::brew_upgrade_cask().await
 }
 
 /// 获取更新设置
@@ -1475,6 +1587,31 @@ pub async fn update_account_priority(
         );
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn update_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    modules::account::update_account_project_id(&account_id, project_id.clone())?;
+    for tm in proxy_state.active_token_managers().await {
+        tm.update_account_project_id(&account_id, project_id.clone());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auto_fetch_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<String, String> {
+    let pid = modules::account::auto_fetch_account_project_id(&account_id).await?;
+    for tm in proxy_state.active_token_managers().await {
+        tm.update_account_project_id(&account_id, Some(pid.clone()));
+    }
+    Ok(pid)
 }
 
 /// 更新账号自定义标签

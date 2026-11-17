@@ -31,7 +31,7 @@ pub struct ClaudeRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Output configuration for reasoning effort and structured output
+    /// Output configuration for effort level (Claude API v2.0.67+)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
     // [NEW] Image generation parameters (for Anthropic protocol compatibility)
@@ -100,15 +100,6 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
 
-    #[serde(rename = "compaction")]
-    Compaction {
-        #[serde(default)]
-        content: Option<String>,
-    },
-
-    #[serde(rename = "fallback")]
-    Fallback {},
-
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -130,13 +121,6 @@ pub enum ContentBlock {
         source: DocumentSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<serde_json::Value>,
-    },
-
-    #[serde(rename = "search_result")]
-    SearchResult {
-        source: String,
-        title: String,
-        content: Vec<McpTextBlock>,
     },
 
     #[serde(rename = "redacted_thinking")]
@@ -177,104 +161,6 @@ pub enum ContentBlock {
         #[serde(default)]
         content: serde_json::Value,
     },
-
-    #[serde(rename = "web_fetch_tool_result")]
-    WebFetchToolResult {
-        tool_use_id: String,
-        #[serde(default)]
-        content: serde_json::Value,
-    },
-
-    #[serde(rename = "advisor_tool_result")]
-    AdvisorToolResult {
-        tool_use_id: String,
-        content: AdvisorResultContent,
-    },
-
-    #[serde(
-        rename = "code_execution_tool_result",
-        alias = "bash_code_execution_tool_result",
-        alias = "text_editor_code_execution_tool_result"
-    )]
-    CodeExecutionToolResult {
-        tool_use_id: String,
-        #[serde(default)]
-        content: serde_json::Value,
-    },
-
-    #[serde(rename = "tool_search_tool_result")]
-    ToolSearchToolResult {
-        tool_use_id: String,
-        content: ToolSearchResultContent,
-    },
-
-    #[serde(rename = "mcp_tool_use")]
-    McpToolUse {
-        id: String,
-        name: String,
-        server_name: String,
-        input: serde_json::Map<String, serde_json::Value>,
-    },
-
-    #[serde(rename = "mcp_tool_result")]
-    McpToolResult {
-        tool_use_id: String,
-        #[serde(default)]
-        content: McpToolResultContent,
-        #[serde(default)]
-        is_error: bool,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum AdvisorResultContent {
-    #[serde(rename = "advisor_result")]
-    Result { text: String },
-    #[serde(rename = "advisor_tool_result_error")]
-    Error { error_code: String },
-    #[serde(rename = "advisor_redacted_result")]
-    Redacted {},
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ToolSearchResultContent {
-    #[serde(rename = "tool_search_tool_search_result")]
-    Found { tool_references: Vec<ToolReference> },
-    #[serde(rename = "tool_search_tool_result_error")]
-    Error {
-        error_code: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error_message: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ToolReference {
-    #[serde(rename = "tool_reference")]
-    Tool { tool_name: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum McpToolResultContent {
-    Text(String),
-    Blocks(Vec<McpTextBlock>),
-}
-
-impl Default for McpToolResultContent {
-    fn default() -> Self {
-        Self::Text(String::new())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum McpTextBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -293,24 +179,16 @@ pub struct ImageSource {
     pub media_type: Option<String>,
     #[serde(default)]
     pub data: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSource {
     #[serde(rename = "type", default = "default_base64_type")]
-    pub source_type: String, // "base64", "url", "text", or "content"
+    pub source_type: String, // "base64"
     #[serde(default)]
     pub media_type: Option<String>, // e.g. "application/pdf"
     #[serde(default)]
-    pub data: Option<String>, // base64 data or plain text
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<serde_json::Value>,
+    pub data: Option<String>, // base64 data
 }
 
 /// Tool - supports both client tools (with input_schema) and server tools (like web_search)
@@ -333,20 +211,19 @@ pub struct Tool {
 impl Tool {
     /// Check if this is the web_search server tool
     pub fn is_web_search(&self) -> bool {
-        // A client function owns its name, including names used by server tools.
-        if self.type_.as_deref() == Some("custom") || self.input_schema.is_some() {
-            return false;
+        // Check by type (preferred for server tools)
+        if let Some(ref t) = self.type_ {
+            if t.starts_with("web_search") {
+                return true;
+            }
         }
-        if let Some(kind) = self.type_.as_deref() {
-            return kind == "web_search"
-                || kind.starts_with("web_search_")
-                || kind == "builtin_web_search";
+        // Check by name (fallback)
+        if let Some(ref n) = self.name {
+            if n == "web_search" {
+                return true;
+            }
         }
-        // Retain legacy schema-less search declarations.
-        matches!(
-            self.name.as_deref(),
-            Some("web_search" | "google_search" | "builtin_web_search")
-        )
+        false
     }
 
     /// Get the effective tool name
@@ -372,21 +249,12 @@ pub struct Metadata {
 }
 
 /// Output Configuration (Claude API v2.0.67+)
-/// Controls reasoning effort independently of the output format
+/// Controls effort level for model reasoning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<OutputFormat>,
     /// Effort level: "high", "medium", "low"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-}
-
-/// Anthropic structured-output constraint, normalized by the request adapter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OutputFormat {
-    JsonSchema { schema: serde_json::Value },
 }
 
 /// Claude API 响应
@@ -451,26 +319,8 @@ pub struct GeminiPart {
     pub function_response: Option<FunctionResponse>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "inlineData", alias = "inline_data")]
+    #[serde(rename = "inlineData")]
     pub inline_data: Option<InlineData>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "fileData", alias = "file_data")]
-    pub file_data: Option<FileData>,
-}
-
-impl GeminiPart {
-    pub(crate) fn render_media(
-        &self,
-    ) -> Option<crate::proxy::common::response_media::RenderedMedia> {
-        use crate::proxy::common::response_media::{render_file, render_inline};
-        if let Some(inline) = &self.inline_data {
-            return render_inline(Some(&inline.mime_type), &inline.data);
-        }
-        self.file_data
-            .as_ref()
-            .and_then(|file| render_file(file.mime_type.as_deref(), &file.file_uri))
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,21 +342,9 @@ pub struct FunctionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineData {
-    #[serde(rename = "mimeType", alias = "mime_type", default)]
+    #[serde(rename = "mimeType")]
     pub mime_type: String,
     pub data: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileData {
-    #[serde(
-        rename = "mimeType",
-        alias = "mime_type",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub mime_type: Option<String>,
-    #[serde(rename = "fileUri", alias = "file_uri")]
-    pub file_uri: String,
 }
 
 /// Gemini 完整响应
@@ -542,7 +380,7 @@ pub struct Candidate {
     pub grounding_metadata: Option<GroundingMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "promptTokenCount")]
@@ -556,23 +394,6 @@ pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "cachedContentTokenCount")]
     pub cached_content_token_count: Option<u32>,
-}
-
-// Normalize Gemini/Interactions counters before the typed Claude adapter can
-// discard aliases or separately reported thinking tokens. These fields contain
-// total input and combined output, as required by to_claude_usage.
-impl<'de> Deserialize<'de> for UsageMetadata {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = serde_json::Value::deserialize(deserializer)?;
-        let mut usage = crate::proxy::pipeline::usage::ObservedUsage::default();
-        usage.merge_usage(&raw);
-        Ok(Self {
-            prompt_token_count: usage.input_tokens(),
-            candidates_token_count: usage.output_tokens(),
-            total_token_count: usage.total_tokens(),
-            cached_content_token_count: usage.cached_tokens(),
-        })
-    }
 }
 
 // ========== Grounding Metadata (for googleSearch results) ==========

@@ -1,5 +1,7 @@
 # 实例级 QoS 策略
 
+> Historical fork behavior, superseded by the [beta14 migration](testing/upstream_v5.0.4-beta.14_migration.md).
+
 QoS 用于识别慢响应账号并控制隔离、探针和恢复。配置位于数据目录的
 `gui_config.json.proxy.qos`，通过配置文件或现有管理 API 管理，暂无配置页面。
 每个服务实例持有自己的策略；修改测试实例不会改变另一个实例的策略。

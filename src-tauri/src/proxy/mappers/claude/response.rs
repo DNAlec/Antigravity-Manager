@@ -208,38 +208,46 @@ impl NonStreamingProcessor {
                     if signature.is_some() {
                         self.trailing_signature = signature;
                     }
-                } else {
-                    self.flush_thinking();
+                    return;
+                }
 
-                    // 处理之前的 trailingSignature
-                    if let Some(trailing_sig) = self.trailing_signature.take() {
-                        self.flush_text();
-                        self.content_blocks.push(ContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: Some(trailing_sig),
-                            cache_control: None,
-                        });
-                    }
+                self.flush_thinking();
 
-                    self.text_builder.push_str(text);
+                // 处理之前的 trailingSignature
+                if let Some(trailing_sig) = self.trailing_signature.take() {
+                    self.flush_text();
+                    self.content_blocks.push(ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: Some(trailing_sig),
+                        cache_control: None,
+                    });
+                }
 
-                    // 非空 text 带签名 - 立即刷新并输出空 thinking 块
-                    if let Some(sig) = signature {
-                        self.flush_text();
-                        self.content_blocks.push(ContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: Some(sig),
-                            cache_control: None,
-                        });
-                    }
+                self.text_builder.push_str(text);
+
+                // 非空 text 带签名 - 立即刷新并输出空 thinking 块
+                if let Some(sig) = signature {
+                    self.flush_text();
+                    self.content_blocks.push(ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: Some(sig),
+                        cache_control: None,
+                    });
                 }
             }
         }
 
-        if let Some(media) = part.render_media() {
+        // 3. InlineData (Image) 处理
+        if let Some(img) = &part.inline_data {
             self.flush_thinking();
-            self.text_builder.push_str(&media.text);
-            self.flush_text();
+
+            let mime_type = &img.mime_type;
+            let data = &img.data;
+            if !data.is_empty() {
+                let markdown_img = format!("![image](data:{};base64,{})", mime_type, data);
+                self.text_builder.push_str(&markdown_img);
+                self.flush_text();
+            }
         }
     }
 
@@ -441,10 +449,10 @@ impl NonStreamingProcessor {
             .and_then(|c| c.get(0))
             .and_then(|candidate| candidate.finish_reason.as_deref());
 
-        let stop_reason = if finish_reason == Some("MAX_TOKENS") {
-            "max_tokens"
-        } else if self.has_tool_call {
+        let stop_reason = if self.has_tool_call {
             "tool_use"
+        } else if finish_reason == Some("MAX_TOKENS") {
+            "max_tokens"
         } else {
             "end_turn"
         };
@@ -514,65 +522,14 @@ pub fn transform_response(
     message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     registered_tool_names: Vec<String>, // [FIX #3379] For call:default_api leakage recovery
 ) -> Result<ClaudeResponse, String> {
-    let failure_reason = gemini_response
-        .candidates
-        .as_ref()
-        .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.finish_reason.as_deref())
-        .filter(|reason| crate::proxy::pipeline::stream_error::is_failure_finish_reason(reason));
-    let mut processor = NonStreamingProcessor::new(
-        session_id.filter(|_| failure_reason.is_none()),
-        model_name,
-        message_count,
-    );
+    let mut processor = NonStreamingProcessor::new(session_id, model_name, message_count);
     processor.set_registered_tool_names(registered_tool_names);
-    let response = processor.process(gemini_response, scaling_enabled, context_limit);
-    if let Some(reason) = failure_reason {
-        let mut partial = serde_json::to_value(&response).unwrap_or_default();
-        partial["stop_reason"] = serde_json::Value::Null;
-        return Err(serde_json::json!({
-            "error":crate::proxy::pipeline::stream_error::model_finish_error(reason),
-            "partial_response":partial
-        })
-        .to_string());
-    }
-    Ok(response)
+    Ok(processor.process(gemini_response, scaling_enabled, context_limit))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tool_output_preserves_output_limit_instead_of_claiming_tool_completion() {
-        for (finish, expected) in [("MAX_TOKENS", "max_tokens"), ("STOP", "tool_use")] {
-            let gemini: GeminiResponse = serde_json::from_value(serde_json::json!({
-                "candidates":[{
-                    "content":{"role":"model","parts":[{
-                        "functionCall":{"name":"inspect","args":{"path":"src"},"id":"call_limit"}
-                    }]},
-                    "finishReason":finish
-                }],
-                "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":8}
-            }))
-            .unwrap();
-            let response = transform_response(
-                &gemini,
-                false,
-                1_000_000,
-                None,
-                "gemini-flash".into(),
-                1,
-                vec!["inspect".into()],
-            )
-            .unwrap();
-            assert_eq!(response.stop_reason, expected);
-            assert!(
-                matches!(&response.content[0], ContentBlock::ToolUse { name, .. } if name == "inspect")
-            );
-            assert_eq!(response.usage.output_tokens, 8);
-        }
-    }
 
     #[test]
     fn test_simple_text_response() {
@@ -587,7 +544,6 @@ mod tests {
                         function_call: None,
                         function_response: None,
                         inline_data: None,
-                        file_data: None,
                     }],
                 }),
                 finish_reason: Some("STOP".to_string()),
@@ -643,7 +599,6 @@ mod tests {
                             function_call: None,
                             function_response: None,
                             inline_data: None,
-                            file_data: None,
                         },
                         GeminiPart {
                             text: Some("The answer is 42".to_string()),
@@ -652,7 +607,6 @@ mod tests {
                             function_call: None,
                             function_response: None,
                             inline_data: None,
-                            file_data: None,
                         },
                     ],
                 }),

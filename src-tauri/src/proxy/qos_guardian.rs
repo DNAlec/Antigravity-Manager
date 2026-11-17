@@ -1,10 +1,12 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::proxy::qos_config::QoSConfig;
 use crate::proxy::token_manager::ProxyToken;
+
+/// 阶梯自愈时间表 (单位: 分钟): 2m -> 5m -> 10m -> 15m -> 20m -> 30m
+pub const DEFAULT_QOS_LADDER_MINUTES: [u64; 6] = [2, 5, 10, 15, 20, 30];
 
 /// 账号 QoS 运行时健康状态
 #[derive(Debug, Clone, PartialEq)]
@@ -24,40 +26,13 @@ pub enum AccountQoSState {
         current_wait: Duration, // 本级等待总时长
     },
     /// 探针执行中：后台轻量探针正在发出“你好”测速，防止并发重复探测
-    Probing {
-        level: usize,
-        started_at: Instant,
-        claim_id: uuid::Uuid,
-    },
+    Probing { level: usize, started_at: Instant },
     /// 缓刑观察期：探针通过，单路试探真实请求，连续 2 次真实请求通过才转 Healthy，再次失败从严惩罚
     HalfOpen {
         level: usize,
         consecutive_healthy: u8,
         entered_at: Instant,
     },
-}
-
-/// A probe may complete only the transition that it claimed, even if the account
-/// is reset and reaches the same jail level again before the request finishes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ProbeClaim {
-    pub level: usize,
-    pub config: QoSConfig,
-    claim_id: uuid::Uuid,
-}
-
-impl ProbeClaim {
-    pub fn accepts_ttft(self, ttft_ms: f64) -> bool {
-        ttft_ms < self.config.probe_success_threshold_secs * 1000.0
-    }
-
-    fn matches(self, state: &AccountQoSState) -> bool {
-        matches!(
-            state,
-            AccountQoSState::Probing { level, claim_id, .. }
-                if *level == self.level && *claim_id == self.claim_id
-        )
-    }
 }
 
 /// 单次请求的 TTFT 观测记录
@@ -129,8 +104,9 @@ pub struct QoSGuardian {
     pub session_watermarks: Arc<DashMap<(String, String), (u32, Instant)>>,
     /// 惩罚历史记忆: account_id -> (last_level, updated_at)，保留 30 分钟防短时高频复发
     pub penalty_memory: Arc<DashMap<String, (usize, Instant)>>,
-    /// Each operation copies this policy before acquiring any account-state lock.
-    config: RwLock<QoSConfig>,
+    /// 阶梯冷却时间表
+    pub ladder_intervals: Vec<Duration>,
+    /// 自动限流进小黑屋机制开关 (默认关闭)
     pub auto_jail_enabled: Arc<AtomicBool>,
 }
 
@@ -142,31 +118,19 @@ impl Default for QoSGuardian {
 
 impl QoSGuardian {
     pub fn new() -> Self {
+        let ladder = DEFAULT_QOS_LADDER_MINUTES
+            .iter()
+            .map(|&m| Duration::from_secs(m * 60))
+            .collect();
+
         Self {
             states: Arc::new(DashMap::new()),
             samples: Arc::new(DashMap::new()),
             session_watermarks: Arc::new(DashMap::new()),
             penalty_memory: Arc::new(DashMap::new()),
+            ladder_intervals: ladder,
             auto_jail_enabled: Arc::new(AtomicBool::new(false)),
-            config: RwLock::new(QoSConfig::default()),
         }
-    }
-
-    pub fn config_snapshot(&self) -> QoSConfig {
-        *self
-            .config
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// Apply a validated policy without rewriting cooldowns or probe claims.
-    pub fn update_config(&self, config: QoSConfig) -> Result<(), String> {
-        config.validate()?;
-        *self
-            .config
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = config;
-        Ok(())
     }
 
     /// 查询自动限流进小黑屋机制是否启用
@@ -247,8 +211,7 @@ impl QoSGuardian {
             {
                 let elapsed = jailed_at.elapsed();
                 if elapsed < *current_wait {
-                    let remaining = *current_wait - elapsed;
-                    return Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0));
+                    return Some((*current_wait - elapsed).as_secs());
                 } else {
                     return Some(0);
                 }
@@ -462,22 +425,18 @@ impl QoSGuardian {
     where
         F: Fn(&str) -> bool,
     {
-        let config = self.config_snapshot();
         let ttft_secs = ttft_ms / 1000.0;
 
         // 2. 动态预算补偿算法：
-        // - 每 100K 未缓存 Token 额外补偿 +15.0s 物理 Prefill 计算耗时
-        // - 基础阈值：按实例策略选择普通或深度思考阈值
+        // - 每 100K 未缓存 Token 额外补偿 +15.0s 物理 Prefill 耗时
+        //   （实测 150K 冷启动首字 36~44s，原来的 7.0s/100K 明显低估，会把正常 prefill 判成限速）
+        // - 基础阈值：非深度思考为 20.0s，深度思考上浮至 35.0s
         let uncached_bonus_secs = (uncached_tokens as f64 / 100_000.0) * 15.0;
-        let base_threshold_secs = if is_deep_thinking {
-            config.deep_thinking_threshold_secs
-        } else {
-            config.normal_threshold_secs
-        };
+        let base_threshold_secs = if is_deep_thinking { 35.0 } else { 20.0 };
         let threshold_secs = base_threshold_secs + uncached_bonus_secs;
 
-        // 恢复阈值同样支持未缓存增量补偿
-        let vindicate_threshold_secs = config.recovery_threshold_secs + uncached_bonus_secs;
+        // 宽限平反阈值：基础为 18.5s，同比例支持未缓存增量补偿
+        let vindicate_threshold_secs = 18.5 + uncached_bonus_secs;
 
         // 标记是否为大 Token 冷启动 (未缓存 >= 60K)
         let is_cold_start = uncached_tokens >= 60_000;
@@ -549,7 +508,7 @@ impl QoSGuardian {
             // 同行健康，唯独当前账号超标
             Some(_) => ttft_secs > threshold_secs,
             // 纯净同行不足时，退化为绝对阈值防护 (额外 +10.0s 兜底)
-            None => ttft_secs > (threshold_secs + config.no_peer_grace_secs),
+            None => ttft_secs > (threshold_secs + 10.0),
         };
 
         StrikeAssessment {
@@ -770,7 +729,6 @@ impl QoSGuardian {
     {
         self.update_watermark(account_id, session_id, watermark_tokens);
 
-        let config = self.config_snapshot();
         let ttft_secs = ttft_ms / 1000.0;
         let now = Instant::now();
         let assessment = self.assess_strike(
@@ -784,12 +742,6 @@ impl QoSGuardian {
         );
 
         let threshold_secs = assessment.threshold_secs;
-        let final_threshold_secs = threshold_secs
-            + if assessment.peer_avg_secs.is_none() {
-                config.no_peer_grace_secs
-            } else {
-                0.0
-            };
         let vindicate_threshold_secs = assessment.vindicate_threshold_secs;
         let uncached_bonus_secs = assessment.uncached_bonus_secs;
         let is_cold_start = assessment.is_cold_start;
@@ -840,7 +792,7 @@ impl QoSGuardian {
                         "⚠️ [QoS Guardian] Account {} tagged as SUSPICIOUS (TTFT={:.2}s > {:.2}s, uncached_tokens={}, bonus=+{:.2}s)",
                         account_id,
                         ttft_secs,
-                        final_threshold_secs,
+                        threshold_secs,
                         uncached_tokens,
                         uncached_bonus_secs
                     );
@@ -872,11 +824,11 @@ impl QoSGuardian {
 
                     if strike_count >= 2 {
                         // 5 分钟内累计 2 次超标：坐实被上游降速！关入小黑屋并触发会话解绑
-                        let level = self.resolve_initial_jail_level(account_id, &config);
-                        let wait_duration = Duration::from_secs(config.jail_ladder_secs[level]);
+                        let level = self.resolve_initial_jail_level(account_id);
+                        let wait_duration = self.ladder_intervals[level];
 
                         tracing::error!(
-                            "🚨 [QoS Guardian] Account {} exceeded the local QoS latency threshold twice in the strike window. Jailing Level {} ({:?}) & unbinding session.",
+                            "🚨 [QoS Guardian] Account {} CONFIRMED THROTTLED (2 strikes in window). Jailing Level {} ({:?}) & unbinding session!",
                             account_id, level, wait_duration
                         );
 
@@ -942,8 +894,8 @@ impl QoSGuardian {
             } => {
                 if is_strike {
                     // 缓刑期间真实业务请求再次卡顿：判定假康复，从严惩罚！
-                    let next_level = (level + 1).min(config.jail_ladder_secs.len() - 1);
-                    let next_wait = Duration::from_secs(config.jail_ladder_secs[next_level]);
+                    let next_level = (level + 1).min(self.ladder_intervals.len() - 1);
+                    let next_wait = self.ladder_intervals[next_level];
 
                     tracing::error!(
                         "💥 [QoS Guardian] Account {} FAILED Half-Open probation (TTFT={:.2}s). Escalating to Level {} ({:?})!",
@@ -999,12 +951,12 @@ impl QoSGuardian {
     }
 
     /// 确定入狱初始阶梯：30 分钟内二次复发直接继承并升级阶梯
-    fn resolve_initial_jail_level(&self, account_id: &str, config: &QoSConfig) -> usize {
+    fn resolve_initial_jail_level(&self, account_id: &str) -> usize {
         let memory_ttl = Duration::from_secs(30 * 60);
         if let Some(mem) = self.penalty_memory.get(account_id) {
             let (last_level, recorded_at) = *mem.value();
             if recorded_at.elapsed() <= memory_ttl {
-                let escalated = (last_level + 1).min(config.jail_ladder_secs.len() - 1);
+                let escalated = (last_level + 1).min(self.ladder_intervals.len() - 1);
                 tracing::info!(
                     "🧠 [QoS Guardian] Account {} has recent penalty memory (Lv {}), escalating to Lv {}",
                     account_id, last_level, escalated
@@ -1047,138 +999,90 @@ impl QoSGuardian {
         entry.retain(|s| s.timestamp.elapsed() <= ttl);
     }
 
-    /// 只有仍持有本次探针领取权时，才将账号置为 HalfOpen。
-    pub(crate) fn mark_probe_passed(&self, account_id: &str, claim: ProbeClaim) -> bool {
-        let Some(mut state) = self.states.get_mut(account_id) else {
-            return false;
-        };
-        if !claim.matches(state.value()) {
-            return false;
-        }
-
-        *state = AccountQoSState::HalfOpen {
-            level: claim.level,
-            consecutive_healthy: 0,
-            entered_at: Instant::now(),
-        };
-        true
+    /// 手动或探针将账号置为 HalfOpen
+    pub fn mark_probe_passed(&self, account_id: &str, level: usize) {
+        self.states.insert(
+            account_id.to_string(),
+            AccountQoSState::HalfOpen {
+                level,
+                consecutive_healthy: 0,
+                entered_at: Instant::now(),
+            },
+        );
     }
 
-    /// Resume only an expired jail; an active probe owns its own transition.
+    /// 将处于小黑屋或探测中的账号转入 HalfOpen 缓刑观察期（用于 CacheFirst 原地等待冷却后恢复本会话复用）
     pub fn promote_to_half_open(&self, account_id: &str) {
-        let Some(mut state) = self.states.get_mut(account_id) else {
-            return;
-        };
-        let level = match *state {
-            AccountQoSState::Jailed {
-                level,
-                jailed_at,
-                current_wait,
-            } if jailed_at.elapsed() >= current_wait => level,
+        let level = match self.get_state(account_id) {
+            AccountQoSState::Jailed { level, .. } | AccountQoSState::Probing { level, .. } => level,
             _ => return,
         };
-        *state = AccountQoSState::HalfOpen {
-            level,
-            consecutive_healthy: 0,
-            entered_at: Instant::now(),
-        };
+        self.mark_probe_passed(account_id, level);
     }
 
-    /// 本次探针失败升级阶梯；已重置、移除或被新探针替换的结果不再回写。
-    pub(crate) fn mark_probe_failed(
-        &self,
-        account_id: &str,
-        claim: ProbeClaim,
-    ) -> Option<(usize, Duration)> {
-        let mut state = self.states.get_mut(account_id)?;
-        if !claim.matches(state.value()) {
-            return None;
-        }
-
-        let next_level = (claim.level + 1).min(claim.config.jail_ladder_secs.len() - 1);
-        let next_wait = Duration::from_secs(claim.config.jail_ladder_secs[next_level]);
+    /// 探针失败升级阶梯 (关键：从 0 开始重新计时)
+    pub fn mark_probe_failed(&self, account_id: &str, current_level: usize) -> (usize, Duration) {
+        let next_level = (current_level + 1).min(self.ladder_intervals.len() - 1);
+        let next_wait = self.ladder_intervals[next_level];
         let now = Instant::now();
 
         self.penalty_memory
             .insert(account_id.to_string(), (next_level, now));
 
-        *state = AccountQoSState::Jailed {
-            level: next_level,
-            jailed_at: now, // 从 0 开始重新计时
-            current_wait: next_wait,
-        };
+        self.states.insert(
+            account_id.to_string(),
+            AccountQoSState::Jailed {
+                level: next_level,
+                jailed_at: now, // 从 0 开始重新计时
+                current_wait: next_wait,
+            },
+        );
 
-        Some((next_level, next_wait))
+        (next_level, next_wait)
     }
 
-    /// 原子领取已到期的隔离账号；候选快照中的状态可能已被重置或重新隔离。
-    #[cfg(test)]
-    pub(crate) fn try_mark_probing(&self, account_id: &str) -> Option<ProbeClaim> {
-        self.try_mark_probing_with_config(account_id, self.config_snapshot())
+    /// 标记账号开始探测
+    pub fn mark_probing(&self, account_id: &str, level: usize) {
+        self.states.insert(
+            account_id.to_string(),
+            AccountQoSState::Probing {
+                level,
+                started_at: Instant::now(),
+            },
+        );
     }
 
-    pub(crate) fn try_mark_probing_with_config(
-        &self,
-        account_id: &str,
-        config: QoSConfig,
-    ) -> Option<ProbeClaim> {
-        if !self.is_auto_jail_enabled() {
-            return None;
-        }
-        let mut state = self.states.get_mut(account_id)?;
-        let AccountQoSState::Jailed {
-            level,
-            jailed_at,
-            current_wait,
-        } = *state
-        else {
-            return None;
-        };
-        if jailed_at.elapsed() < current_wait {
-            return None;
-        }
-
-        let claim = ProbeClaim {
-            level,
-            config,
-            claim_id: uuid::Uuid::new_v4(),
-        };
-        *state = AccountQoSState::Probing {
-            level,
-            started_at: Instant::now(),
-            claim_id: claim.claim_id,
-        };
-        Some(claim)
-    }
-
-    /// Collect a snapshot before writing to DashMap (upstream Fixes #3749).
-    /// Prepare credentials without state guards, then atomically claim the current
-    /// expired jail. Claims retain the local policy and reject stale completions.
-    pub(crate) fn take_expired_jails_for_probing<T>(
-        &self,
-        mut prepare: impl FnMut(&str, QoSConfig) -> Option<T>,
-    ) -> Vec<(T, ProbeClaim)> {
-        if !self.is_auto_jail_enabled() {
-            return Vec::new();
-        }
-        let candidates: Vec<String> = self
+    /// 收集已到期的小黑屋账号并统一原子标记为探测中，返回 (account_id, level) 列表。
+    ///
+    /// 【防止 DashMap 读写自死锁 (Fixes #3749)】
+    /// 必须先收集快照并彻底结束 `states.iter()` 释放分片读锁，再对状态进行更新。
+    /// 在 DashMap 迭代器持有分片读锁时，若在循环内调用 `insert()` 或 `get_mut()` 写入同一分片，
+    /// 会引发同线程自死锁，导致后台巡检线程永久挂死并逐步卡死整个 HTTP 网关。
+    pub fn take_expired_jails_for_probing(&self) -> Vec<(String, usize)> {
+        // 阶段 1：收集到期账号，结束迭代器并释放所有分片读锁
+        let candidates: Vec<(String, usize)> = self
             .states
             .iter()
             .filter_map(|entry| match *entry.value() {
                 AccountQoSState::Jailed {
+                    level,
                     jailed_at,
                     current_wait,
-                    ..
-                } if jailed_at.elapsed() >= current_wait => Some(entry.key().clone()),
+                } if jailed_at.elapsed() >= current_wait => Some((entry.key().clone(), level)),
                 _ => None,
             })
             .collect();
+
+        // 阶段 2：读锁已完全释放，逐个安全原子更新为 Probing 状态
         let mut expired = Vec::with_capacity(candidates.len());
-        for account_id in candidates {
-            let config = self.config_snapshot();
-            if let Some(prepared) = prepare(&account_id, config) {
-                if let Some(claim) = self.try_mark_probing_with_config(&account_id, config) {
-                    expired.push((prepared, claim));
+        for (account_id, level) in candidates {
+            if let Some(mut entry) = self.states.get_mut(&account_id) {
+                if let AccountQoSState::Jailed { .. } = *entry.value() {
+                    *entry.value_mut() = AccountQoSState::Probing {
+                        level,
+                        started_at: Instant::now(),
+                    };
+                    expired.push((account_id, level));
                 }
             }
         }
@@ -1201,679 +1105,6 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
-
-    fn configurable_policy() -> QoSConfig {
-        QoSConfig {
-            normal_threshold_secs: 12.0,
-            deep_thinking_threshold_secs: 22.0,
-            recovery_threshold_secs: 10.0,
-            no_peer_grace_secs: 3.0,
-            probe_timeout_secs: 3.0,
-            probe_success_threshold_secs: 2.0,
-            jail_ladder_secs: [10, 20, 30, 40, 50, 60],
-        }
-    }
-
-    #[test]
-    fn qos_cold_start_requires_bucket_baseline_and_keeps_configured_threshold() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian.update_config(configurable_policy()).unwrap();
-        let accounts = vec![
-            create_test_token("account", "PRO"),
-            create_test_token("peer", "PRO"),
-        ];
-        // A hot-cache peer must not cause a cold-start false positive.
-        guardian.push_sample("peer", 4000.0, false, false);
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "account",
-                None,
-                "PRO",
-                100_000.0,
-                false,
-                Some(100_000),
-                &accounts,
-                |_| false
-            ),
-            QoSAction::None
-        );
-        for _ in 0..3 {
-            guardian.push_sample_with_bucket("peer", 4000.0, false, true, cold_bucket_of(100_000));
-        }
-        // Local base 12s + upstream prefill compensation 15s = 27s.
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "account",
-                None,
-                "PRO",
-                27_000.0,
-                false,
-                Some(100_000),
-                &accounts,
-                |_| false
-            ),
-            QoSAction::None
-        );
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "account",
-                None,
-                "PRO",
-                27_001.0,
-                false,
-                Some(100_000),
-                &accounts,
-                |_| false
-            ),
-            QoSAction::TaggedSuspicious
-        );
-    }
-
-    #[test]
-    fn qos_snapshot_claim_preserves_reset_during_credential_preparation() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian.states.insert(
-            "account".into(),
-            AccountQoSState::Jailed {
-                level: 0,
-                jailed_at: Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-        let claims = guardian.take_expired_jails_for_probing(|id, _| {
-            guardian.reset_account(id);
-            Some(id.to_string())
-        });
-        assert!(claims.is_empty());
-        assert_eq!(guardian.get_state("account"), AccountQoSState::Healthy);
-    }
-
-    #[test]
-    fn qos_configured_strike_thresholds_preserve_strict_boundaries_and_input_compensation() {
-        for (thinking, peer, input_tokens, boundary_secs) in [
-            (false, true, 0, 12.0),
-            (true, true, 0, 22.0),
-            (false, false, 0, 15.0),
-            (true, false, 0, 25.0),
-            (false, true, 40_000, 18.0),
-            (true, true, 40_000, 28.0),
-            (false, false, 40_000, 21.0),
-            (true, false, 40_000, 31.0),
-        ] {
-            for (offset_ms, expected) in
-                [(0.0, QoSAction::None), (1.0, QoSAction::TaggedSuspicious)]
-            {
-                let guardian = QoSGuardian::new();
-                guardian.set_auto_jail_enabled(true);
-                guardian.update_config(configurable_policy()).unwrap();
-                let accounts = vec![
-                    create_test_token("account", "PRO"),
-                    create_test_token("peer", "PRO"),
-                ];
-                if peer {
-                    guardian.push_sample("peer", 4000.0, false, false);
-                }
-                let action = guardian.record_and_evaluate(
-                    "account",
-                    None,
-                    "PRO",
-                    boundary_secs * 1000.0 + offset_ms,
-                    thinking,
-                    Some(input_tokens),
-                    &accounts,
-                    |_| false,
-                );
-                assert_eq!(
-                    action, expected,
-                    "thinking={thinking}, peer={peer}, input={input_tokens}, offset={offset_ms}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn qos_configured_peer_brake_uses_the_same_request_threshold() {
-        for (thinking, input, threshold) in
-            [(false, 0, 12.0), (true, 0, 22.0), (false, 40_000, 18.0)]
-        {
-            for (peer_offset_ms, expected) in
-                [(0.0, QoSAction::None), (-1.0, QoSAction::TaggedSuspicious)]
-            {
-                let guardian = QoSGuardian::new();
-                guardian.set_auto_jail_enabled(true);
-                guardian.update_config(configurable_policy()).unwrap();
-                let accounts = vec![
-                    create_test_token("account", "PRO"),
-                    create_test_token("peer", "PRO"),
-                ];
-                guardian.push_sample("peer", threshold * 1000.0 + peer_offset_ms, false, false);
-                assert_eq!(
-                    guardian.record_and_evaluate(
-                        "account",
-                        None,
-                        "PRO",
-                        100_000.0,
-                        thinking,
-                        Some(input),
-                        &accounts,
-                        |_| false
-                    ),
-                    expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn qos_configured_recovery_threshold_preserves_deadband_and_two_pass_rule() {
-        for (half_open, input_tokens, boundary_secs) in [
-            (false, 0, 10.0),
-            (true, 0, 10.0),
-            (false, 40_000, 16.0),
-            (true, 40_000, 16.0),
-        ] {
-            let guardian = QoSGuardian::new();
-            guardian.set_auto_jail_enabled(true);
-            guardian.update_config(configurable_policy()).unwrap();
-            let state = if half_open {
-                AccountQoSState::HalfOpen {
-                    level: 0,
-                    consecutive_healthy: 0,
-                    entered_at: Instant::now(),
-                }
-            } else {
-                AccountQoSState::Suspicious {
-                    first_strike_at: Instant::now(),
-                    strike_count: 1,
-                    consecutive_healthy: 0,
-                }
-            };
-            guardian.states.insert("account".into(), state.clone());
-            let accounts = vec![
-                create_test_token("account", "PRO"),
-                create_test_token("peer", "PRO"),
-            ];
-            guardian.push_sample("peer", 4000.0, false, false);
-            assert_eq!(
-                guardian.record_and_evaluate(
-                    "account",
-                    None,
-                    "PRO",
-                    boundary_secs * 1000.0,
-                    false,
-                    Some(input_tokens),
-                    &accounts,
-                    |_| false
-                ),
-                QoSAction::None
-            );
-            assert_eq!(guardian.get_state("account"), state);
-            assert_eq!(
-                guardian.record_and_evaluate(
-                    "account",
-                    None,
-                    "PRO",
-                    boundary_secs * 1000.0 - 1.0,
-                    false,
-                    Some(input_tokens),
-                    &accounts,
-                    |_| false
-                ),
-                QoSAction::None
-            );
-            assert_eq!(
-                guardian.record_and_evaluate(
-                    "account",
-                    None,
-                    "PRO",
-                    boundary_secs * 1000.0 - 1.0,
-                    false,
-                    Some(input_tokens),
-                    &accounts,
-                    |_| false
-                ),
-                if half_open {
-                    QoSAction::HalfOpenPassed
-                } else {
-                    QoSAction::Vindicated
-                }
-            );
-            assert!(guardian.is_healthy("account"));
-        }
-    }
-
-    #[test]
-    fn qos_config_update_preserves_existing_state_and_is_instance_local() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let other = QoSGuardian::new();
-        let now = Instant::now();
-        let jailed = AccountQoSState::Jailed {
-            level: 3,
-            jailed_at: now,
-            current_wait: Duration::from_secs(900),
-        };
-        guardian.states.insert("account".into(), jailed.clone());
-        guardian.penalty_memory.insert("account".into(), (3, now));
-        guardian.push_sample("account", 4000.0, false, false);
-        guardian
-            .session_watermarks
-            .insert(("account".into(), "session".into()), (100, now));
-
-        guardian.update_config(configurable_policy()).unwrap();
-
-        assert_eq!(guardian.config_snapshot(), configurable_policy());
-        assert_eq!(other.config_snapshot(), QoSConfig::default());
-        let fresh_accounts = vec![create_test_token("fresh", "PRO")];
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "fresh",
-                None,
-                "PRO",
-                20_000.0,
-                false,
-                None,
-                &fresh_accounts,
-                |_| false
-            ),
-            QoSAction::TaggedSuspicious
-        );
-        assert_eq!(
-            other.record_and_evaluate(
-                "fresh",
-                None,
-                "PRO",
-                20_000.0,
-                false,
-                None,
-                &fresh_accounts,
-                |_| false
-            ),
-            QoSAction::None
-        );
-        assert_eq!(guardian.get_state("account"), jailed);
-        assert_eq!(guardian.try_mark_probing("account"), None);
-        assert_eq!(*guardian.penalty_memory.get("account").unwrap(), (3, now));
-        assert_eq!(guardian.samples.get("account").unwrap().len(), 1);
-        assert_eq!(
-            *guardian
-                .session_watermarks
-                .get(&("account".into(), "session".into()))
-                .unwrap(),
-            (100, now)
-        );
-
-        let mut invalid = configurable_policy();
-        invalid.normal_threshold_secs = f64::NAN;
-        assert!(guardian.update_config(invalid).is_err());
-        assert_eq!(guardian.config_snapshot(), configurable_policy());
-        assert_eq!(guardian.get_state("account"), jailed);
-    }
-
-    #[test]
-    fn qos_probe_claim_keeps_policy_and_ladder_until_completion() {
-        for level in 0..6 {
-            let guardian = QoSGuardian::new();
-            guardian.set_auto_jail_enabled(true);
-            let original = configurable_policy();
-            guardian.update_config(original).unwrap();
-            let claim = jail_for_probe(&guardian, level);
-            let mut changed = original;
-            changed.probe_timeout_secs = 5.0;
-            changed.probe_success_threshold_secs = 4.0;
-            changed.jail_ladder_secs = [11, 22, 33, 44, 55, 66];
-            guardian.update_config(changed).unwrap();
-
-            assert_eq!(claim.config, original);
-            assert!(claim.accepts_ttft(1999.0));
-            assert!(!claim.accepts_ttft(2000.0));
-            assert!(!claim.accepts_ttft(3000.0));
-            let next_level = (level + 1).min(5);
-            assert_eq!(
-                guardian.mark_probe_failed("account", claim),
-                Some((
-                    next_level,
-                    Duration::from_secs(original.jail_ladder_secs[next_level])
-                ))
-            );
-            let next_claim = expire_jail_and_claim(&guardian, "account");
-            assert_eq!(next_claim.config, changed);
-            assert!(next_claim.accepts_ttft(3000.0));
-        }
-    }
-
-    #[test]
-    fn qos_configured_ladder_applies_to_new_jail_and_half_open_failure() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian.update_config(configurable_policy()).unwrap();
-        let accounts = vec![create_test_token("account", "PRO")];
-        guardian.record_and_evaluate(
-            "account",
-            None,
-            "PRO",
-            30_000.0,
-            false,
-            None,
-            &accounts,
-            |_| false,
-        );
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "account",
-                None,
-                "PRO",
-                30_000.0,
-                false,
-                None,
-                &accounts,
-                |_| false
-            ),
-            QoSAction::TriggerJailedAndUnbind {
-                level: 0,
-                wait_duration: Duration::from_secs(10)
-            }
-        );
-        let claim = expire_jail_and_claim(&guardian, "account");
-        assert!(guardian.mark_probe_passed("account", claim));
-        let mut changed = configurable_policy();
-        changed.jail_ladder_secs = [11, 22, 33, 44, 55, 66];
-        guardian.update_config(changed).unwrap();
-        assert_eq!(
-            guardian.record_and_evaluate(
-                "account",
-                None,
-                "PRO",
-                30_000.0,
-                false,
-                None,
-                &accounts,
-                |_| false
-            ),
-            QoSAction::HalfOpenFailed {
-                escalated_level: 1,
-                wait_duration: Duration::from_secs(22)
-            }
-        );
-    }
-
-    #[test]
-    fn qos_config_updates_do_not_wait_for_account_state_locks() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian
-            .states
-            .insert("account".into(), AccountQoSState::Healthy);
-        std::thread::scope(|scope| {
-            let state = guardian.states.get_mut("account").unwrap();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let guardian_ref = &guardian;
-            scope.spawn(move || {
-                tx.send(guardian_ref.update_config(configurable_policy()))
-                    .unwrap();
-            });
-            let result = rx.recv_timeout(Duration::from_secs(2));
-            drop(state);
-            result
-                .expect("config update must not acquire account state locks")
-                .unwrap();
-        });
-    }
-
-    #[test]
-    fn probe_claim_uses_current_expired_jail_level_once() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian.states.insert(
-            "account".into(),
-            AccountQoSState::Jailed {
-                level: 3,
-                jailed_at: Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-
-        assert_eq!(guardian.try_mark_probing("account").unwrap().level, 3);
-        assert!(matches!(
-            guardian.get_state("account"),
-            AccountQoSState::Probing { level: 3, .. }
-        ));
-        assert_eq!(guardian.try_mark_probing("account"), None);
-    }
-
-    #[test]
-    fn probe_claim_preserves_states_changed_after_candidate_scan() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let now = Instant::now();
-        for current in [
-            AccountQoSState::Healthy,
-            AccountQoSState::Suspicious {
-                first_strike_at: now,
-                strike_count: 1,
-                consecutive_healthy: 0,
-            },
-            AccountQoSState::Jailed {
-                level: 2,
-                jailed_at: now,
-                current_wait: Duration::from_secs(120),
-            },
-            AccountQoSState::Probing {
-                level: 1,
-                started_at: now,
-                claim_id: uuid::Uuid::new_v4(),
-            },
-            AccountQoSState::HalfOpen {
-                level: 1,
-                consecutive_healthy: 0,
-                entered_at: now,
-            },
-        ] {
-            // A candidate ID alone must not authorize overwriting its current state.
-            guardian.states.insert("account".into(), current.clone());
-            assert_eq!(guardian.try_mark_probing("account"), None, "{current:?}");
-            assert_eq!(guardian.get_state("account"), current);
-        }
-    }
-
-    #[test]
-    fn probe_claim_does_not_recreate_a_removed_account() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        assert_eq!(guardian.try_mark_probing("removed"), None);
-        assert!(!guardian.states.contains_key("removed"));
-    }
-
-    #[test]
-    fn probe_claim_has_one_winner_across_concurrent_scans() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        guardian.states.insert(
-            "account".into(),
-            AccountQoSState::Jailed {
-                level: 0,
-                jailed_at: Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-        let barrier = std::sync::Barrier::new(4);
-        let winners = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..4)
-                .map(|_| {
-                    scope.spawn(|| {
-                        barrier.wait();
-                        guardian.try_mark_probing("account").is_some()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| usize::from(handle.join().unwrap()))
-                .sum::<usize>()
-        });
-        assert_eq!(winners, 1);
-    }
-
-    fn expire_jail_and_claim(guardian: &QoSGuardian, account_id: &str) -> ProbeClaim {
-        {
-            let mut state = guardian.states.get_mut(account_id).unwrap();
-            let AccountQoSState::Jailed {
-                jailed_at,
-                current_wait,
-                ..
-            } = state.value_mut()
-            else {
-                panic!("expected a jailed account before probing");
-            };
-            *jailed_at = Instant::now() - *current_wait;
-        }
-        guardian.try_mark_probing(account_id).unwrap()
-    }
-
-    fn jail_for_probe(guardian: &QoSGuardian, level: usize) -> ProbeClaim {
-        guardian.states.insert(
-            "account".into(),
-            AccountQoSState::Jailed {
-                level,
-                jailed_at: Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-        guardian.try_mark_probing("account").unwrap()
-    }
-
-    #[test]
-    fn probe_completion_preserves_manual_reset_and_release() {
-        for reset in [QoSGuardian::reset_account, QoSGuardian::release_from_jail] {
-            let guardian = QoSGuardian::new();
-            guardian.set_auto_jail_enabled(true);
-            let claim = jail_for_probe(&guardian, 1);
-            guardian
-                .penalty_memory
-                .insert("account".into(), (1, Instant::now()));
-
-            reset(&guardian, "account");
-
-            assert!(!guardian.mark_probe_passed("account", claim));
-            assert_eq!(guardian.mark_probe_failed("account", claim), None);
-            assert_eq!(guardian.get_state("account"), AccountQoSState::Healthy);
-            assert!(!guardian.penalty_memory.contains_key("account"));
-        }
-    }
-
-    #[test]
-    fn probe_completion_does_not_recreate_a_removed_account() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let claim = jail_for_probe(&guardian, 1);
-        guardian.states.remove("account");
-
-        assert!(!guardian.mark_probe_passed("account", claim));
-        assert_eq!(guardian.mark_probe_failed("account", claim), None);
-        assert!(!guardian.states.contains_key("account"));
-        assert!(!guardian.penalty_memory.contains_key("account"));
-    }
-
-    #[test]
-    fn stale_probe_completion_preserves_a_new_claim_at_the_same_level() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let old_claim = jail_for_probe(&guardian, 1);
-        guardian.reset_account("account");
-        let new_claim = jail_for_probe(&guardian, 1);
-        let current = guardian.get_state("account");
-        assert_ne!(old_claim, new_claim);
-
-        assert!(!guardian.mark_probe_passed("account", old_claim));
-        assert_eq!(guardian.mark_probe_failed("account", old_claim), None);
-        assert_eq!(guardian.get_state("account"), current);
-        assert!(!guardian.penalty_memory.contains_key("account"));
-        assert!(guardian.mark_probe_passed("account", new_claim));
-        assert!(guardian.is_half_open("account"));
-    }
-
-    #[test]
-    fn stale_probe_completion_preserves_a_later_jail_and_penalty() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let claim = jail_for_probe(&guardian, 0);
-        let now = Instant::now();
-        let current = AccountQoSState::Jailed {
-            level: 3,
-            jailed_at: now,
-            current_wait: Duration::from_secs(guardian.config_snapshot().jail_ladder_secs[3]),
-        };
-        guardian.states.insert("account".into(), current.clone());
-        guardian.penalty_memory.insert("account".into(), (3, now));
-
-        assert!(!guardian.mark_probe_passed("account", claim));
-        assert_eq!(guardian.mark_probe_failed("account", claim), None);
-        assert_eq!(guardian.get_state("account"), current);
-        assert_eq!(*guardian.penalty_memory.get("account").unwrap(), (3, now));
-    }
-
-    #[test]
-    fn cache_first_promotion_preserves_live_jails_and_probes() {
-        let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
-        let claim = jail_for_probe(&guardian, 1);
-        let probing = guardian.get_state("account");
-        guardian.promote_to_half_open("account");
-        assert_eq!(guardian.get_state("account"), probing);
-        assert!(guardian.mark_probe_passed("account", claim));
-
-        let jailed = AccountQoSState::Jailed {
-            level: 2,
-            jailed_at: Instant::now(),
-            current_wait: Duration::from_secs(600),
-        };
-        guardian.states.insert("account".into(), jailed.clone());
-        guardian.promote_to_half_open("account");
-        assert_eq!(guardian.get_state("account"), jailed);
-
-        guardian.states.insert(
-            "account".into(),
-            AccountQoSState::Jailed {
-                level: 2,
-                jailed_at: Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-        guardian.promote_to_half_open("account");
-        assert!(guardian.is_half_open("account"));
-        guardian.states.remove("account");
-        guardian.promote_to_half_open("account");
-        assert!(!guardian.states.contains_key("account"));
-    }
-
-    #[test]
-    fn probe_completion_applies_only_once() {
-        for passes in [true, false] {
-            let guardian = QoSGuardian::new();
-            guardian.set_auto_jail_enabled(true);
-            let claim = jail_for_probe(&guardian, 1);
-            if passes {
-                assert!(guardian.mark_probe_passed("account", claim));
-            } else {
-                assert_eq!(
-                    guardian.mark_probe_failed("account", claim),
-                    Some((2, Duration::from_secs(10 * 60)))
-                );
-            }
-            let current = guardian.get_state("account");
-            let penalty = guardian.penalty_memory.get("account").map(|entry| *entry);
-
-            assert!(!guardian.mark_probe_passed("account", claim));
-            assert_eq!(guardian.mark_probe_failed("account", claim), None);
-            assert_eq!(guardian.get_state("account"), current);
-            assert_eq!(
-                guardian.penalty_memory.get("account").map(|entry| *entry),
-                penalty
-            );
-        }
-    }
 
     fn create_test_token(account_id: &str, tier: &str) -> ProxyToken {
         ProxyToken {
@@ -1903,13 +1134,14 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         }
     }
 
     #[test]
     fn test_pure_peer_baseline_filtering() {
         let guardian = QoSGuardian::new();
-        guardian.set_auto_jail_enabled(true);
         let acc_a = create_test_token("acc_a", "PRO");
         let acc_b = create_test_token("acc_b", "PRO");
         let acc_c = create_test_token("acc_c", "PRO");
@@ -2074,14 +1306,12 @@ mod tests {
         assert!(guardian.is_jailed_or_probing("acc_a"));
 
         // 探针失败 -> 升级为 Level 1 (5m)，时间从 0 重新计时
-        let failed_claim = expire_jail_and_claim(&guardian, "acc_a");
-        let (next_lv, wait) = guardian.mark_probe_failed("acc_a", failed_claim).unwrap();
+        let (next_lv, wait) = guardian.mark_probe_failed("acc_a", 0);
         assert_eq!(next_lv, 1);
         assert_eq!(wait, Duration::from_secs(5 * 60));
 
         // 下一次探针成功 (<8s) -> 转移到 HalfOpen 缓刑期
-        let passed_claim = expire_jail_and_claim(&guardian, "acc_a");
-        assert!(guardian.mark_probe_passed("acc_a", passed_claim));
+        guardian.mark_probe_passed("acc_a", 1);
         assert!(guardian.is_half_open("acc_a"));
 
         // 缓刑期间真实业务请求连续 2 次通过 (<8s) -> 正式满血出狱
@@ -2254,7 +1484,7 @@ mod tests {
         let g = guardian.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let expired = g.take_expired_jails_for_probing(|id, _| Some(id.to_string()));
+            let expired = g.take_expired_jails_for_probing();
             let _ = tx.send(expired);
         });
 
@@ -2265,7 +1495,7 @@ mod tests {
         // 断言：仅已到期账号被取出
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "acc_expired");
-        assert_eq!(result[0].1.level, 0);
+        assert_eq!(result[0].1, 0);
 
         // 断言：到期账号状态已原子转换为 Probing
         match guardian.get_state("acc_expired") {
@@ -2280,7 +1510,7 @@ mod tests {
         }
 
         // 断言：再次调用不会重复取出（已在 Probing 中）
-        let second_run = guardian.take_expired_jails_for_probing(|id, _| Some(id.to_string()));
+        let second_run = guardian.take_expired_jails_for_probing();
         assert!(second_run.is_empty());
     }
 

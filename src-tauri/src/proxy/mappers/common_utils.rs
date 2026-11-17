@@ -554,53 +554,32 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
     }
 }
 
-/// Remove client placeholders only from known Gemini control fields.
-/// Text, tool arguments/results and schemas may legitimately contain this literal.
-pub fn clean_undefined_control_fields(body: &mut Value) {
-    fn clean_fields(value: &mut Value, fields: &[&str]) {
-        if let Some(object) = value.as_object_mut() {
-            for field in fields {
-                if object.get(*field).and_then(Value::as_str) == Some("[undefined]") {
-                    object.remove(*field);
+/// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
+pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
+    if depth > 10 {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            // 移除值为 "[undefined]" 的键
+            map.retain(|_, v| {
+                if let Some(s) = v.as_str() {
+                    s != "[undefined]"
+                } else {
+                    true
                 }
+            });
+            // 递归处理嵌套
+            for v in map.values_mut() {
+                deep_clean_undefined(v, depth + 1);
             }
         }
-    }
-
-    let body = if body.get("request").is_some_and(Value::is_object) {
-        &mut body["request"]
-    } else {
-        body
-    };
-    if let Some(config) = body.get_mut("generationConfig") {
-        clean_fields(
-            config,
-            &[
-                "temperature",
-                "topP",
-                "topK",
-                "candidateCount",
-                "maxOutputTokens",
-                "presencePenalty",
-                "frequencyPenalty",
-                "seed",
-                "responseMimeType",
-                "responseLogprobs",
-                "logprobs",
-            ],
-        );
-        if let Some(thinking) = config.get_mut("thinkingConfig") {
-            clean_fields(
-                thinking,
-                &["thinkingBudget", "thinkingLevel", "includeThoughts"],
-            );
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                deep_clean_undefined(v, depth + 1);
+            }
         }
-        if let Some(image) = config.get_mut("imageConfig") {
-            clean_fields(image, &["aspectRatio", "imageSize", "personGeneration"]);
-        }
-    }
-    if let Some(calling) = body.pointer_mut("/toolConfig/functionCallingConfig") {
-        clean_fields(calling, &["mode"]);
+        _ => {}
     }
 }
 
@@ -779,158 +758,42 @@ pub fn map_claude_tool_choice_to_gemini(tool_choice: &Value) -> Option<Value> {
     }
 }
 
-/// Resolve selectors against the final declarations, so namespace qualification
-/// and allowed-tool filtering cannot leave a dangling function name upstream.
-pub fn map_openai_tool_choice_to_gemini(
-    tool_choice: &Value,
-    declarations: &mut Vec<Value>,
-    tools: &[Value],
-) -> Result<Option<Value>, String> {
-    let config = |mode: &str| json!({"functionCallingConfig": {"mode": mode}});
+/// 将 OpenAI 的 tool_choice 规范化映射为 Google Gemini 标准的 toolConfig
+/// 遵循“客户端有就传，没有就不传”原则：支持 "auto", "required", "none" 及 {"type": "function", "function": {"name": "..."}}
+pub fn map_openai_tool_choice_to_gemini(tool_choice: &Value) -> Option<Value> {
     if let Some(s) = tool_choice.as_str() {
-        return match s.to_lowercase().as_str() {
-            "auto" => Ok(Some(config("AUTO"))),
-            "required" if !declarations.is_empty() => Ok(Some(config("ANY"))),
-            "none" => Ok(Some(config("NONE"))),
-            _ => Err("tool_choice requires a supported mode and declared tools".into()),
-        };
-    }
-    if tool_choice.is_null() {
-        return Ok(None);
-    }
-
-    let is_builtin = |kind: &str| {
-        matches!(
-            kind,
-            "web_search"
-                | "web_search_preview"
-                | "file_search"
-                | "code_interpreter"
-                | "computer_use_preview"
-                | "image_generation"
-                | "mcp"
-                | "apply_patch"
-                | "shell"
-                | "local_shell"
-        )
-    };
-    let choice_kind = tool_choice
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if is_builtin(choice_kind) && tools.iter().any(|tool| tool["type"] == choice_kind) {
-        // These server tools are not client functions. Retain the existing
-        // best-effort adapter behavior instead of rejecting their nameless selector.
-        return Ok(None);
-    }
-    let tool_kinds =
-        crate::proxy::mappers::openai::request::ResponsesToolKinds::from_tools(Some(tools));
-
-    let resolve = |selector: &Value| -> Result<Vec<String>, String> {
-        let kind = selector.get("type").and_then(Value::as_str).unwrap_or("");
-        let function = selector
-            .get("function")
-            .or_else(|| selector.get("custom"))
-            .unwrap_or(selector);
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| is_builtin(kind).then_some(kind))
-            .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| "tool_choice selector requires a tool name".to_string())?;
-        let namespace = selector
-            .get("namespace")
-            .or_else(|| function.get("namespace"))
-            .and_then(Value::as_str);
-        let qualified = tool_kinds.backend_name(name, namespace);
-        let names: Vec<String> = match kind {
-            "function" | "custom" => declarations
-                .iter()
-                .filter_map(|decl| decl["name"].as_str())
-                .filter(|declared| *declared == qualified)
-                .filter(|declared| {
-                    namespace.is_none_or(|ns| {
-                        tool_kinds
-                            .qualified_names_in_namespace(ns)
-                            .contains(declared)
-                    })
-                })
-                .map(str::to_owned)
-                .collect(),
-            "namespace" => {
-                let selected_namespace = namespace.map_or_else(
-                    || name.to_owned(),
-                    |ns| {
-                        crate::proxy::mappers::openai::request::qualify_namespace_tool_name(
-                            ns, name,
-                        )
-                    },
-                );
-                let members = tool_kinds.qualified_names_in_namespace(&selected_namespace);
-                declarations
-                    .iter()
-                    .filter_map(|decl| decl["name"].as_str())
-                    .filter(|declared| members.contains(declared))
-                    .map(str::to_owned)
-                    .collect()
-            }
-            kind if is_builtin(kind) => declarations
-                .iter()
-                .filter_map(|decl| decl["name"].as_str())
-                .filter(|declared| *declared == name)
-                .map(str::to_owned)
-                .collect(),
-            _ => return Err(format!("Unsupported tool_choice selector type: {kind}")),
-        };
-        if names.is_empty() {
-            return Err(format!(
-                "tool_choice references an undeclared tool: {qualified}"
-            ));
+        match s.to_lowercase().as_str() {
+            "auto" => Some(json!({
+                "functionCallingConfig": { "mode": "AUTO" }
+            })),
+            "required" => Some(json!({
+                "functionCallingConfig": { "mode": "ANY" }
+            })),
+            "none" => Some(json!({
+                "functionCallingConfig": { "mode": "NONE" }
+            })),
+            _ => None,
         }
-        Ok(names)
-    };
-
-    let is_allowed = tool_choice["type"] == "allowed_tools";
-    let (mode, selected) = if is_allowed {
-        let policy = tool_choice.get("allowed_tools").unwrap_or(tool_choice);
-        let mode = match policy.get("mode").and_then(Value::as_str) {
-            Some("auto") => "AUTO",
-            Some("required") => "ANY",
-            _ => return Err("allowed_tools requires mode auto or required".into()),
-        };
-        let selectors = policy
-            .get("tools")
-            .and_then(Value::as_array)
-            .filter(|tools| !tools.is_empty())
-            .ok_or_else(|| "allowed_tools requires a non-empty tool list".to_string())?;
-        let mut selected = HashSet::new();
-        for selector in selectors {
-            selected.extend(resolve(selector)?);
+    } else if let Some(obj) = tool_choice.as_object() {
+        let choice_type = obj.get("type").and_then(Value::as_str);
+        if choice_type == Some("function") {
+            let func_name = obj
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("name").and_then(Value::as_str))?;
+            Some(json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [func_name]
+                }
+            }))
+        } else {
+            None
         }
-        (mode, selected)
     } else {
-        ("ANY", resolve(tool_choice)?.into_iter().collect())
-    };
-    // Preserve declaration order. AUTO does not support allowedFunctionNames,
-    // so filter the declarations themselves for both allowed_tools modes.
-    let names: Vec<String> = declarations
-        .iter()
-        .filter_map(|decl| decl["name"].as_str())
-        .filter(|name| selected.contains(*name))
-        .map(str::to_owned)
-        .collect();
-    if is_allowed {
-        declarations.retain(|decl| {
-            decl["name"]
-                .as_str()
-                .is_some_and(|name| selected.contains(name))
-        });
+        None
     }
-    let mut result = config(mode);
-    if mode == "ANY" {
-        result["functionCallingConfig"]["allowedFunctionNames"] = json!(names);
-    }
-    Ok(Some(result))
 }
 
 /// 检测是否携带任何工具定义 (无论是本地函数还是联网工具)
@@ -1590,89 +1453,6 @@ mod tests {
     }
 
     #[test]
-    fn r36_text_attachments_use_shared_readable_projection_with_aliases_and_metadata() {
-        use base64::{engine::general_purpose, Engine as _};
-        for (mime, text) in [
-            ("text/plain", "x"),
-            ("text/markdown", "# 中文\n**正文**"),
-            ("text/csv", "name,value\na,1"),
-            ("text/html", "<p>DOC_36</p>"),
-            ("Text/Plain; charset=utf-8", "UTF8_36"),
-        ] {
-            let data = general_purpose::STANDARD.encode(text);
-            assert_eq!(
-                create_gemini_inline_part(Some(mime), &data, "File"),
-                json!({"text":text})
-            );
-            for wrapped in [false, true] {
-                let body = json!({
-                    "contents":[{"role":"user","parts":[{"inline_data":{"mime_type":mime,"data":data},"thoughtSignature":"KEEP_SIGNATURE_36"}]}],
-                    "system_instruction":{"parts":[{"inlineData":{"mimeType":mime,"data":data}}]}
-                });
-                let mut body = if wrapped {
-                    json!({"request":body})
-                } else {
-                    body
-                };
-                assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 0);
-                let inner = if wrapped { &body["request"] } else { &body };
-                assert_eq!(
-                    inner["contents"][0]["parts"][0],
-                    json!({"text":text,"thoughtSignature":"KEEP_SIGNATURE_36"})
-                );
-                assert_eq!(
-                    inner["system_instruction"]["parts"][0],
-                    json!({"text":text})
-                );
-                let once = body.clone();
-                assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 0);
-                assert_eq!(body, once);
-            }
-        }
-        let unicode = "???中文";
-        let data = general_purpose::URL_SAFE.encode(unicode);
-        assert!(data.contains('_'));
-        assert_eq!(
-            create_gemini_inline_part(Some("text/plain"), &data, "File"),
-            json!({"text":unicode})
-        );
-    }
-
-    #[test]
-    fn r36_text_projection_keeps_binary_validation_and_rejects_invalid_text() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-        let json_data = STANDARD.encode(r#"{"value":"JSON_36"}"#);
-        let audio = STANDARD.encode([1, 2, 3]);
-        let text = STANDARD.encode("DOC_BODY_36");
-        let invalid_utf8 = STANDARD.encode([0xff, 0xfe, 0xff]);
-        let mut body = json!({"contents":[{"role":"user","parts":[
-            {"inlineData":{"mimeType":"image/png","data":png}},
-            {"inlineData":{"mimeType":"application/json","data":json_data}},
-            {"inlineData":{"mimeType":"audio/wav","data":audio}},
-            {"inlineData":{"mimeType":"image/png","data":text}},
-            {"inlineData":{"mimeType":"application/pdf","data":text}},
-            {"inlineData":{"mimeType":"text/plain","data":invalid_utf8}},
-            {"inlineData":{"mimeType":"text/plain","data":"INVALID_BASE64!"}}
-        ]}]});
-        assert_eq!(sanitize_gemini_payload_inline_data(&mut body), 4);
-        let parts = body["contents"][0]["parts"].as_array().unwrap();
-        for (index, mime, data) in [
-            (0, "image/png", png),
-            (1, "application/json", json_data.as_str()),
-            (2, "audio/wav", audio.as_str()),
-        ] {
-            assert_eq!(
-                parts[index]["inlineData"],
-                json!({"mimeType":mime,"data":data})
-            );
-        }
-        assert!(parts[3..].iter().all(|part| part["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("invalid or corrupted"))));
-    }
-
-    #[test]
     fn test_sanitize_gemini_payload_inline_data() {
         let valid_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let mut payload = json!({
@@ -1853,211 +1633,53 @@ mod tests {
     }
 }
 
-// Strip visible container prefixes for block recognition; offsets still refer
-// to the original text so protected source is always retained verbatim.
-fn markdown_unquote_line(mut line: &str) -> &str {
-    loop {
-        let trimmed = line.trim_start_matches(' ');
-        if line.len() - trimmed.len() > 3 || !trimmed.starts_with('>') {
-            return line;
-        }
-        line = &trimmed[1..];
-        if line.starts_with([' ', '\t']) {
-            line = &line[1..];
-        }
-    }
-}
-
-fn markdown_list_content_start(line: &str, active_indent: Option<usize>) -> Option<usize> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    if indent > 3 && !active_indent.is_some_and(|active| indent >= active) {
-        return None;
-    }
-    let bytes = trimmed.as_bytes();
-    let marker_len = match bytes.first()? {
-        b'-' | b'+' | b'*' => 1,
-        b'0'..=b'9' => {
-            let digits = bytes
-                .iter()
-                .take_while(|byte| byte.is_ascii_digit())
-                .count();
-            if digits > 9 || !matches!(bytes.get(digits), Some(b'.' | b')')) {
-                return None;
-            }
-            digits + 1
-        }
-        _ => return None,
-    };
-    if !matches!(bytes.get(marker_len), Some(b' ' | b'\t')) {
-        return None;
-    }
-    Some(indent + marker_len + 1)
-}
-
-/// Markdown code is source text, not a visual input. Keep this recognition shared
-/// by normal message text and tool output before either lowers images to Gemini.
-fn markdown_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut blocks = Vec::new();
-    let mut fence: Option<(u8, usize, usize)> = None;
-    let mut list_indent = None;
-    let mut offset = 0;
-    for source_line in text.split_inclusive('\n') {
-        let mut line = markdown_unquote_line(source_line);
-        if fence.is_none() {
-            if let Some(start) = markdown_list_content_start(line, list_indent) {
-                list_indent = Some(start);
-                line = &line[start..];
-            } else if let Some(indent) = list_indent {
-                if line.as_bytes().iter().take_while(|&&b| b == b' ').count() >= indent {
-                    line = &line[indent..];
-                } else if !line.trim().is_empty() {
-                    list_indent = None;
-                }
-            }
-        } else if let Some(indent) = list_indent {
-            if line.as_bytes().iter().take_while(|&&b| b == b' ').count() >= indent {
-                line = &line[indent..];
-            }
-        }
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        let bytes = trimmed.as_bytes();
-        let marker = bytes.first().copied().unwrap_or_default();
-        let run = bytes.iter().take_while(|&&b| b == marker).count();
-        if let Some((opening, length, start)) = fence {
-            if indent <= 3 && marker == opening && run >= length && trimmed[run..].trim().is_empty()
-            {
-                blocks.push(start..offset + source_line.len());
-                fence = None;
-            }
-        } else if indent <= 3
-            && matches!(marker, b'`' | b'~')
-            && run >= 3
-            && (marker != b'`' || !trimmed[run..].contains('`'))
-        {
-            fence = Some((marker, run, offset));
-        } else if indent >= 4 || line.starts_with('\t') {
-            blocks.push(offset..offset + source_line.len());
-        }
-        offset += source_line.len();
-    }
-    if let Some((_, _, start)) = fence {
-        blocks.push(start..text.len());
-    }
-
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for block in blocks {
-        markdown_inline_code_ranges(text, start..block.start, &mut ranges);
-        start = block.end;
-        ranges.push(block);
-    }
-    markdown_inline_code_ranges(text, start..text.len(), &mut ranges);
-    ranges
-}
-
-fn markdown_is_escaped(text: &str, position: usize) -> bool {
-    text.as_bytes()[..position]
-        .iter()
-        .rev()
-        .take_while(|&&b| b == b'\\')
-        .count()
-        % 2
-        == 1
-}
-
-fn markdown_inline_code_ranges(
-    text: &str,
-    range: std::ops::Range<usize>,
-    ranges: &mut Vec<std::ops::Range<usize>>,
-) {
-    let bytes = text.as_bytes();
-    let mut runs = Vec::new();
-    let mut cursor = range.start;
-    while cursor < range.end {
-        if bytes[cursor] != b'`' {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        while cursor < range.end && bytes[cursor] == b'`' {
-            cursor += 1;
-        }
-        runs.push(start..cursor);
-    }
-    // Index the next exact-length delimiter once, including escaped closing
-    // ticks (backslashes are literal inside code), to avoid quadratic scans.
-    let mut next_by_length = std::collections::HashMap::new();
-    let mut closing = vec![None; runs.len()];
-    for (index, run) in runs.iter().enumerate().rev() {
-        closing[index] = next_by_length.insert(run.len(), index);
-    }
-    let mut index = 0;
-    while index < runs.len() {
-        if !markdown_is_escaped(text, runs[index].start) {
-            if let Some(end) = closing[index] {
-                ranges.push(runs[index].start..runs[end].end);
-                index = end + 1;
-                continue;
-            }
-        }
-        index += 1;
-    }
-}
-
-fn markdown_image_matches(text: &str) -> Vec<(std::ops::Range<usize>, &str, &str)> {
-    static IMAGE: Lazy<Option<regex::Regex>> = Lazy::new(|| {
-        regex::Regex::new(
-            r"!\[(?:\\.|[^\]\\])*\]\(data:(image/[^;\s)]+);base64,([a-zA-Z0-9+/=]+)\)",
-        )
-        .ok()
-    });
-    let Some(pattern) = IMAGE.as_ref() else {
-        return Vec::new();
-    };
-    if !text.contains("data:image/") {
-        return Vec::new();
-    }
-    let code = markdown_code_ranges(text);
-    let mut code_index = 0;
-    pattern
-        .captures_iter(text)
-        .filter_map(|capture| {
-            let (matched, mime, data) = (capture.get(0)?, capture.get(1)?, capture.get(2)?);
-            while code_index < code.len() && code[code_index].end <= matched.start() {
-                code_index += 1;
-            }
-            if markdown_is_escaped(text, matched.start())
-                || code
-                    .get(code_index)
-                    .is_some_and(|range| range.start < matched.end())
-            {
-                return None;
-            }
-            Some((matched.range(), mime.as_str(), data.as_str()))
-        })
-        .collect()
-}
-
-/// Promote rendered Markdown data images while retaining literal source examples.
+/// [FIX] Parse markdown base64 images from text and split into Gemini parts
+/// This prevents base64 reflection bloat where generated images are sent back as huge text strings
 pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
     let mut parts = Vec::new();
-    let mut last_match = 0;
-    for (matched, mime, data) in markdown_image_matches(text) {
-        if matched.start > last_match {
-            parts.push(json!({"text": &text[last_match..matched.start]}));
+    // Match ![...](data:image/...;base64,...)
+    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
+        let mut last_match = 0;
+
+        for cap in re.captures_iter(text) {
+            let m = cap.get(0).unwrap();
+
+            // Add preceding text
+            if m.start() > last_match {
+                let preceding = &text[last_match..m.start()];
+                if !preceding.trim().is_empty() {
+                    parts.push(json!({"text": preceding}));
+                }
+            }
+
+            // Add inlineData image
+            let mime = cap.get(1).unwrap().as_str();
+            let b64 = cap.get(2).unwrap().as_str();
+            let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
+            parts.push(part);
+
+            last_match = m.end();
         }
-        parts.push(create_gemini_inline_part(
-            Some(mime),
-            data,
-            "Markdown Image",
-        ));
-        last_match = matched.end;
+
+        // Add remaining text
+        if last_match < text.len() {
+            let remaining = &text[last_match..];
+            if !remaining.trim().is_empty() {
+                parts.push(json!({"text": remaining}));
+            }
+        }
+
+        if parts.is_empty() && !text.trim().is_empty() {
+            parts.push(json!({"text": text}));
+        }
+
+        return parts;
     }
-    if last_match < text.len() {
-        parts.push(json!({"text": &text[last_match..]}));
+
+    if !text.trim().is_empty() {
+        parts.push(json!({"text": text}));
     }
+
     parts
 }
 
@@ -2158,32 +1780,42 @@ pub fn extract_multimodal_from_tool_text(raw_text: &str, extra_parts: &mut Vec<V
         }
     }
 
-    // Use the same Markdown source boundaries as normal message text.
-    let mut clean_text = String::new();
-    let mut last_match = 0;
-    for (matched, mime_type, b64_data) in markdown_image_matches(raw_text) {
-        if !is_supported_tool_image_mime(mime_type) {
-            continue;
+    // 3. 严格检测 Markdown 图片语法：![alt](data:image/...;base64,...)
+    // 只有明确采用 Markdown 图片语法的结构才允许解构提取，绝不从普通文本/终端输出中模糊切词匹配
+    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
+        let mut clean_text = String::new();
+        let mut last_match = 0;
+        let mut found_image = false;
+
+        for cap in re.captures_iter(raw_text) {
+            let m = cap.get(0).unwrap();
+            let mime_type = cap.get(1).unwrap().as_str();
+            let b64_data = cap.get(2).unwrap().as_str();
+
+            if is_supported_tool_image_mime(mime_type) {
+                if let Some((valid_mime, valid_b64)) =
+                    validate_and_sanitize_inline_data(Some(mime_type), b64_data)
+                {
+                    clean_text.push_str(&raw_text[last_match..m.start()]);
+                    extra_parts.push(create_gemini_inline_part(
+                        Some(&valid_mime),
+                        &valid_b64,
+                        "Tool Result Image",
+                    ));
+                    clean_text.push_str(&format!(
+                        "[Image: forwarded to visual input ({})]",
+                        valid_mime
+                    ));
+                    last_match = m.end();
+                    found_image = true;
+                }
+            }
         }
-        if let Some((valid_mime, valid_b64)) =
-            validate_and_sanitize_inline_data(Some(mime_type), b64_data)
-        {
-            clean_text.push_str(&raw_text[last_match..matched.start]);
-            extra_parts.push(create_gemini_inline_part(
-                Some(&valid_mime),
-                &valid_b64,
-                "Tool Result Image",
-            ));
-            clean_text.push_str(&format!(
-                "[Image: forwarded to visual input ({})]",
-                valid_mime
-            ));
-            last_match = matched.end;
+
+        if found_image {
+            clean_text.push_str(&raw_text[last_match..]);
+            return clean_text;
         }
-    }
-    if last_match > 0 {
-        clean_text.push_str(&raw_text[last_match..]);
-        return clean_text;
     }
 
     // 4. 普通纯文本（代码、日志、测试数据等）：对齐官方原生，100% 原始透传，绝不破坏文本内容
@@ -2369,74 +2001,19 @@ pub fn validate_and_sanitize_inline_data(
     Some((final_mime, clean_b64.to_string()))
 }
 
-/// Forward a remote media source for the upstream to read, keeping signed URLs intact.
-/// MIME hints are advisory; extensionless URLs use the caller's media default.
-pub fn create_gemini_file_part(
-    source_uri: &str,
-    mime_type: Option<&str>,
-    default_mime: &str,
-) -> Result<Value, String> {
-    let parsed = reqwest::Url::parse(source_uri)
-        .map_err(|_| "Media source URL must be an absolute HTTP(S) or gs URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https" | "gs") || parsed.host_str().is_none() {
-        return Err("Media source URL must be an absolute HTTP(S) or gs URL".to_string());
-    }
-    let extension = parsed.path().rsplit('.').next().unwrap_or_default();
-    let inferred_mime = match extension.to_ascii_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "heic" | "heif" => "image/heic",
-        "avif" => "image/avif",
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        "md" => "text/markdown",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "html" | "htm" => "text/html",
-        _ => default_mime,
-    };
-    let mime = mime_type
-        .map(str::trim)
-        .filter(|mime| !mime.is_empty())
-        .unwrap_or(inferred_mime);
-    Ok(json!({"fileData": {"fileUri": source_uri, "mimeType": mime}}))
-}
-
-fn normalized_inline_part(mime_type: Option<&str>, b64_data: &str) -> Option<Value> {
-    let is_text = mime_type.is_some_and(|mime| {
-        mime.split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("text/")
-    });
-    if is_text {
-        use base64::{engine::general_purpose, Engine as _};
-        let data = general_purpose::STANDARD
-            .decode(b64_data.trim())
-            .or_else(|_| general_purpose::URL_SAFE.decode(b64_data.trim()))
-            .ok()?;
-        // Text files have no image magic or minimum size. Project their UTF-8
-        // body as text so every adapter can use it without MIME support upstream.
-        return String::from_utf8(data)
-            .ok()
-            .map(|text| json!({"text": text}));
-    }
-    let (mime, data) = validate_and_sanitize_inline_data(mime_type, b64_data)?;
-    Some(json!({"inlineData": {"mimeType": mime, "data": data}}))
-}
-
-/// Create a readable text part, validated binary inlineData, or a fallback for invalid data.
+/// Helper to create a Gemini inlineData part or fallback text if invalid
 pub fn create_gemini_inline_part(
     mime_type: Option<&str>,
     b64_data: &str,
     fallback_label: &str,
 ) -> Value {
-    if let Some(part) = normalized_inline_part(mime_type, b64_data) {
-        part
+    if let Some((valid_mime, valid_data)) = validate_and_sanitize_inline_data(mime_type, b64_data) {
+        json!({
+            "inlineData": {
+                "mimeType": valid_mime,
+                "data": valid_data
+            }
+        })
     } else {
         tracing::warn!(
             "[Image-Defense] Omitted invalid or corrupt base64 data (len: {}, mime: {:?})",
@@ -2450,8 +2027,7 @@ pub fn create_gemini_inline_part(
 }
 
 /// Sanitizes any inlineData in an entire Gemini JSON request payload in-place.
-/// Projects UTF-8 text attachments into readable text and replaces invalid binary
-/// inlineData / inline_data parts with placeholders. Returns the invalid part count.
+/// Replaces invalid inlineData / inline_data parts with placeholder text parts.
 pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
     let mut total_sanitized = 0;
 
@@ -2476,9 +2052,20 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
 
-                    if let Some(Value::Object(normalized)) = normalized_inline_part(mime, data) {
-                        obj.remove(key);
-                        obj.extend(normalized);
+                    if let Some((valid_mime, valid_data)) =
+                        validate_and_sanitize_inline_data(mime, data)
+                    {
+                        // Ensure mimeType and data are normalized
+                        obj.insert(
+                            "inlineData".to_string(),
+                            json!({
+                                "mimeType": valid_mime,
+                                "data": valid_data
+                            }),
+                        );
+                        if key == "inline_data" {
+                            obj.remove("inline_data");
+                        }
                     } else {
                         total_sanitized += 1;
                         tracing::warn!(
@@ -2530,12 +2117,6 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
 ///
 /// 返回被降级替换的图像数量。
 pub fn purge_corrupted_images_from_gemini_payload(body: &mut Value) -> usize {
-    omit_images_from_gemini_payload(body, true)
-}
-
-/// Prepare/replay omission without publishing a global blacklist change until
-/// the retry policy has approved it.
-pub fn omit_images_from_gemini_payload(body: &mut Value, record_blacklist: bool) -> usize {
     let root = if body.get("request").is_some() {
         body.get_mut("request").unwrap()
     } else {
@@ -2587,13 +2168,13 @@ pub fn omit_images_from_gemini_payload(body: &mut Value, record_blacklist: bool)
     }
 
     // 2. 根据单图 vs 多图策略判定是否写入全局持久黑名单 (Review 建议 #1)
-    if record_blacklist && total_images == 1 {
+    if total_images == 1 {
         // 单图场景：100% 确认该图片为上游解码失败源，记录全局黑名单安全可靠
         record_corrupted_image_hash(&image_data_list[0]);
         tracing::warn!(
             "[Image-Defense] Single-image request encountered 400. Purged to placeholder and recorded hash to blacklist."
         );
-    } else if record_blacklist {
+    } else {
         // 多图场景：上游 400 无法指明具体哪张图片损坏。
         // 为保障当前轮次自愈恢复，全部降级为占位符；但不将所有哈希写入全局黑名单，避免健康图片被误杀
         tracing::warn!(
@@ -3338,26 +2919,19 @@ mod defense_tests {
 
     #[test]
     fn test_map_openai_tool_choice_to_gemini() {
-        let mut declarations = vec![json!({"name":"query_db"})];
         // 1. "auto"
         let auto_choice = json!("auto");
-        let mapped = map_openai_tool_choice_to_gemini(&auto_choice, &mut declarations, &[])
-            .unwrap()
-            .unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&auto_choice).unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "AUTO");
 
         // 2. "required"
         let req_choice = json!("required");
-        let mapped = map_openai_tool_choice_to_gemini(&req_choice, &mut declarations, &[])
-            .unwrap()
-            .unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&req_choice).unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "ANY");
 
         // 3. "none"
         let none_choice = json!("none");
-        let mapped = map_openai_tool_choice_to_gemini(&none_choice, &mut declarations, &[])
-            .unwrap()
-            .unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&none_choice).unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "NONE");
 
         // 4. {"type": "function", "function": {"name": "query_db"}}
@@ -3365,9 +2939,7 @@ mod defense_tests {
             "type": "function",
             "function": { "name": "query_db" }
         });
-        let mapped = map_openai_tool_choice_to_gemini(&func_choice, &mut declarations, &[])
-            .unwrap()
-            .unwrap();
+        let mapped = map_openai_tool_choice_to_gemini(&func_choice).unwrap();
         assert_eq!(mapped["functionCallingConfig"]["mode"], "ANY");
         assert_eq!(
             mapped["functionCallingConfig"]["allowedFunctionNames"][0],

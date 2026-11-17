@@ -155,8 +155,6 @@ pub async fn internal_start_proxy_service(
     integration: crate::modules::integration::SystemManager,
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<ProxyStatus, String> {
-    config.qos.validate()?;
-    let _config_guard = crate::modules::config::config_apply_guard().await;
     // 1. 检查状态并加锁
     {
         let instance_lock = state.instance.read().await;
@@ -201,7 +199,7 @@ pub async fn internal_start_proxy_service(
     let _monitor = state.monitor.read().await.as_ref().unwrap().clone();
 
     // 檢查並啟動管理服務器（如果尚未運行）
-    ensure_admin_server_inner(
+    ensure_admin_server(
         config.clone(),
         state,
         integration.clone(),
@@ -220,8 +218,7 @@ pub async fn internal_start_proxy_service(
             .clone()
     };
 
-    // A reused admin server owns the live QoS policy, which may have changed
-    // since this start request was created. New servers apply it in start().
+    // 同步配置到运行中的 TokenManager
     token_manager.start_auto_cleanup().await;
     token_manager
         .update_sticky_config(config.scheduling.clone())
@@ -290,18 +287,6 @@ pub async fn ensure_admin_server(
     integration: crate::modules::integration::SystemManager,
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<(), String> {
-    config.qos.validate()?;
-    let _config_guard = crate::modules::config::config_apply_guard().await;
-    ensure_admin_server_inner(config, state, integration, cloudflared_state).await
-}
-
-// Caller holds config_apply_guard; internal_start_proxy_service already holds it.
-async fn ensure_admin_server_inner(
-    config: ProxyConfig,
-    state: &ProxyServiceState,
-    integration: crate::modules::integration::SystemManager,
-    cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
-) -> Result<(), String> {
     let mut admin_lock = state.admin_server.write().await;
     if admin_lock.is_some() {
         return Ok(());
@@ -357,7 +342,6 @@ async fn ensure_admin_server_inner(
         config.proxy_pool.clone(),
         config.only_raw_quota_models,
         config.image_scheduler.clone(),
-        config.qos,
     )
     .await
     {
@@ -1216,7 +1200,6 @@ mod tests {
             config.proxy_pool.clone(),
             config.only_raw_quota_models,
             config.image_scheduler.clone(),
-            config.qos,
         )
         .await
         .expect("AxumServer::start on ephemeral port");
