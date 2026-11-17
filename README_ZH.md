@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.10)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.11)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.10-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.11-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -530,7 +530,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.10**（2026-11-17）：补齐失败尝试诊断，集成提示词与 MCP 兼容实验修复。复审已剔除会破坏工具调用的改名，429 改善仍待生产验证。详见[发布说明](CHANGELOG.md)。PR #19，上游 #3976/#3980（Thanks to @DNAlec, @cubelikeplayDaniel, @Lucas-Qh-Lai）。
+> 最新版本 **v5.0.11**（2026-11-17）：整版迁移上游 beta14，包含提示词侧载和账户修复（PR #20，上游 #3981/#3982/#3983）。升级前备份配置与数据；旧 fork QoS/诊断实现已替换。详见[发布说明](CHANGELOG.md)。Thanks to @DNAlec, @lbjlaq, @cubelikeplayDaniel, @muzisuisuisui, @ThermalEng, @Lucas-Qh-Lai。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

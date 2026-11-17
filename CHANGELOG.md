@@ -3,6 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.11 (2026-11-17)**:
+        -   **[整版迁移] (PR [#20](https://github.com/DNAlec/Antigravity-Manager/pull/20), Thanks to @DNAlec, @lbjlaq)**: 应用实现对齐上游 v5.0.4-beta.14（66bc8ba7）；兼容适配后续由 sub2api 承担，保留 Docker Compose 发布和禁用上游自动安装更新的策略。
+        -   **[提示词与风控] (上游 #3981/#3982/#3983、PR #3976, Thanks to @muzisuisuisui, @cubelikeplayDaniel, @lbjlaq)**: 引入 Pi/WorkBuddy/Codex/DSH 触发文本改写、系统提示侧载和规则作用范围；采用发布标签行为，不包含 #3976 尚未进入标签的后续改动。
+        -   **[账户与协议] (上游 PR #3970/#3978/#3980, Ref #3960/#3974/#3979, Thanks to @cubelikeplayDaniel, @ThermalEng, @Lucas-Qh-Lai)**: 引入 PAYGO/项目 ID 支持、aicode OAuth scope、MCP namespace 和模型误冻结修复。
+        -   **升级与回滚**: 替换 fork 的 QoS、缓存及失败尝试诊断实现。部署前一致性备份完整数据目录与配置；保存配置会丢弃旧 proxy.qos 字段，回滚需同时恢复旧镜像和备份。检查已有自定义规则及工具名兼容性。
+        -   **验证边界**: 264 项定向 Rust 测试通过，1 项上游 OpenAI 系统提示旧断言失败；TypeScript 和 sub2api TestAM 转换测试通过。429 改善和真实客户端兼容性仍需生产验证。
+
     *   **v5.0.10 (2026-11-17)**:
         -   **[失败诊断] (PR [#19](https://github.com/DNAlec/Antigravity-Manager/pull/19), Ref 上游 #3975, Thanks to @DNAlec)**: 在统一出站层保留失败请求的端点类别、状态和耗时，仅写本地日志，不改变客户端响应或重试策略。
         -   **[提示词兼容实验] (上游 PR [#3976](https://github.com/lbjlaq/Antigravity-Manager/pull/3976), Ref #3972, Thanks to @cubelikeplayDaniel)**: 接入交互式 Agent 前导句和行内规则处理，收窄匹配以保留后续指令。复审剔除缺少执行映射的 session-move 改名；未纳入已关闭的 #3977。

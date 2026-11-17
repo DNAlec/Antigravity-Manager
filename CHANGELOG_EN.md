@@ -3,6 +3,13 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.11 (2026-11-17)**:
+        -   **[Full upstream migration] (PR [#20](https://github.com/DNAlec/Antigravity-Manager/pull/20), Thanks to @DNAlec, @lbjlaq)**: Align application behavior with upstream v5.0.4-beta.14 (66bc8ba7); handle future client compatibility in sub2api. Retain Docker Compose publishing and disable upstream package installation.
+        -   **[Prompt handling] (upstream #3981/#3982/#3983, PR #3976, Thanks to @muzisuisuisui, @cubelikeplayDaniel, @lbjlaq)**: Adopt Pi/WorkBuddy/Codex/DSH rewrites, system-prompt sideloading and rewrite scopes. Later PR #3976 changes absent from the release tag are not included.
+        -   **[Accounts and protocols] (upstream PR #3970/#3978/#3980, Ref #3960/#3974/#3979, Thanks to @cubelikeplayDaniel, @ThermalEng, @Lucas-Qh-Lai)**: Adopt PAYGO/project IDs, aicode OAuth scope, MCP namespace support and model-freeze fixes.
+        -   **Upgrade and rollback**: Replace fork QoS, cache and attempt diagnostics. Take a consistent full data/config backup before deployment: saving settings drops old proxy.qos fields, so rollback requires both the old image and backup. Review saved rewrite rules and executable tool names.
+        -   **Validation limits**: 264 targeted Rust tests passed; one upstream OpenAI assertion about system prompt placement failed. TypeScript and sub2api TestAM conversion tests passed. Production 429 improvement and real-client compatibility remain unverified.
+
     *   **v5.0.10 (2026-11-17)**:
         -   **[Failure diagnostics] (PR [#19](https://github.com/DNAlec/Antigravity-Manager/pull/19), Ref upstream #3975, Thanks to @DNAlec)**: Persist bounded endpoint categories, status and timing at the shared transport boundary, only in local logs; client responses and retry policy remain unchanged.
         -   **[Experimental prompt compatibility] (upstream PR [#3976](https://github.com/lbjlaq/Antigravity-Manager/pull/3976), Ref #3972, Thanks to @cubelikeplayDaniel)**: Integrate the interactive-agent preamble and inline rule handling with bounded matching that retains following instructions. Peer review excluded session-move renaming without execution mapping. Closed PR #3977 is excluded.
