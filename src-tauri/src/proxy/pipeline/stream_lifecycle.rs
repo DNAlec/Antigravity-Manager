@@ -26,12 +26,6 @@ pub trait ProtocolStreamHandler: Send + 'static {
     /// 返回需要向下游发送的字节块序列
     fn process_line(&mut self, line: &str) -> Vec<Bytes>;
 
-    /// Observe counters attached to a terminal error without rendering its
-    /// candidate content or opening a successful response.
-    fn observe_upstream_usage(&mut self, _usage: &serde_json::Value) -> Vec<Bytes> {
-        Vec::new()
-    }
-
     /// 检查是否已有正文内容输出给下游（用于判断中断时是优雅截断还是首包不可重试错误）
     fn has_content(&self) -> bool;
 
@@ -47,24 +41,18 @@ pub trait ProtocolStreamHandler: Send + 'static {
         false
     }
 
-    /// Whether every rendered candidate received an upstream terminal reason.
-    /// None leaves completion validation to adapters with their own terminal format.
-    fn upstream_completion(&self) -> Option<bool> {
-        None
-    }
-
-    /// A protocol may defer its terminal frame briefly to collect trailing usage.
-    /// The driver fixes the deadline on first observation; subsequent frames do not extend it.
-    fn completion_tail_timeout(&self) -> Option<std::time::Duration> {
-        None
-    }
-
     /// 流正常结束调用，产出协议专属的终结帧
     /// （Claude 下发 message_delta(end_turn) + message_stop，OpenAI 下发 [DONE] 及可选 usage chunk）
     fn emit_finalize(&mut self) -> Vec<Bytes>;
 
-    /// Preserve partial output with a distinct truncation or error terminal.
-    /// An interruption must not authorize executing unfinished tool calls.
+    /// [黄金三元组异常截断收尾契约] 上游异常中断/超时且已有正文/工具调用输出（has_content == true）时调用：
+    /// 此时为了避免客户端抛出 StreamTruncatedError 丢弃已生成的成千上万 token，必须优雅收尾；
+    /// 但与正常 EOF (emit_finalize) 不同，异常收尾遵循零正文篡改原则：
+    /// 1. 绝不向模型正文注入任何假横幅或篡改已有文本；
+    /// 2. 若存在工具调用，严格优先保持 tool_use (Claude) / tool_calls (OpenAI) / STOP (Gemini)；
+    /// 3. 仅当纯文本生成中途断流时，设置截断型终止原因（Claude 下发 max_tokens，OpenAI 下发 length，Gemini 下发 MAX_TOKENS）。
+    ///
+    /// 默认实现回退至普通 emit_finalize()。
     fn emit_abnormal_finalize(&mut self, _error_report: &StreamErrorReport) -> Vec<Bytes> {
         self.emit_finalize()
     }
@@ -107,7 +95,7 @@ pub trait ProtocolStreamHandler: Send + 'static {
         Bytes::from(": ping\n\n")
     }
 
-    /// Commit successful upstream state only; failed or interrupted streams never call this hook.
+    /// 可选钩子：流终止前提交会话状态（如 thinking_acc.commit(session_id)）
     fn on_finish(&mut self) {}
 }
 
@@ -193,45 +181,6 @@ pub enum StreamPhase {
     Streaming,
 }
 
-/// Convert structured SSE failures before adapters can flatten them into an
-/// ordinary EOF. Error envelopes are terminal even after partial output; no
-/// request is replayed, and no successful completion is synthesized afterward.
-fn process_upstream_line<H: ProtocolStreamHandler>(
-    handler: &mut H,
-    detector: &mut super::stream_error::UpstreamSseErrorDetector,
-    line: &str,
-    config: &StreamLifecycleConfig,
-) -> (Vec<Bytes>, Option<String>) {
-    let decoded = detector.process_line(line);
-    if let Err(failure) = decoded {
-        let report = crate::proxy::mappers::error_classifier::report_upstream_error(
-            config.adapter_name,
-            config.function_name,
-            failure.status,
-            &format!("upstream stream error {}: {}", failure.status, failure.body),
-            &config.trace_info,
-        );
-        let mut frames = failure
-            .usage
-            .as_ref()
-            .map(|usage| handler.observe_upstream_usage(usage))
-            .unwrap_or_default();
-        frames.extend(handler.emit_initial_error(&report));
-        let (terminal_frames, _) = handler.emit_error_finalize(&report);
-        frames.extend(terminal_frames);
-        (frames, Some(report.client_message()))
-    } else {
-        (
-            decoded
-                .ok()
-                .flatten()
-                .map(|line| handler.process_line(&line))
-                .unwrap_or_default(),
-            None,
-        )
-    }
-}
-
 /// 通用出站流生命周期驱动器（模板方法）
 pub fn run_stream_lifecycle<S, E, H>(
     mut upstream_stream: Pin<Box<S>>,
@@ -260,10 +209,8 @@ where
         let mut last_activity = tokio::time::Instant::now();
         let mut error_emitted = false;
         let mut abnormal_error_report: Option<crate::proxy::mappers::error_classifier::StreamErrorReport> = None;
-        let mut completion_deadline = None;
-        let mut error_detector = super::stream_error::UpstreamSseErrorDetector::default();
 
-        'upstream: loop {
+        loop {
             tokio::select! {
                 next_chunk = upstream_stream.next() => {
                     match next_chunk {
@@ -275,26 +222,13 @@ where
                                         let line_raw = buffer.split_to(pos + 1);
                                         let line_str = String::from_utf8_lossy(&line_raw);
                                         let line = line_str.trim();
-                                        let (chunks, failure) = process_upstream_line(&mut handler, &mut error_detector, line, &config);
-                                        let emitted_error_frame = !chunks.is_empty();
-                                        for out_chunk in chunks { yield Ok(out_chunk); }
-                                        if let Some(error) = failure {
-                                            if !emitted_error_frame { yield Err(error); }
-                                            error_emitted = true;
-                                            break 'upstream;
-                                        }
-                                        if completion_deadline.is_none() {
-                                            completion_deadline = handler.completion_tail_timeout()
-                                                .map(|wait| tokio::time::Instant::now() + wait);
+                                        if line.is_empty() {
+                                            continue;
                                         }
 
-                                        // DONE ends transport, but does not prove the model
-                                        // completed. Finalize below using the candidate state.
-                                        if line.strip_prefix("data:")
-                                            .is_some_and(|data| data.trim() == "[DONE]")
-                                        {
-                                            buffer.clear();
-                                            break 'upstream;
+                                        let chunks = handler.process_line(line);
+                                        for out_chunk in chunks {
+                                            yield Ok(out_chunk);
                                         }
 
                                         // [关键终结状态机感知]
@@ -356,31 +290,6 @@ where
                                     }
                                 }
                                 Err(e) => {
-                                    // A reset can follow a complete final JSON event without
-                                    // its newline, including an empty provider refusal.
-                                    if !buffer.is_empty() {
-                                        let line_str = String::from_utf8_lossy(&buffer);
-                                        let line = line_str.trim();
-                                        if !line.is_empty() {
-                                            let (chunks, failure) = process_upstream_line(&mut handler, &mut error_detector, line, &config);
-                                            let emitted_error_frame = !chunks.is_empty();
-                                            for out_chunk in chunks { yield Ok(out_chunk); }
-                                            if let Some(error) = failure {
-                                                if !emitted_error_frame { yield Err(error); }
-                                                error_emitted = true;
-                                                break 'upstream;
-                                            }
-                                        }
-                                        buffer.clear();
-                                    }
-                                    // A completed model response is only waiting for optional
-                                    // usage trailers. A transport close cannot revoke its finish.
-                                    if handler.is_terminal()
-                                        || completion_deadline.is_some()
-                                        || handler.upstream_completion() == Some(true)
-                                    {
-                                        break;
-                                    }
                                     let report = crate::proxy::mappers::error_classifier::report_stream_error(
                                         config.adapter_name,
                                         config.function_name,
@@ -441,13 +350,9 @@ where
                                 let line_str = String::from_utf8_lossy(&buffer);
                                 let line = line_str.trim();
                                 if !line.is_empty() {
-                                    let (chunks, failure) = process_upstream_line(&mut handler, &mut error_detector, line, &config);
-                                    let emitted_error_frame = !chunks.is_empty();
-                                    for out_chunk in chunks { yield Ok(out_chunk); }
-                                    if let Some(error) = failure {
-                                        if !emitted_error_frame { yield Err(error); }
-                                        error_emitted = true;
-                                        break 'upstream;
+                                    let chunks = handler.process_line(line);
+                                    for out_chunk in chunks {
+                                        yield Ok(out_chunk);
                                     }
                                 }
                                 buffer.clear();
@@ -486,12 +391,6 @@ where
                         }
                     }
                 }
-                _ = async {
-                    match completion_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => break,
                 _ = heartbeat_interval.tick() => {
                     let phase_timeout_secs = match phase {
                         StreamPhase::InitialTtft => config.initial_ttft_secs,
@@ -589,6 +488,7 @@ where
 
         // 协议守卫：如果因错误退出，严格禁止追加发送终结帧，防止破坏客户端状态机
         if error_emitted {
+            handler.on_finish();
             return;
         }
 
@@ -605,12 +505,9 @@ where
             let line_str = String::from_utf8_lossy(&buffer);
             let line = line_str.trim();
             if !line.is_empty() {
-                let (chunks, failure) = process_upstream_line(&mut handler, &mut error_detector, line, &config);
-                let emitted_error_frame = !chunks.is_empty();
-                for out_chunk in chunks { yield Ok(out_chunk); }
-                if let Some(error) = failure {
-                    if !emitted_error_frame { yield Err(error); }
-                    return;
+                let chunks = handler.process_line(line);
+                for out_chunk in chunks {
+                    yield Ok(out_chunk);
                 }
             }
             buffer.clear();
@@ -638,25 +535,8 @@ where
                 report.client_message()
             );
             yield Err(report.client_message());
+            handler.on_finish();
             return;
-        }
-
-        // The final complete JSON event may only become visible while flushing
-        // an unterminated line after a transport reset.
-        if handler.upstream_completion() == Some(true) {
-            abnormal_error_report = None;
-        }
-
-        if !handler.is_terminal()
-            && handler.upstream_completion() == Some(false)
-            && abnormal_error_report.is_none()
-        {
-            abnormal_error_report = Some(crate::proxy::mappers::error_classifier::report_stream_error(
-                config.adapter_name,
-                config.function_name,
-                &"upstream stream ended without finishReason",
-                &config.trace_info,
-            ));
         }
 
         // [Double-Finalization Guard]
@@ -676,9 +556,7 @@ where
             }
         }
 
-        if abnormal_error_report.is_none() {
-            handler.on_finish();
-        }
+        handler.on_finish();
     })
 }
 
@@ -1159,7 +1037,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "stream_completion_tests.rs"]
-mod stream_completion_tests;

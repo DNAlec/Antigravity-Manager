@@ -14,7 +14,7 @@ pub fn wrap_request_v2(
     _upstream: Option<&std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>>,
     upstream_session_id: Option<&str>,
     is_retry: bool,
-) -> Result<Value, String> {
+) -> Value {
     // 优先使用传入的 mapped_model，其次尝试从 body 获取
     let original_model = body
         .get("model")
@@ -51,10 +51,16 @@ pub fn wrap_request_v2(
         (body.clone(), None)
     };
 
+    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
+    crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
+
     // [PIPELINE] 统一清洗提示词与风控伪 Header（兼容第三方聚合器如 New API 以 Gemini 原生协议转入时的特征残留）
     crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
         &mut inner_request,
     );
+
+    // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
+    let is_target_claude = final_model_name.to_lowercase().contains("claude");
 
     let lower_model = final_model_name.to_lowercase();
 
@@ -119,6 +125,9 @@ pub fn wrap_request_v2(
         for (_i, content) in contents.iter_mut().enumerate() {
             let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
             let is_assistant = role == "model" || role == "assistant";
+
+            let mut name_counters: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
 
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 // 1. 如果是 assistant/model 轮次，预先扫描提取 turn_signature (对齐 Anthropic)
@@ -246,6 +255,21 @@ pub fn wrap_request_v2(
                         if let Some(obj) = part.as_object_mut() {
                             // 1. 处理 functionCall (Assistant 请求调用工具)
                             if let Some(fc) = obj.get_mut("functionCall") {
+                                if fc.get("id").is_none() && is_target_claude {
+                                    let name = fc
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown");
+                                    let count = name_counters.entry(name.to_string()).or_insert(0);
+                                    let call_id = format!("call_{}_{}", name, count);
+                                    *count += 1;
+
+                                    fc.as_object_mut()
+                                        .unwrap()
+                                        .insert("id".to_string(), json!(call_id));
+                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
+                                }
+
                                 // 处理签名校验与兼容性 (对齐 Anthropic)
                                 let _call_id =
                                     fc.get("id").and_then(|v| v.as_str()).map(str::to_string);
@@ -267,6 +291,22 @@ pub fn wrap_request_v2(
                                 obj.remove("thoughtSignature");
                                 obj.remove("thought_signature");
                             }
+                            if let Some(fr) = obj.get_mut("functionResponse") {
+                                if fr.get("id").is_none() && is_target_claude {
+                                    let name = fr
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown");
+                                    let count = name_counters.entry(name.to_string()).or_insert(0);
+                                    let call_id = format!("call_{}_{}", name, count);
+                                    *count += 1;
+
+                                    fr.as_object_mut()
+                                        .unwrap()
+                                        .insert("id".to_string(), json!(call_id));
+                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
+                                }
+                            }
                         }
                         saw_non_thinking = true;
                         new_parts.push(part);
@@ -275,7 +315,7 @@ pub fn wrap_request_v2(
                 *parts = new_parts;
             }
         }
-        crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
+        crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
             contents,
             &final_model_name,
             should_inject,
@@ -444,14 +484,14 @@ pub fn wrap_request_v2(
                                     let mut params = params_json_schema;
                                     crate::proxy::common::json_schema::clean_json_schema(
                                         &mut params,
-                                    )?;
+                                    );
                                     crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                         &mut params,
                                     );
                                     decl_obj.insert("parameters".to_string(), params);
                                 } else if let Some(params) = decl_obj.get_mut("parameters") {
                                     // 标准 parameters 字段
-                                    crate::proxy::common::json_schema::clean_json_schema(params)?;
+                                    crate::proxy::common::json_schema::clean_json_schema(params);
                                     crate::proxy::mappers::openai::request::enforce_uppercase_types(
                                         params,
                                     );
@@ -674,7 +714,7 @@ pub fn wrap_request_v2(
         &mut inner_request,
         &config.final_model,
         Some(&official_request_id),
-    )?;
+    );
     let reordered_inner = inner_request;
 
     let mut final_request_obj = json!({
@@ -691,11 +731,17 @@ pub fn wrap_request_v2(
         final_request_obj["requestType"] = json!("agent");
     }
 
+    if let Some(tok) = token {
+        if tok.is_paygo() {
+            final_request_obj["enabledCreditTypes"] = json!(["GOOGLE_ONE_AI"]);
+        }
+    }
+
     crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(
         &mut final_request_obj,
-    )?;
+    );
 
-    Ok(final_request_obj)
+    final_request_obj
 }
 
 #[cfg(test)]
@@ -726,8 +772,7 @@ mod test_fixes {
             }]
         });
 
-        let result =
-            wrap_request(&body, "proj", "gemini-pro", None, Some(session_id), None).unwrap();
+        let result = wrap_request(&body, "proj", "gemini-pro", None, Some(session_id), None);
         let injected_sig = result["request"]["contents"][0]["parts"][0]["thoughtSignature"]
             .as_str()
             .unwrap();
@@ -753,7 +798,7 @@ mod test_fixes {
             }]
         });
 
-        let result = wrap_request(&body, "proj", "gemini-pro", None, None, None).unwrap();
+        let result = wrap_request(&body, "proj", "gemini-pro", None, None, None);
         let part = &result["request"]["contents"][0]["parts"][0];
         assert_eq!(
             part["thoughtSignature"].as_str(),
@@ -776,72 +821,40 @@ pub fn unwrap_response(response: &Value) -> Value {
 /// 目点是为了让客户端（如 OpenCode/Vercel AI SDK）能感知到 ID，
 /// 并在下一轮对话中原样带回，从而满足 Google v1internal 对 Claude 模型的校验。
 pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
-    ResponseToolIds::default().inject(response, model_name);
-}
+    if !model_name.to_lowercase().contains("claude") {
+        return;
+    }
 
-/// Keep generated identities for the lifetime of a response, including wrapped
-/// frames and cumulative retransmissions. Explicit upstream IDs remain intact.
-#[derive(Default)]
-pub(crate) struct ResponseToolIds {
-    calls: std::collections::HashMap<(u64, String), Vec<String>>,
-}
-
-impl ResponseToolIds {
-    pub(crate) fn inject(&mut self, response: &mut Value, model_name: &str) {
-        if !model_name.to_ascii_lowercase().contains("claude") {
-            return;
-        }
-        let response = if response.get("response").is_some() {
-            &mut response["response"]
-        } else {
-            response
-        };
-        let Some(candidates) = response.get_mut("candidates").and_then(Value::as_array_mut) else {
-            return;
-        };
+    if let Some(candidates) = response
+        .get_mut("candidates")
+        .and_then(|c| c.as_array_mut())
+    {
         for candidate in candidates {
-            let index = candidate.get("index").and_then(Value::as_u64).unwrap_or(0);
-            let Some(parts) = candidate
+            if let Some(parts) = candidate
                 .get_mut("content")
                 .and_then(|c| c.get_mut("parts"))
-                .and_then(Value::as_array_mut)
-            else {
-                continue;
-            };
-            let mut occurrences = std::collections::HashMap::new();
-            for part in parts {
-                let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) else {
-                    continue;
-                };
-                if call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !id.is_empty())
-                {
-                    continue;
+                .and_then(|p| p.as_array_mut())
+            {
+                let mut name_counters: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for part in parts {
+                    if let Some(fc) = part.get_mut("functionCall").and_then(|f| f.as_object_mut()) {
+                        if fc.get("id").is_none() {
+                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                            let count = name_counters.entry(name.to_string()).or_insert(0);
+                            let call_id = format!("call_{}_{}", name, count);
+                            *count += 1;
+
+                            fc.insert("id".to_string(), json!(call_id));
+                            tracing::debug!("[Gemini-Wrap] Response stage: Injected synthetic call_id '{}' for client", call_id);
+                        }
+                    }
                 }
-                let mut identity_fields = call.clone();
-                // Missing, null, and empty IDs all mean the same absent ID.
-                identity_fields.remove("id");
-                let mut identity = Value::Object(identity_fields);
-                identity.sort_all_objects();
-                let key = identity.to_string();
-                let count = occurrences.entry(key.clone()).or_insert(0usize);
-                let ids = self.calls.entry((index, key)).or_default();
-                if ids.len() <= *count {
-                    ids.push(format!("call_{}", uuid::Uuid::new_v4().simple()));
-                }
-                call.insert("id".into(), json!(ids[*count]));
-                *count += 1;
             }
         }
     }
 }
 
-/// Layer-3 后台摘要请求的超时（秒）。
-///
-/// 上游客户端的默认超时是 600s，对"摘要整段对话"这种辅助任务过长 ——
-/// 一旦上游卡住，会长时间占住一个后台任务与连接。这里显式收紧到有界值。
 pub fn wrap_request(
     body: &Value,
     project_id: &str,
@@ -849,7 +862,7 @@ pub fn wrap_request(
     account_id: Option<&str>,
     session_id: Option<&str>,
     token: Option<&crate::proxy::token_manager::ProxyToken>,
-) -> Result<Value, String> {
+) -> Value {
     wrap_request_v2(
         body,
         project_id,
@@ -878,8 +891,7 @@ mod tests {
             "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
         });
 
-        let result =
-            wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
         assert_eq!(result["project"], "test-project");
         assert_eq!(result["model"], "gemini-2.5-flash");
         assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
@@ -905,7 +917,7 @@ mod tests {
             "messages": []
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
 
         // 验证没有多余注入的 systemInstruction
         assert!(result
@@ -945,8 +957,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -973,8 +984,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         // 新规则：Pro 模型不再显式下发 thinkingBudget（交服务端默认）
         assert!(
             result_pro["request"]["generationConfig"]["thinkingConfig"]
@@ -1016,8 +1026,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1036,7 +1045,7 @@ mod tests {
             }
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
         let sys = result
             .get("request")
             .unwrap()
@@ -1061,7 +1070,7 @@ mod tests {
             }
         });
 
-        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
         let sys = result
             .get("request")
             .unwrap()
@@ -1093,8 +1102,7 @@ mod tests {
             "contents": [{"parts": parts}]
         });
 
-        let result =
-            wrap_request(&body, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-3-pro-image", None, None, None);
 
         let request = result.get("request").unwrap();
         let contents = request.get("contents").unwrap().as_array().unwrap();
@@ -1140,8 +1148,7 @@ mod tests {
         });
 
         // Test with Pro model
-        let result =
-            wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None);
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1186,8 +1193,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             });
 
-            let result =
-                wrap_request(&body, "proj", "claude-sonnet-4-6", None, None, None).unwrap();
+            let result = wrap_request(&body, "proj", "claude-sonnet-4-6", None, None, None);
             let req = result.get("request").unwrap();
 
             // 1. 确保根目录没有 thinking
@@ -1237,8 +1243,7 @@ mod tests {
                 None,
                 None,
                 None,
-            )
-            .unwrap();
+            );
             let req = result.get("request").unwrap();
             let gen_config = req.get("generationConfig").unwrap();
             let thinking_config = gen_config.get("thinkingConfig").unwrap();
@@ -1275,8 +1280,7 @@ mod tests {
         });
 
         // Test with Pro-preview model (should NOT auto-inject to avoid 400)
-        let result =
-            wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None).unwrap();
+        let result = wrap_request(&body, "test-proj", "gemini-3-pro-preview", None, None, None);
         let req = result.get("request").unwrap();
         let gen_config = req.get("generationConfig").unwrap();
 
@@ -1291,8 +1295,7 @@ mod tests {
             "model": "gemini-3-pro",
             "generationConfig": {}
         });
-        let result_std =
-            wrap_request(&body_std, "test-proj", "gemini-3-pro", None, None, None).unwrap();
+        let result_std = wrap_request(&body_std, "test-proj", "gemini-3-pro", None, None, None);
         let gen_config_std = result_std
             .get("request")
             .unwrap()
@@ -1315,8 +1318,7 @@ mod tests {
             "prompt": "Test"
         });
 
-        let result_1 =
-            wrap_request(&body_1, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
+        let result_1 = wrap_request(&body_1, "test-proj", "gemini-3-pro-image", None, None, None);
         let req_1 = result_1.get("request").unwrap();
         let gen_config_1 = req_1.get("generationConfig").unwrap();
         let image_config_1 = gen_config_1.get("imageConfig").unwrap();
@@ -1332,8 +1334,7 @@ mod tests {
              "prompt": "Test"
         });
 
-        let result_2 =
-            wrap_request(&body_2, "test-proj", "gemini-3-pro-image", None, None, None).unwrap();
+        let result_2 = wrap_request(&body_2, "test-proj", "gemini-3-pro-image", None, None, None);
         let req_2 = result_2.get("request").unwrap();
         let image_config_2 = req_2["generationConfig"]["imageConfig"]
             .as_object()
@@ -1417,15 +1418,7 @@ mod tests {
             }
         });
 
-        let mut wrapped =
-            wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None).unwrap();
-        crate::proxy::thinking_store::finalize_request_text_context(
-            "",
-            wrapped["request"]["contents"].as_array_mut().unwrap(),
-            "gemini-3-pro",
-            true,
-            false,
-        );
+        let wrapped = wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None);
         let contents = wrapped["request"]["contents"].as_array().unwrap();
         let model_msg = &contents[0];
         let parts = model_msg["parts"].as_array().unwrap();
@@ -1435,14 +1428,7 @@ mod tests {
             parts.iter().all(|p| p.get("thought") != Some(&json!(true))),
             "无签名思考块必须被丢弃"
         );
-        assert!(parts
-            .iter()
-            .all(|part| part.get("thoughtSignature").is_none()));
-        assert_eq!(
-            parts[0]["text"],
-            "second thought block that should be downgraded"
-        );
-        assert_eq!(parts[1]["text"], "Regular model response");
+        assert_eq!(parts[0]["text"], "Regular model response");
     }
 
     #[test]
@@ -1467,8 +1453,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
@@ -1487,8 +1472,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1499,8 +1483,7 @@ mod tests {
                 "thinkingConfig": { "thinkingLevel": "LOW" }
             }
         });
-        let wrapped =
-            wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None).unwrap();
+        let wrapped = wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None);
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "LOW");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1519,8 +1502,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], false);
         assert_eq!(tc["thinkingBudget"], 0);
@@ -1536,8 +1518,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1556,8 +1537,7 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
@@ -1575,57 +1555,9 @@ mod tests {
             None,
             None,
             None,
-        )
-        .unwrap();
+        );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["thinkingLevel"], "HIGH");
         assert!(tc.get("thinkingBudget").is_none());
-    }
-}
-
-#[cfg(test)]
-mod r26_tool_identity_tests {
-    use super::*;
-
-    #[test]
-    fn r26_native_pipeline_preserves_colliding_original_ids_and_normalizes_other_aliases() {
-        let body = wrap_request(&json!({"contents":[
-            {"role":"user","parts":[{"text":"Run all three"}]},
-            {"role":"model","parts":[
-                {"functionCall":{"id":"call12","name":"read","args":{}}},
-                {"functionCall":{"id":"call_12","name":"write","args":{}}},
-                {"functionCall":{"id":"call34","name":"list","args":{}}}
-            ]},
-            {"role":"user","parts":[
-                {"functionResponse":{"id":"call12","name":"read","response":{"output":"READ"}}},
-                {"functionResponse":{"id":"call_12","name":"write","response":{"output":"WRITE"}}},
-                {"functionResponse":{"id":"call_34","name":"list","response":{"output":"LIST"}}}
-            ]}
-        ]}),"r26-project","gemini-2.5-flash",None,None,None).unwrap();
-        let parts: Vec<_> = body["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|turn| turn["parts"].as_array().unwrap())
-            .collect();
-        let calls: Vec<_> = parts
-            .iter()
-            .filter_map(|part| part.get("functionCall"))
-            .collect();
-        let results: Vec<_> = parts
-            .iter()
-            .filter_map(|part| part.get("functionResponse"))
-            .collect();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(results.len(), 3);
-        for (index, id, name) in [
-            (0, "call12", "read"),
-            (1, "call_12", "write"),
-            (2, "call_34", "list"),
-        ] {
-            assert_eq!(calls[index]["id"], id);
-            assert_eq!(results[index]["id"], id);
-            assert_eq!(results[index]["name"], name);
-        }
     }
 }

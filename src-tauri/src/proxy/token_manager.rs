@@ -1,13 +1,3 @@
-use crate::proxy::session_bindings::{SessionBindings, SessionLease};
-#[cfg(test)]
-mod qos_binding_tests;
-mod refresh_policy;
-#[cfg(test)]
-mod reload_binding_tests;
-mod response_confirmation;
-use refresh_policy::TokenRefreshError;
-pub use response_confirmation::{confirm_session_response_stream, SessionResponseConfirmation};
-pub type LeasedCredentials = (String, String, String, String, u64, Option<SessionLease>);
 // 移除冗余的顶层导入，因为这些在代码中已由 full path 或局部导入处理
 use axum::http::StatusCode;
 use dashmap::DashMap;
@@ -18,7 +8,6 @@ use std::sync::{Arc, Weak};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::account::{classify_lock_reason, AccountLockKind};
-use crate::proxy::qos_config::QoSConfig;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::server::{ImagePermit, ImageScheduler};
 use crate::proxy::sticky_config::StickySessionConfig;
@@ -131,8 +120,7 @@ async fn update_account_json(
         update(&mut content);
         let serialized = serde_json::to_string_pretty(&content)
             .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
-        crate::utils::fs::write_private_atomic(&path, serialized.as_bytes())
-            .map_err(|e| format!("写入文件失败: {}", e))
+        std::fs::write(&path, serialized).map_err(|e| format!("写入文件失败: {}", e))
     })
     .await
     .map_err(|e| format!("spawn_blocking panicked: {}", e))?
@@ -223,9 +211,34 @@ pub struct ProxyToken {
     pub model_weekly_reset_times: HashMap<String, i64>,
     /// [NEW] 各模型及各同族配额组具体配额窗口快照（包含 is_weekly, remaining_fraction, reset_time）
     pub model_quota_windows: HashMap<String, Vec<QuotaWindowStatus>>,
+    /// [NEW Issue #3960] 是否签署了 GCP 服务条款 / 企业客户端授权标记
+    pub is_gcp_tos: bool,
+    /// [NEW Issue #3960] 原始未归一化的订阅等级代码 (如 "GCP_GE_PAYGO_TIER")
+    pub raw_tier: Option<String>,
 }
 
 impl ProxyToken {
+    /// 判定当前账号是否处于 GCP PAYGO 计费层级或具备企业自费项目
+    pub fn is_paygo(&self) -> bool {
+        if let Some(ref raw) = self.raw_tier {
+            let u = raw.to_ascii_uppercase();
+            if u.contains("PAYGO") || u == "GCP_GE_PAYGO_TIER" {
+                return true;
+            }
+        }
+        if self.is_gcp_tos {
+            if let Some(ref pid) = self.project_id {
+                if !pid.is_empty()
+                    && pid != "aicode-consumers"
+                    && pid != "test-project"
+                    && pid != "project-id"
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// 根据当前请求的目标模型与归一化模型组，计算该账号的实际生效调度优先级。
     /// 若设置了对应模型组（"gemini" | "claude"）的独立优先级则优先采用，否则回退至账号全局 `priority`。
     pub fn effective_priority(&self, target_model: &str, normalized_target: &str) -> u8 {
@@ -361,15 +374,11 @@ impl Drop for InFlightGuard {
 
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
-    // An unreadable account retains only its file identity and session leases, never selectable credentials.
-    unreadable_accounts: DashMap<String, PathBuf>,
-    reload_lock: tokio::sync::Mutex<()>,
-    current_index: Arc<AtomicUsize>,
     last_used_account: Arc<tokio::sync::Mutex<Option<(String, std::time::Instant)>>>,
     data_dir: PathBuf,
     rate_limit_tracker: Arc<RateLimitTracker>, // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
-    session_accounts: Arc<SessionBindings>,    // Versioned session/account bindings
+    session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
 
@@ -406,7 +415,6 @@ pub struct TokenManager {
     /// [NEW] QoS 智能熔断与阶梯探针守卫
     pub qos_guardian: Arc<crate::proxy::qos_guardian::QoSGuardian>,
     qos_probe_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    qos_upstream: std::sync::RwLock<Weak<crate::proxy::upstream::client::UpstreamClient>>,
 }
 
 impl TokenManager {
@@ -424,14 +432,11 @@ impl TokenManager {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             tokens: Arc::new(DashMap::new()),
-            unreadable_accounts: DashMap::new(),
-            reload_lock: tokio::sync::Mutex::new(()),
-            current_index: Arc::new(AtomicUsize::new(0)),
             last_used_account: Arc::new(tokio::sync::Mutex::new(None)),
             data_dir,
             rate_limit_tracker: Arc::new(RateLimitTracker::new()),
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
-            session_accounts: Arc::new(SessionBindings::new()),
+            session_accounts: Arc::new(DashMap::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
                 crate::models::CircuitBreakerConfig::default(),
@@ -456,7 +461,6 @@ impl TokenManager {
                 guardian
             },
             qos_probe_handle: Arc::new(tokio::sync::Mutex::new(None)),
-            qos_upstream: std::sync::RwLock::new(Weak::new()),
         }
     }
 
@@ -658,22 +662,11 @@ impl TokenManager {
         buffer_secs: i64,
         timeout_duration: std::time::Duration,
     ) -> Result<ProxyToken, String> {
-        self.refresh_account_token_for_selection(account_id, buffer_secs, timeout_duration)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn refresh_account_token_for_selection(
-        &self,
-        account_id: &str,
-        buffer_secs: i64,
-        timeout_duration: std::time::Duration,
-    ) -> Result<ProxyToken, TokenRefreshError> {
         let (token_email, refresh_token, account_path) = {
             let entry = self
                 .tokens
                 .get(account_id)
-                .ok_or_else(|| self.missing_pool_refresh_error(account_id))?;
+                .ok_or_else(|| format!("账号 {} 不存在于内存池中", account_id))?;
             (
                 entry.email.clone(),
                 entry.refresh_token.clone(),
@@ -682,10 +675,7 @@ impl TokenManager {
         };
 
         if refresh_token.is_empty() {
-            return Err(TokenRefreshError::CredentialRejected(format!(
-                "账号 {} 的 refresh_token 为空",
-                token_email
-            )));
+            return Err(format!("账号 {} 的 refresh_token 为空", token_email));
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -737,7 +727,7 @@ impl TokenManager {
                         entry.timestamp = now + token_response.expires_in;
                         entry.clone()
                     } else {
-                        return Err(self.missing_pool_refresh_error(account_id));
+                        return Err(format!("账号 {} 在刷新过程中被移除", account_id));
                     };
 
                     // 写盘操作后台化：内存已更新，磁盘持久化 spawn 到 blocking 线程池
@@ -778,10 +768,7 @@ impl TokenManager {
                                 val["token"]["oauth_client_key"] = ck.into();
                             }
                             if let Ok(s) = serde_json::to_string_pretty(&val) {
-                                let _ = crate::utils::fs::write_private_atomic(
-                                    &write_path,
-                                    s.as_bytes(),
-                                );
+                                let _ = std::fs::write(&write_path, s);
                             }
                         });
                     }
@@ -821,10 +808,7 @@ impl TokenManager {
                             );
                         }
                     }
-                    Err(TokenRefreshError::from_oauth(format!(
-                        "Token refresh failed: {}",
-                        e
-                    )))
+                    Err(format!("Token refresh failed: {}", e))
                 }
             }
         };
@@ -837,10 +821,10 @@ impl TokenManager {
                     timeout_duration,
                     token_email
                 );
-                Err(TokenRefreshError::Temporary(format!(
+                Err(format!(
                     "Token refresh timed out after {:?}",
                     timeout_duration
-                )))
+                ))
             }
         }
     }
@@ -918,8 +902,7 @@ impl TokenManager {
                         };
                         val["token"]["project_id"] = pid_clone.into();
                         if let Ok(s) = serde_json::to_string_pretty(&val) {
-                            let _ =
-                                crate::utils::fs::write_private_atomic(&write_path, s.as_bytes());
+                            let _ = std::fs::write(&write_path, s);
                         }
                     });
                     trimmed
@@ -962,81 +945,6 @@ impl TokenManager {
             self.project_id_failures.remove(account_id);
         }
         !expired
-    }
-
-    /// Stop dispatching this account without invalidating in-flight or warm bindings.
-    fn quarantine_unreadable_account(&self, id: &str, path: &std::path::Path) {
-        if self.tokens.contains_key(id) {
-            self.unreadable_accounts
-                .insert(id.to_owned(), path.to_owned());
-            self.tokens.remove(id);
-        }
-    }
-
-    /// OAuth can start before a pool reload and finish while the account is
-    /// quarantined. A missing token in that window is not a rejected credential.
-    fn missing_pool_refresh_error(&self, account_id: &str) -> TokenRefreshError {
-        if self.unreadable_accounts.contains_key(account_id) || self.tokens.contains_key(account_id)
-        {
-            TokenRefreshError::Temporary(format!(
-                "Account {account_id} changed during reload; retry refresh."
-            ))
-        } else {
-            TokenRefreshError::CredentialRejected(format!("账号 {} 不存在于内存池中", account_id))
-        }
-    }
-
-    async fn recover_unreadable_binding(
-        &self,
-        mode: crate::proxy::sticky_config::SchedulingMode,
-        quota_group: &str,
-        session_id: Option<&str>,
-    ) -> Result<(), String> {
-        if mode != crate::proxy::sticky_config::SchedulingMode::CacheFirst
-            || quota_group == "image_gen"
-        {
-            return Ok(());
-        }
-        let Some(lease) = session_id.and_then(|id| self.session_accounts.disk_protected_lease(id))
-        else {
-            return Ok(());
-        };
-        let id = lease.account_id();
-        if self.unreadable_accounts.contains_key(id) {
-            let _reload = self.reload_lock.lock().await;
-            if self.unreadable_accounts.contains_key(id) {
-                let _ = self.reload_account_locked(id).await;
-                if self.unreadable_accounts.contains_key(id) {
-                    if let Some(stop) = self.cache_first_bound_account_stop(
-                        mode,
-                        quota_group,
-                        session_id,
-                        id,
-                        "state on disk",
-                    ) {
-                        return Err(stop);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pool_selection(
-        &self,
-        id: &str,
-        mode: crate::proxy::sticky_config::SchedulingMode,
-        quota_group: &str,
-        session_id: Option<&str>,
-    ) -> Result<(), String> {
-        if self.unreadable_accounts.contains_key(id) || !self.tokens.contains_key(id) {
-            return Err(self
-                .cache_first_bound_account_stop(mode, quota_group, session_id, id, "state on disk")
-                .unwrap_or_else(|| {
-                    "Selected account is no longer available; retry request.".to_owned()
-                }));
-        }
-        Ok(())
     }
 
     /// 读取 `accounts.json` 索引，返回 `(全部注册账号 ID, disabled/proxy_disabled 账号 ID)`。
@@ -1095,7 +1003,6 @@ impl TokenManager {
 
     /// 从主应用账号目录加载所有账号
     pub async fn load_accounts(&self) -> Result<usize, String> {
-        let _reload = self.reload_lock.lock().await;
         let accounts_dir = self.resolved_data_dir().join("accounts");
 
         if !accounts_dir.exists() {
@@ -1111,17 +1018,6 @@ impl TokenManager {
 
         // 阶段 1：在局部集合中加载新账号，严禁提前清空现有活跃池导致并发 503 宕机
         let mut new_tokens = std::collections::HashMap::new();
-        let known: HashMap<PathBuf, String> = self
-            .tokens
-            .iter()
-            .map(|t| (t.account_path.clone(), t.key().clone()))
-            .chain(
-                self.unreadable_accounts
-                    .iter()
-                    .map(|t| (t.value().clone(), t.key().clone())),
-            )
-            .collect();
-        let mut unreadable_paths = HashSet::new();
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
@@ -1140,26 +1036,7 @@ impl TokenManager {
             // 孤儿账号（已在界面删除但磁盘残留的 *.json 文件）拒绝载入代理调度池，仅记录 warning 跳过，
             // 严禁在此主动删除文件，避免并发导入或未提交窗口期误删 refresh token。
             if let Some(ref valid_ids) = valid_in_index {
-                let is_valid = if valid_ids.contains(stem)
-                    || known.get(&path).is_some_and(|id| valid_ids.contains(id))
-                {
-                    true
-                } else if let Ok(content) = std::fs::read_to_string(&path) {
-                    // 兼容 stem != id 的情况，解析内部 id
-                    serde_json::from_str::<serde_json::Value>(&content)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("id")
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .map(|internal_id| valid_ids.contains(&internal_id))
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-
-                if !is_valid {
+                if !Self::is_account_file_in_index(&path, valid_ids) {
                     tracing::warn!(
                         "[Proxy] Skipping orphan account file {:?} from proxy pool (not present in accounts.json index)",
                         path
@@ -1168,11 +1045,7 @@ impl TokenManager {
                 }
             }
 
-            if disabled_in_index.contains(stem)
-                || known
-                    .get(&path)
-                    .is_some_and(|id| disabled_in_index.contains(id))
-            {
+            if disabled_in_index.contains(stem) {
                 // 实体文件是账号状态的真实权威来源。先检查实体文件，若实体文件本身未停用（索引数据陈旧），以实体文件为准；
                 // 仅当实体文件确实标记为停用或不可读时才跳过。
                 let is_truly_disabled = if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1213,17 +1086,15 @@ impl TokenManager {
                         };
                         is_disabled || is_proxy_disabled
                     } else {
-                        unreadable_paths.insert(path.clone());
                         true
                     }
                 } else {
-                    unreadable_paths.insert(path.clone());
                     true
                 };
 
                 if is_truly_disabled {
                     tracing::info!(
-                        "[Proxy] Account {} is disabled in the index and its entity is disabled or unreadable; skip dispatch",
+                        "[Proxy] Account {} is confirmed disabled/proxy_disabled in both index and entity, skipping from proxy pool",
                         stem
                     );
                     continue;
@@ -1239,19 +1110,13 @@ impl TokenManager {
             match self.load_single_account(&path).await {
                 Ok(Some(token)) => {
                     let account_id = token.account_id.clone();
-                    if valid_in_index
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&account_id))
-                    {
-                        new_tokens.insert(account_id, token);
-                    }
+                    new_tokens.insert(account_id, token);
                 }
                 Ok(None) => {
                     // 跳过无效账号
                 }
                 Err(e) => {
                     tracing::warn!("加载账号失败 {:?}: {}", path, e);
-                    unreadable_paths.insert(path);
                 }
             }
         }
@@ -1260,20 +1125,10 @@ impl TokenManager {
 
         // 阶段 2：零停机平滑原子同步到 self.tokens
         // 剔除已在磁盘删除或停用的账号
-        for (path, id) in known {
-            if new_tokens.contains_key(&id) {
-                continue;
-            }
-            if unreadable_paths.contains(&path) {
-                self.quarantine_unreadable_account(&id, &path);
-            } else {
-                self.remove_account(&id);
-            }
-        }
+        self.tokens.retain(|k, _| new_tokens.contains_key(k));
         // 更新或插入新载入的有效账号
         for (k, v) in new_tokens {
-            self.tokens.insert(k.clone(), v);
-            self.unreadable_accounts.remove(&k);
+            self.tokens.insert(k, v);
         }
 
         // 若上次记录的使用账号已不在池中，则安全清理
@@ -1334,27 +1189,12 @@ impl TokenManager {
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
     pub async fn reload_account(&self, account_id: &str) -> Result<(), String> {
-        let _reload = self.reload_lock.lock().await;
-        self.reload_account_locked(account_id).await
-    }
-
-    async fn reload_account_locked(&self, account_id: &str) -> Result<(), String> {
         let path = self
-            .unreadable_accounts
-            .get(account_id)
-            .map(|p| p.value().clone())
-            .or_else(|| {
-                self.tokens
-                    .get(account_id)
-                    .map(|token| token.account_path.clone())
-            })
-            .unwrap_or_else(|| {
-                self.resolved_data_dir()
-                    .join("accounts")
-                    .join(format!("{}.json", account_id))
-            });
-        if matches!(path.try_exists(), Ok(false)) {
-            self.remove_account(account_id);
+            .data_dir
+            .join("accounts")
+            .join(format!("{}.json", account_id));
+        if !path.exists() {
+            self.remove_account_and_clear_locks(account_id).await;
             return Err(format!("账号文件不存在: {:?}", path));
         }
 
@@ -1409,17 +1249,12 @@ impl TokenManager {
         }
 
         match self.load_single_account(&path).await {
-            Ok(Some(token)) if token.account_id != account_id => {
-                self.remove_account(account_id);
-                Err("Account file identity changed; reload the pool.".to_string())
-            }
             Ok(Some(token)) => {
                 // 配额刷新是权威快照：立即释放该账号的历史模型级 900s 熔断；
                 // 再按模型粒度释放已恢复的 QuotaExhausted，严格保留 429 速率限制退避与 0 配额模型的锁 (Ref #3840, #3845)
                 self.clear_unsupported_models_for_account(account_id);
                 self.reconcile_recovered_quota_locks(account_id, &token);
                 self.tokens.insert(account_id.to_string(), token);
-                self.unreadable_accounts.remove(account_id);
 
                 self.sync_image_scheduler_accounts();
                 let _ = self.get_all_available_models();
@@ -1432,11 +1267,7 @@ impl TokenManager {
                 self.remove_account_and_clear_locks(account_id).await;
                 Ok(())
             }
-            Err(e) => {
-                self.quarantine_unreadable_account(account_id, &path);
-                self.sync_image_scheduler_accounts();
-                Err(format!("同步账号失败: {}", e))
-            }
+            Err(e) => Err(format!("同步账号失败: {}", e)),
         }
     }
 
@@ -1534,20 +1365,10 @@ impl TokenManager {
 
     /// 从内存中彻底移除指定账号及其关联数据 (Issue #1477)
     pub fn remove_account(&self, account_id: &str) {
-        self.unreadable_accounts.remove(account_id);
         // ... (省略原有逻辑)
-        self.session_accounts.invalidate_account(account_id, || {
-            if self.tokens.remove(account_id).is_some() {
-                tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
-            }
-        });
-        // Invalidate any in-flight probe before the account can be re-enabled.
-        self.qos_guardian.states.remove(account_id);
-        self.qos_guardian.samples.remove(account_id);
-        self.qos_guardian.penalty_memory.remove(account_id);
-        self.qos_guardian
-            .session_watermarks
-            .retain(|(account, _), _| account != account_id);
+        if self.tokens.remove(account_id).is_some() {
+            tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
+        }
         self.rate_limit_tracker.clear(account_id);
         self.refresh_locks.remove(account_id);
         self.invalid_grant_failures.remove(account_id);
@@ -1556,6 +1377,8 @@ impl TokenManager {
         self.invalid_grant_failures.remove(account_id);
         self.in_flight_requests.remove(account_id);
         self.clear_unsupported_models_for_account(account_id);
+        self.qos_guardian.release_from_jail(account_id);
+        self.session_accounts.retain(|_, v| v != account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -1597,9 +1420,13 @@ impl TokenManager {
     /// Apply a saved GCP project_id dynamically to in-memory ProxyToken.
     pub fn update_account_project_id(&self, account_id: &str, project_id: Option<String>) {
         if let Some(mut token) = self.tokens.get_mut(account_id) {
-            token.project_id = project_id
+            let pid = project_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            if pid.is_some() {
+                token.is_gcp_tos = true;
+            }
+            token.project_id = pid;
         }
         self.project_id_failures.remove(account_id);
     }
@@ -1722,6 +1549,7 @@ impl TokenManager {
     }
 
     /// 组级配额族 Key 解析（无模型上下文时的兼容入口）。
+    #[allow(dead_code)]
     fn quota_family_key(display_name_lower: &str, bucket_id_lower: &str) -> String {
         Self::quota_family_key_with_codenames(display_name_lower, bucket_id_lower, &[])
     }
@@ -2502,10 +2330,21 @@ impl TokenManager {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        // 【新增】提取订阅等级 (subscription_tier 为 "FREE" | "PRO" | "ULTRA")
+        let is_gcp_tos = token_obj
+            .get("is_gcp_tos")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // 【新增】提取订阅等级 (subscription_tier 为 "FREE" | "PRO" | "ULTRA" | "ENTERPRISE")
         let subscription_tier = account
             .get("quota")
             .and_then(|q| q.get("subscription_tier"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let raw_tier = account
+            .get("quota")
+            .and_then(|q| q.get("raw_tier"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -2804,6 +2643,8 @@ impl TokenManager {
             model_reset_times,
             model_weekly_reset_times,
             model_quota_windows,
+            is_gcp_tos,
+            raw_tier,
         }))
     }
 
@@ -4137,36 +3978,6 @@ impl TokenManager {
         scheduler: &Arc<ImageScheduler>,
         request_timeout: u64,
     ) -> Result<(String, String, String, String, u64, ImagePermit), (StatusCode, String)> {
-        self.get_image_token_with_lease(
-            force_rotate,
-            session_id,
-            target_model,
-            scheduler,
-            request_timeout,
-        )
-        .await
-        .map(|(a, p, e, id, wait, permit, _)| (a, p, e, id, wait, permit))
-    }
-
-    pub async fn get_image_token_with_lease(
-        &self,
-        force_rotate: bool,
-        session_id: Option<&str>,
-        target_model: &str,
-        scheduler: &Arc<ImageScheduler>,
-        request_timeout: u64,
-    ) -> Result<
-        (
-            String,
-            String,
-            String,
-            String,
-            u64,
-            ImagePermit,
-            Option<SessionLease>,
-        ),
-        (StatusCode, String),
-    > {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(request_timeout);
         let mut scheduler_changes = scheduler.subscribe_changes();
@@ -4178,7 +3989,7 @@ impl TokenManager {
             loop {
                 let selection = wait_for_image_token_selection(
                     deadline,
-                    self.get_token_filtered_with_lease(
+                    self.get_token_filtered(
                         "image_gen",
                         force_rotate,
                         session_id,
@@ -4194,7 +4005,7 @@ impl TokenManager {
                             "图片队列等待超时".to_string(),
                         ));
                     }
-                    Some(Ok((access_token, project_id, email, account_id, wait_ms, lease))) => {
+                    Some(Ok((access_token, project_id, email, account_id, wait_ms))) => {
                         if let Some(permit) = scheduler.try_acquire(&account_id) {
                             return Ok((
                                 access_token,
@@ -4203,7 +4014,6 @@ impl TokenManager {
                                 account_id,
                                 wait_ms,
                                 permit,
-                                lease,
                             ));
                         }
                         busy_accounts.insert(account_id);
@@ -4273,48 +4083,6 @@ impl TokenManager {
         target_model: &str,
         excluded_accounts: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
-        self.get_token_filtered_with_lease(
-            quota_group,
-            force_rotate,
-            session_id,
-            target_model,
-            excluded_accounts,
-        )
-        .await
-        .map(|(a, p, e, id, wait, _)| (a, p, e, id, wait))
-    }
-
-    pub async fn get_token_filtered_with_lease(
-        &self,
-        quota_group: &str,
-        force_rotate: bool,
-        session_id: Option<&str>,
-        target_model: &str,
-        excluded_accounts: &HashSet<String>,
-    ) -> Result<LeasedCredentials, String> {
-        self.get_token_filtered_with_retry_lease(
-            quota_group,
-            force_rotate,
-            session_id,
-            target_model,
-            excluded_accounts,
-            &mut None,
-        )
-        .await
-    }
-
-    /// Keep selection authority across HTTP retries and token acquisition errors.
-    /// Only this request's own release (or an unclaimed account-removal successor)
-    /// may advance its lease; a concurrent request's binding is never adopted here.
-    pub async fn get_token_filtered_with_retry_lease(
-        &self,
-        quota_group: &str,
-        force_rotate: bool,
-        session_id: Option<&str>,
-        target_model: &str,
-        excluded_accounts: &HashSet<String>,
-        selection_lease: &mut Option<SessionLease>,
-    ) -> Result<LeasedCredentials, String> {
         // [FIX] 检查并处理待重新加载的账号（配额保护同步）
         let pending_reload = crate::proxy::server::take_pending_reload_accounts();
         for account_id in pending_reload {
@@ -4338,18 +4106,26 @@ impl TokenManager {
             );
         }
 
-        let budget = crate::proxy::pipeline::token_budget::TokenAcquisitionBudget::new();
-        budget
-            .run(self.get_token_internal(
+        // 【优化 Issue #284】添加 15 秒超时，防止死锁（为多账号热路径刷新容灾留足窗口）
+        let timeout_duration = std::time::Duration::from_secs(15);
+        match tokio::time::timeout(
+            timeout_duration,
+            self.get_token_internal(
                 quota_group,
                 force_rotate,
                 session_id,
                 target_model,
                 excluded_accounts,
-                &budget,
-                selection_lease,
-            ))
-            .await
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(
+                "Token acquisition timeout (15s) - system too busy or deadlock detected"
+                    .to_string(),
+            ),
+        }
     }
 
     /// 扫描磁盘上的账号文件，统计封禁/禁用/可用数量（用于池空诊断）
@@ -4436,65 +4212,22 @@ impl TokenManager {
         session_id: Option<&str>,
         target_model: &str,
         excluded_accounts: &HashSet<String>,
-        budget: &crate::proxy::pipeline::token_budget::TokenAcquisitionBudget,
-        selection_lease: &mut Option<SessionLease>,
-    ) -> Result<LeasedCredentials, String> {
-        let scoped_session_id =
-            crate::proxy::session_bindings::scheduling_session_id(quota_group, session_id);
-        let session_id = scoped_session_id.as_deref();
-        // 0. 读取当前调度配置
-        let scheduling = self.sticky_config.read().await.clone();
-        use crate::proxy::sticky_config::SchedulingMode;
-        if scheduling.mode == SchedulingMode::PerformanceFirst {
-            *selection_lease = None;
-        }
-        let selection_snapshot = |lease: Option<&SessionLease>| {
-            if scheduling.mode == SchedulingMode::PerformanceFirst {
-                return Ok(None);
-            }
-            session_id
-                .map(|sid| match lease {
-                    Some(lease) => {
-                        self.session_accounts
-                            .retry_snapshot(sid, lease)
-                            .ok_or_else(|| {
-                                crate::proxy::session_bindings::SESSION_BINDING_CHANGED.to_owned()
-                            })
-                    }
-                    None => Ok(self.session_accounts.snapshot(sid)),
-                })
-                .transpose()
-        };
-        // A stale retry cannot even initiate a reload of another request's binding.
-        if selection_lease.is_some() {
-            selection_snapshot(selection_lease.as_ref())?;
-        }
-        self.recover_unreadable_binding(scheduling.mode, quota_group, session_id)
-            .await?;
-        let initial_snapshot = selection_snapshot(selection_lease.as_ref())?;
-
-        if selection_lease.is_none() {
-            *selection_lease = session_id
-                .and_then(|sid| self.session_accounts.bound_lease(sid))
-                .filter(|lease| {
-                    initial_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.matches_lease(lease))
-                });
-        }
-        let account_epochs = self.session_accounts.account_epochs();
+    ) -> Result<(String, String, String, String, u64), String> {
         let now_ts = chrono::Utc::now().timestamp();
-        let mut tokens_snapshot: Vec<ProxyToken> =
-            self.tokens.iter().map(|e| e.value().clone()).collect();
-        let bound_missing_at_snapshot = selection_lease
-            .as_ref()
-            .map(SessionLease::account_id)
-            .filter(|id| !tokens_snapshot.iter().any(|token| token.account_id == *id))
-            .map(str::to_owned);
-        tokens_snapshot.retain(|token| {
-            !(token.validation_blocked
-                && (token.validation_blocked_until == 0 || token.validation_blocked_until > now_ts))
-        });
+        let mut tokens_snapshot: Vec<ProxyToken> = self
+            .tokens
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|token| {
+                if token.validation_blocked
+                    && (token.validation_blocked_until == 0
+                        || token.validation_blocked_until > now_ts)
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
         tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
         let mut total = tokens_snapshot.len();
         if total == 0 {
@@ -4522,16 +4255,17 @@ impl TokenManager {
             .collect();
 
         let is_advanced_canary = if !accounts_with_capability.is_empty() {
-            // 只要池中有明确支持的账号，且并非所有 FREE 账号都普惠支持（例如只在 PRO/ULTRA 账号中出现），
+            // 只要池中有明确支持的账号，且并非所有 FREE 账号都普惠支持（例如只在 PRO/ULTRA/ENTERPRISE/PAYGO 账号中出现），
             // 就直接将候选池收敛到这些具备实际能力的账号！
             let only_in_paid_tiers = accounts_with_capability.iter().all(|t| {
-                matches!(
-                    t.subscription_tier
-                        .as_deref()
-                        .map(str::to_uppercase)
-                        .as_deref(),
-                    Some("PRO") | Some("ULTRA")
-                )
+                t.is_paygo()
+                    || matches!(
+                        t.subscription_tier
+                            .as_deref()
+                            .map(str::to_uppercase)
+                            .as_deref(),
+                        Some("PRO") | Some("ULTRA") | Some("ENTERPRISE")
+                    )
             });
             // 如果仅在付费账号中出现，或者只有部分账号拥有（灰度特征），均触发精准收敛
             only_in_paid_tiers || accounts_with_capability.len() < tokens_snapshot.len()
@@ -4554,24 +4288,25 @@ impl TokenManager {
             if !accounts_with_capability.is_empty() {
                 tokens_snapshot = accounts_with_capability;
             } else {
-                // 冷启动：先行保留符合基本高级订阅资质的账号 (PRO / ULTRA)
+                // 冷启动：先行保留符合基本高级订阅资质的账号 (PRO / ULTRA / ENTERPRISE / PAYGO)
                 tokens_snapshot.retain(|t| {
-                    matches!(
-                        t.subscription_tier
-                            .as_deref()
-                            .map(str::to_uppercase)
-                            .as_deref(),
-                        Some("PRO") | Some("ULTRA")
-                    )
+                    t.is_paygo()
+                        || matches!(
+                            t.subscription_tier
+                                .as_deref()
+                                .map(str::to_uppercase)
+                                .as_deref(),
+                            Some("PRO") | Some("ULTRA") | Some("ENTERPRISE")
+                        )
                 });
                 if tokens_snapshot.is_empty() {
                     if before_tier > 0 {
                         tracing::warn!(
-                            "Model {} requires PRO or ULTRA subscription, but no PRO/ULTRA accounts available in pool",
+                            "Model {} requires PRO, ULTRA, ENTERPRISE or PAYGO subscription, but no matching accounts available in pool",
                             target_model
                         );
                         return Err(format!(
-                            "Model {} requires PRO or ULTRA subscription, but no PRO/ULTRA accounts are available",
+                            "Model {} requires PRO, ULTRA, ENTERPRISE or PAYGO subscription, but no eligible accounts are available",
                             target_model
                         ));
                     }
@@ -4795,6 +4530,10 @@ impl TokenManager {
                 .collect::<Vec<_>>()
         );
 
+        // 0. 读取当前调度配置
+        let scheduling = self.sticky_config.read().await.clone();
+        use crate::proxy::sticky_config::SchedulingMode;
+
         // 【新增】检查配额保护是否启用（如果关闭，则忽略 protected_models 检查）
         let quota_protection_enabled = crate::modules::config::load_app_config()
             .map(|cfg| cfg.quota_protection.enabled)
@@ -4802,223 +4541,170 @@ impl TokenManager {
 
         // ===== [FIX #820] 固定账号模式：优先使用指定账号 =====
         let preferred_id = self.preferred_account_id.read().await.clone();
-        'preferred_selection: {
-            if !force_rotate {
-                if let Some(ref pref_id) = preferred_id {
-                    // 查找优先账号
-                    if let Some(preferred_token) = tokens_snapshot
-                        .iter()
-                        .find(|t| &t.account_id == pref_id)
-                        .cloned()
-                    {
-                        // 检查账号是否可用（未限流、未被配额保护）
-                        match Self::get_account_state_on_disk(&preferred_token.account_path).await {
-                            OnDiskAccountState::Disabled => {
-                                tracing::warn!(
+        if !force_rotate {
+            if let Some(ref pref_id) = preferred_id {
+                // 查找优先账号
+                if let Some(preferred_token) = tokens_snapshot
+                    .iter()
+                    .find(|t| &t.account_id == pref_id)
+                    .cloned()
+                {
+                    // 检查账号是否可用（未限流、未被配额保护）
+                    match Self::get_account_state_on_disk(&preferred_token.account_path).await {
+                        OnDiskAccountState::Disabled => {
+                            tracing::warn!(
                                 "🔒 [FIX #820] Preferred account {} is disabled on disk, purging and falling back",
                                 preferred_token.email
                             );
-                                self.remove_account(&preferred_token.account_id);
-                                tokens_snapshot
-                                    .retain(|t| t.account_id != preferred_token.account_id);
-                                total = tokens_snapshot.len();
+                            self.remove_account(&preferred_token.account_id);
+                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
+                            total = tokens_snapshot.len();
 
-                                {
-                                    let mut preferred = self.preferred_account_id.write().await;
-                                    if preferred.as_deref() == Some(pref_id.as_str()) {
-                                        *preferred = None;
-                                    }
-                                }
-
-                                if total == 0 {
-                                    return Err("Token pool is empty".to_string());
+                            {
+                                let mut preferred = self.preferred_account_id.write().await;
+                                if preferred.as_deref() == Some(pref_id.as_str()) {
+                                    *preferred = None;
                                 }
                             }
-                            OnDiskAccountState::Unknown => {
-                                if let Some(stop) = self.cache_first_bound_account_stop(
-                                    scheduling.mode,
-                                    quota_group,
-                                    session_id,
-                                    &preferred_token.account_id,
-                                    "state on disk",
-                                ) {
-                                    return Err(stop);
-                                }
-                                tracing::warn!(
+
+                            if total == 0 {
+                                return Err(self.empty_pool_error());
+                            }
+                        }
+                        OnDiskAccountState::Unknown => {
+                            tracing::warn!(
                                 "🔒 [FIX #820] Preferred account {} state on disk is unavailable, falling back",
                                 preferred_token.email
                             );
-                                // Don't purge on transient read/parse failures; just skip this token for this request.
-                                tokens_snapshot
-                                    .retain(|t| t.account_id != preferred_token.account_id);
-                                total = tokens_snapshot.len();
-                                if total == 0 {
-                                    return Err("Token pool is empty".to_string());
-                                }
+                            // Don't purge on transient read/parse failures; just skip this token for this request.
+                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
+                            total = tokens_snapshot.len();
+                            if total == 0 {
+                                return Err(self.empty_pool_error());
                             }
-                            OnDiskAccountState::Enabled => {
-                                let normalized_target =
-                                    crate::proxy::common::model_mapping::normalize_to_standard_id(
-                                        target_model,
-                                    )
-                                    .unwrap_or_else(|| target_model.to_string());
+                        }
+                        OnDiskAccountState::Enabled => {
+                            let normalized_target =
+                                crate::proxy::common::model_mapping::normalize_to_standard_id(
+                                    target_model,
+                                )
+                                .unwrap_or_else(|| target_model.to_string());
 
-                                let is_validation_blocked = preferred_token.validation_blocked
-                                    && (preferred_token.validation_blocked_until == 0
-                                        || preferred_token.validation_blocked_until
-                                            > chrono::Utc::now().timestamp());
+                            let is_validation_blocked = preferred_token.validation_blocked
+                                && (preferred_token.validation_blocked_until == 0
+                                    || preferred_token.validation_blocked_until
+                                        > chrono::Utc::now().timestamp());
 
-                                let is_rate_limited = self
-                                    .is_rate_limited(
-                                        &preferred_token.account_id,
-                                        Some(&normalized_target),
-                                    )
-                                    .await;
-                                let is_quota_protected = quota_protection_enabled
-                                    && preferred_token
-                                        .protected_models
-                                        .contains(&normalized_target);
+                            let is_rate_limited = self
+                                .is_rate_limited(
+                                    &preferred_token.account_id,
+                                    Some(&normalized_target),
+                                )
+                                .await;
+                            let is_quota_protected = quota_protection_enabled
+                                && preferred_token
+                                    .protected_models
+                                    .contains(&normalized_target);
 
-                                // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
-                                let preferred_quota = preferred_token
-                                    .model_quotas
-                                    .get(&normalized_target)
-                                    .or_else(|| preferred_token.model_quotas.get(target_model))
-                                    .copied();
-                                let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
-                                let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
-                                    t.account_id != preferred_token.account_id
-                                        && !self.rate_limit_tracker.is_rate_limited(
-                                            &t.account_id,
-                                            Some(&normalized_target),
-                                        )
-                                        && t.model_quotas
-                                            .get(&normalized_target)
-                                            .or_else(|| t.model_quotas.get(target_model))
-                                            .copied()
-                                            .unwrap_or(0)
-                                            > 0
-                                });
+                            // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
+                            let preferred_quota = preferred_token
+                                .model_quotas
+                                .get(&normalized_target)
+                                .or_else(|| preferred_token.model_quotas.get(target_model))
+                                .copied();
+                            let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
+                            let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
+                                t.account_id != preferred_token.account_id
+                                    && !self
+                                        .rate_limit_tracker
+                                        .is_rate_limited(&t.account_id, Some(&normalized_target))
+                                    && t.model_quotas
+                                        .get(&normalized_target)
+                                        .or_else(|| t.model_quotas.get(target_model))
+                                        .copied()
+                                        .unwrap_or(0)
+                                        > 0
+                            });
 
-                                if is_validation_blocked {
-                                    tracing::warn!(
+                            if is_validation_blocked {
+                                tracing::warn!(
                                     "🔒 [Validation-Blocked] Preferred account {} is blocked for validation, seamlessly falling back to available account in pool",
                                     preferred_token.email
                                 );
-                                } else if has_zero_quota && has_healthy_alternative {
-                                    tracing::warn!(
+                            } else if has_zero_quota && has_healthy_alternative {
+                                tracing::warn!(
                                     "🔒 [Auto-Switch #3639] Preferred account {} has 0% quota for model {}, seamlessly falling back to available account in pool",
                                     preferred_token.email,
                                     normalized_target
                                 );
-                                } else if !is_rate_limited && !is_quota_protected {
-                                    tracing::info!(
-                                        "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
-                                        preferred_token.email
-                                    );
+                            } else if !is_rate_limited && !is_quota_protected {
+                                tracing::info!(
+                                    "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
+                                    preferred_token.email
+                                );
 
-                                    // 直接使用优先账号，跳过轮询逻辑
-                                    let mut token = preferred_token.clone();
-                                    let session_lease = initial_snapshot.as_ref().map(|snapshot| {
-                                        let mut lease = self
-                                            .session_accounts
-                                            .candidate(snapshot, &token.account_id);
-                                        lease.set_account_epoch(
-                                            account_epochs
-                                                .get(&token.account_id)
-                                                .copied()
-                                                .unwrap_or(0),
-                                        );
-                                        lease
-                                    });
-                                    *selection_lease = session_lease.clone();
+                                // 直接使用优先账号，跳过轮询逻辑
+                                let mut token = preferred_token.clone();
 
-                                    // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
-                                    const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
-                                    let now = chrono::Utc::now().timestamp();
-                                    if now >= token.timestamp - TOKEN_REFRESH_BUFFER_SECS {
-                                        let hot_path_timeout =
-                                            std::time::Duration::from_millis(3500);
-                                        match self
-                                            .refresh_account_token_for_selection(
-                                                &token.account_id,
-                                                TOKEN_REFRESH_BUFFER_SECS,
-                                                hot_path_timeout,
-                                            )
-                                            .await
-                                        {
-                                            Ok(refreshed) => {
-                                                token = refreshed;
-                                            }
-                                            Err(e) => {
-                                                if let Some(stop) = self.cache_first_refresh_stop(
-                                                    &e,
-                                                    scheduling.mode,
-                                                    quota_group,
-                                                    session_id,
-                                                    &token.account_id,
-                                                ) {
-                                                    tracing::warn!("Bound preferred account refresh deferred ({}): {}", token.email, e);
-                                                    return Err(stop);
-                                                }
-                                                tracing::warn!(
+                                // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
+                                const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
+                                let now = chrono::Utc::now().timestamp();
+                                if now >= token.timestamp - TOKEN_REFRESH_BUFFER_SECS {
+                                    let hot_path_timeout = std::time::Duration::from_millis(3500);
+                                    match self
+                                        .refresh_account_token_with_timeout(
+                                            &token.account_id,
+                                            TOKEN_REFRESH_BUFFER_SECS,
+                                            hot_path_timeout,
+                                        )
+                                        .await
+                                    {
+                                        Ok(refreshed) => {
+                                            token = refreshed;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
                                                 "Preferred account token refresh failed ({}): {}，继续尝试或回退",
                                                 token.email,
                                                 e
                                             );
-                                                // A failed refresh is never permission to send an
-                                                // expired or explicitly rejected credential.
-                                                if !e.is_temporary()
-                                                    || token.timestamp
-                                                        <= chrono::Utc::now().timestamp()
-                                                {
-                                                    break 'preferred_selection;
-                                                }
-                                            }
                                         }
                                     }
+                                }
 
-                                    // 确保有 project_id
-                                    let hot_path_timeout = std::time::Duration::from_millis(3500);
-                                    let project_id = self
-                                        .resolve_project_id_with_timeout(
-                                            &token.account_id,
-                                            &token.access_token,
-                                            &token.account_path,
-                                            hot_path_timeout,
-                                        )
-                                        .await;
-
-                                    self.validate_pool_selection(
+                                // 确保有 project_id
+                                let hot_path_timeout = std::time::Duration::from_millis(3500);
+                                let project_id = self
+                                    .resolve_project_id_with_timeout(
                                         &token.account_id,
-                                        scheduling.mode,
-                                        quota_group,
-                                        session_id,
-                                    )?;
-                                    return Ok((
-                                        token.access_token,
-                                        project_id,
-                                        token.email,
-                                        token.account_id,
-                                        0,
-                                        session_lease,
-                                    ));
+                                        &token.access_token,
+                                        &token.account_path,
+                                        hot_path_timeout,
+                                    )
+                                    .await;
+
+                                return Ok((
+                                    token.access_token,
+                                    project_id,
+                                    token.email,
+                                    token.account_id,
+                                    0,
+                                ));
+                            } else {
+                                if is_rate_limited {
+                                    tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
                                 } else {
-                                    if is_rate_limited {
-                                        tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
-                                    } else {
-                                        tracing::warn!("🔒 [FIX #820] Preferred account {} is quota-protected for {}, falling back to round-robin", preferred_token.email, target_model);
-                                    }
+                                    tracing::warn!("🔒 [FIX #820] Preferred account {} is quota-protected for {}, falling back to round-robin", preferred_token.email, target_model);
                                 }
                             }
                         }
-                    } else {
-                        tracing::warn!("🔒 [FIX #820] Preferred account {} not found in pool, falling back to round-robin", pref_id);
                     }
+                } else {
+                    tracing::warn!("🔒 [FIX #820] Preferred account {} not found in pool, falling back to round-robin", pref_id);
                 }
             }
-            // ===== [END FIX #820] =====
         }
+        // ===== [END FIX #820] =====
 
         // 【优化 Issue #284】将锁操作移到循环外，避免重复获取锁
         // 预先获取 last_used_account 的快照，避免在循环中多次加锁
@@ -5034,13 +4720,6 @@ impl TokenManager {
         let mut need_update_last_used: Option<(String, std::time::Instant)> = None;
 
         for attempt in 0..total {
-            let allow_initial_claim_cohort = selection_lease.is_none();
-            let mut binding_snapshot = if attempt == 0 && selection_lease.is_none() {
-                initial_snapshot.clone()
-            } else {
-                selection_snapshot(selection_lease.as_ref())?
-            };
-            let mut session_lease = None;
             let rotate = force_rotate || attempt > 0;
 
             // ===== 【核心】粘性会话与智能调度逻辑 =====
@@ -5059,12 +4738,7 @@ impl TokenManager {
                 let sid = session_id.unwrap();
 
                 // 1. 检查会话是否已绑定账号
-                if let Some(bound_lease) = self.session_accounts.bound_lease(sid).filter(|lease| {
-                    binding_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.matches_lease(lease))
-                }) {
-                    let bound_id = bound_lease.account_id().to_string();
+                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
                     // 【修复】先通过 account_id 找到对应的账号，获取其 email
                     // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) =
@@ -5119,10 +4793,7 @@ impl TokenManager {
                                 "Sticky Session: Bound account {} is VALIDATION BLOCKED, unbinding and switching.",
                                 bound_token.email
                             );
-                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                binding_snapshot = Some(renewed.snapshot());
-                                *selection_lease = Some(renewed);
-                            }
+                            self.session_accounts.remove(sid);
                         } else if bound_zero_quota && has_healthy_alternative {
                             // [FIX #3639] 粘性绑定的账号目标模型额度已归零且号池有可用账号，无缝解绑并自动迁移至健康账号
                             tracing::info!(
@@ -5130,26 +4801,17 @@ impl TokenManager {
                                 bound_token.email,
                                 normalized_target
                             );
-                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                binding_snapshot = Some(renewed.snapshot());
-                                *selection_lease = Some(renewed);
-                            }
+                            self.session_accounts.remove(sid);
                             attempted.insert(bound_token.account_id.clone());
                         } else if quota_protection_enabled
                             && bound_token.protected_models.contains(&normalized_target)
                         {
                             tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
-                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                binding_snapshot = Some(renewed.snapshot());
-                                *selection_lease = Some(renewed);
-                            }
+                            self.session_accounts.remove(sid);
                         } else if attempted.contains(&bound_id) {
                             // [FIX] 绑定的账号在当前轮次请求中已尝试失败，立即解绑避免死锁
                             tracing::debug!("Sticky Session: Bound account {} already attempted in current request, unbinding", bound_token.email);
-                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                binding_snapshot = Some(renewed.snapshot());
-                                *selection_lease = Some(renewed);
-                            }
+                            self.session_accounts.remove(sid);
                         } else if is_qos_jailed {
                             if scheduling.mode == SchedulingMode::CacheFirst {
                                 // CacheFirst（缓存优先）：触发限速小黑屋时绝不解绑会话换号，按最大等待时长原地精准等待冷却后继续复用，保住昂贵 KV Cache
@@ -5176,13 +4838,11 @@ impl TokenManager {
                                         rem_secs,
                                         wait_secs
                                     );
-                                    budget
-                                        .wait_for_cooldown(std::time::Duration::from_secs(
-                                            wait_secs,
-                                        ))
-                                        .await?;
+                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
+                                        .await;
                                 }
-                                self.validate_cached_account_after_wait(&key, &normalized_target)?;
+                                self.qos_guardian
+                                    .promote_to_half_open(&bound_token.account_id);
                                 tracing::info!(
                                     "Sticky Session: Successfully reusing bound account {} for session {} after QoS wait",
                                     bound_token.email,
@@ -5198,10 +4858,7 @@ impl TokenManager {
                                     "Sticky Session: Bound account {} is JAILED in QoS Guardian, unbinding and switching.",
                                     bound_token.email
                                 );
-                                if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                    binding_snapshot = Some(renewed.snapshot());
-                                    *selection_lease = Some(renewed);
-                                }
+                                self.session_accounts.remove(sid);
                             }
                         } else if reset_sec > 0 {
                             if scheduling.max_wait_seconds > 0
@@ -5224,13 +4881,12 @@ impl TokenManager {
                                         scheduling.max_wait_seconds,
                                         wait_secs
                                     );
-                                    budget
-                                        .wait_for_cooldown(std::time::Duration::from_secs(
-                                            wait_secs,
-                                        ))
-                                        .await?;
+                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs))
+                                        .await;
                                 }
-                                self.validate_cached_account_after_wait(&key, &normalized_target)?;
+                                self.rate_limit_tracker
+                                    .clear_model(&key, &normalized_target);
+                                self.rate_limit_tracker.clear_account_only(&key);
                                 tracing::info!(
                                     "Sticky Session: Successfully reusing bound account {} for session {} after rate-limit wait",
                                     bound_token.email,
@@ -5246,10 +4902,7 @@ impl TokenManager {
                                     "Sticky Session: Bound account {} is rate-limited for {} ({}s), unbinding and switching.",
                                     bound_token.email, normalized_target, reset_sec
                                 );
-                                if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                    binding_snapshot = Some(renewed.snapshot());
-                                    *selection_lease = Some(renewed);
-                                }
+                                self.session_accounts.remove(sid);
                             }
                         } else {
                             // 3. 账号可用且未被标记为尝试失败，优先复用（无论 Balance 还是 CacheFirst，配额 > 0% 且未被限流、未被封禁/模型冻结时绝不主动解绑，坚决保护上游 KV 缓存）
@@ -5259,30 +4912,12 @@ impl TokenManager {
                                 Some((bound_token.account_id.clone(), std::time::Instant::now()));
                         }
                     } else {
-                        if scheduling.mode == SchedulingMode::CacheFirst
-                            && quota_group != "image_gen"
-                            && (self.unreadable_accounts.contains_key(&bound_id)
-                                || (self.tokens.contains_key(&bound_id)
-                                    && bound_missing_at_snapshot.as_deref()
-                                        == Some(bound_id.as_str())))
-                        {
-                            use crate::proxy::session_bindings::ColdSessionRelease;
-                            match self.session_accounts.release_unavailable(&bound_lease) {
-                                ColdSessionRelease::Warm => return Err("CacheFirst bound account state on disk is temporarily unavailable; retry later.".into()),
-                                ColdSessionRelease::Stale => return Err(crate::proxy::session_bindings::SESSION_BINDING_CHANGED.into()),
-                                ColdSessionRelease::Released(next) => {binding_snapshot=Some(next.snapshot());*selection_lease=Some(next);}
-                            }
-                        } else {
-                            // 绑定的账号已不可用（已被删除、被上游封禁、或当前目标模型已被 403 冻结移出候选池），安全自动解绑
-                            tracing::debug!(
-                                "Sticky Session: Bound account not found for session {}, unbinding",
-                                sid
-                            );
-                            if let Some(renewed) = self.session_accounts.abandon(&bound_lease) {
-                                binding_snapshot = Some(renewed.snapshot());
-                                *selection_lease = Some(renewed);
-                            }
-                        }
+                        // 绑定的账号已不可用（已被删除、被上游封禁、或当前目标模型已被 403 冻结移出候选池），安全自动解绑
+                        tracing::debug!(
+                            "Sticky Session: Bound account not found for session {}, unbinding",
+                            sid
+                        );
+                        self.session_accounts.remove(sid);
                     }
                 }
             }
@@ -5436,61 +5071,40 @@ impl TokenManager {
                 }
             }
 
-            // Capture a lease before refresh/project lookup can yield. Concurrent first
-            // selections adopt one winner; rotations retain the observed generation.
-            if let (Some(selected), Some(snapshot)) =
-                (target_token.as_ref(), binding_snapshot.as_ref())
-            {
-                let proposed = self
-                    .session_accounts
-                    .candidate(snapshot, &selected.account_id);
-                let lease = if !rotate {
-                    let expected_epoch = account_epochs
-                        .get(&selected.account_id)
-                        .copied()
-                        .unwrap_or(0);
-                    if allow_initial_claim_cohort {
-                        self.session_accounts
-                            .claim(snapshot, &selected.account_id, expected_epoch)
-                            // Manual clear/removal can invalidate a first selection too.
-                            .unwrap_or_else(|| proposed.clone())
-                    } else {
-                        self.session_accounts
-                            .claim_for_retry(snapshot, &selected.account_id, expected_epoch)
-                            .ok_or_else(|| {
-                                crate::proxy::session_bindings::SESSION_BINDING_CHANGED.to_owned()
-                            })?
-                    }
-                } else {
-                    proposed.clone()
-                };
-                if lease.account_id() != selected.account_id {
-                    if let Some(winner) = tokens_snapshot
-                        .iter()
-                        .find(|t| t.account_id == lease.account_id())
-                    {
-                        if !self
-                            .is_rate_limited(&winner.account_id, Some(&normalized_target))
-                            .await
-                            && !self.qos_guardian.is_jailed_or_probing(&winner.account_id)
-                            && !(quota_protection_enabled
-                                && winner.protected_models.contains(&normalized_target))
-                            && !winner
-                                .model_quotas
-                                .get(&normalized_target)
-                                .copied()
-                                .is_some_and(|q| q <= 0)
-                        {
-                            target_token = Some(winner.clone());
-                            session_lease = Some(lease);
+            // 同一会话的并发第一次绑定归到已经写下的账号，后到的请求改用赢家。
+            if let Some(ref selected) = target_token {
+                if let Some(sid) = session_id {
+                    if scheduling.mode != SchedulingMode::PerformanceFirst && !rotate {
+                        let bound = {
+                            self.session_accounts
+                                .entry(sid.to_string())
+                                .or_insert_with(|| selected.account_id.clone())
+                                .clone()
+                        };
+                        if bound != selected.account_id {
+                            if let Some(winner) =
+                                tokens_snapshot.iter().find(|t| t.account_id == bound)
+                            {
+                                let winner_limited = self
+                                    .is_rate_limited(&winner.account_id, Some(&normalized_target))
+                                    .await;
+                                if !winner_limited {
+                                    tracing::info!(
+                                        "Sticky Session: Adopted concurrent binding {} for session {}",
+                                        winner.email,
+                                        sid
+                                    );
+                                    target_token = Some(winner.clone());
+                                }
+                            }
                         } else {
-                            session_lease = Some(proposed);
+                            tracing::info!(
+                                "Sticky Session: Ensured binding account {} to session {}",
+                                selected.email,
+                                sid
+                            );
                         }
-                    } else {
-                        session_lease = Some(proposed);
                     }
-                } else {
-                    session_lease = Some(lease);
                 }
             }
 
@@ -5524,9 +5138,7 @@ impl TokenManager {
                             );
 
                             // 物理冷却延迟
-                            budget
-                                .wait_for_cooldown(std::time::Duration::from_millis(wait_ms))
-                                .await?;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
 
                             // 重新尝试选择账号
                             let mut retry_token = None;
@@ -5583,16 +5195,6 @@ impl TokenManager {
 
             // Safety net: avoid selecting an account that has been disabled on disk but still
             // exists in the in-memory snapshot (e.g. stale cache + sticky session binding).
-            if session_lease.is_none() {
-                session_lease = binding_snapshot
-                    .as_ref()
-                    .map(|snapshot| self.session_accounts.candidate(snapshot, &token.account_id));
-            }
-            if let Some(lease) = session_lease.as_mut() {
-                lease
-                    .set_account_epoch(account_epochs.get(&token.account_id).copied().unwrap_or(0));
-            }
-            *selection_lease = session_lease.clone();
             match Self::get_account_state_on_disk(&token.account_path).await {
                 OnDiskAccountState::Disabled => {
                     tracing::warn!(
@@ -5604,15 +5206,6 @@ impl TokenManager {
                     continue;
                 }
                 OnDiskAccountState::Unknown => {
-                    if let Some(stop) = self.cache_first_bound_account_stop(
-                        scheduling.mode,
-                        quota_group,
-                        session_id,
-                        &token.account_id,
-                        "state on disk",
-                    ) {
-                        return Err(stop);
-                    }
                     tracing::warn!(
                         "Selected account {} state on disk is unavailable, skipping",
                         token.email
@@ -5635,7 +5228,7 @@ impl TokenManager {
                 // 若遇上游 OAuth 网络卡顿（如常见 9s DNS/TCP 挂起），3.5s 立即超时跳过并轮换到下一个账号
                 let hot_path_timeout = std::time::Duration::from_millis(3500);
                 match self
-                    .refresh_account_token_for_selection(
+                    .refresh_account_token_with_timeout(
                         &token.account_id,
                         TOKEN_REFRESH_BUFFER_SECS,
                         hot_path_timeout,
@@ -5647,30 +5240,16 @@ impl TokenManager {
                         tracing::debug!("Token 刷新成功！");
                     }
                     Err(e) => {
-                        if let Some(stop) = self.release_session_after_refresh_failure(
-                            &e,
-                            scheduling.mode,
-                            quota_group,
-                            session_id,
-                            &token.account_id,
-                            &mut session_lease,
-                        ) {
-                            *selection_lease = session_lease.clone();
-                            tracing::warn!(
-                                "Bound account refresh deferred ({}): {}",
-                                token.email,
-                                e
-                            );
-                            return Err(stop);
-                        }
                         tracing::error!(
                             "Token 刷新失败或超时 ({}): {}，尝试下一个账号",
                             token.email,
                             e
                         );
-                        *selection_lease = session_lease.clone();
                         last_error = Some(format!("Token refresh failed: {}", e));
                         attempted.insert(token.account_id.clone());
+                        if let Some(sid) = session_id {
+                            self.abandon_session(sid, &token.account_id);
+                        }
                         if quota_group != "image_gen"
                             && matches!(&last_used_account_id, Some((id, _)) if id == &token.account_id)
                         {
@@ -5706,19 +5285,12 @@ impl TokenManager {
                 }
             }
 
-            self.validate_pool_selection(
-                &token.account_id,
-                scheduling.mode,
-                quota_group,
-                session_id,
-            )?;
             return Ok((
                 token.access_token,
                 project_id,
                 token.email,
                 token.account_id,
                 0,
-                session_lease,
             ));
         }
 
@@ -6111,7 +5683,7 @@ impl TokenManager {
         let Ok(serialized) = serde_json::to_string_pretty(&content) else {
             return false;
         };
-        crate::utils::fs::write_private_atomic(path, serialized.as_bytes()).is_ok()
+        std::fs::write(path, serialized).is_ok()
     }
 
     /// 标记账号请求成功，重置连续失败计数
@@ -6125,15 +5697,7 @@ impl TokenManager {
         self.rate_limit_tracker.mark_success(&resolved_id);
     }
 
-    /// A penalty can drop affinity only when the current scheduling mode permits
-    /// it. A configuration writer must not be mistaken for a non-CacheFirst mode.
-    fn penalty_may_unbind_sessions(&self) -> bool {
-        self.sticky_config.try_read().is_ok_and(|config| {
-            config.mode != crate::proxy::sticky_config::SchedulingMode::CacheFirst
-        })
-    }
-
-    /// Apply an account cooldown; the scheduling policy decides whether its sessions move.
+    /// 标记账号发生短时网络故障或超时，施加短时冷却并将粘性会话即时解绑迁移
     pub fn mark_account_transient_failure(
         &self,
         account_id: &str,
@@ -6162,15 +5726,19 @@ impl TokenManager {
             crate::proxy::rate_limit::RateLimitReason::ServerError,
             None,
         );
-        let unbind_sessions = self.penalty_may_unbind_sessions();
-        if unbind_sessions {
-            self.session_accounts
-                .invalidate_account(&resolved_id, || {});
+        // 非 CacheFirst 模式下主动解除绑定到该故障账号的粘性会话；CacheFirst 模式下保留会话绑定以便后续请求在 max_wait_seconds 内精准等待复用
+        let is_cache_first = self
+            .sticky_config
+            .try_read()
+            .map(|c| c.mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst)
+            .unwrap_or(false);
+        if !is_cache_first {
+            self.session_accounts.retain(|_, v| *v != resolved_id);
         }
         tracing::warn!(
             account_id = %resolved_id,
             cooldown_secs = %effective_secs,
-            session_unbound = unbind_sessions,
+            session_unbound = !is_cache_first,
             reason = %reason,
             "Account marked with transient failure cooldown in rate limit tracker"
         );
@@ -6763,51 +6331,6 @@ impl TokenManager {
         }
     }
 
-    // A non-empty refresh replaces the raw catalog and routing candidates together.
-    // Empty responses preserve the last usable snapshot.
-    fn refresh_advertised_models(
-        token: &mut ProxyToken,
-        models: &[crate::models::quota::ModelQuota],
-    ) {
-        if models.is_empty() {
-            return;
-        }
-        let previous_metadata = std::mem::take(&mut token.model_metadata);
-        token.available_models.clear();
-        for m in models {
-            let raw = m.name.trim().to_lowercase();
-            if raw.is_empty() || raw.contains("-disabled") || raw.ends_with("_disabled") {
-                continue;
-            }
-            let mut meta = crate::models::quota::ModelListingMeta::from(m);
-            if let Some(previous) = previous_metadata.get(&raw) {
-                meta.merge_from(previous);
-            }
-            token.model_metadata.insert(raw.clone(), meta);
-            let norm_name = crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
-                .unwrap_or_else(|| m.name.clone());
-            let pct_val = m.percentage as i32;
-            token
-                .model_quotas
-                .entry(norm_name)
-                .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
-                .or_insert(pct_val);
-            token.model_quotas.insert(m.name.clone(), pct_val);
-            let m_lower = raw;
-            token.model_quotas.insert(m_lower.clone(), pct_val);
-            let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
-            if base_name != m_lower {
-                token
-                    .model_quotas
-                    .entry(base_name.clone())
-                    .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
-                    .or_insert(pct_val);
-                token.available_models.insert(base_name);
-            }
-            token.available_models.insert(m_lower);
-        }
-    }
-
     /// 实时刷新配额并精确锁定账号
     ///
     /// 当 429 发生时调用此方法:
@@ -6855,7 +6378,52 @@ impl TokenManager {
             Ok((quota_data, _project_id)) => {
                 // [NEW] 实时刷新成功后，立即同步最新配额数据与 available_models 至内存缓存
                 if let Some(mut token) = self.tokens.get_mut(&account_id) {
-                    Self::refresh_advertised_models(&mut token, &quota_data.models);
+                    if !quota_data.models.is_empty() {
+                        token.available_models.clear();
+                        token.model_limits.clear();
+                    }
+                    for m in &quota_data.models {
+                        let norm_name =
+                            crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
+                                .unwrap_or_else(|| m.name.clone());
+                        let pct_val = m.percentage as i32;
+                        token
+                            .model_quotas
+                            .entry(norm_name)
+                            .and_modify(|existing: &mut i32| *existing = (*existing).max(pct_val))
+                            .or_insert(pct_val);
+                        token.model_quotas.insert(m.name.clone(), pct_val);
+                        let m_lower = m.name.to_lowercase();
+                        token.model_quotas.insert(m_lower.clone(), pct_val);
+                        let base_name =
+                            crate::proxy::common::model_mapping::strip_tier_suffix(&m_lower);
+                        if base_name != m_lower {
+                            token
+                                .model_quotas
+                                .entry(base_name.clone())
+                                .and_modify(|existing: &mut i32| {
+                                    *existing = (*existing).max(pct_val)
+                                })
+                                .or_insert(pct_val);
+                            token.available_models.insert(base_name.clone());
+                        }
+                        token.available_models.insert(m_lower.clone());
+                        if let Some(limit) = m.max_output_tokens.filter(|&v| v > 0) {
+                            let limit_u64 = limit as u64;
+                            token.model_limits.insert(m.name.clone(), limit_u64);
+                            if m_lower != m.name {
+                                token.model_limits.entry(m_lower).or_insert(limit_u64);
+                            }
+                            if base_name != m.name.to_lowercase() {
+                                token
+                                    .model_limits
+                                    .entry(base_name)
+                                    .and_modify(|existing| *existing = (*existing).max(limit_u64))
+                                    .or_insert(limit_u64);
+                            }
+                        }
+                    }
+
                     // 实时刷新时复用统一 Gemini 4+ 分组同步与三套配额窗口快照写入入口，
                     // 确保 Argon 门禁、未来新代号专属桶（若上游拆分）以及重置时间戳与冷启动加载完全一致。
                     let is_ultra = token
@@ -7286,7 +6854,7 @@ impl TokenManager {
             return false;
         }
 
-        self.record_rate_limit_atomic(
+        let recorded = self.record_rate_limit_atomic(
             &account_id,
             status,
             retry_after_header,
@@ -7296,7 +6864,10 @@ impl TokenManager {
             TrackerParserMode::Current,
         );
 
-        status == 429 && is_quota_depleted && !has_explicit_retry_time
+        status == 429
+            && (recorded.is_some() || is_quota_depleted)
+            && !has_explicit_retry_time
+            && is_quota_depleted
     }
 
     /// [NEW] 将指定账号的目标模型配额在内存中即时标记为 0%
@@ -7591,7 +7162,7 @@ impl TokenManager {
         let Ok(serialized) = serde_json::to_string_pretty(&content) else {
             return;
         };
-        if let Err(e) = crate::utils::fs::write_private_atomic(&path, serialized.as_bytes()) {
+        if let Err(e) = std::fs::write(&path, serialized) {
             tracing::debug!("Failed to persist live limit for {}: {}", account_id, e);
         }
     }
@@ -7647,8 +7218,7 @@ impl TokenManager {
             let Ok(serialized) = serde_json::to_string_pretty(&content) else {
                 return;
             };
-            if let Err(error) = crate::utils::fs::write_private_atomic(&path, serialized.as_bytes())
-            {
+            if let Err(error) = std::fs::write(&path, serialized) {
                 tracing::debug!("Failed to clear live limit for {}: {}", account_id, error);
                 return;
             }
@@ -7657,122 +7227,6 @@ impl TokenManager {
     }
 
     // ===== 调度配置相关方法 =====
-
-    fn release_session_after_refresh_failure(
-        &self,
-        error: &TokenRefreshError,
-        mode: crate::proxy::sticky_config::SchedulingMode,
-        quota_group: &str,
-        session_id: Option<&str>,
-        account_id: &str,
-        lease: &mut Option<SessionLease>,
-    ) -> Option<String> {
-        if error.is_temporary()
-            && mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst
-            && quota_group != "image_gen"
-        {
-            if let Some(current) = lease.as_ref() {
-                use crate::proxy::session_bindings::ColdSessionRelease;
-                match self.session_accounts.abandon_if_cold(current) {
-                    ColdSessionRelease::Warm => return Some(
-                        "CacheFirst bound account token refresh is temporarily unavailable; retry later.".into()
-                    ),
-                    ColdSessionRelease::Released(next) => *lease = Some(next),
-                    ColdSessionRelease::Stale => {
-                        // A newer selection owns the binding. Re-entering the
-                        // rotation loop would take a fresh snapshot and could
-                        // replace it despite this request's now-stale lease.
-                        return Some("CacheFirst bound account selection changed during token refresh; retry later.".into());
-                    }
-                }
-            } else {
-                return self.cache_first_refresh_stop(
-                    error,
-                    mode,
-                    quota_group,
-                    session_id,
-                    account_id,
-                );
-            }
-        } else {
-            self.abandon_session_lease(lease);
-        }
-        None
-    }
-
-    fn cache_first_refresh_stop(
-        &self,
-        error: &TokenRefreshError,
-        mode: crate::proxy::sticky_config::SchedulingMode,
-        quota_group: &str,
-        session_id: Option<&str>,
-        account_id: &str,
-    ) -> Option<String> {
-        if !error.is_temporary() {
-            return None;
-        }
-        self.cache_first_bound_account_stop(
-            mode,
-            quota_group,
-            session_id,
-            account_id,
-            "token refresh",
-        )
-    }
-
-    fn cache_first_bound_account_stop(
-        &self,
-        mode: crate::proxy::sticky_config::SchedulingMode,
-        quota_group: &str,
-        session_id: Option<&str>,
-        account_id: &str,
-        unavailable: &str,
-    ) -> Option<String> {
-        if mode != crate::proxy::sticky_config::SchedulingMode::CacheFirst
-            || quota_group == "image_gen"
-            || !session_id
-                .and_then(|id| {
-                    if unavailable == "state on disk" {
-                        self.session_accounts.disk_protected_lease(id)
-                    } else {
-                        self.session_accounts.committed_lease(id)
-                    }
-                })
-                .is_some_and(|lease| lease.account_id() == account_id)
-        {
-            return None;
-        }
-        // Preserve the warm binding without sending credentials whose validity
-        // or current disk state is unknown. Handlers recognize this prefix and stop the
-        // outer gateway from replacing the AM instance as well.
-        Some(format!(
-            "CacheFirst bound account {unavailable} is temporarily unavailable; retry later."
-        ))
-    }
-
-    // Waiting is not evidence of recovery: read current state without deleting
-    // cooldowns that another request may have extended while this request slept.
-    fn validate_cached_account_after_wait(
-        &self,
-        account_id: &str,
-        model: &str,
-    ) -> Result<(), String> {
-        self.qos_guardian.promote_to_half_open(account_id);
-        if self.qos_guardian.is_jailed_or_probing(account_id) {
-            return Err(
-                "CacheFirst bound account is still in QoS cooldown or probing; retry later.".into(),
-            );
-        }
-        let remaining = self
-            .rate_limit_tracker
-            .get_remaining_wait(account_id, Some(model));
-        if remaining > 0 {
-            return Err(format!(
-                "CacheFirst bound account is rate-limited. Cooldown wait {remaining}s."
-            ));
-        }
-        Ok(())
-    }
 
     /// 获取当前调度配置
     pub async fn get_sticky_config(&self) -> StickySessionConfig {
@@ -7807,72 +7261,32 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
-    /// Release only the generation selected by this request. A grace retry may
-    /// reclaim the renewed vacant generation if no other request has claimed it.
-    pub fn abandon_session_lease(&self, lease: &mut Option<SessionLease>) -> bool {
-        let Some(current) = lease.as_ref() else {
-            return false;
-        };
-        if let Some(next) = self.session_accounts.abandon(current) {
-            *lease = Some(next);
-            true
-        } else {
-            // A rotating candidate may not yet own the published binding. Keep
-            // its generation for GraceRetry; stale generations still fail CAS.
-            false
-        }
-    }
-
-    /// A response proves warmth for a request already dispatched. Quarantine
-    /// removes its credential from scheduling but keeps its account generation.
-    /// Confirmed removal still invalidates the lease under the binding lock.
-    fn response_account_known(&self, id: &str) -> bool {
-        self.tokens.contains_key(id) || self.unreadable_accounts.contains_key(id)
-    }
-
-    /// Publish an accepted text request; body confirmation decides whether a
-    /// cold binding becomes warm. Images retain their explicit success contract.
-    pub fn accept_session_response(
-        self: &Arc<Self>,
-        lease: &mut Option<SessionLease>,
-    ) -> Option<SessionResponseConfirmation> {
-        let current = lease.as_ref()?;
-        let accepted = self.session_accounts.accept(current, || {
-            self.response_account_known(current.account_id())
-        })?;
-        *lease = Some(accepted.clone());
-        Some(SessionResponseConfirmation::new(self.clone(), accepted))
-    }
-
-    /// Publish the successful selection, rejecting stale generations and accounts.
-    pub fn commit_session_lease(&self, lease: &mut Option<SessionLease>) -> bool {
-        let Some(current) = lease.as_ref() else {
-            return false;
-        };
-        let next = self.session_accounts.commit(current, || {
-            self.response_account_known(current.account_id())
-        });
-        if let Some(next) = next {
-            *lease = Some(next);
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(test)]
-    fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
-        let mut lease = self
+    /// 比较并删除：只有映射里仍然是这个账号才清掉当前会话。
+    pub fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
+        let still_bound = self
             .session_accounts
-            .bound_lease(session_id)
-            .filter(|l| l.account_id() == account_id);
-        self.abandon_session_lease(&mut lease)
+            .get(session_id)
+            .map(|bound| bound.as_str() == account_id)
+            .unwrap_or(false);
+        if still_bound {
+            self.session_accounts.remove(session_id);
+            true
+        } else {
+            false
+        }
     }
 
-    #[cfg(test)]
-    fn commit_session(&self, session_id: &str, account_id: &str) {
+    /// 上游成功后写下真正用过的账号。轮换成功的新账号也从这里进入粘性表。
+    ///
+    /// 若会话当前仍绑定在另一账号上（未经过 `abandon_session` 或失效解绑），
+    /// 绝不允许由临时强制换号（如生图或非解绑降级重试）静默覆写原会话绑定。
+    pub fn commit_session(&self, session_id: &str, account_id: &str) {
+        if session_id.is_empty() || account_id.is_empty() {
+            return;
+        }
         self.session_accounts
-            .insert(session_id.to_owned(), account_id.to_owned());
+            .entry(session_id.to_string())
+            .or_insert_with(|| account_id.to_string());
     }
 
     /// 解绑当前会话。不清全局 last_used，避免一个租户的失败打散别人的 60 秒窗口。
@@ -8014,18 +7428,26 @@ impl TokenManager {
         account_id: &str,
         session_id: Option<&str>,
         action: crate::proxy::qos_guardian::QoSAction,
-        session_lease: Option<&SessionLease>,
     ) {
-        let unbind_sessions = self.penalty_may_unbind_sessions();
+        let should_wait_in_place = |wd: std::time::Duration| -> bool {
+            self.sticky_config
+                .try_read()
+                .map(|c| {
+                    c.mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst
+                        || (c.max_wait_seconds > 0 && wd.as_secs() <= c.max_wait_seconds)
+                })
+                .unwrap_or(false)
+        };
 
         match action {
             crate::proxy::qos_guardian::QoSAction::TriggerJailedAndUnbind {
                 level,
                 wait_duration,
             } => {
-                if unbind_sessions {
-                    if let Some(lease) = session_lease {
-                        self.session_accounts.abandon(lease);
+                let allow_in_place_wait = should_wait_in_place(wait_duration);
+                if !allow_in_place_wait {
+                    if let Some(sid) = session_id {
+                        self.unbind_session(sid);
                     }
                 }
                 tracing::warn!(
@@ -8033,16 +7455,17 @@ impl TokenManager {
                     account_id,
                     level,
                     wait_duration,
-                    unbind_sessions
+                    !allow_in_place_wait
                 );
             }
             crate::proxy::qos_guardian::QoSAction::HalfOpenFailed {
                 escalated_level,
                 wait_duration,
             } => {
-                if unbind_sessions {
-                    if let Some(lease) = session_lease {
-                        self.session_accounts.abandon(lease);
+                let allow_in_place_wait = should_wait_in_place(wait_duration);
+                if !allow_in_place_wait {
+                    if let Some(sid) = session_id {
+                        self.unbind_session(sid);
                     }
                 }
                 tracing::warn!(
@@ -8050,7 +7473,7 @@ impl TokenManager {
                     account_id,
                     escalated_level,
                     wait_duration,
-                    unbind_sessions
+                    !allow_in_place_wait
                 );
             }
             _ => {}
@@ -8066,7 +7489,6 @@ impl TokenManager {
         ttft_ms: f64,
         is_deep_thinking: bool,
         input_tokens: Option<u32>,
-        session_lease: Option<&SessionLease>,
     ) {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
@@ -8085,15 +7507,7 @@ impl TokenManager {
             &all_tokens,
             |acc_id| rate_limiter.is_rate_limited(acc_id, None),
         );
-        self.handle_qos_action(account_id, session_id, action, session_lease);
-    }
-
-    /// 让后台探针共享业务请求的账号代理及热更新后的客户端。
-    pub(crate) fn register_qos_upstream(
-        &self,
-        upstream: &Arc<crate::proxy::upstream::client::UpstreamClient>,
-    ) {
-        *self.qos_upstream.write().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(upstream);
+        self.handle_qos_action(account_id, session_id, action);
     }
 
     /// 两阶段 QoS 评估 Phase 1（首包到达）：返回 `true` 表示已当场落锤（无需 Phase 2 重复裁决）
@@ -8105,7 +7519,6 @@ impl TokenManager {
         ttft_ms: f64,
         is_deep_thinking: bool,
         input_tokens: Option<u32>,
-        session_lease: Option<&SessionLease>,
     ) -> bool {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
@@ -8125,7 +7538,7 @@ impl TokenManager {
             |acc_id| rate_limiter.is_rate_limited(acc_id, None),
         ) {
             crate::proxy::qos_guardian::PreUsageQoSOutcome::Evaluated(action) => {
-                self.handle_qos_action(account_id, session_id, action, session_lease);
+                self.handle_qos_action(account_id, session_id, action);
                 true
             }
             crate::proxy::qos_guardian::PreUsageQoSOutcome::Deferred => false,
@@ -8142,7 +7555,6 @@ impl TokenManager {
         is_deep_thinking: bool,
         total_input_tokens: u32,
         uncached_tokens: u32,
-        session_lease: Option<&SessionLease>,
     ) {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
@@ -8162,7 +7574,7 @@ impl TokenManager {
             &all_tokens,
             |acc_id| rate_limiter.is_rate_limited(acc_id, None),
         );
-        self.handle_qos_action(account_id, session_id, action, session_lease);
+        self.handle_qos_action(account_id, session_id, action);
     }
 
     /// 两阶段 QoS 评估 Phase 2 兜底（流结束前未收到 `usageMetadata`）
@@ -8174,7 +7586,6 @@ impl TokenManager {
         ttft_ms: f64,
         is_deep_thinking: bool,
         input_tokens: Option<u32>,
-        session_lease: Option<&SessionLease>,
     ) {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
@@ -8193,7 +7604,7 @@ impl TokenManager {
             &all_tokens,
             |acc_id| rate_limiter.is_rate_limited(acc_id, None),
         );
-        self.handle_qos_action(account_id, session_id, action, session_lease);
+        self.handle_qos_action(account_id, session_id, action);
     }
 
     /// 刷新会话上下文水位（Phase 1 已裁决后补充权威 total_input_tokens）
@@ -8239,83 +7650,59 @@ impl TokenManager {
         tracing::info!("QoS probing daemon started (interval: 5s)");
     }
 
-    /// 领取可执行的探针，所有状态锁均在返回前释放。
-    fn claim_due_qos_probes(&self) -> Vec<(ProxyToken, crate::proxy::qos_guardian::ProbeClaim)> {
-        self.qos_guardian
-            .take_expired_jails_for_probing(|account_id, config| {
-                let token = self.tokens.get(account_id).map(|r| r.value().clone())?;
-                if token.timestamp
-                    <= chrono::Utc::now()
-                        .timestamp()
-                        .saturating_add(config.probe_timeout_secs.ceil() as i64)
-                {
-                    return None;
-                }
-                Self::select_probe_model(&token)?;
-                Some(token)
-            })
-    }
-
     /// 执行一次 QoS 阶梯自愈扫描轮次
     async fn run_qos_probing_tick(&self) {
-        let upstream = self
-            .qos_upstream
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .upgrade();
-        let Some(upstream) = upstream else {
-            return;
-        };
-        for (token, claim) in self.claim_due_qos_probes() {
+        let expired_jails = self.qos_guardian.take_expired_jails_for_probing();
+        for (account_id, level) in expired_jails {
             let guardian = self.qos_guardian.clone();
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let account_id = &token.account_id;
-                tracing::info!(
-                    "🔍 [QoS Probe] Sending synthetic 'Hello' probe to account {} (Level {})...",
-                    account_id,
-                    claim.level
-                );
-                let probe_res =
-                    Self::send_pure_hello_probe_internal(&token, &upstream, claim.config).await;
-                match probe_res {
-                    Ok(ttft_ms) if claim.accepts_ttft(ttft_ms) => {
-                        if guardian.mark_probe_passed(account_id, claim) {
+            if let Some(token) = self.tokens.get(&account_id).map(|r| r.value().clone()) {
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "🔍 [QoS Probe] Sending synthetic 'Hello' probe to account {} (Level {})...",
+                        account_id,
+                        level
+                    );
+                    let probe_res = Self::send_pure_hello_probe_internal(&token).await;
+                    match probe_res {
+                        Ok(ttft_ms) if ttft_ms < 8000.0 => {
                             tracing::info!(
-                                "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < {:.2}s)! Moving to Half-Open probation.",
+                                "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < 8s)! Moving to Half-Open probation.",
                                 account_id,
-                                ttft_ms / 1000.0,
-                                claim.config.probe_success_threshold_secs
+                                ttft_ms / 1000.0
+                            );
+                            guardian.mark_probe_passed(&account_id, level);
+                        }
+                        Ok(ttft_ms) => {
+                            tracing::warn!(
+                                "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= 8s. Escalating jail level.",
+                                account_id,
+                                ttft_ms / 1000.0
+                            );
+                            let (next_lv, wait) = guardian.mark_probe_failed(&account_id, level);
+                            tracing::warn!(
+                                "Account {} escalated to Level {} (wait {:?})",
+                                account_id,
+                                next_lv,
+                                wait
                             );
                         }
-                    }
-                    Ok(ttft_ms) => {
-                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
-                        {
+                        Err(err) => {
                             tracing::warn!(
-                                "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= {:.2}s. Escalated to Level {} (wait {:?})",
+                                "⏳ [QoS Probe] Account {} probe failed: {}. Escalating jail level.",
                                 account_id,
-                                ttft_ms / 1000.0,
-                                claim.config.probe_success_threshold_secs,
+                                err
+                            );
+                            let (next_lv, wait) = guardian.mark_probe_failed(&account_id, level);
+                            tracing::warn!(
+                                "Account {} escalated to Level {} (wait {:?})",
+                                account_id,
                                 next_lv,
                                 wait
                             );
                         }
                     }
-                    Err(err) => {
-                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
-                        {
-                            tracing::warn!(
-                                "⏳ [QoS Probe] Account {} probe failed: {}. Escalated to Level {} (wait {:?})",
-                                account_id,
-                                err,
-                                next_lv,
-                                wait
-                            );
-                        }
-                    }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -8326,71 +7713,51 @@ impl TokenManager {
             .get(account_id)
             .map(|t| t.value().clone())
             .ok_or_else(|| format!("Account {} not found", account_id))?;
-        let upstream = self
-            .qos_upstream
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .upgrade()
-            .ok_or_else(|| "QoS probe upstream is not initialized".to_string())?;
-        Self::send_pure_hello_probe_internal(&token, &upstream, self.qos_guardian.config_snapshot())
-            .await
+        Self::send_pure_hello_probe_internal(&token).await
     }
 
-    async fn send_pure_hello_probe_internal(
-        token: &ProxyToken,
-        upstream: &crate::proxy::upstream::client::UpstreamClient,
-        config: QoSConfig,
-    ) -> Result<f64, String> {
-        let endpoints: Vec<String> = crate::proxy::upstream::client::V1_INTERNAL_BASE_URL_FALLBACKS
+    /// 选择探针模型：只挑账号真实可用、且配额为正的 Gemini 文本 Flash 档。
+    ///
+    /// 探针的唯一目的是测量「账号 → 上游」的链路首包时延，因此必须满足：
+    /// 1. 模型确实归属该账号（`model_quotas` / `available_models`），否则上游直接 400/429，
+    ///    探针永远失败、刑期只能逐级升级，账号永远回不到 Healthy；
+    /// 2. 走 Flash 档（单次成本最低、最不容易撞容量类 429，且不消耗 Pro / Argon 配额）。
+    fn select_probe_model(token: &ProxyToken) -> Option<String> {
+        let mut candidates: Vec<(String, i32)> = token
+            .model_quotas
             .iter()
-            .map(|base| format!("{base}:streamGenerateContent?alt=sse"))
+            .map(|(name, quota)| (name.clone(), *quota))
             .collect();
-        Self::send_pure_hello_probe_to_endpoints(token, upstream, &endpoints, config).await
+        // 历史账号可能尚未同步配额表，用 available_models 兜底补全（未知配额视为 0，排在末位）
+        for name in &token.available_models {
+            if !candidates.iter().any(|(known, _)| known == name) {
+                candidates.push((name.clone(), 0));
+            }
+        }
+
+        candidates.sort_by_key(|(name, quota)| {
+            let lower = name.to_lowercase();
+            let gemini_text = lower.starts_with("gemini")
+                && !lower.contains("image")
+                && crate::proxy::common::model_mapping::extract_gemini4_codename(&lower).as_deref()
+                    != Some("argon");
+            (
+                if gemini_text { 0 } else { 1 },
+                if lower.contains("flash") { 0 } else { 1 },
+                if *quota > 0 { 0 } else { 1 },
+                lower.clone(),
+            )
+        });
+
+        candidates.into_iter().next().map(|(name, _)| name)
     }
 
-    // Upstream model-quota selection, with local protection and text-only guards.
-    fn select_probe_model(token: &ProxyToken) -> Option<&str> {
-        // Loaded metadata contains only advertised wire IDs. The quota and
-        // routing indexes also contain synthetic bucket/base aliases that
-        // must never be sent to the upstream probe endpoint.
-        token
-            .available_models
-            .iter()
-            .filter(|model| {
-                token.model_metadata.is_empty() || token.model_metadata.contains_key(*model)
-            })
-            .filter(|model| {
-                let lower = model.to_ascii_lowercase();
-                let bucket = crate::proxy::common::model_mapping::normalize_to_standard_id(model);
-                lower.starts_with("gemini-")
-                    && !["image", "tts", "audio"]
-                        .iter()
-                        .any(|kind| lower.contains(kind))
-                    && token
-                        .model_quotas
-                        .get(*model)
-                        .is_none_or(|quota| *quota > 0)
-                    && !token.protected_models.contains(*model)
-                    && !bucket.is_some_and(|b| token.protected_models.contains(&b))
-            })
-            .min_by_key(|model| {
-                let lower = model.to_ascii_lowercase();
-                (
-                    crate::proxy::common::model_mapping::extract_gemini4_codename(&lower)
-                        .as_deref()
-                        == Some("argon"),
-                    !lower.contains("flash"),
-                    !token
-                        .model_quotas
-                        .get(*model)
-                        .is_some_and(|quota| *quota > 0),
-                    !lower.contains("flash-lite"),
-                    lower,
-                )
-            })
-            .map(String::as_str)
-    }
-
+    /// 构造对齐官方 v1internal 信封的极简探针报文。
+    ///
+    /// [FIX] 修复历史缺陷：旧实现直接向 `v1internal:streamGenerateContent` 投递裸
+    /// `{contents, generationConfig}`，缺少 `project` / `requestId` / `request` 包装，
+    /// 上游恒定返回 `400 INVALID_ARGUMENT (Unknown name "contents")`，
+    /// 使 QoS 阶梯探针永远失败、账号刑期只能逐级升级而无法自愈。
     fn build_probe_envelope(token: &ProxyToken, model: &str) -> serde_json::Value {
         let project_id = token
             .project_id
@@ -8421,159 +7788,71 @@ impl TokenManager {
         })
     }
 
-    #[cfg(test)]
-    async fn send_pure_hello_probe_to_endpoint(
-        token: &ProxyToken,
-        upstream: &crate::proxy::upstream::client::UpstreamClient,
-        endpoint: &str,
-        config: QoSConfig,
-    ) -> Result<f64, String> {
-        Self::send_pure_hello_probe_to_endpoints(token, upstream, &[endpoint.to_string()], config)
-            .await
-    }
+    async fn send_pure_hello_probe_internal(token: &ProxyToken) -> Result<f64, String> {
+        let model = Self::select_probe_model(token)
+            .ok_or_else(|| format!("探针跳过：账号 {} 缺少可用模型元数据", token.email))?;
+        let body = Self::build_probe_envelope(token, &model);
 
-    async fn send_pure_hello_probe_to_endpoints(
-        token: &ProxyToken,
-        upstream: &crate::proxy::upstream::client::UpstreamClient,
-        endpoints: &[String],
-        config: QoSConfig,
-    ) -> Result<f64, String> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs_f64(config.probe_timeout_secs),
-            async {
-                if token.timestamp
-                    <= chrono::Utc::now()
-                        .timestamp()
-                        .saturating_add(config.probe_timeout_secs.ceil() as i64)
-                {
-                    return Err("QoS probe is waiting for refreshed credentials".to_string());
-                }
-                let model = Self::select_probe_model(token)
-                    .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
-                let body = Self::build_probe_envelope(token, model);
-                let client = upstream.get_client(Some(&token.account_id)).await;
-                let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-                let mut last_error = "Probe attempted no endpoint".to_string();
-                // Upstream fallback policy: retry network/404/408/5xx failures,
-                // but keep the entire chain within the local probe deadline.
-                for endpoint in endpoints {
-                    let attempt_start = std::time::Instant::now();
-                    let bytes = body_bytes.clone();
-                    let resp = match client
-                        .post(endpoint)
-                        .bearer_auth(&token.access_token)
-                        .header("User-Agent", upstream.get_user_agent().await)
-                        .header("Content-Type", "application/json")
-                        .body(rquest::Body::wrap_stream(futures::stream::once(
-                            async move { Ok::<_, std::io::Error>(bytes) },
-                        )))
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            last_error = format!("Probe HTTP error: {e}");
-                            continue;
-                        }
-                    };
-                    if !resp.status().is_success() {
-                        last_error = format!("Probe HTTP status: {}", resp.status());
-                        let code = resp.status().as_u16();
-                        if code == 404 || code == 408 || (500..600).contains(&code) {
-                            continue;
-                        }
-                        return Err(last_error);
-                    }
-                    // Keepalive or thinking-only data is not recovery evidence.
-                    if Self::wait_for_qos_probe_generation(resp).await? {
-                        return Ok(attempt_start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    last_error = format!("Probe received an empty response from {endpoint}");
-                }
-                Err(last_error)
-            },
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "QoS probe exceeded its {}s deadline",
-                config.probe_timeout_secs
-            )
-        })?
-    }
+        let client = rquest::Client::builder()
+            .timeout(std::time::Duration::from_millis(8000))
+            .build()
+            .map_err(|e| format!("Client builder error: {}", e))?;
+        let hub_ua = crate::modules::hub_version::get_current_hub_user_agent();
 
-    /// True for generated text; false only for a clean zero-byte response.
-    async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<bool, String> {
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-        let mut pending = bytes::BytesMut::new();
-        let mut event_data = String::new();
-        let mut saw_bytes = false;
-        // Keepalive traffic and arbitrary chunk boundaries must not count as tokens.
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Probe stream error: {e}"))?;
-            if pending.len() + event_data.len() + chunk.len() > 64 * 1024 {
-                return Err("QoS probe SSE event exceeded 64 KiB".to_string());
+        // 与主链路共用端点优先级：Daily 主力 → Sandbox 灾备
+        let mut last_error = String::from("Probe attempted no endpoint");
+        for base in crate::proxy::upstream::client::V1_INTERNAL_BASE_URL_FALLBACKS {
+            let endpoint = format!("{}:streamGenerateContent?alt=sse", base);
+            let start = std::time::Instant::now();
+
+            let resp = match client
+                .post(endpoint.as_str())
+                .header("Authorization", format!("Bearer {}", token.access_token))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", hub_ua.clone())
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // 网络层故障属于端点级问题，换下一个候选端点继续探
+                    last_error = format!("{} -> {}", endpoint, e);
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                last_error = format!("{} -> HTTP {} (model={})", endpoint, status, model);
+                // 与 should_try_next_endpoint 保持一致的终止语义：408 / 404 / 5xx 才回退，
+                // 400 / 401 / 403 / 429 属于账号或报文级结论，直接判失败，避免重试放大。
+                let code = status.as_u16();
+                if code == 408 || code == 404 || (500..600).contains(&code) {
+                    continue;
+                }
+                return Err(last_error);
             }
-            saw_bytes |= !chunk.is_empty();
-            pending.extend_from_slice(&chunk);
-            while let Some(end) = pending.iter().position(|&byte| byte == b'\n') {
-                let line = pending.split_to(end + 1);
-                let line = std::str::from_utf8(&line)
-                    .map_err(|_| "QoS probe received invalid UTF-8".to_string())?
-                    .trim_end_matches(['\r', '\n']);
-                if line.is_empty() {
-                    if Self::qos_probe_event_has_generation(&event_data)? {
-                        return Ok(true);
-                    }
-                    event_data.clear();
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    if !event_data.is_empty() {
-                        event_data.push('\n');
-                    }
-                    event_data.push_str(data.strip_prefix(' ').unwrap_or(data));
-                }
-            }
-        }
-        if saw_bytes {
-            Err("QoS probe ended without generated text".to_string())
-        } else {
-            Ok(false)
-        }
-    }
 
-    fn qos_probe_event_has_generation(data: &str) -> Result<bool, String> {
-        if data.trim().is_empty() {
-            return Ok(false);
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            if let Some(chunk_res) = stream.next().await {
+                let _ = chunk_res.map_err(|e| format!("{} -> stream error: {}", endpoint, e))?;
+                let ttft_ms = start.elapsed().as_micros() as f64 / 1000.0;
+                tracing::debug!(
+                    "🔍 [QoS Probe] {} via {} (model={}) TTFT={:.0}ms",
+                    token.email,
+                    endpoint,
+                    model,
+                    ttft_ms
+                );
+                return Ok(ttft_ms);
+            }
+
+            last_error = format!("{} -> empty stream (model={})", endpoint, model);
         }
-        if data.trim() == "[DONE]" {
-            return Err("QoS probe ended without generated text".to_string());
-        }
-        let event: serde_json::Value = serde_json::from_str(data)
-            .map_err(|_| "QoS probe received invalid SSE JSON".to_string())?;
-        let response = event.get("response").unwrap_or(&event);
-        if event.get("error").is_some() || response.get("error").is_some() {
-            return Err("QoS probe received an upstream error event".to_string());
-        }
-        Ok(response
-            .get("candidates")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|candidates| {
-                candidates.iter().any(|candidate| {
-                    candidate
-                        .pointer("/content/parts")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|parts| {
-                            parts.iter().any(|part| {
-                                !crate::proxy::thinking_store::is_thought_part(part)
-                                    && part
-                                        .get("text")
-                                        .and_then(serde_json::Value::as_str)
-                                        .is_some_and(|text| !text.trim().is_empty())
-                            })
-                        })
-                })
-            }))
+
+        Err(last_error)
     }
 
     /// [NEW] 从账号配额信息中提取最近的刷新时间戳
@@ -8893,6 +8172,9 @@ impl TokenManager {
                         } else if gemini {
                             vec![
                                 "gemini-3-flash".to_string(),
+                                "gemini-3.8-flash".to_string(),
+                                "gemini-3.7-flash".to_string(),
+                                "gemini-3-pro-high".to_string(),
                                 "gemini-3.1-pro-high".to_string(),
                                 "gemini-3.1-flash-image".to_string(),
                                 "gemini-3-pro-image".to_string(),
@@ -9219,7 +8501,7 @@ impl TokenManager {
         .await?;
 
         // Clear sticky session if blocked
-        self.session_accounts.invalidate_account(account_id, || {});
+        self.session_accounts.retain(|_, v| *v != account_id);
 
         tracing::info!(
             "🚫 Account {} validation blocked until {} (reason: {})",
@@ -9273,32 +8555,15 @@ impl TokenManager {
             alt_model,
         )?;
 
-        self.apply_forbidden_outcome(account_id, outcome, target_model, alt_model);
+        // Clear sticky session if forbidden
+        self.session_accounts.retain(|_, v| *v != account_id);
 
-        tracing::warn!(
-            "🚫 Account {} marked as forbidden (403): {}",
-            account_id,
-            truncate_reason(reason, 1000)
-        );
-
-        Ok(())
-    }
-
-    fn apply_forbidden_outcome(
-        &self,
-        account_id: &str,
-        outcome: crate::modules::account::ForbiddenApplyResult,
-        target_model: Option<&str>,
-        alt_model: Option<&str>,
-    ) {
         match outcome {
             crate::modules::account::ForbiddenApplyResult::AccountLocked => {
-                // Account removal also invalidates every lease for this account.
+                // 账号级 403/封禁：从内存池中移除，避免重试时再次选中
                 self.remove_account(account_id);
             }
             crate::modules::account::ForbiddenApplyResult::ModelLocked(scope) => {
-                // Other models' warm sessions remain valid. The failed request
-                // abandons its own lease; future selection filters this model.
                 // 模型级 403：保留账号供其他模型使用，立即冻结当前模型。
                 // mark_account_forbidden 已经触发 reload；这里同步内存 token，
                 // 让本次请求的后续重试立即避开该模型。
@@ -9328,6 +8593,14 @@ impl TokenManager {
                 }
             }
         }
+
+        tracing::warn!(
+            "🚫 Account {} marked as forbidden (403): {}",
+            account_id,
+            truncate_reason(reason, 1000)
+        );
+
+        Ok(())
     }
 }
 
@@ -9345,1108 +8618,8 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::SchedulingMode;
     use std::cmp::Ordering;
     use std::time::Duration;
-
-    // A synchronous DashMap deadlock also blocks Tokio timers. Run the scenario in
-    // a child process so the parent can kill and reap it on a regression.
-    fn run_qos_regression_child(test_name: &str, scenario: impl FnOnce()) {
-        const CHILD_ENV: &str = "ANTIGRAVITY_QOS_REGRESSION_CHILD";
-        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
-            scenario();
-            return;
-        }
-
-        let data_dir = tempfile::tempdir().expect("create isolated QoS test data directory");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test_name, "--nocapture"])
-            .env(CHILD_ENV, test_name)
-            .env("ABV_DATA_DIR", data_dir.path())
-            .env(
-                "ABV_DATA_DIR_POINTER_FILE",
-                data_dir.path().join("location.json"),
-            )
-            .spawn()
-            .expect("spawn isolated QoS regression");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    assert!(status.success(), "QoS regression child failed: {status}");
-                    return;
-                }
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                result => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "QoS regression child exceeded deadline or could not be reaped: {result:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn qos_expired_jail_tick_does_not_block_runtime() {
-        run_qos_regression_child(
-            "proxy::token_manager::tests::qos_expired_jail_tick_does_not_block_runtime",
-            || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async {
-                    let manager = Arc::new(TokenManager::new(PathBuf::new()));
-                    manager.set_qos_auto_jail(true);
-                    let upstream = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
-                        None, None,
-                    ));
-                    manager.register_qos_upstream(&upstream);
-                    let jailed = crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                        level: 0,
-                        jailed_at: std::time::Instant::now(),
-                        current_wait: Duration::ZERO,
-                    };
-                    manager
-                        .qos_guardian
-                        .states
-                        .insert("missing-token".into(), jailed.clone());
-                    let tick_manager = manager.clone();
-                    tokio::spawn(async move { tick_manager.run_qos_probing_tick().await })
-                        .await
-                        .unwrap();
-                    // No credentials: no real upstream probe and no orphan Probing state.
-                    assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
-                    tokio::spawn(async { tokio::task::yield_now().await })
-                        .await
-                        .unwrap();
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn qos_probe_claim_releases_iteration_locks_and_claims_each_due_account_once() {
-        run_qos_regression_child(
-            "proxy::token_manager::tests::qos_probe_claim_releases_iteration_locks_and_claims_each_due_account_once",
-            || {
-                use crate::proxy::qos_guardian::AccountQoSState;
-
-                let manager = TokenManager::new(PathBuf::new());
-
-                manager.set_qos_auto_jail(true);
-                for (account_id, level, wait) in [
-                    ("due-a", 0, Duration::ZERO),
-                    ("due-b", 2, Duration::ZERO),
-                    ("not-due", 1, Duration::from_secs(3600)),
-                ] {
-                    let mut token = qos_probe_test_token();
-                    token.account_id = account_id.into();
-                    manager.tokens.insert(account_id.into(), token);
-                    manager.qos_guardian.states.insert(
-                        account_id.into(),
-                        AccountQoSState::Jailed {
-                            level,
-                            jailed_at: std::time::Instant::now(),
-                            current_wait: wait,
-                        },
-                    );
-                }
-                let waiting = manager.qos_guardian.get_state("not-due");
-
-                // Claiming is synchronous state management: no daemon or network probe runs.
-                let mut claimed: Vec<_> = manager
-                    .claim_due_qos_probes()
-                    .into_iter()
-                    .map(|(token, claim)| (token.account_id, claim.level))
-                    .collect();
-                claimed.sort();
-                assert_eq!(claimed, vec![("due-a".into(), 0), ("due-b".into(), 2)]);
-                for (account_id, level) in &claimed {
-                    assert!(matches!(
-                        manager.qos_guardian.get_state(account_id),
-                        AccountQoSState::Probing { level: actual, .. } if actual == *level
-                    ));
-                }
-                assert_eq!(manager.qos_guardian.get_state("not-due"), waiting);
-                assert!(manager.claim_due_qos_probes().is_empty());
-            },
-        );
-    }
-
-    #[test]
-    fn qos_probe_claim_waits_for_refreshed_credentials() {
-        use crate::proxy::qos_guardian::AccountQoSState;
-        let manager = TokenManager::new(PathBuf::new());
-        manager.set_qos_auto_jail(true);
-        let mut token = qos_probe_test_token();
-        token.account_id = "expired".into();
-        token.timestamp = chrono::Utc::now().timestamp() - 1;
-        manager.tokens.insert(token.account_id.clone(), token);
-        let jailed = AccountQoSState::Jailed {
-            level: 0,
-            jailed_at: std::time::Instant::now(),
-            current_wait: Duration::ZERO,
-        };
-        manager
-            .qos_guardian
-            .states
-            .insert("expired".into(), jailed.clone());
-        assert!(manager.claim_due_qos_probes().is_empty());
-        assert_eq!(manager.qos_guardian.get_state("expired"), jailed);
-    }
-
-    #[test]
-    fn qos_probe_completion_cannot_restore_a_removed_account() {
-        use crate::proxy::qos_guardian::AccountQoSState;
-        let manager = TokenManager::new(PathBuf::new());
-        manager.set_qos_auto_jail(true);
-        let account_id = "removed-probe-account";
-        let mut token = qos_probe_test_token();
-        token.account_id = account_id.into();
-        manager.tokens.insert(account_id.into(), token);
-        let guardian = &manager.qos_guardian;
-        let now = std::time::Instant::now();
-        guardian.states.insert(
-            account_id.into(),
-            AccountQoSState::Jailed {
-                level: 1,
-                jailed_at: now,
-                current_wait: Duration::ZERO,
-            },
-        );
-        guardian.penalty_memory.insert(account_id.into(), (1, now));
-        guardian.push_sample(account_id, 1000.0, false, false);
-        guardian
-            .session_watermarks
-            .insert((account_id.into(), "session".into()), (100, now));
-        let (_, claim) = manager.claim_due_qos_probes().pop().unwrap();
-
-        manager.remove_account(account_id);
-
-        assert!(!guardian.mark_probe_passed(account_id, claim));
-        assert_eq!(guardian.mark_probe_failed(account_id, claim), None);
-        assert!(!manager.tokens.contains_key(account_id));
-        assert!(!guardian.states.contains_key(account_id));
-        assert!(!guardian.penalty_memory.contains_key(account_id));
-        assert!(!guardian.samples.contains_key(account_id));
-        assert!(!guardian
-            .session_watermarks
-            .contains_key(&(account_id.into(), "session".into())));
-    }
-
-    fn qos_probe_test_token() -> ProxyToken {
-        let mut token = create_test_token("probe-account", None, 1.0, None, Some(100));
-        token.project_id = Some("probe-project".into());
-        token.available_models = ["gemini-2.5-flash", "gemini-3-pro-image"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        token
-    }
-
-    #[test]
-    fn qos_probe_payload_ignores_business_prompts_and_thinking_settings() {
-        run_qos_regression_child(
-            "proxy::token_manager::tests::qos_probe_payload_ignores_business_prompts_and_thinking_settings",
-            || {
-                use crate::proxy::config::{GlobalSystemPromptConfig, ThinkingBudgetConfig};
-
-                // Global settings are modified only in this isolated child process.
-                crate::proxy::config::update_global_system_prompt_config(GlobalSystemPromptConfig {
-                    enabled: true,
-                    content: "Business-only instruction: write a long analysis before answering.".into(),
-                });
-                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig {
-                    flash_low: 16000,
-                    flash_medium: 16000,
-                    flash_high: 16000,
-                    flash_tiered: 16000,
-                    pro_low: 16000,
-                    pro_high: 16000,
-                    custom_value: 16000,
-                    ..Default::default()
-                });
-                let mut token = qos_probe_test_token();
-                token.email = "probe@example.com".into();
-                for model in ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash-low", "gemini-3.1-pro-high", "gemini-4-argon"] {
-                    let body = TokenManager::build_probe_envelope(&token, model);
-                    assert_eq!(body["project"], "probe-project");
-                    assert_eq!(body["model"], model);
-                    assert_eq!(body["userAgent"], "antigravity");
-                    let request = &body["request"];
-                    assert!(request.get("systemInstruction").is_none());
-                    assert!(request.get("tools").is_none());
-                    assert_eq!(request["contents"], serde_json::json!([
-                        {"role": "user", "parts": [{"text": "你好"}]}
-                    ]));
-                    assert_eq!(request["generationConfig"], serde_json::json!({
-                        "maxOutputTokens": 10, "temperature": 0.0
-                    }));
-                    assert!(body["requestId"].as_str().unwrap().starts_with("agent/"));
-                }
-                token.email = "probe@gmail.com".into();
-                let body = TokenManager::build_probe_envelope(&token, "gemini-3.1-flash-lite");
-                assert_eq!(body["userAgent"], "antigravity");
-            },
-        );
-    }
-
-    #[tokio::test]
-    async fn qos_loaded_probe_model_uses_only_advertised_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = TokenManager::new(dir.path().to_owned());
-        let path = dir.path().join("account.json");
-        for (wire_id, protect, expected) in [
-            ("gemini-3.1-flash-lite", true, None),
-            (
-                "gemini-3.8-flash-high",
-                false,
-                Some("gemini-3.8-flash-high"),
-            ),
-            ("gemini-4-argon-low", false, None), // No eligible Argon quota group.
-            ("gemini-3.1-flash-image", false, None),
-            ("gemini-3-flash-audio", false, None),
-        ] {
-            let account = serde_json::json!({
-                "id":"probe-fixture","email":"fixture@example.com",
-                "token":{"access_token":"fixture","refresh_token":"fixture","expires_in":3600,
-                    "expiry_timestamp":chrono::Utc::now().timestamp()+3600},
-                "quota":{"models":[{"name":wire_id,"percentage":100}],"quota_groups":[]}
-            });
-            std::fs::write(&path, account.to_string()).unwrap();
-            let mut token = manager.load_single_account(&path).await.unwrap().unwrap();
-            if protect {
-                token.protected_models.insert(wire_id.to_string());
-            }
-            assert_eq!(TokenManager::select_probe_model(&token), expected);
-        }
-    }
-
-    #[test]
-    fn qos_realtime_refresh_replaces_raw_probe_candidates() {
-        let mut token = qos_probe_test_token();
-        let initial = "gemini-3.8-flash-high";
-        let refreshed = "gemini-3.8-flash-low";
-        for id in [initial, refreshed] {
-            let model = serde_json::from_value(
-                serde_json::json!({"name":id,"percentage":75,"reset_time":""}),
-            )
-            .unwrap();
-            TokenManager::refresh_advertised_models(&mut token, &[model]);
-            assert_eq!(TokenManager::select_probe_model(&token), Some(id));
-        }
-        TokenManager::refresh_advertised_models(&mut token, &[]);
-        assert_eq!(TokenManager::select_probe_model(&token), Some(refreshed));
-        assert!(!token.model_metadata.contains_key(initial));
-        token.protected_models.insert(refreshed.into());
-        assert_eq!(TokenManager::select_probe_model(&token), None);
-    }
-
-    #[test]
-    fn qos_probe_model_selection_excludes_non_text_and_protected_models() {
-        let mut token = qos_probe_test_token();
-        token.available_models = [
-            "gemini-3.1-flash-lite",
-            "gemini-3.8-flash-low",
-            "gemini-4-argon-low",
-            "gemini-3-pro-image",
-            "gemini-3-flash-tts",
-            "gemini-3-flash-audio",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        assert_eq!(
-            TokenManager::select_probe_model(&token),
-            Some("gemini-3.1-flash-lite")
-        );
-
-        // Flash Lite has its own quota bucket; Pro protection must not block it.
-        token.protected_models.insert("gemini-3-pro-high".into());
-        assert_eq!(
-            TokenManager::select_probe_model(&token),
-            Some("gemini-3.1-flash-lite")
-        );
-        token
-            .protected_models
-            .insert("gemini-3.1-flash-lite".into());
-        assert_eq!(
-            TokenManager::select_probe_model(&token),
-            Some("gemini-3.8-flash-low")
-        );
-        token.protected_models.insert("gemini-3.8-flash-low".into());
-        assert_eq!(
-            TokenManager::select_probe_model(&token),
-            Some("gemini-4-argon-low")
-        );
-        token.protected_models.insert("gemini-4-argon".into());
-        assert_eq!(TokenManager::select_probe_model(&token), None);
-    }
-
-    #[test]
-    fn qos_probe_claim_waits_for_an_authorized_unprotected_text_model() {
-        use crate::proxy::qos_guardian::AccountQoSState;
-        for (models, protected) in [
-            (vec![], vec![]),
-            (vec!["gemini-3-pro-image"], vec![]),
-            (vec!["claude-sonnet-4-6", "gpt-oss-120b"], vec![]),
-            (vec!["gemini-3.1-flash-lite"], vec!["gemini-3.1-flash-lite"]),
-            (vec!["gemini-3.8-flash-low"], vec!["gemini-3.8-flash"]),
-        ] {
-            let manager = TokenManager::new(PathBuf::new());
-            manager.set_qos_auto_jail(true);
-            let mut token = qos_probe_test_token();
-            token.available_models = models.into_iter().map(str::to_string).collect();
-            token.protected_models = protected.into_iter().map(str::to_string).collect();
-            let account_id = token.account_id.clone();
-            let now = std::time::Instant::now();
-            let jailed = AccountQoSState::Jailed {
-                level: 1,
-                jailed_at: now,
-                current_wait: Duration::ZERO,
-            };
-            manager.tokens.insert(account_id.clone(), token);
-            manager
-                .qos_guardian
-                .states
-                .insert(account_id.clone(), jailed.clone());
-            manager
-                .qos_guardian
-                .penalty_memory
-                .insert(account_id.clone(), (1, now));
-
-            assert!(manager.claim_due_qos_probes().is_empty());
-            assert_eq!(manager.qos_guardian.get_state(&account_id), jailed);
-            assert_eq!(
-                *manager
-                    .qos_guardian
-                    .penalty_memory
-                    .get(&account_id)
-                    .unwrap(),
-                (1, now)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn qos_manual_probe_reports_missing_text_model_before_sending() {
-        let mut token = qos_probe_test_token();
-        token.available_models.clear();
-        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-        let result = TokenManager::send_pure_hello_probe_to_endpoint(
-            &token,
-            &upstream,
-            "http://127.0.0.1:9/unused",
-            QoSConfig::default(),
-        )
-        .await;
-        assert_eq!(
-            result,
-            Err("QoS probe has no authorized Gemini text model".into())
-        );
-    }
-
-    async fn qos_probe_stub(
-        status: axum::http::StatusCode,
-        chunks: Vec<&'static str>,
-        stall: bool,
-    ) -> (
-        String,
-        tokio::sync::mpsc::Receiver<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        qos_probe_stub_with_delay(status, chunks, stall, Duration::ZERO).await
-    }
-
-    async fn qos_probe_stub_with_delay(
-        status: axum::http::StatusCode,
-        chunks: Vec<&'static str>,
-        stall: bool,
-        delay: Duration,
-    ) -> (
-        String,
-        tokio::sync::mpsc::Receiver<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use futures::StreamExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
-            let tx = tx.clone();
-            let chunks = chunks.clone();
-            async move {
-                let (parts, body) = request.into_parts();
-                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
-                tx.send((
-                    parts.uri,
-                    parts.headers,
-                    serde_json::from_slice(&bytes).unwrap(),
-                ))
-                .await
-                .unwrap();
-                tokio::time::sleep(delay).await;
-                let stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
-                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(chunk.as_bytes()))
-                }))
-                .chain(futures::stream::pending().take(usize::from(stall)));
-                axum::http::Response::builder()
-                    .status(status)
-                    .header("content-type", "text/event-stream")
-                    .body(axum::body::Body::from_stream(stream))
-                    .unwrap()
-            }
-        });
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, rx, handle)
-    }
-
-    #[tokio::test]
-    async fn qos_probe_sends_valid_envelope_through_bound_account_proxy() {
-        use crate::proxy::config::{ProxyEntry, ProxyPoolConfig};
-        let (url, mut received, server) = qos_probe_stub(
-            axum::http::StatusCode::OK,
-            vec![": keepalive\r\n\r\n", "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}}\r\n\r\n"],
-            false,
-        ).await;
-        let proxy = ProxyEntry {
-            id: "bound-proxy".into(),
-            name: "local probe stub".into(),
-            url,
-            auth: None,
-            enabled: true,
-            priority: 0,
-            tags: vec![],
-            max_accounts: None,
-            health_check_url: None,
-            last_check_time: None,
-            is_healthy: true,
-            latency: None,
-        };
-        let config = ProxyPoolConfig {
-            enabled: true,
-            proxies: vec![proxy],
-            account_bindings: HashMap::from([("probe-account".into(), "bound-proxy".into())]),
-            ..Default::default()
-        };
-        let pool = Arc::new(crate::proxy::proxy_pool::ProxyPoolManager::new(Arc::new(
-            tokio::sync::RwLock::new(config),
-        )));
-        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, Some(pool));
-        let mut token = qos_probe_test_token();
-        token.available_models = HashSet::from(["gemini-3.8-flash-low".into()]);
-        let result = TokenManager::send_pure_hello_probe_to_endpoint(
-            &token,
-            &upstream,
-            "http://127.0.0.1:9/v1internal:streamGenerateContent?alt=sse",
-            QoSConfig::default(),
-        )
-        .await;
-        server.abort();
-        assert!(result.is_ok(), "{result:?}");
-        let (uri, headers, body) = received.recv().await.unwrap();
-        assert_eq!(uri.path(), "/v1internal:streamGenerateContent");
-        assert_eq!(headers["authorization"], "Bearer test_token");
-        assert_eq!(body["project"], "probe-project");
-        assert_eq!(body["model"], "gemini-3.8-flash-low");
-        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 10);
-        assert!(body["request"].get("systemInstruction").is_none());
-        assert!(body.get("contents").is_none());
-        assert!(body["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|content| {
-                content["parts"]
-                    .as_array()
-                    .is_some_and(|parts| parts.iter().any(|part| part["text"] == "你好"))
-            }));
-    }
-
-    #[tokio::test]
-    async fn qos_probe_rejects_error_empty_and_keepalive_only_streams() {
-        for (status, chunks) in [
-            (axum::http::StatusCode::BAD_REQUEST, vec!["bad request"]),
-            (axum::http::StatusCode::OK, vec!["data: {\"error\":{\"code\":429}}\n\n"]),
-            (axum::http::StatusCode::OK, vec![": keepalive\n\n"]),
-            (axum::http::StatusCode::OK, vec!["data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"thinking\"}]}}]}}\n\n", "data: [DONE]\n\n"]),
-            (axum::http::StatusCode::OK, vec![]),
-        ] {
-            let (url, _received, server) = qos_probe_stub(status, chunks, false).await;
-            let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-            let result = TokenManager::send_pure_hello_probe_to_endpoint(&qos_probe_test_token(), &upstream, &url, QoSConfig::default()).await;
-            server.abort();
-            assert!(result.is_err(), "{result:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn qos_probe_fallback_distinguishes_endpoint_and_account_errors() {
-        for (status, should_fallback) in [
-            (503, true),
-            (404, true),
-            (408, true),
-            (400, false),
-            (401, false),
-            (403, false),
-            (429, false),
-        ] {
-            let (first, _received, first_server) = qos_probe_stub(
-                axum::http::StatusCode::from_u16(status).unwrap(),
-                vec!["error"],
-                false,
-            )
-            .await;
-            let (second, mut received, second_server) = qos_probe_stub(
-                axum::http::StatusCode::OK,
-                vec!["data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}}\n\n"],
-                false).await;
-            let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-            let result = TokenManager::send_pure_hello_probe_to_endpoints(
-                &qos_probe_test_token(),
-                &upstream,
-                &[first, second],
-                QoSConfig::default(),
-            )
-            .await;
-            first_server.abort();
-            second_server.abort();
-            assert_eq!(
-                result.is_ok(),
-                should_fallback,
-                "status={status}: {result:?}"
-            );
-            assert_eq!(
-                received.try_recv().is_ok(),
-                should_fallback,
-                "status={status}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn qos_empty_endpoint_falls_back_without_inflating_success_ttft() {
-        let delay = Duration::from_millis(300);
-        let (first, _rx1, server1) =
-            qos_probe_stub_with_delay(axum::http::StatusCode::OK, vec![], false, delay).await;
-        let (second, _rx2, server2) = qos_probe_stub(
-            axum::http::StatusCode::OK,
-            vec!["data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n"],
-            false,
-        )
-        .await;
-        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-        let start = std::time::Instant::now();
-        let ttft = TokenManager::send_pure_hello_probe_to_endpoints(
-            &qos_probe_test_token(),
-            &upstream,
-            &[first, second],
-            QoSConfig::default(),
-        )
-        .await
-        .unwrap();
-        assert!(start.elapsed().as_secs_f64() * 1000.0 - ttft >= delay.as_millis() as f64);
-        server1.abort();
-        server2.abort();
-    }
-
-    #[tokio::test]
-    async fn qos_probe_keeps_eight_second_deadline_after_keepalive() {
-        let (url, _received, server) =
-            qos_probe_stub(axum::http::StatusCode::OK, vec![": keepalive\n\n"], true).await;
-        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-        let started = std::time::Instant::now();
-        let result = TokenManager::send_pure_hello_probe_to_endpoint(
-            &qos_probe_test_token(),
-            &upstream,
-            &url,
-            QoSConfig::default(),
-        )
-        .await;
-        server.abort();
-        assert_eq!(result, Err("QoS probe exceeded its 8s deadline".into()));
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[test]
-    fn qos_probe_claim_uses_configured_credential_margin() {
-        use crate::proxy::qos_guardian::AccountQoSState;
-        let manager = TokenManager::new(PathBuf::new());
-        manager.set_qos_auto_jail(true);
-        let mut token = qos_probe_test_token();
-        token.timestamp = chrono::Utc::now().timestamp() + 30;
-        manager
-            .tokens
-            .insert(token.account_id.clone(), token.clone());
-        let jailed = AccountQoSState::Jailed {
-            level: 0,
-            jailed_at: std::time::Instant::now(),
-            current_wait: Duration::ZERO,
-        };
-        manager
-            .qos_guardian
-            .states
-            .insert(token.account_id.clone(), jailed.clone());
-        manager
-            .qos_guardian
-            .update_config(QoSConfig {
-                probe_timeout_secs: 60.0,
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(manager.claim_due_qos_probes().is_empty());
-        assert_eq!(manager.qos_guardian.get_state(&token.account_id), jailed);
-
-        manager
-            .qos_guardian
-            .update_config(QoSConfig::default())
-            .unwrap();
-        let claimed = manager.claim_due_qos_probes();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].1.config, QoSConfig::default());
-    }
-
-    #[tokio::test]
-    async fn qos_probe_keeps_claimed_deadline_after_policy_update() {
-        use crate::proxy::qos_guardian::AccountQoSState;
-        let manager = TokenManager::new(PathBuf::new());
-        manager.set_qos_auto_jail(true);
-        let token = qos_probe_test_token();
-        manager
-            .tokens
-            .insert(token.account_id.clone(), token.clone());
-        manager.qos_guardian.states.insert(
-            token.account_id.clone(),
-            AccountQoSState::Jailed {
-                level: 0,
-                jailed_at: std::time::Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-        manager
-            .qos_guardian
-            .update_config(QoSConfig {
-                probe_timeout_secs: 1.0,
-                probe_success_threshold_secs: 1.0,
-                ..Default::default()
-            })
-            .unwrap();
-        let (_, claim) = manager.claim_due_qos_probes().pop().unwrap();
-        manager
-            .qos_guardian
-            .update_config(QoSConfig {
-                probe_timeout_secs: 5.0,
-                probe_success_threshold_secs: 4.0,
-                ..Default::default()
-            })
-            .unwrap();
-        let (url, _received, server) =
-            qos_probe_stub(axum::http::StatusCode::OK, vec![": keepalive\n\n"], true).await;
-        let upstream = crate::proxy::upstream::client::UpstreamClient::new(None, None);
-        let started = std::time::Instant::now();
-        let result =
-            TokenManager::send_pure_hello_probe_to_endpoint(&token, &upstream, &url, claim.config)
-                .await;
-        server.abort();
-        assert_eq!(result, Err("QoS probe exceeded its 1s deadline".into()));
-        assert!(started.elapsed() < Duration::from_secs(3));
-    }
-
-    #[test]
-    fn qos_proxy_start_preserves_newer_admin_policy() {
-        run_qos_regression_child(
-            "proxy::token_manager::tests::qos_proxy_start_preserves_newer_admin_policy",
-            || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async {
-                    let data_dir = crate::modules::account::get_data_dir().unwrap();
-                    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                    let port = port_reservation.local_addr().unwrap().port();
-                    let mut initial = crate::models::AppConfig::default();
-                    initial.proxy.port = port;
-                    initial.proxy.thinking_budget.flash_high_legacy_migrated = true;
-                    initial
-                        .proxy
-                        .thinking_budget
-                        .thinking_budget_32k_legacy_migrated = true;
-                    initial.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
-                    initial.proxy.api_key = "qos-stale-start-test".into();
-                    initial.proxy.admin_password = None;
-                    initial.proxy.proxy_pool.enabled = false;
-                    initial.proxy.proxy_pool.proxies.clear();
-                    initial.proxy.upstream_proxy.enabled = false;
-                    crate::modules::config::save_app_config(&initial).unwrap();
-                    let state = crate::commands::proxy::ProxyServiceState::new();
-                    let cloudflared =
-                        Arc::new(crate::commands::cloudflared::CloudflaredState::new());
-                    drop(port_reservation);
-                    crate::commands::proxy::ensure_admin_server(
-                        initial.proxy.clone(),
-                        &state,
-                        crate::modules::integration::SystemManager::Headless,
-                        cloudflared.clone(),
-                    )
-                    .await
-                    .unwrap();
-                    let manager = state
-                        .admin_server
-                        .read()
-                        .await
-                        .as_ref()
-                        .unwrap()
-                        .axum_server
-                        .token_manager
-                        .clone();
-                    assert!(manager.tokens.is_empty());
-                    assert_eq!(manager.qos_guardian.config_snapshot(), initial.proxy.qos);
-
-                    let client = reqwest::Client::builder()
-                        .no_proxy()
-                        .connect_timeout(Duration::from_secs(2))
-                        .timeout(Duration::from_secs(3))
-                        .build()
-                        .unwrap();
-                    let base = format!("http://127.0.0.1:{port}");
-                    let mut updated = initial.clone();
-                    updated.proxy.qos.normal_threshold_secs = 32.0;
-                    updated.proxy.qos.deep_thinking_threshold_secs = 47.0;
-                    updated.proxy.qos.jail_ladder_secs = [150, 360, 720, 1080, 1440, 2160];
-                    client
-                        .post(format!("{base}/api/config"))
-                        .bearer_auth(&initial.proxy.api_key)
-                        .json(&serde_json::json!({"config": &updated}))
-                        .send()
-                        .await
-                        .unwrap()
-                        .error_for_status()
-                        .unwrap();
-                    assert_eq!(manager.qos_guardian.config_snapshot(), updated.proxy.qos);
-                    let saved_bytes = std::fs::read(data_dir.join("gui_config.json")).unwrap();
-
-                    // The desktop startup task still holds A after the HTTP save
-                    // applied B to the resident admin server and released the gate.
-                    let status = crate::commands::proxy::internal_start_proxy_service(
-                        initial.proxy,
-                        &state,
-                        crate::modules::integration::SystemManager::Headless,
-                        cloudflared,
-                    )
-                    .await
-                    .unwrap();
-                    assert!(
-                        status.running,
-                        "upstream now starts an empty pool so accounts can be enabled later"
-                    );
-                    assert_eq!(status.active_accounts, 0);
-                    let reused_manager = state
-                        .admin_server
-                        .read()
-                        .await
-                        .as_ref()
-                        .unwrap()
-                        .axum_server
-                        .token_manager
-                        .clone();
-                    assert!(Arc::ptr_eq(&manager, &reused_manager));
-                    assert!(manager.tokens.is_empty());
-                    let running = client
-                        .get(format!("{base}/api/proxy/qos/config"))
-                        .bearer_auth(&updated.proxy.api_key)
-                        .send()
-                        .await
-                        .unwrap()
-                        .error_for_status()
-                        .unwrap()
-                        .json::<QoSConfig>()
-                        .await
-                        .unwrap();
-                    assert_eq!(running, updated.proxy.qos);
-                    assert_eq!(
-                        serde_json::from_slice::<serde_json::Value>(
-                            &std::fs::read(data_dir.join("gui_config.json")).unwrap()
-                        )
-                        .unwrap(),
-                        serde_json::from_slice::<serde_json::Value>(&saved_bytes).unwrap()
-                    );
-                    assert_eq!(
-                        crate::modules::config::load_app_config().unwrap().proxy.qos,
-                        updated.proxy.qos
-                    );
-
-                    manager.graceful_shutdown(Duration::from_secs(1)).await;
-                    let admin = state.admin_server.write().await.take().unwrap();
-                    admin.stop().await;
-                });
-                runtime.shutdown_timeout(Duration::from_secs(2));
-            },
-        );
-    }
-
-    #[test]
-    fn qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates() {
-        run_qos_regression_child(
-            "proxy::token_manager::tests::qos_expired_jail_preserves_http_liveness_after_empty_pool_and_config_updates",
-            || {
-                use crate::proxy::qos_config::QoSConfig;
-
-                async fn read_running_qos(
-                    client: &reqwest::Client,
-                    base: &str,
-                    api_key: &str,
-                ) -> QoSConfig {
-                    client
-                        .get(format!("{base}/api/proxy/qos/config"))
-                        .bearer_auth(api_key)
-                        .send()
-                        .await
-                        .unwrap()
-                        .error_for_status()
-                        .unwrap()
-                        .json::<QoSConfig>()
-                        .await
-                        .unwrap()
-                }
-
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async {
-                    let data_dir = crate::modules::account::get_data_dir().unwrap();
-                    let manager = Arc::new(TokenManager::new(data_dir.clone()));
-                    manager.set_qos_auto_jail(true);
-                    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                    let port = port_reservation.local_addr().unwrap().port();
-                    let mut config = crate::models::AppConfig::default();
-                    config.proxy.qos_auto_jail = true;
-                    config.proxy.port = port;
-                    config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
-                    config.proxy.api_key = "qos-local-liveness-test".into();
-                    config.proxy.admin_password = None;
-                    config.proxy.proxy_pool.enabled = false;
-                    config.proxy.proxy_pool.proxies.clear();
-                    config.proxy.upstream_proxy.enabled = false;
-                    crate::modules::config::save_app_config(&config).unwrap();
-                    let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
-                    drop(port_reservation);
-                    let (server, server_task) = crate::proxy::AxumServer::start(
-                        "127.0.0.1".into(),
-                        port,
-                        manager.clone(),
-                        config.proxy.custom_mapping.clone(),
-                        config.proxy.request_timeout,
-                        config.proxy.upstream_proxy.clone(),
-                        config.proxy.user_agent_override.clone(),
-                        crate::proxy::ProxySecurityConfig::from_proxy_config(&config.proxy),
-                        monitor,
-                        config.proxy.experimental.clone(),
-                        config.proxy.debug_logging.clone(),
-                        crate::modules::integration::SystemManager::Headless,
-                        Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
-                        config.proxy.proxy_pool.clone(),
-                        config.proxy.only_raw_quota_models,
-                        config.proxy.image_scheduler.clone(),
-                        config.proxy.qos,
-                    )
-                    .await
-                    .unwrap();
-                    server.set_running(true).await;
-                    let client = reqwest::Client::builder()
-                        .no_proxy()
-                        .pool_max_idle_per_host(0)
-                        .connect_timeout(Duration::from_secs(2))
-                        .timeout(Duration::from_secs(3))
-                        .build()
-                        .unwrap();
-                    let base = format!("http://127.0.0.1:{port}");
-                    let health = client.get(format!("{base}/health")).send().await.unwrap();
-                    assert_eq!(health.status(), reqwest::StatusCode::OK);
-                    assert_eq!(
-                        read_running_qos(&client, &base, &config.proxy.api_key).await,
-                        QoSConfig::default(),
-                    );
-
-                    let jailed = crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                        level: 0,
-                        jailed_at: std::time::Instant::now(),
-                        current_wait: Duration::ZERO,
-                    };
-                    manager.qos_guardian.states.insert("missing-token".into(), jailed.clone());
-                    for (debug_enabled, normal_threshold_secs) in [(true, 24.0), (false, 28.0), (true, 30.0)] {
-                        // No tokens are inserted in this runtime: neither the daemon nor
-                        // the request handler can issue an authenticated upstream request.
-                        assert!(manager.tokens.is_empty());
-                        let unavailable = client
-                            .post(format!("{base}/v1beta/models/gemini-4-argon:streamGenerateContent"))
-                            .bearer_auth(&config.proxy.api_key)
-                            .json(&serde_json::json!({
-                                "contents": [{"role": "user", "parts": [{"text": "local test"}]}]
-                            }))
-                            .send()
-                            .await
-                            .unwrap();
-                        assert_eq!(unavailable.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-
-                        config.proxy.debug_logging.enabled = debug_enabled;
-                        config.proxy.qos.normal_threshold_secs = normal_threshold_secs;
-                        config.proxy.qos.deep_thinking_threshold_secs = normal_threshold_secs + 15.0;
-                        config.proxy.qos.no_peer_grace_secs = 12.0;
-                        config.proxy.qos.probe_timeout_secs = 9.0;
-                        config.proxy.qos.jail_ladder_secs = [150, 360, 720, 1080, 1440, 2160];
-                        let saved = client
-                            .post(format!("{base}/api/config"))
-                            .bearer_auth(&config.proxy.api_key)
-                            .json(&serde_json::json!({"config": &config}))
-                            .send()
-                            .await
-                            .unwrap();
-                        assert_eq!(saved.status(), reqwest::StatusCode::OK);
-                        assert_eq!(
-                            read_running_qos(&client, &base, &config.proxy.api_key).await,
-                            config.proxy.qos,
-                        );
-
-                        let tick_manager = manager.clone();
-                        tokio::spawn(async move { tick_manager.run_qos_probing_tick().await })
-                            .await
-                            .unwrap();
-                        assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
-
-                        // Idle pooling is disabled, so these exercise a new TCP accept.
-                        let health = client
-                            .get(format!("{base}/health"))
-                            .send()
-                            .await
-                            .unwrap()
-                            .error_for_status()
-                            .unwrap()
-                            .json::<serde_json::Value>()
-                            .await
-                            .unwrap();
-                        assert_eq!(health["status"], "ok");
-                        let reloaded = client
-                            .get(format!("{base}/api/config"))
-                            .bearer_auth(&config.proxy.api_key)
-                            .send()
-                            .await
-                            .unwrap()
-                            .error_for_status()
-                            .unwrap()
-                            .json::<crate::models::AppConfig>()
-                            .await
-                            .unwrap();
-                        assert_eq!(reloaded.proxy.debug_logging.enabled, debug_enabled);
-                        assert_eq!(reloaded.proxy.qos, config.proxy.qos);
-                    }
-
-                    // A concurrent full save must wait before writing to disk,
-                    // not just before applying the already-persisted policy.
-                    let before_gate = std::fs::read(data_dir.join("gui_config.json")).unwrap();
-                    let old_policy = manager.qos_guardian.config_snapshot();
-                    let apply_guard = crate::modules::config::config_apply_guard().await;
-                    config.proxy.qos.no_peer_grace_secs = 14.0;
-                    let pending_client = client.clone();
-                    let pending_config = config.clone();
-                    let pending_url = format!("{base}/api/config");
-                    let (started, ready) = tokio::sync::oneshot::channel();
-                    let mut pending_save = tokio::spawn(async move {
-                        started.send(()).unwrap();
-                        pending_client.post(pending_url)
-                            .bearer_auth(&pending_config.proxy.api_key)
-                            .json(&serde_json::json!({"config": pending_config}))
-                            .send().await.unwrap()
-                    });
-                    ready.await.unwrap();
-                    assert!(tokio::time::timeout(Duration::from_millis(100), &mut pending_save).await.is_err());
-                    assert_eq!(std::fs::read(data_dir.join("gui_config.json")).unwrap(), before_gate);
-                    assert_eq!(manager.qos_guardian.config_snapshot(), old_policy);
-                    drop(apply_guard);
-                    assert_eq!(pending_save.await.unwrap().status(), reqwest::StatusCode::OK);
-                    assert_eq!(read_running_qos(&client, &base, &config.proxy.api_key).await, config.proxy.qos);
-                    assert_eq!(crate::modules::config::load_app_config().unwrap().proxy.qos, config.proxy.qos);
-
-                    let saved_bytes = std::fs::read(data_dir.join("gui_config.json")).unwrap();
-                    let mut invalid = config.clone();
-                    invalid.proxy.qos.probe_success_threshold_secs = invalid.proxy.qos.probe_timeout_secs + 1.0;
-                    invalid.proxy.debug_logging.enabled = !config.proxy.debug_logging.enabled;
-                    let rejected = client
-                        .post(format!("{base}/api/config"))
-                        .bearer_auth(&config.proxy.api_key)
-                        .json(&serde_json::json!({"config": &invalid}))
-                        .send()
-                        .await
-                        .unwrap();
-                    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-                    assert_eq!(
-                        read_running_qos(&client, &base, &config.proxy.api_key).await,
-                        config.proxy.qos,
-                    );
-                    assert_eq!(std::fs::read(data_dir.join("gui_config.json")).unwrap(), saved_bytes);
-                    assert_eq!(manager.qos_guardian.get_state("missing-token"), jailed);
-
-                    server.stop();
-                    manager.graceful_shutdown(Duration::from_secs(1)).await;
-                    tokio::time::timeout(Duration::from_secs(2), server_task)
-                        .await
-                        .expect("HTTP accept task should stop")
-                        .unwrap();
-                    drop(server);
-
-                    // Reconstruct the server and manager from persisted configuration,
-                    // proving that startup applies the instance policy before probing.
-                    let persisted = crate::modules::config::load_app_config().unwrap();
-                    assert_eq!(persisted.proxy.qos, config.proxy.qos);
-                    let restarted_manager = Arc::new(TokenManager::new(data_dir));
-                    assert_eq!(restarted_manager.qos_guardian.config_snapshot(), QoSConfig::default());
-                    let (restarted_server, restarted_task) = crate::proxy::AxumServer::start(
-                        "127.0.0.1".into(),
-                        persisted.proxy.port,
-                        restarted_manager.clone(),
-                        persisted.proxy.custom_mapping.clone(),
-                        persisted.proxy.request_timeout,
-                        persisted.proxy.upstream_proxy.clone(),
-                        persisted.proxy.user_agent_override.clone(),
-                        crate::proxy::ProxySecurityConfig::from_proxy_config(&persisted.proxy),
-                        Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None)),
-                        persisted.proxy.experimental.clone(),
-                        persisted.proxy.debug_logging.clone(),
-                        crate::modules::integration::SystemManager::Headless,
-                        Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
-                        persisted.proxy.proxy_pool.clone(),
-                        persisted.proxy.only_raw_quota_models,
-                        persisted.proxy.image_scheduler.clone(),
-                        persisted.proxy.qos,
-                    )
-                    .await
-                    .unwrap();
-                    restarted_server.set_running(true).await;
-                    assert!(restarted_manager.tokens.is_empty());
-                    assert_eq!(
-                        read_running_qos(&client, &base, &persisted.proxy.api_key).await,
-                        persisted.proxy.qos,
-                    );
-                    restarted_server.stop();
-                    restarted_manager.graceful_shutdown(Duration::from_secs(1)).await;
-                    tokio::time::timeout(Duration::from_secs(2), restarted_task)
-                        .await
-                        .expect("restarted HTTP accept task should stop")
-                        .unwrap();
-                });
-                runtime.shutdown_timeout(Duration::from_secs(2));
-            },
-        );
-    }
 
     #[tokio::test]
     async fn test_empty_pool_error_reports_banned_accounts_instead_of_generic_429() {
@@ -11595,6 +9768,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         }
     }
 
@@ -11986,6 +10161,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         }
     }
 
@@ -12615,6 +10792,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
 
         // 账号 2: PRO 订阅，经定时刷新成功上报 Claude 5.5 模型配额
@@ -12653,6 +10832,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
 
         // 验证辅助函数检测
@@ -12871,6 +11052,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
 
         std::fs::write(
@@ -12947,6 +11130,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
 
         manager.tokens.insert(token.account_id.clone(), token);
@@ -12971,1062 +11156,6 @@ mod tests {
         assert!(
             !manager.rate_limit_tracker.is_rate_limited("acc_tracked_1", None),
             "Calling mark_account_success with email must resolve to account_id and clear tracker limit"
-        );
-    }
-
-    fn leased_token_manager() -> (tempfile::TempDir, TokenManager, &'static str) {
-        let temp = tempfile::tempdir().unwrap();
-        let manager = TokenManager::new(temp.path().to_path_buf());
-        let model = "claude-sonnet-4-6";
-        let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
-            .unwrap_or_else(|| model.to_owned());
-        for id in ["lease-a", "lease-b"] {
-            let path = temp.path().join(format!("{id}.json"));
-            std::fs::write(&path, r#"{"disabled":false}"#).unwrap();
-            let mut token = create_test_token(id, Some("PRO"), 1.0, None, Some(100));
-            token.account_path = path;
-            token.project_id = Some("lease-project".to_owned());
-            token.model_quotas.insert(normalized.clone(), 100);
-            manager.tokens.insert(id.to_owned(), token);
-        }
-        (temp, manager, model)
-    }
-
-    fn accepted_test_response(
-        manager: &Arc<TokenManager>,
-        session: &str,
-    ) -> (Option<SessionLease>, SessionResponseConfirmation) {
-        let snapshot = manager.session_accounts.snapshot(session);
-        let mut lease = Some(manager.session_accounts.candidate(&snapshot, "lease-a"));
-        let confirmation = manager.accept_session_response(&mut lease).unwrap();
-        (lease, confirmation)
-    }
-
-    #[tokio::test]
-    async fn preoutput_validation_refusal_never_confirms_a_cold_session() {
-        use crate::proxy::pipeline::stream_error::{
-            observe_stream_errors, UpstreamStreamErrorObserver,
-        };
-        use crate::proxy::sticky_config::SchedulingMode;
-        use futures::StreamExt;
-        for warm in [false, true] {
-            for streaming in [false, true] {
-                let (_temp, manager, _) = leased_token_manager();
-                let manager = Arc::new(manager);
-                if warm {
-                    manager.commit_session("confirmation", "lease-a");
-                }
-                let (_lease, mut confirmation) = accepted_test_response(&manager, "confirmation");
-                let rejection = serde_json::json!({"error":{
-                    "code":400,"status":"INVALID_ARGUMENT","message":"Unknown field bad_parameter"
-                }});
-                if streaming {
-                    let observer = UpstreamStreamErrorObserver::default();
-                    let raw = futures::stream::iter(vec![Ok::<_, String>(bytes::Bytes::from(
-                        format!("data: {rejection}\n\n"),
-                    ))]);
-                    let stream = observe_stream_errors(raw, observer.clone());
-                    let _: Vec<_> =
-                        confirm_session_response_stream(stream, observer, Some(confirmation))
-                            .collect()
-                            .await;
-                } else {
-                    confirmation.observe_json(&serde_json::json!({"response":rejection}));
-                    drop(confirmation);
-                }
-                assert_eq!(
-                    manager
-                        .session_accounts
-                        .committed_lease("confirmation")
-                        .is_some(),
-                    warm
-                );
-                let temporary = TokenRefreshError::Temporary("connection reset".into());
-                assert_eq!(
-                    manager
-                        .cache_first_refresh_stop(
-                            &temporary,
-                            SchedulingMode::CacheFirst,
-                            "chat",
-                            Some("confirmation"),
-                            "lease-a",
-                        )
-                        .is_some(),
-                    warm,
-                    "only a previously warm session blocks refresh failover"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn response_confirmation_preserves_output_transport_failure_and_unread_bodies() {
-        use crate::proxy::pipeline::stream_error::{
-            observe_stream_errors, UpstreamStreamErrorObserver,
-        };
-        use futures::StreamExt;
-        for case in [
-            "output_then_refusal",
-            "transport",
-            "empty",
-            "unread",
-            "partial_drop",
-        ] {
-            let (_temp, manager, _) = leased_token_manager();
-            let manager = Arc::new(manager);
-            let (_lease, confirmation) = accepted_test_response(&manager, "confirmation");
-            assert!(manager
-                .session_accounts
-                .committed_lease("confirmation")
-                .is_none());
-            let output = Ok::<_, String>(bytes::Bytes::from_static(
-                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"answer\"}]}}]}\n\n",
-            ));
-            let frames = match case {
-                "output_then_refusal" => vec![
-                    output,
-                    Ok(bytes::Bytes::from_static(
-                        b"data: {\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\"}}\n\n",
-                    )),
-                ],
-                "transport" => vec![Err("connection reset".into())],
-                "partial_drop" => vec![output],
-                _ => vec![],
-            };
-            let observer = UpstreamStreamErrorObserver::default();
-            let raw = observe_stream_errors(futures::stream::iter(frames), observer.clone());
-            let mut stream = Box::pin(confirm_session_response_stream(
-                raw,
-                observer,
-                Some(confirmation),
-            ));
-            if case == "partial_drop" {
-                assert!(stream.next().await.is_some());
-                assert!(
-                    manager
-                        .session_accounts
-                        .committed_lease("confirmation")
-                        .is_some(),
-                    "substantive output confirms before the response is dropped"
-                );
-            } else if case != "unread" {
-                while stream.next().await.is_some() {}
-            }
-            drop(stream);
-            assert!(
-                manager
-                    .session_accounts
-                    .committed_lease("confirmation")
-                    .is_some(),
-                "{case}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn measured_usage_keeps_prefill_affinity_without_visible_output() {
-        use crate::proxy::pipeline::stream_error::{
-            observe_stream_errors, UpstreamStreamErrorObserver,
-        };
-        use futures::StreamExt;
-        for (usage, warm) in [
-            (serde_json::json!({"promptTokenCount":9}), true),
-            (serde_json::json!({"cachedContentTokenCount":9}), true),
-            (serde_json::json!({"candidatesTokenCount":2}), true),
-            (serde_json::json!({"thoughtsTokenCount":2}), true),
-            (
-                serde_json::json!({"completion_tokens_details":{"reasoning_tokens":5}}),
-                true,
-            ),
-            (
-                serde_json::json!({"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":5}}),
-                false,
-            ),
-            (serde_json::json!({"cache_creation_input_tokens":3}), true),
-            (serde_json::json!({"totalTokenCount":999}), false),
-            (
-                serde_json::json!({"promptTokenCount":0,"cachedContentTokenCount":0,"candidatesTokenCount":0}),
-                false,
-            ),
-        ] {
-            for streaming in [false, true] {
-                let (_temp, manager, _) = leased_token_manager();
-                let manager = Arc::new(manager);
-                let (_, mut confirmation) = accepted_test_response(&manager, "measured");
-                let response = serde_json::json!({"error":{"code":400,"status":"INVALID_ARGUMENT"},"usageMetadata":usage});
-                if streaming {
-                    let observer = UpstreamStreamErrorObserver::default();
-                    let raw = futures::stream::iter(vec![Ok::<_, String>(bytes::Bytes::from(
-                        format!("data: {response}\n\n"),
-                    ))]);
-                    let raw = observe_stream_errors(raw, observer.clone());
-                    let _: Vec<_> =
-                        confirm_session_response_stream(raw, observer, Some(confirmation))
-                            .collect()
-                            .await;
-                } else {
-                    confirmation.observe_json(&response);
-                    drop(confirmation);
-                }
-                assert_eq!(
-                    manager
-                        .session_accounts
-                        .committed_lease("measured")
-                        .is_some(),
-                    warm,
-                    "measured usage={usage} streaming={streaming}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rejected_parallel_response_cannot_undo_another_confirmation() {
-        let (_temp, manager, _) = leased_token_manager();
-        let manager = Arc::new(manager);
-        let (_, mut rejected) = accepted_test_response(&manager, "parallel");
-        let (_, confirmed) = accepted_test_response(&manager, "parallel");
-        rejected.observe_json(&serde_json::json!({"error":{"code":400}}));
-        drop(confirmed);
-        drop(rejected);
-        assert!(manager
-            .session_accounts
-            .committed_lease("parallel")
-            .is_some());
-
-        let (_, mut a) = accepted_test_response(&manager, "both-rejected");
-        let (_, mut b) = accepted_test_response(&manager, "both-rejected");
-        for confirmation in [&mut a, &mut b] {
-            confirmation.observe_json(&serde_json::json!({"error":{"code":400}}));
-        }
-        drop(a);
-        drop(b);
-        assert!(manager
-            .session_accounts
-            .committed_lease("both-rejected")
-            .is_none());
-    }
-
-    #[test]
-    fn response_confirmation_respects_abandonment_rotation_and_account_epoch() {
-        for remove_account in [false, true] {
-            let (_temp, manager, _) = leased_token_manager();
-            let manager = Arc::new(manager);
-            let (mut lease, old_response) = accepted_test_response(&manager, "aba");
-            assert!(manager.abandon_session_lease(&mut lease));
-            let snapshot = manager.session_accounts.snapshot("aba");
-            let mut replacement = Some(manager.session_accounts.candidate(&snapshot, "lease-b"));
-            assert!(manager.commit_session_lease(&mut replacement));
-            if remove_account {
-                manager.remove_account("lease-a");
-            }
-            drop(old_response);
-            assert_eq!(
-                manager
-                    .session_accounts
-                    .committed_lease("aba")
-                    .unwrap()
-                    .account_id(),
-                "lease-b"
-            );
-        }
-        let (_temp, manager, _) = leased_token_manager();
-        let manager = Arc::new(manager);
-        let (_, old_response) = accepted_test_response(&manager, "removed");
-        manager.remove_account("lease-a");
-        drop(old_response);
-        assert!(manager.session_accounts.bound_lease("removed").is_none());
-    }
-
-    #[tokio::test]
-    async fn measured_prefill_confirms_before_drop_and_blocks_temporary_refresh_rotation() {
-        use crate::proxy::pipeline::stream_error::{
-            observe_stream_errors, UpstreamStreamErrorObserver,
-        };
-        use futures::StreamExt;
-        for measured in [true, false] {
-            let (_temp, manager, _) = leased_token_manager();
-            let manager = Arc::new(manager);
-            let (mut lease, confirmation) = accepted_test_response(&manager, "live-prefill");
-            let count = if measured { 4096 } else { 0 };
-            let frame = bytes::Bytes::from(format!("data: {{\"usageMetadata\":{{\"promptTokenCount\":{count},\"cachedContentTokenCount\":{count}}}}}\n\n"));
-            let source = futures::stream::iter(vec![Ok::<_, String>(frame)])
-                .chain(futures::stream::pending());
-            let observer = UpstreamStreamErrorObserver::default();
-            let raw = observe_stream_errors(source, observer.clone());
-            let mut live = Box::pin(confirm_session_response_stream(
-                raw,
-                observer,
-                Some(confirmation),
-            ));
-            assert!(live.next().await.unwrap().is_ok());
-            assert_eq!(
-                manager
-                    .session_accounts
-                    .committed_lease("live-prefill")
-                    .is_some(),
-                measured
-            );
-            let failure = TokenRefreshError::Temporary("timeout".into());
-            let stop = manager.release_session_after_refresh_failure(
-                &failure,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("live-prefill"),
-                "lease-a",
-                &mut lease,
-            );
-            assert_eq!(stop.is_some(), measured);
-            drop(live);
-            assert_eq!(
-                manager.session_accounts.get("live-prefill").as_deref(),
-                if measured { Some("lease-a") } else { None }
-            );
-        }
-    }
-
-    #[test]
-    fn cold_refresh_recovery_cannot_clear_a_parallel_warm_confirmation() {
-        let (_temp, manager, _) = leased_token_manager();
-        let manager = Arc::new(manager);
-        let (mut lease, confirmation) = accepted_test_response(&manager, "warm-race");
-        let temporary = TokenRefreshError::Temporary("timeout".into());
-        assert!(manager
-            .cache_first_refresh_stop(
-                &temporary,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm-race"),
-                "lease-a"
-            )
-            .is_none());
-        drop(confirmation); // A concurrent response confirms after the old pre-check.
-        assert!(manager
-            .release_session_after_refresh_failure(
-                &temporary,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm-race"),
-                "lease-a",
-                &mut lease
-            )
-            .is_some());
-        assert_eq!(
-            manager.session_accounts.get("warm-race").as_deref(),
-            Some("lease-a")
-        );
-        let mut missing = None;
-        assert!(manager
-            .release_session_after_refresh_failure(
-                &temporary,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm-race"),
-                "lease-a",
-                &mut missing
-            )
-            .is_some());
-        let mut stale = lease.clone();
-        let replacement = manager
-            .session_accounts
-            .candidate(&manager.session_accounts.snapshot("warm-race"), "lease-b");
-        assert!(manager.commit_session_lease(&mut Some(replacement)));
-        assert!(manager
-            .release_session_after_refresh_failure(
-                &temporary,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm-race"),
-                "lease-a",
-                &mut stale
-            )
-            .is_some());
-        assert_eq!(
-            manager.session_accounts.get("warm-race").as_deref(),
-            Some("lease-b")
-        );
-        lease = manager.session_accounts.bound_lease("warm-race");
-        // Explicit credential rejection still releases even a warm binding.
-        let rejected = TokenRefreshError::CredentialRejected("invalid_grant".into());
-        assert!(manager
-            .release_session_after_refresh_failure(
-                &rejected,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm-race"),
-                "lease-b",
-                &mut lease
-            )
-            .is_none());
-        assert!(manager.session_accounts.get("warm-race").is_none());
-    }
-
-    #[test]
-    fn repeated_cold_refresh_failures_leave_healthy_candidates_available() {
-        for rejected_first in [true, false] {
-            let (_temp, manager, _) = leased_token_manager();
-            let snapshot = manager.session_accounts.snapshot("cold-recovery");
-            let mut first = Some(
-                manager
-                    .session_accounts
-                    .claim(&snapshot, "lease-a", 0)
-                    .unwrap(),
-            );
-            let first_error = if rejected_first {
-                TokenRefreshError::CredentialRejected("invalid_grant".into())
-            } else {
-                TokenRefreshError::Temporary("connection reset".into())
-            };
-            assert!(manager
-                .release_session_after_refresh_failure(
-                    &first_error,
-                    SchedulingMode::CacheFirst,
-                    "chat",
-                    Some("cold-recovery"),
-                    "lease-a",
-                    &mut first
-                )
-                .is_none());
-            let mut second = Some(manager.session_accounts.candidate(
-                &manager.session_accounts.snapshot("cold-recovery"),
-                "lease-b",
-            ));
-            let temporary = TokenRefreshError::Temporary("connection reset".into());
-            assert!(manager
-                .release_session_after_refresh_failure(
-                    &temporary,
-                    SchedulingMode::CacheFirst,
-                    "chat",
-                    Some("cold-recovery"),
-                    "lease-b",
-                    &mut second
-                )
-                .is_none());
-            assert!(manager
-                .session_accounts
-                .bound_lease("cold-recovery")
-                .is_none());
-            // A third healthy account can own the new vacant generation.
-            let mut third_token = manager.tokens.get("lease-b").unwrap().clone();
-            third_token.account_id = "lease-c".into();
-            manager.tokens.insert("lease-c".into(), third_token);
-            let mut third = Some(manager.session_accounts.candidate(
-                &manager.session_accounts.snapshot("cold-recovery"),
-                "lease-c",
-            ));
-            assert!(manager.commit_session_lease(&mut third));
-            assert_eq!(
-                manager.session_accounts.get("cold-recovery").as_deref(),
-                Some("lease-c")
-            );
-            assert!(!manager.commit_session_lease(&mut first));
-        }
-    }
-
-    #[tokio::test]
-    async fn delayed_401_retry_cannot_replace_a_parallel_confirmed_binding() {
-        use crate::proxy::pipeline::rotation::{
-            apply_retry_strategy, record_attempted_account, scheduling_allows_grace,
-            should_rotate_account, RequestRetryState, RetryStrategy,
-        };
-        use crate::proxy::sticky_config::SchedulingMode;
-        for mode in [SchedulingMode::CacheFirst, SchedulingMode::Balance] {
-            let (_temp, manager, model) = leased_token_manager();
-            let manager = Arc::new(manager);
-            manager.sticky_config.write().await.mode = mode;
-            manager.commit_session("delayed-401", "lease-a");
-            let mut old = None;
-            let (_, _, _, first, _, _) = manager
-                .get_token_filtered_with_retry_lease(
-                    "chat",
-                    false,
-                    Some("delayed-401"),
-                    model,
-                    &HashSet::new(),
-                    &mut old,
-                )
-                .await
-                .unwrap();
-            assert_eq!(first, "lease-a");
-            let mut newer = old.clone();
-            assert!(manager.abandon_session_lease(&mut newer));
-            let (_, _, _, second, _, _) = manager
-                .get_token_filtered_with_retry_lease(
-                    "chat",
-                    true,
-                    Some("delayed-401"),
-                    model,
-                    &HashSet::from(["lease-a".to_owned()]),
-                    &mut newer,
-                )
-                .await
-                .unwrap();
-            assert_eq!(second, "lease-b");
-            let mut confirmation = manager.accept_session_response(&mut newer).unwrap();
-            confirmation.observe_json(&serde_json::json!({"candidates":[{
-                "content":{"parts":[{"text":"warm B"}]},"finishReason":"STOP"
-            }],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":3}}));
-            drop(confirmation);
-            assert!(manager
-                .session_accounts
-                .committed_lease("delayed-401")
-                .is_some());
-
-            // Pool refresh makes C preferable while R1's old upstream call is pending.
-            let mut third = manager.tokens.get("lease-b").unwrap().clone();
-            third.account_id = "lease-c".into();
-            third.email = "lease-c@example.test".into();
-            manager.tokens.insert("lease-c".into(), third);
-            manager
-                .tokens
-                .get_mut("lease-b")
-                .unwrap()
-                .model_quotas
-                .insert(model.into(), 50);
-            assert!(!manager.abandon_session_lease(&mut old));
-            let mut retry = RequestRetryState::default();
-            let strategy = retry.determine_strategy_adaptive_with_policy(
-                "lease-a",
-                401,
-                "unauthorized",
-                None,
-                false,
-                0,
-                3,
-                scheduling_allows_grace(mode, 3),
-            );
-            assert_eq!(
-                strategy,
-                RetryStrategy::FixedDelay(std::time::Duration::from_millis(200))
-            );
-            assert!(apply_retry_strategy(strategy.clone(), 0, 6, 401, "delayed-401").await);
-            assert!(should_rotate_account(401, Some(&strategy)));
-            let mut force_rotate = false;
-            let mut excluded = HashSet::new();
-            record_attempted_account(&mut excluded, "lease-a", 3, &mut force_rotate);
-            let error = manager
-                .get_token_filtered_with_retry_lease(
-                    "chat",
-                    force_rotate,
-                    Some("delayed-401"),
-                    model,
-                    &excluded,
-                    &mut old,
-                )
-                .await
-                .unwrap_err();
-            assert!(crate::proxy::session_bindings::is_session_binding_changed_error(&error));
-            retry.preserve_token_error(&error);
-            let response = retry
-                .finish_error_response(axum::response::Response::new(axum::body::Body::empty()));
-            assert_eq!(response.headers()["x-am-cache-affinity"], "preserve");
-            assert!(manager.accept_session_response(&mut old).is_none());
-            assert!(
-                old.is_some(),
-                "failed CAS must retain the request's retry fence"
-            );
-            assert_eq!(
-                manager
-                    .session_accounts
-                    .committed_lease("delayed-401")
-                    .unwrap()
-                    .account_id(),
-                "lease-b"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn retry_selection_keeps_own_release_and_account_removal_recoverable() {
-        for remove_account in [false, true] {
-            let (_temp, manager, model) = leased_token_manager();
-            let manager = Arc::new(manager);
-            manager.commit_session("recovery", "lease-a");
-            let mut lease = manager.session_accounts.bound_lease("recovery");
-            if remove_account {
-                manager.remove_account("lease-a");
-            } else {
-                assert!(manager.abandon_session_lease(&mut lease));
-            }
-            let (_, _, _, selected, _, _) = manager
-                .get_token_filtered_with_retry_lease(
-                    "chat",
-                    true,
-                    Some("recovery"),
-                    model,
-                    &HashSet::from(["lease-a".to_owned()]),
-                    &mut lease,
-                )
-                .await
-                .unwrap();
-            assert_eq!(selected, "lease-b");
-            let mut confirmation = manager.accept_session_response(&mut lease).unwrap();
-            confirmation.observe_json(&serde_json::json!({"candidates":[{
-                "content":{"parts":[{"text":"recovered"}]},"finishReason":"STOP"
-            }]}));
-            drop(confirmation);
-            assert_eq!(
-                manager
-                    .session_accounts
-                    .committed_lease("recovery")
-                    .unwrap()
-                    .account_id(),
-                "lease-b"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn manual_clear_cannot_be_undone_by_retry_or_preferred_selection() {
-        for preferred in [false, true] {
-            let (_temp, manager, model) = leased_token_manager();
-            manager.commit_session("cleared", "lease-a");
-            let mut old = manager.session_accounts.bound_lease("cleared");
-            manager.session_accounts.clear();
-            if preferred {
-                *manager.preferred_account_id.write().await = Some("lease-b".into());
-            }
-            let error = manager
-                .get_token_filtered_with_retry_lease(
-                    "chat",
-                    false,
-                    Some("cleared"),
-                    model,
-                    &HashSet::new(),
-                    &mut old,
-                )
-                .await
-                .unwrap_err();
-            assert!(crate::proxy::session_bindings::is_session_binding_changed_error(&error));
-            assert!(manager.session_accounts.get("cleared").is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn cache_first_refresh_timeout_keeps_binding_without_returning_credentials() {
-        for (expires_in, preferred) in [(200, false), (-1, false), (-1, true)] {
-            let (_temp, manager, model) = leased_token_manager();
-            manager
-                .update_sticky_config(crate::proxy::sticky_config::StickySessionConfig {
-                    mode: crate::proxy::sticky_config::SchedulingMode::CacheFirst,
-                    ..Default::default()
-                })
-                .await;
-            manager.commit_session("warm-refresh", "lease-a");
-            manager.tokens.get_mut("lease-a").unwrap().timestamp =
-                chrono::Utc::now().timestamp() + expires_in;
-            if preferred {
-                manager.set_preferred_account(Some("lease-a".into())).await;
-            }
-            // Hold only the refresh mutex: the production 3.5s watchdog fires
-            // before OAuth is reached, so this regression never uses a network.
-            let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
-            let _guard = refresh_lock.lock().await;
-            manager
-                .refresh_locks
-                .insert("lease-a".into(), refresh_lock.clone());
-            let result = tokio::time::timeout(
-                Duration::from_secs(6),
-                manager.get_token_filtered_with_lease(
-                    "chat",
-                    false,
-                    Some("warm-refresh"),
-                    model,
-                    &HashSet::new(),
-                ),
-            )
-            .await
-            .expect("refresh watchdog must finish");
-            let error = result.expect_err("must neither migrate to B nor send the old token");
-            assert!(error.starts_with("CacheFirst bound account "));
-            assert_eq!(
-                manager.session_accounts.get("warm-refresh").as_deref(),
-                Some("lease-a")
-            );
-        }
-    }
-
-    #[test]
-    fn cache_first_refresh_protection_does_not_block_real_account_recovery() {
-        use crate::proxy::sticky_config::SchedulingMode;
-        let (_temp, manager, _) = leased_token_manager();
-        manager.commit_session("warm", "lease-a");
-        let temporary = TokenRefreshError::Temporary("refresh timeout".into());
-        let cold_snapshot = manager.session_accounts.snapshot("cold");
-        let cold = manager
-            .session_accounts
-            .claim(&cold_snapshot, "lease-a", 0)
-            .unwrap();
-        assert!(
-            manager
-                .cache_first_refresh_stop(
-                    &temporary,
-                    SchedulingMode::CacheFirst,
-                    "chat",
-                    Some("cold"),
-                    "lease-a"
-                )
-                .is_none(),
-            "a provisional selection has no warm cache to protect"
-        );
-        assert!(manager.session_accounts.commit(&cold, || true).is_some());
-        assert!(
-            manager
-                .cache_first_refresh_stop(
-                    &temporary,
-                    SchedulingMode::CacheFirst,
-                    "chat",
-                    Some("cold"),
-                    "lease-a"
-                )
-                .is_some(),
-            "successful response turns the same claim into a warm binding"
-        );
-        assert!(manager
-            .cache_first_refresh_stop(
-                &temporary,
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm"),
-                "lease-a"
-            )
-            .is_some());
-        for (error, mode, kind, sid, account) in [
-            (
-                TokenRefreshError::from_oauth("invalid_grant".into()),
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm"),
-                "lease-a",
-            ),
-            (
-                TokenRefreshError::Temporary("timeout".into()),
-                SchedulingMode::Balance,
-                "chat",
-                Some("warm"),
-                "lease-a",
-            ),
-            (
-                TokenRefreshError::Temporary("timeout".into()),
-                SchedulingMode::CacheFirst,
-                "image_gen",
-                Some("warm"),
-                "lease-a",
-            ),
-            (
-                TokenRefreshError::Temporary("timeout".into()),
-                SchedulingMode::CacheFirst,
-                "chat",
-                None,
-                "lease-a",
-            ),
-            (
-                TokenRefreshError::Temporary("timeout".into()),
-                SchedulingMode::CacheFirst,
-                "chat",
-                Some("warm"),
-                "lease-b",
-            ),
-        ] {
-            assert!(manager
-                .cache_first_refresh_stop(&error, mode, kind, sid, account)
-                .is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn cache_first_unknown_account_file_preserves_warm_binding() {
-        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
-        for preferred in [false, true] {
-            let (temp, manager, model) = leased_token_manager();
-            manager
-                .update_sticky_config(StickySessionConfig {
-                    mode: SchedulingMode::CacheFirst,
-                    ..Default::default()
-                })
-                .await;
-            manager.commit_session("warm-disk", "lease-a");
-            if preferred {
-                manager.set_preferred_account(Some("lease-a".into())).await;
-            }
-            let path = temp.path().join("lease-a.json");
-            std::fs::write(&path, r#"{"token":"#).unwrap();
-            let error = manager
-                .get_token_filtered_with_lease(
-                    "chat",
-                    false,
-                    Some("warm-disk"),
-                    model,
-                    &HashSet::new(),
-                )
-                .await
-                .expect_err("temporary state uncertainty must not select B or use A");
-            assert!(error.starts_with("CacheFirst bound account "));
-            assert!(error.contains("state on disk"));
-            assert_eq!(
-                manager.session_accounts.get("warm-disk").as_deref(),
-                Some("lease-a")
-            );
-            assert!(manager.tokens.contains_key("lease-a"));
-
-            std::fs::write(&path, r#"{"disabled":false}"#).unwrap();
-            let (_, _, _, account, _, mut lease) = manager
-                .get_token_filtered_with_lease(
-                    "chat",
-                    false,
-                    Some("warm-disk"),
-                    model,
-                    &HashSet::new(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(account, "lease-a");
-            assert!(manager.commit_session_lease(&mut lease));
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_account_file_preserves_balance_and_cold_fallback() {
-        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
-        for (mode, bound) in [
-            (SchedulingMode::Balance, true),
-            (SchedulingMode::CacheFirst, false),
-        ] {
-            let (temp, manager, model) = leased_token_manager();
-            manager
-                .update_sticky_config(StickySessionConfig {
-                    mode,
-                    ..Default::default()
-                })
-                .await;
-            if bound {
-                manager.commit_session("disk-fallback", "lease-a");
-            }
-            manager.set_preferred_account(Some("lease-a".into())).await;
-            std::fs::write(temp.path().join("lease-a.json"), r#"{"token":"#).unwrap();
-            let (_, _, _, account, _, mut lease) = manager
-                .get_token_filtered_with_lease(
-                    "chat",
-                    false,
-                    Some("disk-fallback"),
-                    model,
-                    &HashSet::new(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(account, "lease-b");
-            assert!(manager.commit_session_lease(&mut lease));
-        }
-    }
-
-    #[tokio::test]
-    async fn explicitly_disabled_account_still_recovers_in_cache_first() {
-        use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
-        for preferred in [false, true] {
-            let (temp, manager, model) = leased_token_manager();
-            manager
-                .update_sticky_config(StickySessionConfig {
-                    mode: SchedulingMode::CacheFirst,
-                    ..Default::default()
-                })
-                .await;
-            manager.commit_session("disabled-disk", "lease-a");
-            if preferred {
-                manager.set_preferred_account(Some("lease-a".into())).await;
-            }
-            std::fs::write(temp.path().join("lease-a.json"), r#"{"disabled":true}"#).unwrap();
-            let (_, _, _, account, _, mut lease) = manager
-                .get_token_filtered_with_lease(
-                    "chat",
-                    false,
-                    Some("disabled-disk"),
-                    model,
-                    &HashSet::new(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(account, "lease-b");
-            assert!(manager.commit_session_lease(&mut lease));
-            assert_eq!(
-                manager.session_accounts.get("disabled-disk").as_deref(),
-                Some("lease-b")
-            );
-        }
-    }
-
-    #[test]
-    fn model_forbidden_preserves_unrelated_warm_leases() {
-        use crate::modules::account::ForbiddenApplyResult;
-        let (_temp, manager, model) = leased_token_manager();
-        manager.commit_session("other-model", "lease-a");
-        let mut other_lease = manager.session_accounts.bound_lease("other-model");
-        manager.apply_forbidden_outcome(
-            "lease-a",
-            ForbiddenApplyResult::ModelLocked(model.into()),
-            Some(model),
-            None,
-        );
-        assert!(manager
-            .tokens
-            .get("lease-a")
-            .unwrap()
-            .is_model_forbidden(model));
-        assert!(!manager
-            .tokens
-            .get("lease-a")
-            .unwrap()
-            .is_model_forbidden("gemini-3.8-flash"));
-        assert_eq!(
-            manager.session_accounts.get("other-model").as_deref(),
-            Some("lease-a")
-        );
-        assert!(
-            manager.commit_session_lease(&mut other_lease),
-            "model rejection must not invalidate other models' in-flight success"
-        );
-
-        manager.apply_forbidden_outcome(
-            "lease-a",
-            ForbiddenApplyResult::AccountLocked,
-            Some(model),
-            None,
-        );
-        assert!(manager.session_accounts.get("other-model").is_none());
-        assert!(!manager.tokens.contains_key("lease-a"));
-        assert!(!manager.commit_session_lease(&mut other_lease));
-    }
-
-    #[tokio::test]
-    async fn image_busy_selection_keeps_text_binding_for_session_and_api_key_scopes() {
-        for sid in ["tenant:sess-root", "tenant:key-tenant"] {
-            let (_temp, manager, _) = leased_token_manager();
-            let model = "gemini-3.1-flash-image";
-            let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
-                .unwrap_or_else(|| model.into());
-            for mut token in manager.tokens.iter_mut() {
-                token.model_quotas.insert(normalized.clone(), 100);
-                token.available_models.insert(model.into());
-            }
-            manager.commit_session(sid, "lease-a");
-            let excluded = HashSet::from(["lease-a".into()]);
-            let (_, _, _, account, _, mut lease) = manager
-                .get_token_filtered_with_lease("image_gen", false, Some(sid), model, &excluded)
-                .await
-                .unwrap();
-            assert_eq!(account, "lease-b");
-            assert!(manager.commit_session_lease(&mut lease));
-            assert_eq!(
-                manager.session_accounts.get(sid).as_deref(),
-                Some("lease-a")
-            );
-            let image_sid =
-                crate::proxy::session_bindings::scheduling_session_id("image_gen", Some(sid))
-                    .unwrap();
-            assert_eq!(
-                manager.session_accounts.get(&image_sid).as_deref(),
-                Some("lease-b")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn sticky_lease_rotation_blocks_late_success_and_failure() {
-        let (_temp, manager, model) = leased_token_manager();
-        let excluded = HashSet::from(["lease-b".to_owned()]);
-        let (_, _, _, a, _, mut old) = manager
-            .get_token_filtered_with_lease("chat", false, Some("lease-session"), model, &excluded)
-            .await
-            .unwrap();
-        assert_eq!(a, "lease-a");
-        let excluded = HashSet::from([a]);
-        let (_, _, _, b, _, mut next) = manager
-            .get_token_filtered_with_lease("chat", true, Some("lease-session"), model, &excluded)
-            .await
-            .unwrap();
-        assert_eq!(b, "lease-b");
-        assert!(manager.commit_session_lease(&mut next));
-        assert!(!manager.abandon_session_lease(&mut old));
-        assert!(!manager.commit_session_lease(&mut old));
-        assert_eq!(manager.session_accounts.get("lease-session"), Some(b));
-    }
-
-    #[tokio::test]
-    async fn sticky_lease_fixed_account_and_performance_mode() {
-        let (_temp, manager, model) = leased_token_manager();
-        manager
-            .set_preferred_account(Some("lease-a".to_owned()))
-            .await;
-        let (_, _, _, account, _, mut lease) = manager
-            .get_token_filtered_with_lease(
-                "chat",
-                false,
-                Some("fixed-session"),
-                model,
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(account, "lease-a");
-        assert!(manager.commit_session_lease(&mut lease));
-        assert_eq!(manager.session_accounts.get("fixed-session"), Some(account));
-        let mut config = manager.get_sticky_config().await;
-        config.mode = crate::proxy::sticky_config::SchedulingMode::PerformanceFirst;
-        manager.update_sticky_config(config).await;
-        let (_, _, _, _, _, mut lease) = manager
-            .get_token_filtered_with_lease(
-                "chat",
-                false,
-                Some("performance-session"),
-                model,
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert!(lease.is_none());
-        assert!(!manager.commit_session_lease(&mut lease));
-        assert!(manager
-            .session_accounts
-            .get("performance-session")
-            .is_none());
-    }
-
-    #[test]
-    fn sticky_lease_removed_rotating_candidate_cannot_reappear() {
-        let (_temp, manager, _) = leased_token_manager();
-        manager
-            .session_accounts
-            .claim(&manager.session_accounts.snapshot("s"), "lease-a", 0)
-            .unwrap();
-        let mut lease = Some(
-            manager
-                .session_accounts
-                .candidate(&manager.session_accounts.snapshot("s"), "lease-b"),
-        );
-        manager.remove_account("lease-b");
-        assert!(!manager.commit_session_lease(&mut lease));
-        assert_eq!(
-            manager.session_accounts.get("s").as_deref(),
-            Some("lease-a")
-        );
-    }
-
-    #[test]
-    fn sticky_lease_rotation_grace_retry_keeps_unpublished_candidate() {
-        let (_temp, manager, _) = leased_token_manager();
-        manager
-            .session_accounts
-            .claim(&manager.session_accounts.snapshot("s"), "lease-a", 0)
-            .unwrap();
-        let mut lease = Some(
-            manager
-                .session_accounts
-                .candidate(&manager.session_accounts.snapshot("s"), "lease-b"),
-        );
-        assert!(!manager.abandon_session_lease(&mut lease));
-        assert!(manager.commit_session_lease(&mut lease));
-        assert_eq!(
-            manager.session_accounts.get("s").as_deref(),
-            Some("lease-b")
         );
     }
 
@@ -14067,11 +11196,7 @@ mod tests {
 
         // 未解绑时调用 commit_session 不得覆写既有绑定（如强制轮换/生图换号）
         manager.commit_session(session_id, acc1);
-        let claimed = manager
-            .session_accounts
-            .claim(&manager.session_accounts.snapshot(session_id), acc2, 0)
-            .unwrap();
-        manager.session_accounts.commit(&claimed, || true).unwrap();
+        manager.commit_session(session_id, acc2);
         assert_eq!(
             manager.session_accounts.get(session_id).unwrap().as_str(),
             acc1,
@@ -14514,82 +11639,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooldown_longer_than_work_watchdog_preserves_selection() {
-        async fn scenario(qos: bool, bound: bool) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("account.json");
-            std::fs::write(
-                &path,
-                r#"{"disabled":false,"token":{"project_id":"local-project"}}"#,
-            )
-            .unwrap();
-            let manager = TokenManager::new(dir.path().into());
-            let account = "cooldown-account";
-            let model = "gemini-4-argon";
-            let mut token = create_test_token(account, Some("PRO"), 1.0, None, Some(100));
-            token.account_path = path;
-            token.project_id = Some("local-project".into());
-            token.model_quotas.insert(model.into(), 100);
-            manager.tokens.insert(account.into(), token);
-            manager
-                .update_sticky_config(StickySessionConfig {
-                    mode: crate::proxy::sticky_config::SchedulingMode::CacheFirst,
-                    max_wait_seconds: 60,
-                    ..Default::default()
-                })
-                .await;
-            if bound {
-                manager.commit_session("waiting-session", account);
-            }
-            if qos {
-                manager.set_qos_auto_jail(true);
-                manager.qos_guardian.states.insert(
-                    account.into(),
-                    crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                        level: 0,
-                        jailed_at: std::time::Instant::now(),
-                        current_wait: Duration::from_secs(16),
-                    },
-                );
-            } else {
-                manager.rate_limit_tracker.set_lockout_until(
-                    account,
-                    std::time::SystemTime::now() + Duration::from_secs(16),
-                    crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
-                    Some(model.into()),
-                );
-            }
-            let excluded = HashSet::new();
-            let selected = crate::proxy::pipeline::budget::scope(
-                crate::proxy::pipeline::budget::RequestContext::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                ),
-                manager.get_token_filtered(
-                    "chat",
-                    false,
-                    bound.then_some("waiting-session"),
-                    model,
-                    &excluded,
-                ),
-            )
-            .await
-            .expect("planned cooldown must not trigger the 15-second work watchdog");
-            assert_eq!(selected.3, account);
-            if bound {
-                assert_eq!(
-                    manager.session_accounts.get("waiting-session").as_deref(),
-                    Some(account)
-                );
-            }
-        }
-        tokio::join!(
-            scenario(true, true),
-            scenario(false, true),
-            scenario(false, false)
-        );
-    }
-
-    #[tokio::test]
     async fn test_cache_first_mode_preserves_sticky_session_and_handles_qos_wait() {
         use crate::proxy::sticky_config::{SchedulingMode, StickySessionConfig};
 
@@ -14672,24 +11721,8 @@ mod tests {
             })
             .await;
         // 连续两次慢首字触发 QoS Jailed
-        manager.record_qos_ttft(
-            acc1_id,
-            Some(session_id),
-            "PRO",
-            50_000.0,
-            false,
-            Some(100),
-            manager.session_accounts.bound_lease(session_id).as_ref(),
-        );
-        manager.record_qos_ttft(
-            acc1_id,
-            Some(session_id),
-            "PRO",
-            50_000.0,
-            false,
-            Some(100),
-            manager.session_accounts.bound_lease(session_id).as_ref(),
-        );
+        manager.record_qos_ttft(acc1_id, Some(session_id), "PRO", 50_000.0, false, Some(100));
+        manager.record_qos_ttft(acc1_id, Some(session_id), "PRO", 50_000.0, false, Some(100));
         assert!(
             manager.qos_guardian.is_jailed_or_probing(acc1_id),
             "acc1 应已进入 QoS 小黑屋"
@@ -14704,24 +11737,6 @@ mod tests {
             "CacheFirst 模式下进入 QoS 小黑屋时绝不能解除会话绑定"
         );
 
-        let blocked = manager
-            .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
-            .await;
-        assert!(blocked.unwrap_err().contains("QoS cooldown"));
-        assert_eq!(
-            manager.session_accounts.get(session_id).as_deref(),
-            Some(acc1_id)
-        );
-        assert!(manager.qos_guardian.is_jailed_or_probing(acc1_id));
-        manager.qos_guardian.states.insert(
-            acc1_id.into(),
-            crate::proxy::qos_guardian::AccountQoSState::Jailed {
-                level: 0,
-                jailed_at: std::time::Instant::now(),
-                current_wait: Duration::ZERO,
-            },
-        );
-
         let (_token, _project_id, email_after_jail, selected_after_jail, _wait) = manager
             .get_token_filtered("chat", false, Some(session_id), target_model, &excluded)
             .await
@@ -14734,68 +11749,6 @@ mod tests {
         assert!(
             manager.qos_guardian.is_half_open(acc1_id),
             "CacheFirst 原地等待结束后账号应转入 HalfOpen 观察缓刑期继续服务本会话"
-        );
-        // Another request extends either the model or account cooldown while we wait.
-        for extension_model in [Some(norm_target.clone()), None] {
-            manager.rate_limit_tracker.clear(acc1_id);
-            manager.rate_limit_tracker.set_lockout_until(
-                acc1_id,
-                std::time::SystemTime::now() + Duration::from_millis(200),
-                crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
-                Some(norm_target.clone()),
-            );
-            let waiting = manager.get_token_filtered(
-                "chat",
-                false,
-                Some(session_id),
-                target_model,
-                &excluded,
-            );
-            let extension = async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                manager.rate_limit_tracker.set_lockout_until(
-                    acc1_id,
-                    std::time::SystemTime::now() + Duration::from_secs(120),
-                    crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
-                    extension_model,
-                );
-            };
-            let (result, ()) = tokio::join!(waiting, extension);
-            assert!(result.unwrap_err().contains("rate-limited"));
-            assert!(
-                manager
-                    .rate_limit_tracker
-                    .get_remaining_wait(acc1_id, Some(&norm_target))
-                    > 100
-            );
-            assert_eq!(
-                manager.session_accounts.get(session_id).as_deref(),
-                Some(acc1_id)
-            );
-        }
-
-        // A short request budget must not erase a cooldown when it skips the wait.
-        manager.rate_limit_tracker.clear(acc1_id);
-        manager.rate_limit_tracker.set_lockout_until(
-            acc1_id,
-            std::time::SystemTime::now() + Duration::from_secs(1),
-            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
-            Some(norm_target.clone()),
-        );
-        let result = crate::proxy::pipeline::budget::scope(
-            crate::proxy::pipeline::budget::RequestContext::new(
-                std::time::Instant::now() + Duration::from_secs(20),
-            ),
-            manager.get_token_filtered("chat", false, Some(session_id), target_model, &excluded),
-        )
-        .await;
-        assert!(result.unwrap_err().contains("rate-limited"));
-        assert!(manager
-            .rate_limit_tracker
-            .is_rate_limited(acc1_id, Some(&norm_target)));
-        assert_eq!(
-            manager.session_accounts.get(session_id).as_deref(),
-            Some(acc1_id)
         );
     }
 
@@ -15829,6 +12782,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
 
         manager.tokens.insert(token.account_id.clone(), token);
@@ -15985,14 +12940,6 @@ mod tests {
             .model_quotas
             .insert("gemini-3.1-flash-image".to_string(), 33);
 
-        token.model_metadata = token
-            .model_quotas
-            .keys()
-            .cloned()
-            .map(|name| (name, Default::default()))
-            .collect();
-
-        token.available_models = token.model_metadata.keys().cloned().collect();
         assert_eq!(
             TokenManager::select_probe_model(&token).as_deref(),
             Some("gemini-3.8-flash-high"),
@@ -17589,6 +14536,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
         manager.tokens.insert("acc-active".to_string(), tok);
         let future_reset =
@@ -17668,6 +14617,8 @@ mod tests {
             model_reset_times: HashMap::new(),
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
+            is_gcp_tos: false,
+            raw_tier: None,
         };
         manager.tokens.insert("acc-toggle".to_string(), tok);
         manager
@@ -17694,7 +14645,7 @@ mod tests {
         assert!(!manager.tokens.contains_key("acc-toggle"));
         assert!(manager.get_preferred_account().await.is_none());
         assert!(manager.last_used_account.lock().await.is_none());
-        assert!(!manager.session_accounts.bound_lease("sess-1").is_some());
+        assert!(!manager.session_accounts.contains_key("sess-1"));
         assert!(!manager.is_model_unsupported("acc-toggle", "gemini-4-hydrogen-high"));
         assert!(!manager.invalid_grant_failures.contains_key("acc-toggle"));
         assert!(!manager.project_id_failures.contains_key("acc-toggle"));
@@ -17752,7 +14703,7 @@ mod tests {
             .insert("gemini-3.1-pro-high".to_string());
         probe_tok
             .model_quotas
-            .insert("gemini-3.1-pro-high".to_string(), 100);
+            .insert("gemini-3.1-pro-high".to_string(), 0);
         assert_eq!(
             TokenManager::select_probe_model(&probe_tok).as_deref(),
             Some("gemini-3.1-pro-high"),

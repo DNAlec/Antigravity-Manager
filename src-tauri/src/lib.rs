@@ -586,6 +586,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
@@ -813,6 +814,7 @@ pub fn run() {
             commands::delete_account,
             commands::delete_accounts,
             commands::release_account_qos_jail,
+            commands::remove_account_forbidden_model,
             commands::reorder_accounts,
             commands::switch_account,
             commands::export_accounts,
@@ -874,6 +876,7 @@ pub fn run() {
             commands::get_antigravity_cli_path,
             commands::get_antigravity_args,
             commands::check_for_updates,
+            commands::check_native_update,
             commands::check_homebrew_installation,
             commands::check_appimage_installation,
             commands::get_update_settings,
@@ -933,6 +936,8 @@ pub fn run() {
             commands::warm_up_account,
             commands::update_account_label,
             commands::update_account_priority,
+            commands::update_account_project_id,
+            commands::auto_fetch_account_project_id,
             // HTTP API settings commands
             commands::get_http_api_settings,
             commands::save_http_api_settings,

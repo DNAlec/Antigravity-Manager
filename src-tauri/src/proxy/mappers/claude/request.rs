@@ -163,30 +163,22 @@ pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
-/// Strip cache hints only from protocol envelopes. Tool schemas, arguments,
-/// and result payloads are caller-owned JSON and may use the same property name.
+/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
+///
+/// 用于处理嵌套结构和非标准位置的 cache_control。
+/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
 fn deep_clean_cache_control(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.remove("cache_control");
-            map.remove("prompt_cache_breakpoint");
-            for key in [
-                "request",
-                "contents",
-                "systemInstruction",
-                "parts",
-                "tools",
-                "functionDeclarations",
-                "functionCall",
-                "functionResponse",
-            ] {
-                if let Some(child) = map.get_mut(key) {
-                    deep_clean_cache_control(child);
-                }
+            if map.remove("cache_control").is_some() {
+                tracing::debug!("[DEBUG-593] Removed cache_control from nested JSON object");
+            }
+            for (_, v) in map.iter_mut() {
+                deep_clean_cache_control(v);
             }
         }
-        Value::Array(items) => {
-            for item in items {
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
                 deep_clean_cache_control(item);
             }
         }
@@ -202,29 +194,75 @@ fn deep_clean_cache_control(value: &mut Value) {
 /// thinking/redacted_thinking blocks always come before other block types.
 fn sort_thinking_blocks_first(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if msg.role != "assistant" {
-            continue;
-        }
-        if let MessageContent::Array(blocks) = &mut msg.content {
-            // Only thought blocks have an ordering constraint. Moving text past a
-            // tool call changes both the conversation and its cached prefix.
-            if blocks.len() <= 1 {
-                continue;
-            }
-            let mut thinking = Vec::new();
-            let mut rest = Vec::new();
-            for block in blocks.drain(..) {
-                match &block {
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                        thinking.push(block);
+        if msg.role == "assistant" {
+            if let MessageContent::Array(blocks) = &mut msg.content {
+                // [FIX #709] Triple-stage partition: [Thinking, Text, ToolUse]
+                // This ensures protocol compliance while maintaining logical order.
+
+                let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
+                let mut text_blocks: Vec<ContentBlock> = Vec::new();
+                let mut tool_blocks: Vec<ContentBlock> = Vec::new();
+                let mut other_blocks: Vec<ContentBlock> = Vec::new();
+
+                let original_len = blocks.len();
+                let mut needs_reorder = false;
+                let mut saw_non_thinking = false;
+
+                for (_i, block) in blocks.iter().enumerate() {
+                    match block {
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                            if saw_non_thinking {
+                                needs_reorder = true;
+                            }
+                        }
+                        ContentBlock::Text { .. } => {
+                            saw_non_thinking = true;
+                        }
+                        ContentBlock::ToolUse { .. } => {
+                            saw_non_thinking = true;
+                            // Check if tool is after text (this is normal, but we want a strict group order)
+                        }
+                        _ => saw_non_thinking = true,
                     }
-                    ContentBlock::Text { text }
-                        if text.trim().is_empty() || text == "(no content)" => {}
-                    _ => rest.push(block),
+                }
+
+                if needs_reorder || original_len > 1 {
+                    // For safety, we always perform the triple partition if there's more than one block.
+                    // This also handles empty text block filtering.
+                    for block in blocks.drain(..) {
+                        match &block {
+                            ContentBlock::Thinking { .. }
+                            | ContentBlock::RedactedThinking { .. } => {
+                                thinking_blocks.push(block);
+                            }
+                            ContentBlock::Text { text } => {
+                                // Filter out purely empty or structural text like "(no content)"
+                                if !text.trim().is_empty() && text != "(no content)" {
+                                    text_blocks.push(block);
+                                }
+                            }
+                            ContentBlock::ToolUse { .. } => {
+                                tool_blocks.push(block);
+                            }
+                            _ => {
+                                other_blocks.push(block);
+                            }
+                        }
+                    }
+
+                    // Reconstruct in strict order: Thinking -> Text/Other -> Tool
+                    blocks.extend(thinking_blocks);
+                    blocks.extend(text_blocks);
+                    blocks.extend(other_blocks);
+                    blocks.extend(tool_blocks);
+
+                    if needs_reorder {
+                        tracing::warn!(
+                            "[FIX #709] Reordered assistant messages to [Thinking, Text, Tool] structure."
+                        );
+                    }
                 }
             }
-            blocks.extend(thinking);
-            blocks.extend(rest);
         }
     }
 }
@@ -451,7 +489,15 @@ pub fn transform_claude_request_in_timed(
     let has_web_search_tool = claude_req
         .tools
         .as_ref()
-        .map(|tools| tools.iter().any(Tool::is_web_search))
+        .map(|tools| {
+            tools.iter().any(|t| {
+                t.is_web_search()
+                    || t.name.as_deref() == Some("google_search")
+                    || t.name.as_deref() == Some("builtin_web_search")
+                    || t.type_.as_deref() == Some("web_search_20250305")
+                    || t.type_.as_deref() == Some("builtin_web_search")
+            })
+        })
         .unwrap_or(false);
 
     // 用于存储 tool_use id -> name 映射
@@ -551,7 +597,7 @@ pub fn transform_claude_request_in_timed(
         has_web_search_tool,
         is_thinking_enabled,
         token, // [NEW] 传递 token 用于动态限额
-    )?;
+    );
 
     // 2. Contents (Messages)
     let contents = build_google_contents(
@@ -672,7 +718,7 @@ pub fn transform_claude_request_in_timed(
         &mut inner_request,
         &config.final_model,
         Some(&request_id),
-    )?;
+    );
     let reordered_inner = inner_request;
 
     // [NEW] 动态检测是否需要标记为 agent 请求
@@ -703,9 +749,18 @@ pub fn transform_claude_request_in_timed(
         body["requestType"] = json!("agent");
     }
 
-    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body)?;
+    if let Some(tok) = token {
+        if tok.is_paygo() {
+            body["enabledCreditTypes"] = json!(["GOOGLE_ONE_AI"]);
+        }
+    }
 
+    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+
+    // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
+    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
     deep_clean_cache_control(&mut body);
+    tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
     // [DEFENSE] 净化所有 contents 中的 inlineData，过滤或降级空数据/损坏数据
     if let Some(inner) = body.get_mut("request") {
@@ -867,189 +922,6 @@ fn build_system_instruction(
     }))
 }
 
-const MAX_MEDIA_CONTENT_DEPTH: usize = 32;
-
-/// Convert the same Claude source shapes in user messages and nested tool results.
-fn claude_media_source_parts(
-    source_type: &str,
-    media_type: Option<&str>,
-    data: Option<&str>,
-    url: Option<&str>,
-    content: Option<&Value>,
-    label: &str,
-    depth: usize,
-) -> Result<Vec<Value>, String> {
-    if depth > MAX_MEDIA_CONTENT_DEPTH {
-        return Err("Media content exceeds the maximum nesting depth".to_string());
-    }
-    match source_type {
-        "base64" => Ok(vec![
-            crate::proxy::mappers::common_utils::create_gemini_inline_part(
-                media_type,
-                data.unwrap_or_default(),
-                label,
-            ),
-        ]),
-        "url" => {
-            let uri = url
-                .filter(|uri| !uri.trim().is_empty())
-                .ok_or_else(|| format!("{label} URL source is missing its URL"))?;
-            let default_mime = if label == "Image" {
-                "image/jpeg"
-            } else {
-                "application/pdf"
-            };
-            Ok(vec![
-                crate::proxy::mappers::common_utils::create_gemini_file_part(
-                    uri,
-                    media_type,
-                    default_mime,
-                )?,
-            ])
-        }
-        "text" => {
-            let text = data
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| format!("{label} text source is missing its data"))?;
-            Ok(vec![json!({"text": text})])
-        }
-        "content" => {
-            let content =
-                content.ok_or_else(|| format!("{label} content source is missing its content"))?;
-            let mut parts = Vec::new();
-            append_claude_content_parts(content, &mut parts, depth + 1)?;
-            if parts.is_empty() {
-                return Err(format!("{label} content source has no readable content"));
-            }
-            Ok(parts)
-        }
-        _ => Err(format!("Unsupported {label} source type: {source_type}")),
-    }
-}
-
-/// Keep readable content in order; unknown structured tool output stays readable JSON.
-fn append_claude_content_parts(
-    content: &Value,
-    parts: &mut Vec<Value>,
-    depth: usize,
-) -> Result<(), String> {
-    if depth > MAX_MEDIA_CONTENT_DEPTH {
-        return Err("Media content exceeds the maximum nesting depth".to_string());
-    }
-    match content {
-        Value::String(text) => {
-            if !text.is_empty() {
-                parts.push(json!({"text": text}));
-            }
-        }
-        Value::Array(blocks) => {
-            for block in blocks {
-                append_claude_content_parts(block, parts, depth + 1)?;
-            }
-        }
-        Value::Null => {}
-        Value::Object(block) => match block.get("type").and_then(Value::as_str) {
-            Some(kind @ ("image" | "document")) => {
-                let source = block
-                    .get("source")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| format!("{kind} block is missing its source"))?;
-                let source_type = source
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("base64");
-                parts.extend(claude_media_source_parts(
-                    source_type,
-                    source.get("media_type").and_then(Value::as_str),
-                    source.get("data").and_then(Value::as_str),
-                    source.get("url").and_then(Value::as_str),
-                    source.get("content"),
-                    if kind == "image" { "Image" } else { "Document" },
-                    depth + 1,
-                )?);
-            }
-            Some("text") => {
-                let text = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Text block is missing its text".to_string())?;
-                if !text.is_empty() {
-                    parts.push(json!({"text": text}));
-                }
-            }
-            _ => parts.push(json!({"text": content.to_string()})),
-        },
-        _ => parts.push(json!({"text": content.to_string()})),
-    }
-    Ok(())
-}
-
-/// Server tools already ran in the historical provider session. Keep their
-/// readable results without manufacturing a client function call to replay.
-fn append_server_tool_result_parts(
-    content: &Value,
-    parts: &mut Vec<Value>,
-    depth: usize,
-) -> Result<(), String> {
-    if depth > MAX_MEDIA_CONTENT_DEPTH {
-        return Err("Server tool result exceeds the maximum nesting depth".into());
-    }
-    if let Some(items) = content.as_array() {
-        for item in items {
-            append_server_tool_result_parts(item, parts, depth + 1)?;
-        }
-        return Ok(());
-    }
-    match content.get("type").and_then(Value::as_str) {
-        Some("web_search_result") => {
-            // Search bodies are opaque, but page names and links are useful history.
-            for (field, label) in [("title", "Search result"), ("url", "URL")] {
-                if let Some(text) = content
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
-                    parts.push(json!({"text": format!("{label}: {text}")}));
-                }
-            }
-        }
-        Some("web_search_tool_result_error") => {
-            let error = json!({
-                "type": "web_search_tool_result_error",
-                "error_code": content.get("error_code").and_then(Value::as_str)
-            });
-            parts.push(json!({"text": error.to_string()}));
-        }
-        Some("web_fetch_result") => {
-            if let Some(url) = content.get("url").and_then(Value::as_str) {
-                parts.push(json!({"text": format!("Fetched URL: {url}")}));
-            }
-            if let Some(body) = content.get("content") {
-                append_server_tool_result_parts(body, parts, depth + 1)?;
-            }
-        }
-        Some("code_execution_result" | "bash_code_execution_result") => {
-            for key in ["stdout", "stderr"] {
-                if let Some(text) = content
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    parts.push(json!({"text": format!("{key}:\n{text}")}));
-                }
-            }
-            if let Some(code) = content.get("return_code") {
-                parts.push(json!({"text": format!("Exit code: {code}")}));
-            }
-            if let Some(body) = content.get("content") {
-                append_server_tool_result_parts(body, parts, depth + 1)?;
-            }
-        }
-        _ => append_claude_content_parts(content, parts, depth + 1)?,
-    }
-    Ok(())
-}
-
 /// 构建 Contents (Messages)
 fn build_contents(
     content: &MessageContent,
@@ -1065,6 +937,8 @@ fn build_contents(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
+    last_user_task_text_normalized: &mut Option<String>,
+    previous_was_tool_result: &mut bool,
     _existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
@@ -1112,21 +986,21 @@ fn build_contents(
     match content {
         MessageContent::String(text) => {
             if text != "(no content)" {
-                if !text.trim().is_empty() {
-                    // Leading indentation can make Markdown literal code.
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
                     parts.extend(
-                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text),
+                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
+                            trimmed,
+                        ),
                     );
                 }
             }
         }
         MessageContent::Array(blocks) => {
+            let mut turn_tool_media_parts = Vec::new();
             for item in blocks {
                 match item {
-                    ContentBlock::Text { text }
-                    | ContentBlock::Compaction {
-                        content: Some(text),
-                    } => {
+                    ContentBlock::Text { text } => {
                         if text != "(no content)" && !text.trim().is_empty() {
                             // [2026-09-27] 如果 assistant 消息同时包含 tool_use，且该文本仅为占位符（如 "..."、"·" 等），
                             // 丢弃无实质意义的占位文本，避免在 Gemini 格式转换中被误选为签名锚点，
@@ -1144,18 +1018,36 @@ fn build_contents(
                                 continue;
                             }
 
+                            // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
+                            // 检查该文本是否与上一轮任务描述完全一致。
+                            if !is_assistant && *previous_was_tool_result {
+                                if let Some(last_task) = last_user_task_text_normalized {
+                                    let current_normalized =
+                                        text.replace(|c: char| c.is_whitespace(), "");
+                                    if !current_normalized.is_empty()
+                                        && current_normalized == *last_task
+                                    {
+                                        tracing::info!("[Claude-Request] Dropping duplicated task text echo (len: {})", text.len());
+                                        continue;
+                                    }
+                                }
+                            }
+
                             parts.extend(
                                 crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
                                     text,
                                 ),
                             );
                             saw_non_thinking = true;
+
+                            // 记录最近一次 User 任务文本用于后续比对
+                            if !is_assistant {
+                                *last_user_task_text_normalized =
+                                    Some(text.replace(|c: char| c.is_whitespace(), ""));
+                            }
+                            *previous_was_tool_result = false;
                         }
                     }
-                    // A null compaction summary is a documented failed-compaction no-op.
-                    ContentBlock::Compaction { content: None } => {}
-                    // The provider's fallback boundary is not conversational content.
-                    ContentBlock::Fallback {} => {}
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -1298,28 +1190,28 @@ fn build_contents(
                         continue;
                     }
                     ContentBlock::Image { source, .. } => {
-                        parts.extend(claude_media_source_parts(
-                            &source.source_type,
-                            source.media_type.as_deref(),
-                            source.data.as_deref(),
-                            source.url.as_deref(),
-                            source.content.as_ref(),
-                            "Image",
-                            0,
-                        )?);
-                        saw_non_thinking = true;
+                        if source.source_type == "base64" {
+                            let part =
+                                crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                    source.media_type.as_deref(),
+                                    source.data.as_deref().unwrap_or_default(),
+                                    "Image",
+                                );
+                            parts.push(part);
+                            saw_non_thinking = true;
+                        }
                     }
                     ContentBlock::Document { source, .. } => {
-                        parts.extend(claude_media_source_parts(
-                            &source.source_type,
-                            source.media_type.as_deref(),
-                            source.data.as_deref(),
-                            source.url.as_deref(),
-                            source.content.as_ref(),
-                            "Document",
-                            0,
-                        )?);
-                        saw_non_thinking = true;
+                        if source.source_type == "base64" {
+                            let part =
+                                crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                    source.media_type.as_deref(),
+                                    source.data.as_deref().unwrap_or_default(),
+                                    "Document",
+                                );
+                            parts.push(part);
+                            saw_non_thinking = true;
+                        }
                     }
                     ContentBlock::ToolUse {
                         id,
@@ -1409,34 +1301,35 @@ fn build_contents(
                                     &mut extra_parts,
                                 )
                             }
-                            _ => {
-                                let mut converted = Vec::new();
-                                append_claude_content_parts(content, &mut converted, 0)?;
+                            serde_json::Value::Array(arr) => {
                                 let mut texts = Vec::new();
-                                for part in converted {
-                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                for block in arr {
+                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                         texts.push(text.to_string());
-                                    } else {
-                                        extra_parts.push(part);
+                                    } else if block.get("source").is_some() {
+                                        if block.get("type").and_then(|v| v.as_str())
+                                            == Some("image")
+                                        {
+                                            let source = block.get("source").unwrap();
+                                            let media_type =
+                                                source.get("media_type").and_then(|v| v.as_str());
+                                            let data = source
+                                                .get("data")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default();
+                                            extra_parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                                media_type,
+                                                data,
+                                                "Tool Result Image",
+                                            ));
+                                        }
                                     }
                                 }
                                 texts.join("\n")
                             }
+                            serde_json::Value::Null => String::new(),
+                            _ => content.to_string(),
                         };
-
-                        // FunctionResponsePart accepts media, not text. Keep validation
-                        // notices with the same result instead of emitting orphan parts.
-                        extra_parts.retain(|part| {
-                            if let Some(notice) = part.get("text").and_then(Value::as_str) {
-                                if !merged_content.is_empty() {
-                                    merged_content.push('\n');
-                                }
-                                merged_content.push_str(notice);
-                                false
-                            } else {
-                                true
-                            }
-                        });
 
                         // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
                         if merged_content.trim().is_empty() {
@@ -1448,144 +1341,32 @@ fn build_contents(
                             }
                         }
 
-                        let result_key = if is_error.unwrap_or(false) {
-                            "error"
-                        } else {
-                            "output"
-                        };
-                        let mut response = json!({
-                            "name": func_name,
-                            "response": { (result_key): merged_content },
-                            "id": tool_use_id
+                        let part = json!({
+                            "functionResponse": {
+                                "name": func_name,
+                                "response": {"output": merged_content},
+                                "id": tool_use_id
+                            }
                         });
-                        if !extra_parts.is_empty() {
-                            response["parts"] = Value::Array(extra_parts);
-                        }
-                        parts.push(json!({ "functionResponse": response }));
+
+                        // 危险测试分支法则：ToolResult (functionResponse) 绝不携带签名
+                        parts.push(part);
+
+                        // 暂存随行媒体 parts，确保同一轮中所有 functionResponse 置顶连续，多模态媒体统一延后追加
+                        turn_tool_media_parts.extend(extra_parts);
+
+                        // 标记状态，用于下一条 User 消息的去重判断
+                        *previous_was_tool_result = true;
                     }
-                    ContentBlock::AdvisorToolResult {
-                        tool_use_id,
-                        content,
-                    } => {
-                        match content {
-                            AdvisorResultContent::Result { text } => {
-                                if !text.is_empty() {
-                                    parts.push(json!({"text":text}));
-                                }
-                            }
-                            AdvisorResultContent::Error { error_code } => {
-                                parts.push(json!({"text":format!(
-                                    "Advisor tool error (call {tool_use_id}): {error_code}"
-                                )}));
-                            }
-                            AdvisorResultContent::Redacted {} => {
-                                parts.push(json!({"text":format!(
-                                    "Advisor result (call {tool_use_id}) is provider-encrypted; readable content is unavailable."
-                                )}));
-                            }
-                        }
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::WebFetchToolResult { content, .. }
-                    | ContentBlock::CodeExecutionToolResult { content, .. } => {
-                        append_server_tool_result_parts(content, &mut parts, 0)?;
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::ToolSearchToolResult {
-                        tool_use_id,
-                        content,
-                    } => {
-                        parts.push(
-                            json!({"text":format!("Tool search result (call {tool_use_id}):")}),
-                        );
-                        match content {
-                            ToolSearchResultContent::Found { tool_references } => {
-                                for ToolReference::Tool { tool_name } in tool_references {
-                                    parts.push(
-                                        json!({"text":format!("Discovered tool: {tool_name}")}),
-                                    );
-                                }
-                            }
-                            ToolSearchResultContent::Error {
-                                error_code,
-                                error_message,
-                            } => {
-                                parts.push(
-                                    json!({"text":format!("Tool search failed: {error_code}")}),
-                                );
-                                if let Some(message) = error_message {
-                                    parts.push(json!({"text":message}));
-                                }
-                            }
-                        }
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::SearchResult {
-                        source,
-                        title,
-                        content,
-                    } => {
-                        parts.push(
-                            json!({"text":format!("Search result: {title}\nSource: {source}")}),
-                        );
-                        for McpTextBlock::Text { text } in content {
-                            parts.push(json!({"text":text}));
-                        }
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::McpToolUse {
-                        id,
-                        name,
-                        server_name,
-                        input,
-                    } => {
-                        parts.push(json!({"text": format!(
-                            "MCP tool {server_name}/{name} (call {id})\nInput: {}", json!(input)
-                        )}));
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::McpToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        let status = if *is_error { "error" } else { "result" };
-                        parts.push(
-                            json!({"text": format!("MCP tool {status} (call {tool_use_id}):")}),
-                        );
-                        match content {
-                            McpToolResultContent::Text(text) => parts.push(json!({"text":text})),
-                            McpToolResultContent::Blocks(blocks) => {
-                                for McpTextBlock::Text { text } in blocks {
-                                    parts.push(json!({"text":text}));
-                                }
-                            }
-                        }
-                        saw_non_thinking = true;
-                    }
-                    ContentBlock::WebSearchToolResult { content, .. } => {
-                        let previous_len = parts.len();
-                        let results = content
-                            .as_array()
-                            .map(Vec::as_slice)
-                            .unwrap_or_else(|| std::slice::from_ref(content));
-                        for result in results {
-                            if matches!(
-                                result.get("type").and_then(Value::as_str),
-                                Some("web_search_result" | "web_search_tool_result_error")
-                            ) {
-                                append_server_tool_result_parts(result, &mut parts, 0)?;
-                            }
-                        }
-                        saw_non_thinking |= parts.len() > previous_len;
-                    }
-                    ContentBlock::ServerToolUse { .. } => {
-                        // Historical server calls have already executed; their results above
-                        // remain readable without replaying a client function call.
+                    // ContentBlock::RedactedThinking handled above at line 583
+                    ContentBlock::ServerToolUse { .. }
+                    | ContentBlock::WebSearchToolResult { .. } => {
+                        // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
                         continue;
                     }
                 }
             }
+            parts.extend(turn_tool_media_parts);
         }
     }
 
@@ -1664,6 +1445,8 @@ fn build_google_content(
     mapped_model: &str,
     last_thought_signature: &mut Option<String>,
     pending_tool_use_ids: &mut Vec<String>,
+    last_user_task_text_normalized: &mut Option<String>,
+    previous_was_tool_result: &mut bool,
     existing_tool_result_ids: &std::collections::HashSet<String>,
 ) -> Result<Value, String> {
     let role = if msg.role == "assistant" {
@@ -1723,6 +1506,8 @@ fn build_google_content(
         mapped_model,
         last_thought_signature,
         pending_tool_use_ids,
+        last_user_task_text_normalized,
+        previous_was_tool_result,
         existing_tool_result_ids,
     )?;
 
@@ -1763,6 +1548,10 @@ fn build_google_contents(
     // Track pending tool_use IDs for recovery
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
 
+    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
+    let mut last_user_task_text_normalized: Option<String> = None;
+    let mut previous_was_tool_result = false;
+
     let _msg_count = messages.len();
 
     // [FIX #632] Pre-scan all messages to identify all tool_result IDs that ALREADY exist in the conversation.
@@ -1798,6 +1587,8 @@ fn build_google_contents(
             mapped_model,
             &mut last_thought_signature,
             &mut pending_tool_use_ids,
+            &mut last_user_task_text_normalized,
+            &mut previous_was_tool_result,
             &existing_tool_result_ids,
         )?;
 
@@ -1815,7 +1606,7 @@ fn build_google_contents(
         is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model);
 
     let think_start = std::time::Instant::now();
-    crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
+    crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
         &mut contents,
         mapped_model,
         should_finalize_thinking,
@@ -1837,12 +1628,19 @@ fn build_tools(
         let mut function_declarations: Vec<Value> = Vec::new();
         let has_google_search = has_web_search;
 
+        let is_search_tool = |tool: &Tool| {
+            tool.is_web_search()
+                || tool.name.as_deref() == Some("google_search")
+                || tool.name.as_deref() == Some("builtin_web_search")
+                || tool.type_.as_deref() == Some("builtin_web_search")
+        };
         // 只有搜索工具时，改映射为上游 googleSearch，不进客户端函数列表。
         // 旁边还有 Bash/Read 等函数工具时，web_search 与其他协议一样留在 functionDeclarations。
-        let search_only = !tools_list.is_empty() && tools_list.iter().all(Tool::is_web_search);
+        let search_only =
+            !tools_list.is_empty() && tools_list.iter().all(|tool| is_search_tool(tool));
 
         for tool in tools_list {
-            if search_only && tool.is_web_search() {
+            if search_only && is_search_tool(tool) {
                 continue;
             }
             let name = tool
@@ -1855,8 +1653,7 @@ fn build_tools(
                 "type": "object",
                 "properties": {}
             }));
-            crate::proxy::common::json_schema::validate_tool_schema(&input_schema)?;
-            crate::proxy::common::json_schema::clean_json_schema(&mut input_schema)?;
+            crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
             crate::proxy::mappers::openai::request::enforce_uppercase_types(&mut input_schema);
 
             function_declarations.push(json!({
@@ -1920,7 +1717,7 @@ fn build_generation_config(
     _has_web_search: bool,
     is_thinking_enabled: bool,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW]
-) -> Result<Value, String> {
+) -> Value {
     let mut config = json!({});
 
     // Thinking 配置
@@ -1984,18 +1781,7 @@ fn build_generation_config(
     // max_tokens 映射与「maxOutputTokens > thinkingBudget」不变量、官方硬顶
     // 已由 `configure_inbound_thinking` 统一处理，适配器不再二次协商。
 
-    if let Some(OutputFormat::JsonSchema { schema }) = claude_req
-        .output_config
-        .as_ref()
-        .and_then(|output| output.format.as_ref())
-    {
-        let mut schema = schema.clone();
-        crate::proxy::common::json_schema::clean_response_schema(&mut schema)?;
-        config["responseMimeType"] = json!("application/json");
-        config["responseSchema"] = schema;
-    }
-
-    Ok(config)
+    config
 }
 
 /// Recursively remove 'thought' and 'thoughtSignature' fields
@@ -2023,407 +1809,6 @@ use crate::proxy::mappers::common_utils::is_model_compatible;
 
 #[cfg(test)]
 mod tests {
-    const MEDIA_TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    const MEDIA_TEST_PDF: &str = "JVBERi0xLjQKJSVFT0Y=";
-
-    #[test]
-    fn r23_messages_media_remote_sources_survive_deserialization_and_mapping() {
-        let cases = [
-            (
-                "image",
-                "https://example.com/photo.PNG?sig=a%2Fb&expires=999",
-                None,
-                "image/png",
-            ),
-            (
-                "image",
-                "https://example.com/image?id=123",
-                None,
-                "image/jpeg",
-            ),
-            (
-                "image",
-                "https://example.com/image?id=456",
-                Some("image/webp"),
-                "image/webp",
-            ),
-            (
-                "document",
-                "https://example.com/report.pdf?sig=b%2Fc",
-                None,
-                "application/pdf",
-            ),
-            (
-                "document",
-                "https://example.com/report.txt",
-                None,
-                "text/plain",
-            ),
-        ];
-        for model in [
-            "claude-sonnet-4-6",
-            "gemini-2.5-flash",
-            "gemini-3.1-pro-high",
-        ] {
-            for (kind, uri, mime, expected_mime) in cases {
-                let request: ClaudeRequest = serde_json::from_value(json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": "Read the attached source"},
-                        {"type": kind, "source": {"type": "url", "url": uri, "media_type": mime}}
-                    ]}]
-                }))
-                .unwrap();
-                let roundtrip = serde_json::to_value(&request).unwrap();
-                assert_eq!(roundtrip["messages"][0]["content"][1]["source"]["url"], uri);
-                let body = transform_claude_request_in(
-                    &request,
-                    "media-project",
-                    false,
-                    None,
-                    "media-url-session",
-                    None,
-                )
-                .unwrap();
-                let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
-                assert_eq!(parts.len(), 2, "{model}: {parts:?}");
-                assert_eq!(
-                    parts[1],
-                    json!({"fileData": {"fileUri": uri, "mimeType": expected_mime}})
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn r23_messages_media_plaintext_documents_keep_the_complete_body_and_base64_control() {
-        let document = format!(
-            "  Document begins\n{}\nDocument ends  ",
-            "完整正文 — full body\n".repeat(1024)
-        );
-        for model in [
-            "claude-sonnet-4-6",
-            "gemini-2.5-flash",
-            "gemini-3.1-pro-high",
-        ] {
-            let request: ClaudeRequest = serde_json::from_value(json!({
-                "model": model,
-                "messages": [{"role": "user", "content": [
-                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": document}},
-                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": MEDIA_TEST_PDF}},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}}
-                ]}]
-            })).unwrap();
-            let body = transform_claude_request_in(
-                &request,
-                "media-project",
-                false,
-                None,
-                "media-text-session",
-                None,
-            )
-            .unwrap();
-            let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
-            assert_eq!(parts.len(), 3, "{model}: {parts:?}");
-            assert_eq!(parts[0]["text"], document);
-            assert_eq!(
-                parts[1],
-                json!({"inlineData": {"mimeType": "application/pdf", "data": MEDIA_TEST_PDF}})
-            );
-            assert_eq!(
-                parts[2],
-                json!({"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}})
-            );
-        }
-    }
-
-    #[test]
-    fn r23_messages_media_content_documents_keep_text_image_order() {
-        let uri = "https://example.com/nested.png?token=a%2Fb";
-        let request: ClaudeRequest = serde_json::from_value(json!({
-            "model": "gemini-2.5-flash",
-            "messages": [{"role": "user", "content": [
-                {"type": "document", "source": {"type": "content", "content": "String document body"}},
-                {"type": "document", "source": {"type": "content", "content": [
-                    {"type": "text", "text": "Before image"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}},
-                    {"type": "text", "text": "Between images"},
-                    {"type": "image", "source": {"type": "url", "url": uri}},
-                    {"type": "text", "text": "After image"}
-                ]}}
-            ]}]
-        })).unwrap();
-        let body = transform_claude_request_in(
-            &request,
-            "media-project",
-            false,
-            None,
-            "media-content-session",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            body["request"]["contents"][0]["parts"],
-            json!([
-                {"text": "String document body"},
-                {"text": "Before image"},
-                {"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}},
-                {"text": "Between images"},
-                {"fileData": {"mimeType": "image/png", "fileUri": uri}},
-                {"text": "After image"}
-            ])
-        );
-    }
-
-    #[test]
-    fn r23_messages_media_tool_results_keep_documents_and_images_with_their_owner() {
-        let image_uri = "https://example.com/result.webp?sig=a%2Fb";
-        let document_uri = "https://example.com/result.pdf?sig=b%2Fc";
-        for model in [
-            "claude-sonnet-4-6",
-            "gemini-2.5-flash",
-            "gemini-3.1-pro-high",
-        ] {
-            let request: ClaudeRequest = serde_json::from_value(json!({
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": "Inspect both files"},
-                    {"role": "assistant", "content": [
-                        {"type": "tool_use", "id": "image-call", "name": "inspect_image", "input": {}},
-                        {"type": "tool_use", "id": "document-call", "name": "inspect_document", "input": {}}
-                    ]},
-                    {"role": "user", "content": [
-                        {"type": "tool_result", "tool_use_id": "image-call", "content": [
-                            {"type": "text", "text": "Image result"},
-                            {"type": "image", "source": {"type": "url", "url": image_uri}}
-                        ]},
-                        {"type": "tool_result", "tool_use_id": "document-call", "is_error": true, "content": [
-                            {"type": "document", "source": {"type": "text", "data": "Full document body\nSecond line"}},
-                            {"type": "document", "source": {"type": "url", "url": document_uri}},
-                            {"type": "document", "source": {"type": "content", "content": [
-                                {"type": "text", "text": "Partial document output"},
-                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": MEDIA_TEST_PNG}},
-                                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": MEDIA_TEST_PDF}}
-                            ]}},
-                            {"type": "custom_result", "value": "Readable structured result"}
-                        ]}
-                    ]}
-                ]
-            })).unwrap();
-            let body = transform_claude_request_in(
-                &request,
-                "media-project",
-                false,
-                None,
-                "media-tool-session",
-                None,
-            )
-            .unwrap();
-            let parts: Vec<_> = body["request"]["contents"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|content| content["parts"].as_array().unwrap())
-                .collect();
-            let responses: Vec<_> = parts
-                .iter()
-                .filter_map(|part| part.get("functionResponse"))
-                .collect();
-            assert_eq!(responses.len(), 2, "{model}: {responses:?}");
-            let image = responses
-                .iter()
-                .find(|response| response["id"] == "image-call")
-                .unwrap();
-            assert_eq!(image["name"], "inspect_image");
-            assert_eq!(image["response"]["output"], "Image result");
-            let document = responses
-                .iter()
-                .find(|response| response["id"] == "document-call")
-                .unwrap();
-            assert_eq!(document["name"], "inspect_document");
-            assert!(document["response"].get("output").is_none());
-            assert_eq!(
-                document["response"]["error"],
-                format!(
-                    "Full document body\nSecond line\nPartial document output\n{}",
-                    json!({"type": "custom_result", "value": "Readable structured result"})
-                )
-            );
-            let image_media =
-                json!([{"fileData": {"mimeType": "image/webp", "fileUri": image_uri}}]);
-            let document_media = json!([
-                    {"fileData": {"mimeType": "application/pdf", "fileUri": document_uri}},
-                    {"inlineData": {"mimeType": "image/png", "data": MEDIA_TEST_PNG}},
-                    {"inlineData": {"mimeType": "application/pdf", "data": MEDIA_TEST_PDF}}
-            ]);
-            if model == "gemini-3.1-pro-high" {
-                assert_eq!(image["parts"], image_media);
-                assert_eq!(document["parts"], document_media);
-                assert!(
-                    parts
-                        .iter()
-                        .all(|part| part.get("fileData").is_none()
-                            && part.get("inlineData").is_none())
-                );
-            } else {
-                // Legacy targets place media after results and retain explicit owner positions.
-                assert!(image.get("parts").is_none());
-                assert!(document.get("parts").is_none());
-                assert_eq!(image["response"]["attached_media_positions"], json!([1]));
-                assert_eq!(
-                    document["response"]["attached_media_positions"],
-                    json!([2, 3, 4])
-                );
-                let media: Vec<_> = parts
-                    .iter()
-                    .filter(|part| {
-                        part.get("fileData").is_some() || part.get("inlineData").is_some()
-                    })
-                    .copied()
-                    .collect();
-                assert_eq!(
-                    media,
-                    image_media
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .chain(document_media.as_array().unwrap())
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn r23_messages_media_missing_content_fails_explicitly() {
-        for source in [
-            json!({"type": "url"}),
-            json!({"type": "url", "url": ""}),
-            json!({"type": "text"}),
-            json!({"type": "content", "content": []}),
-            json!({"type": "content", "content": ""}),
-            json!({"type": "content", "content": [{"type": "image"}]}),
-            json!({"type": "file", "file_id": "unavailable-file"}),
-        ] {
-            let request: ClaudeRequest = serde_json::from_value(json!({
-                "model": "gemini-2.5-flash",
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "Read this document"},
-                    {"type": "document", "source": source}
-                ]}]
-            }))
-            .unwrap();
-            assert!(
-                transform_claude_request_in(
-                    &request,
-                    "media-project",
-                    false,
-                    None,
-                    "media-missing-session",
-                    None,
-                )
-                .is_err(),
-                "missing source was accepted: {source}"
-            );
-        }
-    }
-
-    #[test]
-    fn r23_messages_media_recursive_content_is_bounded() {
-        let mut content = json!({"type": "text", "text": "Nested body"});
-        for _ in 0..MAX_MEDIA_CONTENT_DEPTH {
-            content =
-                json!({"type": "document", "source": {"type": "content", "content": content}});
-        }
-        let request: ClaudeRequest = serde_json::from_value(json!({
-            "model": "gemini-2.5-flash",
-            "messages": [{"role": "user", "content": [content]}]
-        }))
-        .unwrap();
-        let error = transform_claude_request_in(
-            &request,
-            "media-project",
-            false,
-            None,
-            "media-depth-session",
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("maximum nesting depth"), "{error}");
-    }
-
-    #[test]
-    fn r19_cache_hints_do_not_erase_tool_business_fields() {
-        for color in ["red", "blue"] {
-            let req:ClaudeRequest=serde_json::from_value(json!({
-                "model":"claude-sonnet-4-6",
-                "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
-                    "cache_control":{"type":"string"},"choice":{"anyOf":[{"type":"string"},{"type":"integer"}]},
-                    "items":{"type":"array","minItems":2,"items":{"type":"string"}}
-                },"required":["cache_control","choice"]}}],
-                "messages":[{"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]},
-                    {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"inspect","input":{"cache_control":color,"choice":3}}]},
-                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"done"}]}]
-            })).unwrap();
-            let body =
-                transform_claude_request_in(&req, "p", false, None, "r19-schema", None).unwrap();
-            let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
-            assert_eq!(schema["properties"]["cache_control"]["type"], "STRING");
-            assert_eq!(
-                schema["properties"]["choice"]["anyOf"],
-                json!([{"type":"STRING"},{"type":"INTEGER"}])
-            );
-            assert_eq!(schema["properties"]["items"]["minItems"], 2);
-            assert!(schema["required"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("cache_control")));
-            let parts: Vec<_> = body["request"]["contents"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|t| t["parts"].as_array().unwrap())
-                .collect();
-            let call = parts.iter().find_map(|p| p.get("functionCall")).unwrap();
-            assert_eq!(call["args"]["cache_control"], color);
-            assert_eq!(call["args"]["choice"], 3);
-            assert!(parts.iter().all(|p| p.get("cache_control").is_none()));
-        }
-    }
-
-    #[test]
-    fn r19_tool_type_unions_preserve_final_array_and_object_constraints() {
-        let req: ClaudeRequest = serde_json::from_value(json!({
-            "model":"claude-sonnet-4-6",
-            "tools":[{"name":"inspect","input_schema":{"type":"object","properties":{
-                "ids":{"type":["array","null"],"items":{"type":"integer"},"minItems":1},
-                "inherited":{"anyOf":[{"type":"array"},{"type":"null"}],"items":{"type":"integer"}},
-                "value":{"type":["array","object"],"items":{"type":"integer"},"properties":{"x":{"type":"integer"}},"required":["x"]},
-                "choice":{"allOf":[{"type":["string","integer"]}]}
-            },"required":["ids","value"]}}],
-            "messages":[{"role":"user","content":"Inspect [1]"}]
-        })).unwrap();
-        let body = transform_claude_request_in(&req, "p", false, None, "r19-union", None).unwrap();
-        let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
-        assert_eq!(
-            schema["properties"]["ids"],
-            json!({"type":"ARRAY","items":{"type":"INTEGER"},"minItems":1,"nullable":true})
-        );
-        assert_eq!(
-            schema["properties"]["inherited"],
-            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"NULL"}],"items":{"type":"INTEGER"}})
-        );
-        assert_eq!(
-            schema["properties"]["value"],
-            json!({"anyOf":[{"type":"ARRAY","items":{"type":"INTEGER"}},{"type":"OBJECT","properties":{"x":{"type":"INTEGER"}},"required":["x"]}]})
-        );
-        assert_eq!(
-            schema["properties"]["choice"],
-            json!({"anyOf":[{"type":"STRING"},{"type":"INTEGER"}]})
-        );
-        assert_eq!(schema["required"], json!(["ids", "value"]));
-    }
-
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::ThinkingBudgetConfig;
@@ -2660,12 +2045,12 @@ mod tests {
             "required": ["location"]
         });
 
-        clean_json_schema(&mut schema).unwrap();
+        clean_json_schema(&mut schema);
 
         // Check removed fields
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("additionalProperties").is_none());
-        assert_eq!(schema["properties"]["location"]["minLength"], 1);
+        assert!(schema["properties"]["location"].get("minLength").is_none());
         assert!(schema["properties"]["unit"].get("default").is_none());
         assert!(schema["properties"]["date"].get("format").is_none());
 
@@ -2773,8 +2158,6 @@ mod tests {
                     role: "user".to_string(),
                     content: MessageContent::Array(vec![ContentBlock::Image {
                         source: ImageSource {
-                            url: None,
-                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some("iVBORw0KGgo=".to_string()),
@@ -3122,70 +2505,6 @@ mod tests {
             }
         } else {
             panic!("Expected Array content");
-        }
-    }
-
-    #[test]
-    fn test_thinking_sort_preserves_text_tool_order_and_signatures() {
-        let cases = [
-            json!([
-                {"type":"text","text":"before"},
-                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
-                {"type":"text","text":"after"}
-            ]),
-            json!([
-                {"type":"text","text":"before"},
-                {"type":"tool_use","id":"toolu_stable","name":"lookup","input":{"q":"hello"}},
-                {"type":"thinking","thinking":"reason","signature":"stable-signature"},
-                {"type":"text","text":"after"},
-                {"type":"redacted_thinking","data":"opaque-redacted"}
-            ]),
-        ];
-        for original in cases {
-            let expected_rest: Vec<_> = original
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|block| {
-                    !matches!(
-                        block["type"].as_str(),
-                        Some("thinking" | "redacted_thinking")
-                    )
-                })
-                .cloned()
-                .collect();
-            let expected_thought: Vec<_> = original
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|block| {
-                    matches!(
-                        block["type"].as_str(),
-                        Some("thinking" | "redacted_thinking")
-                    )
-                })
-                .cloned()
-                .collect();
-            let mut messages: Vec<Message> = serde_json::from_value(json!([
-                {"role":"assistant","content":original},
-                {"role":"user","content":[{"type":"text","text":"untouched"}]}
-            ]))
-            .unwrap();
-            let user_before = serde_json::to_value(&messages[1]).unwrap();
-            sort_thinking_blocks_first(&mut messages);
-            let actual = serde_json::to_value(&messages[0]).unwrap();
-            let blocks = actual["content"].as_array().unwrap();
-            assert_eq!(&blocks[expected_thought.len()..], expected_rest);
-            for (actual, expected) in blocks.iter().zip(&expected_thought) {
-                assert_eq!(actual["type"], expected["type"]);
-                assert_eq!(actual["signature"], expected["signature"]);
-                assert_eq!(actual["thinking"], expected["thinking"]);
-                assert_eq!(actual["data"], expected["data"]);
-            }
-            assert_eq!(serde_json::to_value(&messages[1]).unwrap(), user_before);
-            let once = serde_json::to_value(&messages).unwrap();
-            sort_thinking_blocks_first(&mut messages);
-            assert_eq!(serde_json::to_value(&messages).unwrap(), once);
         }
     }
 
@@ -3792,31 +3111,17 @@ mod tests {
             tool_choice: None,
         };
 
-        let mut result =
+        let result =
             transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
                 .expect("Transform should succeed");
 
-        crate::proxy::thinking_store::finalize_request_text_context(
-            "",
-            result["request"]["contents"].as_array_mut().unwrap(),
-            "claude-sonnet-4-6",
-            true,
-            false,
-        );
         let contents = result["request"]["contents"]
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        // The final pipeline preserves unsigned reasoning as ordinary text.
-        assert_eq!(assistant_parts.len(), 2);
-        assert_eq!(
-            assistant_parts[0]["text"],
-            "Considering the question deeply..."
-        );
-        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
-        assert!(assistant_parts
-            .iter()
-            .all(|part| part.get("thought").is_none() && part.get("thoughtSignature").is_none()));
+        // 新规则：无签名思考块出站前丢弃，仅保留正文
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
     }
 
     #[test]
@@ -4027,8 +3332,6 @@ mod tests {
                     // Corrupt image block 1 (empty data)
                     ContentBlock::Image {
                         source: ImageSource {
-                            url: None,
-                            content: None,
                             source_type: "base64".to_string(),
                             media_type: None,
                             data: None,
@@ -4038,8 +3341,6 @@ mod tests {
                     // Corrupt image block 2 (invalid short base64 +A==)
                     ContentBlock::Image {
                         source: ImageSource {
-                            url: None,
-                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some("+A==".to_string()),
@@ -4049,8 +3350,6 @@ mod tests {
                     // Valid image block
                     ContentBlock::Image {
                         source: ImageSource {
-                            url: None,
-                            content: None,
                             source_type: "base64".to_string(),
                             media_type: Some("image/png".to_string()),
                             data: Some(valid_png_b64.to_string()),
@@ -4245,72 +3544,6 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_images_and_errors_keep_the_result_identity() {
-        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-        for model in [
-            "claude-sonnet-4-6",
-            "gemini-2.5-flash",
-            "gemini-3.8-flash-high",
-        ] {
-            for owner in ["a", "b"] {
-                let results = ["b", "a"].map(|id| {
-                    let mut content = vec![json!({"type":"text","text":"done"})];
-                    if id == owner {
-                        content.push(json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png}}));
-                    }
-                    json!({"type":"tool_result","tool_use_id":id, "is_error":id=="b", "content":content})
-                });
-                let req: ClaudeRequest = serde_json::from_value(json!({"model":model, "messages":[
-                    {"role":"user","content":"inspect"},
-                    {"role":"assistant","content":[
-                        {"type":"tool_use","id":"a","name":"inspect","input":{}},
-                        {"type":"tool_use","id":"b","name":"inspect","input":{}}]},
-                    {"role":"user","content":results}]}))
-                .unwrap();
-                let body = transform_claude_request_in(&req, "p", false, None, "s", None).unwrap();
-                let turns = body["request"]["contents"].as_array().unwrap();
-                let parts: Vec<_> = turns
-                    .iter()
-                    .flat_map(|turn| turn["parts"].as_array().unwrap())
-                    .collect();
-                let responses: Vec<_> = parts
-                    .iter()
-                    .filter_map(|p| p.get("functionResponse"))
-                    .collect();
-                assert_eq!(responses.len(), 2);
-                assert_eq!(responses[0]["id"], "b");
-                assert_eq!(responses[0]["response"]["error"], "done");
-                assert!(responses[0]["response"].get("output").is_none());
-                assert_eq!(responses[1]["response"]["output"], "done");
-                let nested = crate::proxy::model_specs::is_gemini_v3_or_above(model);
-                for fr in responses {
-                    if nested {
-                        assert_eq!(
-                            fr["parts"][0]["inlineData"]["data"].as_str(),
-                            (fr["id"] == owner).then_some(png)
-                        );
-                    } else {
-                        assert_eq!(
-                            fr["response"].get("attached_media_positions").is_some(),
-                            fr["id"] == owner
-                        );
-                        if fr["id"] == owner {
-                            assert_eq!(fr["response"]["attached_media_positions"], json!([1]));
-                        }
-                    }
-                }
-                assert_eq!(
-                    parts
-                        .iter()
-                        .filter(|p| p["inlineData"]["data"] == png)
-                        .count(),
-                    usize::from(!nested)
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_claude_tool_result_multimodal_string_extraction() {
         let fake_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let tool_content = format!(
@@ -4436,192 +3669,5 @@ mod tests {
             }),
             "Raw tool_use_id must never leak as functionResponse name"
         );
-    }
-}
-
-#[cfg(test)]
-mod r24_server_history_tests {
-    use super::*;
-
-    fn mapped(block: Value) -> Value {
-        let request: ClaudeRequest = serde_json::from_value(json!({
-            "model":"claude-sonnet-4-5", "max_tokens":100,
-            "messages":[
-                {"role":"user","content":"Find the answer"},
-                {"role":"assistant","content":[
-                    {"type":"text","text":"Before the result"},
-                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_fetch","input":{}},
-                    block,
-                    {"type":"text","text":"After the result"}
-                ]},
-                {"role":"user","content":"Explain that answer"}
-            ]
-        }))
-        .unwrap();
-        transform_claude_request_in(&request, "project", false, None, "r24-history", None).unwrap()
-    }
-
-    fn visible_text(body: &Value) -> String {
-        body["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|turn| turn["parts"].as_array().unwrap())
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn r24_web_fetch_history_keeps_document_body_and_message_order() {
-        let body = mapped(
-            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
-            "content":{"type":"web_fetch_result","url":"https://example.com/report",
-            "content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Full document body\nSecond line"}}}}),
-        );
-        let text = visible_text(&body);
-        let ordered = [
-            "Before the result",
-            "https://example.com/report",
-            "Full document body\nSecond line",
-            "After the result",
-            "Explain that answer",
-        ];
-        let mut offset = 0;
-        for fragment in ordered {
-            offset += text[offset..].find(fragment).expect(fragment) + fragment.len();
-        }
-        assert!(!body.to_string().contains("functionCall"));
-    }
-
-    #[test]
-    fn r24_code_execution_history_keeps_stdout_stderr_and_nested_text() {
-        for kind in [
-            "code_execution_tool_result",
-            "bash_code_execution_tool_result",
-            "text_editor_code_execution_tool_result",
-        ] {
-            let body = mapped(json!({"type":kind,"tool_use_id":"srvtoolu_1","content":{
-                "type":"code_execution_result","stdout":"42\nline two\n","stderr":"Warning: example\n",
-                "return_code":1,"content":[{"type":"text","text":"Readable tool summary"},
-                {"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document"}]}}]
-            }}));
-            let text = visible_text(&body);
-            for expected in [
-                "42\nline two\n",
-                "Warning: example\n",
-                "Exit code: 1",
-                "Readable tool summary",
-                "Nested document",
-                "After the result",
-            ] {
-                assert!(text.contains(expected), "missing {expected} in {text}");
-            }
-        }
-    }
-
-    #[test]
-    fn r24_server_errors_stay_readable_and_unknown_client_blocks_are_rejected() {
-        let body = mapped(
-            json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1",
-            "content":{"type":"web_fetch_tool_result_error","error_code":"unavailable","message":"Fetch failed"}}),
-        );
-        assert!(visible_text(&body).contains("Fetch failed"));
-        let unknown = json!({"model":"claude-sonnet-4-5","messages":[{"role":"assistant","content":[
-            {"type":"unknown_client_tool_call","name":"execute","input":{"cmd":"keep me explicit"}}
-        ]}]});
-        assert!(serde_json::from_value::<ClaudeRequest>(unknown).is_err());
-    }
-}
-
-#[cfg(test)]
-mod r26_mcp_history_tests {
-    use super::*;
-
-    fn request(blocks: Value) -> Result<ClaudeRequest, serde_json::Error> {
-        serde_json::from_value(
-            json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
-                {"role":"user","content":"Fetch the report"},
-                {"role":"assistant","content":blocks},
-                {"role":"user","content":"Explain that result"}
-            ]}),
-        )
-    }
-    fn mapped_text(request: &ClaudeRequest) -> (Value, String) {
-        let mapped =
-            transform_claude_request_in(request, "r26-project", false, None, "r26-mcp", None)
-                .unwrap();
-        let text = mapped["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|turn| turn["parts"].as_array().unwrap())
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        (mapped, text)
-    }
-
-    #[test]
-    fn r26_mcp_history_degrades_to_readable_context_in_order() {
-        let request = request(json!([
-            {"type":"text","text":"BEFORE_MCP"},
-            {"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":{"needle":"[undefined]"}},
-            {"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":false,"content":[{"type":"text","text":"REPORT_42\nSecond line"}]},
-            {"type":"text","text":"AFTER_MCP"}
-        ])).unwrap();
-        let (mapped, text) = mapped_text(&request);
-        let mut position = 0;
-        for fragment in [
-            "BEFORE_MCP",
-            "docs/lookup",
-            "[undefined]",
-            "REPORT_42\nSecond line",
-            "AFTER_MCP",
-            "Explain that result",
-        ] {
-            position += text[position..]
-                .find(fragment)
-                .unwrap_or_else(|| panic!("Missing {fragment} in {text}"))
-                + fragment.len();
-        }
-        assert!(!mapped.to_string().contains("functionCall"));
-        assert!(!mapped.to_string().contains("functionResponse"));
-    }
-
-    #[test]
-    fn r26_mcp_results_without_adjacent_text_keep_strings_and_errors() {
-        for (error, content) in [
-            (false, json!("SERVER_BODY")),
-            (true, json!([{"type":"text","text":"SERVER_BODY"}])),
-        ] {
-            let request = request(json!([{"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","is_error":error,"content":content}])).unwrap();
-            let (_, text) = mapped_text(&request);
-            assert!(text.contains("SERVER_BODY"));
-            assert!(text.contains(if error {
-                "MCP tool error"
-            } else {
-                "MCP tool result"
-            }));
-        }
-        let control = request(json!([{"type":"text","text":"SERVER_BODY"}])).unwrap();
-        assert!(mapped_text(&control).1.contains("SERVER_BODY"));
-    }
-
-    #[test]
-    fn r26_mcp_degradation_keeps_malformed_and_local_tool_envelopes_strict() {
-        for invalid in [
-            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs"}),
-            json!({"type":"mcp_tool_use","id":"mcptoolu_42","name":"lookup","server_name":"docs","input":[]}),
-            json!({"type":"mcp_tool_result","content":"result"}),
-            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"text"}]}),
-            json!({"type":"mcp_tool_result","tool_use_id":"mcptoolu_42","content":[{"type":"unknown_local_tool","input":{}}]}),
-            json!({"type":"tool_use","id":"toolu_42","input":{}}),
-            json!({"type":"unknown_client_tool_call","name":"execute","input":{}}),
-        ] {
-            assert!(
-                request(json!([{"type":"text","text":"valid adjacent text"},invalid])).is_err()
-            );
-        }
     }
 }

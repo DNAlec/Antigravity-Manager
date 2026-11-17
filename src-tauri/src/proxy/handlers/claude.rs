@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Import Adapter Registry
 use crate::proxy::debug_logger;
 use crate::proxy::mappers::claude::{
-    clean_cache_control_from_messages, create_claude_sse_stream_with_selection,
+    clean_cache_control_from_messages, create_claude_sse_stream_with_anchor,
     filter_invalid_thinking_blocks_with_family, merge_consecutive_messages, models::MessageContent,
     transform_response, ClaudeRequest,
 };
@@ -687,45 +687,6 @@ mod variant_tests {
     }
 
     #[test]
-    fn r34_variant_routing_consumes_effort_but_preserves_output_format() {
-        for routed in [false, true] {
-            let mut request = request_with_effort("gemini-3.5-flash", "low", 10_000);
-            let format = json!({"type":"json_schema","schema":{
-                "type":"object","properties":{"code":{"type":"string","enum":["SCHEMA_CODE_42"]}},"required":["code"]
-            }});
-            request.output_config.as_mut().unwrap().format =
-                Some(serde_json::from_value(format.clone()).unwrap());
-            if routed {
-                request.model = "gemini-3.5-flash-extra-low".into();
-                apply_routed_spec(&mut request, None).unwrap();
-            } else {
-                let effort = crate::proxy::common::variant_mapping::tier_from_effort(Some("low"));
-                apply_variant(&mut request, effort, Some(10_000)).unwrap();
-            }
-            let output = serde_json::to_value(&request).unwrap()["output_config"].clone();
-            assert_eq!(output, json!({"format":format}));
-            let mapped = crate::proxy::mappers::claude::transform_claude_request_in(
-                &request,
-                "r34-project",
-                false,
-                None,
-                "r34-variant-format",
-                None,
-            )
-            .unwrap();
-            assert_eq!(
-                mapped["request"]["generationConfig"]["responseMimeType"],
-                "application/json"
-            );
-            assert_eq!(
-                mapped["request"]["generationConfig"]["responseSchema"]["properties"]["code"]
-                    ["enum"],
-                json!(["SCHEMA_CODE_42"])
-            );
-        }
-    }
-
-    #[test]
     fn applies_pro_high_effort_over_low_budget() {
         let mut request = request_with_effort("gemini-3.1-pro", "high", 1_000);
         let effort = crate::proxy::common::variant_mapping::tier_from_effort(
@@ -857,13 +818,7 @@ fn apply_spec_to_request(
             display: None,
         });
     }
-    // Variant routing consumes reasoning effort, not the independent output constraint.
-    if let Some(output) = request.output_config.as_mut() {
-        output.effort = None;
-        if output.format.is_none() {
-            request.output_config = None;
-        }
-    }
+    request.output_config = None;
     // 尊重客户端显式 max_tokens，只做官方硬顶收敛；缺省交给流水线按官方上限补齐/协商
     if let Some(client_max) = request.max_tokens {
         // 单点硬顶在流水线：`configure_inbound_thinking` 会按官方 max_output_tokens
@@ -1698,9 +1653,9 @@ pub async fn handle_messages(
     let max_attempts = super::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
-    let mut terminal_stream_usage: Option<serde_json::Value> = None;
     let mut retried_without_thinking = false;
     let mut heal_flags = crate::proxy::pipeline::AutoHealFlags::default();
+    let mut degraded_gemini_body: Option<serde_json::Value> = None;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut failure_statuses = super::common::FailureStatusTracker::default();
@@ -1711,8 +1666,7 @@ pub async fn handle_messages(
     let mut force_rotate = false;
     let mut used_attempts = 0usize;
     // GraceRetry 复用同一账号凭据：不重新选号，也不消耗轮换次数（与 gemini/openai 同构）
-    let mut retry_credentials: Option<crate::proxy::token_manager::LeasedCredentials> = None;
-    let mut session_lease = None;
+    let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
     let mut attempted_accounts: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
@@ -1731,7 +1685,7 @@ pub async fn handle_messages(
     let image_scheduler = state.image_scheduler.clone();
     let mut image_permit = None;
 
-    'attempts: while let Some(attempt) = super::common::next_rotation_attempt(
+    while let Some(attempt) = super::common::next_rotation_attempt(
         &mut used_attempts,
         max_attempts,
         retry_credentials.is_some(),
@@ -1754,7 +1708,6 @@ pub async fn handle_messages(
             );
             break;
         }
-        retry_state.begin_attempt();
 
         // 2. 模型路由解析
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
@@ -1804,7 +1757,7 @@ pub async fn handle_messages(
             Ok(creds)
         } else if config.request_type == "image_gen" {
             match token_manager
-                .get_image_token_with_lease(
+                .get_image_token(
                     force_rotate,
                     session_id,
                     &config.final_model,
@@ -1813,42 +1766,37 @@ pub async fn handle_messages(
                 )
                 .await
             {
-                Ok((access_token, project_id, email, account_id, wait_ms, permit, lease)) => {
+                Ok((access_token, project_id, email, account_id, wait_ms, permit)) => {
                     image_permit = Some(permit);
-                    Ok((access_token, project_id, email, account_id, wait_ms, lease))
+                    Ok((access_token, project_id, email, account_id, wait_ms))
                 }
                 Err((_status, err)) => Err(err),
             }
         } else {
             let mut res = token_manager
-                .get_token_filtered_with_retry_lease(
+                .get_token_filtered(
                     &config.request_type,
                     force_rotate,
                     session_id,
                     &config.final_model,
                     &attempted_accounts,
-                    &mut session_lease,
                 )
                 .await;
 
             if let Err(ref e) = res {
                 if crate::proxy::handlers::common::is_transient_token_error(e) {
                     tracing::warn!(
-                            "Token acquisition transient error ({}), retrying once under scheduling policy...",
+                        "Token acquisition transient error ({}), retrying once with force_rotate...",
                         e
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     res = token_manager
-                        .get_token_filtered_with_retry_lease(
+                        .get_token_filtered(
                             &config.request_type,
-                            crate::proxy::pipeline::rotation::token_retry_force_rotate(
-                                force_rotate,
-                                token_manager.get_scheduling_mode().await,
-                            ),
+                            true,
                             session_id,
                             &config.final_model,
                             &attempted_accounts,
-                            &mut session_lease,
                         )
                         .await;
                 }
@@ -1856,48 +1804,39 @@ pub async fn handle_messages(
             res
         };
 
-        let (access_token, project_id, email, account_id, _wait_ms, selected_session_lease) =
-            match token_result {
-                Ok(t) => t,
-                Err(e) => {
-                    retry_state.preserve_token_error(&e);
-                    if !failure_statuses.is_empty()
-                        && !crate::proxy::session_bindings::is_session_binding_changed_error(&e)
-                    {
-                        tracing::warn!(
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_result {
+            Ok(t) => t,
+            Err(e) => {
+                if !failure_statuses.is_empty() {
+                    tracing::warn!(
                         "[{}] All available accounts attempted or exhausted for this request, breaking retry loop to return upstream error",
                         trace_id
                     );
-                        break;
-                    }
-                    let safe_message = if e.contains("invalid_grant") {
-                        "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
-                    } else {
-                        e
-                    };
-                    let status =
-                        crate::proxy::handlers::common::resolve_token_error_status(&safe_message);
-                    crate::proxy::stage_trace::StageTrace::alert_current_error(
-                        "gateway_local",
-                        format!(
-                            "token_unavailable status={} reason={}",
-                            status.as_u16(),
-                            safe_message
-                        ),
-                    );
-                    return retry_state.finish_error_response(
-                        crate::proxy::handlers::common::build_token_error_response_with_usage(
-                            "claude",
-                            mapped_model.as_str(),
-                            None,
-                            &safe_message,
-                            terminal_stream_usage.as_ref(),
-                        ),
-                    );
+                    break;
                 }
-            };
-
-        session_lease = selected_session_lease;
+                let safe_message = if e.contains("invalid_grant") {
+                    "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
+                } else {
+                    e
+                };
+                let status =
+                    crate::proxy::handlers::common::resolve_token_error_status(&safe_message);
+                crate::proxy::stage_trace::StageTrace::alert_current_error(
+                    "gateway_local",
+                    format!(
+                        "token_unavailable status={} reason={}",
+                        status.as_u16(),
+                        safe_message
+                    ),
+                );
+                return crate::proxy::handlers::common::build_token_error_response(
+                    "claude",
+                    mapped_model.as_str(),
+                    None,
+                    &safe_message,
+                );
+            }
+        };
 
         let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
 
@@ -1930,49 +1869,61 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let (mut gemini_body, transform_timing) =
-            match crate::proxy::mappers::claude::transform_claude_request_in_timed(
-                &request_with_mapped,
-                &project_id,
-                retried_without_thinking,
-                Some(account_id.as_str()),
-                &store_key,
-                &affinity_key,
-                token_obj.as_ref(),
-            ) {
-                Ok((b, timing)) => {
-                    debug!(
-                        "[{}] Transformed Gemini Body: {}",
-                        trace_id,
-                        serde_json::to_string_pretty(&b).unwrap_or_default()
-                    );
-                    (b, timing)
-                }
-                Err(e) => {
-                    crate::proxy::stage_trace::StageTrace::alert_current_error(
-                        "gateway_local",
-                        format!("transform_error account={} err={}", mask_email(&email), e),
-                    );
-                    let headers = [
-                        ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                        ("X-Upstream-Model", config.final_model.as_str()),
-                        ("X-Account-Email", email.as_str()),
-                    ];
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        headers,
-                        Json(json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": format!("Transform error: {}", e)
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-        heal_flags.reapply(&mut gemini_body);
+        let (mut gemini_body, transform_timing) = if let Some(body) = degraded_gemini_body.take() {
+            (
+                body,
+                crate::proxy::mappers::claude::request::TransformTiming::default(),
+            )
+        } else {
+            let (mut b, timing) =
+                match crate::proxy::mappers::claude::transform_claude_request_in_timed(
+                    &request_with_mapped,
+                    &project_id,
+                    retried_without_thinking,
+                    Some(account_id.as_str()),
+                    &store_key,
+                    &affinity_key,
+                    token_obj.as_ref(),
+                ) {
+                    Ok((b, timing)) => {
+                        debug!(
+                            "[{}] Transformed Gemini Body: {}",
+                            trace_id,
+                            serde_json::to_string_pretty(&b).unwrap_or_default()
+                        );
+                        (b, timing)
+                    }
+                    Err(e) => {
+                        crate::proxy::stage_trace::StageTrace::alert_current_error(
+                            "gateway_local",
+                            format!("transform_error account={} err={}", mask_email(&email), e),
+                        );
+                        let headers = [
+                            ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                            ("X-Upstream-Model", config.final_model.as_str()),
+                            ("X-Account-Email", email.as_str()),
+                        ];
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            headers,
+                            Json(json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": format!("Transform error: {}", e)
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+            if heal_flags.retried_with_budget_degraded {
+                crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                    &mut b,
+                );
+            }
+            (b, timing)
+        };
 
         crate::proxy::stage_trace::StageTrace::mark_current(
             "transform",
@@ -2010,27 +1961,6 @@ pub async fn handle_messages(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
-        // Resolve text history only after all request normalization, and use the
-        // same visible prefix when recording the response from this attempt.
-        let thinking_enabled =
-            crate::proxy::pipeline::qos::payload_enables_thinking(&gemini_body, None);
-        let contents_path = if gemini_body.get("request").is_some() {
-            "/request/contents"
-        } else {
-            "/contents"
-        };
-        let response_text_context = gemini_body
-            .pointer_mut(contents_path)
-            .and_then(Value::as_array_mut)
-            .map(|contents| {
-                crate::proxy::thinking_store::finalize_request_text_context(
-                    &store_key,
-                    contents,
-                    &mapped_model,
-                    thinking_enabled,
-                    retried_without_thinking,
-                )
-            });
 
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         let tf_micros = transform_timing.think_fill_micros;
@@ -2181,7 +2111,7 @@ pub async fn handle_messages(
                         config.request_type != "image_gen",
                     );
                     if terminal_plan.abandon_sticky_account {
-                        token_manager.abandon_session_lease(&mut session_lease);
+                        token_manager.abandon_session(&affinity_key, &account_id);
                         tracing::debug!(
                             "Unbound session {} from account {} due to terminal {}",
                             affinity_key,
@@ -2206,7 +2136,6 @@ pub async fn handle_messages(
                                 email.clone(),
                                 account_id.clone(),
                                 0,
-                                session_lease.clone(),
                             ));
                             continue;
                         }
@@ -2234,27 +2163,6 @@ pub async fn handle_messages(
                 // 非终态（连接失败 / 调度错误）：按既有策略冷却并换账号。
                 // 状态码与其余三条链路对齐为 502，不再把所有错误都当 504。
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
-                if let Some(strategy) = retry_state.cache_first_failure(
-                    &account_id,
-                    502,
-                    &e,
-                    None,
-                    &token_manager.get_sticky_config().await,
-                    config.request_type != "image_gen",
-                ) {
-                    if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id).await {
-                        retry_credentials = Some((
-                            access_token.clone(),
-                            project_id.clone(),
-                            email.clone(),
-                            account_id.clone(),
-                            0,
-                            session_lease.clone(),
-                        ));
-                        continue;
-                    }
-                    break;
-                }
                 token_manager.mark_account_transient_failure(&account_id, 30, &e);
                 crate::proxy::pipeline::rotation::record_attempted_account(
                     &mut attempted_accounts,
@@ -2325,21 +2233,7 @@ pub async fn handle_messages(
         let status = response.status();
 
         // 成功
-        // HTTP failures and pre-output SSE errors share the same recovery policy.
-        let (status, retry_after, error_text) = 'upstream_response: {
-            if !status.is_success() {
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|header| header.to_str().ok())
-                    .map(str::to_string);
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
-                break 'upstream_response (status, retry_after, error_text);
-            }
-
+        if status.is_success() {
             crate::proxy::stage_trace::StageTrace::mark_current(
                 "upstream_ok",
                 format!(
@@ -2350,14 +2244,11 @@ pub async fn handle_messages(
                 ),
             );
             let track_image_success = config.request_type == "image_gen";
-            let mut session_confirmation = if !track_image_success {
-                // HTTP acceptance still confirms account health in all scheduling
-                // modes; only cache warmth waits for body validation.
+            if !track_image_success {
+                token_manager.commit_session(&affinity_key, &account_id);
+                // [智能限流] 请求成功，重置该账号的连续失败计数
                 token_manager.mark_account_success(&account_id);
-                token_manager.accept_session_response(&mut session_lease)
-            } else {
-                None
-            };
+            }
 
             // Determine context limit based on model
             let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(
@@ -2377,14 +2268,7 @@ pub async fn handle_messages(
                     "upstream_url": upstream_url,
                 });
                 let gemini_stream = debug_logger::wrap_stream_with_debug(
-                    crate::proxy::pipeline::usage_diagnostics::observe_stream(
-                        response.bytes_stream(),
-                        crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
-                            &config.final_model,
-                            &account_id,
-                            "claude",
-                        ),
-                    ),
+                    Box::pin(response.bytes_stream()),
                     debug_cfg.clone(),
                     trace_id.clone(),
                     "upstream_response",
@@ -2417,29 +2301,10 @@ pub async fn handle_messages(
                         Some(affinity_key.clone()),
                         qos_is_thinking,
                         Some(raw_estimated as u32),
-                        session_lease.clone(),
                     ));
                 let gemini_stream = crate::proxy::pipeline::qos::wrap_gemini_stream_with_qos_usage(
                     gemini_stream,
                     qos_tracker.clone(),
-                );
-                // Preserve structured upstream errors before protocol conversion.
-                let stream_errors =
-                    crate::proxy::pipeline::stream_error::UpstreamStreamErrorObserver::default()
-                        .with_selected_candidate();
-                let gemini_stream = Box::pin(
-                    crate::proxy::pipeline::stream_error::observe_response_errors(
-                        gemini_stream,
-                        stream_errors.clone(),
-                        !client_wants_stream,
-                    ),
-                );
-                let gemini_stream = Box::pin(
-                    crate::proxy::token_manager::confirm_session_response_stream(
-                        gemini_stream,
-                        stream_errors.clone(),
-                        session_confirmation.take(),
-                    ),
                 );
 
                 let current_message_count = request_with_mapped.messages.len();
@@ -2454,7 +2319,7 @@ pub async fn handle_messages(
                 // [FIX #530/#529/#859] Enhanced Peek logic to handle heartbeats and slow start
                 // We must pre-read until we find a MEANINGFUL content block (like message_start).
                 // If we only get heartbeats (ping) and then the stream dies, we should rotate account.
-                let mut claude_stream = create_claude_sse_stream_with_selection(
+                let mut claude_stream = create_claude_sse_stream_with_anchor(
                     gemini_stream,
                     trace_id.clone(),
                     email.clone(),
@@ -2465,8 +2330,7 @@ pub async fn handle_messages(
                     current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                     client_adapter.clone(), // [NEW] Pass client adapter
                     registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
-                    response_text_context.clone(),
-                    stream_errors.candidate_selection().unwrap_or_default(),
+                    Some(causal_anchor),
                 );
 
                 // [FIX #3634 对齐 Anthropic 官方规范并彻底杜绝网关静默超时]
@@ -2625,11 +2489,7 @@ pub async fn handle_messages(
                             budget_secs,
                             &mut failure_statuses,
                         );
-                        retry_state.preserve_on_stop(
-                            token_manager.get_scheduling_mode().await,
-                            config.request_type != "image_gen",
-                        );
-                        break 'attempts;
+                        break;
                     }
                     crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
                         last_error = "Error event during peek".to_string();
@@ -2648,50 +2508,8 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
-                    if let Some(failure) = stream_errors.failure_or_incomplete(Some(&last_error)) {
-                        let failure_status =
-                            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
-                        if failure.replay_safe() {
-                            break 'upstream_response (failure_status, None, failure.body);
-                        }
-                        // Output has already been consumed: classify the error, but do not replay.
-                        retry_state.preserve_http_stop(
-                            failure.status,
-                            &failure.body,
-                            &token_manager.get_sticky_config().await,
-                            config.request_type != "image_gen",
-                        );
-                        failure_statuses.record(failure_status);
-                        terminal_stream_usage = failure.usage.clone();
-                        last_error = failure.body;
-                        break 'attempts;
-                    }
-                    failure_statuses.record(StatusCode::BAD_GATEWAY);
-                    if let Some(strategy) = retry_state.cache_first_failure(
-                        &account_id,
-                        502,
-                        &last_error,
-                        None,
-                        &token_manager.get_sticky_config().await,
-                        config.request_type != "image_gen",
-                    ) {
-                        if apply_retry_strategy(strategy, attempt, max_attempts, 502, &trace_id)
-                            .await
-                        {
-                            retry_credentials = Some((
-                                access_token.clone(),
-                                project_id.clone(),
-                                email.clone(),
-                                account_id.clone(),
-                                0,
-                                session_lease.clone(),
-                            ));
-                            continue 'attempts;
-                        }
-                        break 'attempts;
-                    }
                     force_rotate = true;
-                    continue 'attempts;
+                    continue;
                 }
 
                 match first_data_chunk {
@@ -2712,29 +2530,7 @@ pub async fn handle_messages(
                         // 客户端要非 Stream，需要收集完整响应并转换为 JSON
                         use crate::proxy::mappers::claude::collect_stream_to_json;
 
-                        let collected_response =
-                            collect_stream_to_json(Box::pin(combined_stream)).await;
-                        if let Some(failure) = stream_errors.failure_or_incomplete(
-                            collected_response.as_ref().err().map(String::as_str),
-                        ) {
-                            let failure_status = StatusCode::from_u16(failure.status)
-                                .unwrap_or(StatusCode::BAD_GATEWAY);
-                            if failure.replay_safe() {
-                                break 'upstream_response (failure_status, None, failure.body);
-                            }
-                            // Output has already been consumed: classify the error, but do not replay.
-                            retry_state.preserve_http_stop(
-                                failure.status,
-                                &failure.body,
-                                &token_manager.get_sticky_config().await,
-                                config.request_type != "image_gen",
-                            );
-                            failure_statuses.record(failure_status);
-                            terminal_stream_usage = failure.usage.clone();
-                            last_error = failure.body;
-                            break 'attempts;
-                        }
-                        match collected_response {
+                        match collect_stream_to_json(Box::pin(combined_stream)).await {
                             Ok(full_response) => {
                                 info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                                 let attempts_b64 =
@@ -2766,14 +2562,6 @@ pub async fn handle_messages(
                                     .unwrap();
                             }
                             Err(e) => {
-                                if retry_state.preserve_on_stop(
-                                    token_manager.get_scheduling_mode().await,
-                                    config.request_type != "image_gen",
-                                ) {
-                                    last_error = format!("Stream collection error: {}", e);
-                                    failure_statuses.record(StatusCode::BAD_GATEWAY);
-                                    break 'attempts;
-                                }
                                 tracing::warn!(
                                         "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
                                         trace_id,
@@ -2781,7 +2569,7 @@ pub async fn handle_messages(
                                     );
                                 last_error = format!("Stream collection error: {}", e);
                                 force_rotate = true;
-                                continue 'attempts;
+                                continue;
                             }
                         }
                     }
@@ -2792,35 +2580,19 @@ pub async fn handle_messages(
                             trace_id
                         );
                         last_error = "Empty response stream (None)".to_string();
-                        continue 'attempts;
+                        continue;
                     }
                 }
             } else {
-                // Observe raw usage before response conversion or client scaling.
-                let usage_attempt =
-                    crate::proxy::pipeline::usage_diagnostics::UsageAttempt::current(
-                        &config.final_model,
-                        &account_id,
-                        "claude_json",
-                    );
                 // 处理非流式响应
                 let bytes = match response.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
-                        if let Some(attempt) = usage_attempt {
-                            attempt.finish_error();
-                        }
-                        retry_state.preserve_on_stop(
-                            token_manager.get_scheduling_mode().await,
-                            config.request_type != "image_gen",
-                        );
-                        return retry_state.finish_error_response(
-                            (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Failed to read body: {}", e),
-                            )
-                                .into_response(),
-                        );
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("Failed to read body: {}", e),
+                        )
+                            .into_response()
                     }
                 };
 
@@ -2832,46 +2604,10 @@ pub async fn handle_messages(
                 let gemini_resp: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        if let Some(attempt) = usage_attempt {
-                            attempt.finish_error();
-                        }
-                        retry_state.preserve_on_stop(
-                            token_manager.get_scheduling_mode().await,
-                            config.request_type != "image_gen",
-                        );
-                        return retry_state.finish_error_response(
-                            (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
-                                .into_response(),
-                        );
+                        return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
+                            .into_response()
                     }
                 };
-
-                if let Some(attempt) = usage_attempt {
-                    attempt.finish_json(&gemini_resp);
-                }
-
-                if let Some(failure) =
-                    crate::proxy::pipeline::stream_error::upstream_error_from_selected_candidate(
-                        &gemini_resp,
-                    )
-                {
-                    retry_state.preserve_http_stop(
-                        failure.status,
-                        &failure.body,
-                        &token_manager.get_sticky_config().await,
-                        config.request_type != "image_gen",
-                    );
-                    failure_statuses.record(
-                        StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    );
-                    terminal_stream_usage = failure.usage;
-                    last_error = failure.body;
-                    break 'attempts;
-                }
-
-                if let Some(confirmation) = session_confirmation.as_mut() {
-                    confirmation.observe_json(&gemini_resp);
-                }
 
                 // 解包 response 字段（v1internal 格式）
                 let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
@@ -2879,7 +2615,7 @@ pub async fn handle_messages(
                 if track_image_success
                     && crate::proxy::pipeline::response_has_inline_image_data(raw)
                 {
-                    token_manager.commit_session_lease(&mut session_lease);
+                    token_manager.commit_session(&affinity_key, &account_id);
                     token_manager.mark_account_success(&account_id);
                     token_manager
                         .clear_persisted_live_limit(&account_id, Some(&request_with_mapped.model));
@@ -2984,86 +2720,23 @@ pub async fn handle_messages(
                     ))
                     .unwrap();
             }
-        };
+        }
 
-        failure_statuses.record(status);
+        // 1. 立即提取状态码和 headers（防止 response 被 move）
         let status_code = status.as_u16();
-        last_error = format!("HTTP {}: {}", status_code, error_text);
-        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-        );
-        let scheduling = token_manager.get_sticky_config().await;
+        failure_statuses.record(status);
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
 
-        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
-        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
-        if let Some(heal) = crate::proxy::pipeline::auto_heal::try_auto_heal_with_retry_policy(
-            &classification,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            &mut gemini_body,
-            &mut heal_flags,
-            &mut retry_state,
-            &account_id,
-            &scheduling,
-            config.request_type != "image_gen",
-        ) {
-            force_rotate = false;
-            crate::proxy::stage_trace::StageTrace::alert_current(
-                "self_heal",
-                format!(
-                    "protocol=claude kind={} status={} account={}",
-                    heal.kind, status_code, email
-                ),
-            );
-            if !apply_retry_strategy(
-                RetryStrategy::GraceRetry(std::time::Duration::from_millis(heal.delay_ms)),
-                attempt,
-                max_attempts,
-                status_code,
-                &trace_id,
-            )
+        // 2. 获取错误文本并转移 Response 所有权
+        let error_text = response
+            .text()
             .await
-            {
-                break;
-            }
-            if config.request_type != "image_gen" {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                    session_lease.clone(),
-                ));
-            }
-            continue;
-        }
-
-        // CacheFirst policy is shared across protocols and runs before account penalties.
-        if let Some(strategy) = retry_state.cache_first_failure(
-            &account_id,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            &token_manager.get_sticky_config().await,
-            config.request_type != "image_gen",
-        ) {
-            if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                    session_lease.clone(),
-                ));
-                continue;
-            }
-            break;
-        }
+            .unwrap_or_else(|_| format!("HTTP {}", status));
+        last_error = format!("HTTP {}: {}", status_code, error_text);
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -3089,6 +2762,11 @@ pub async fn handle_messages(
         }
 
         // 3. 统一流水线决策判定（协议无关的唯一真理）
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
 
         if classification.is_model_not_found() {
             // [Pipeline Policy] UA 门禁短路 + 单模型临时熔断 + 是否换号的决策统一由 policy 承担
@@ -3110,7 +2788,7 @@ pub async fn handle_messages(
             );
 
             if can_rotate {
-                token_manager.abandon_session_lease(&mut session_lease);
+                token_manager.abandon_session(&affinity_key, &account_id);
                 tracing::warn!(
                     "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
                     trace_id, status_code, email, request_with_mapped.model, attempt, pool_size
@@ -3157,6 +2835,27 @@ pub async fn handle_messages(
                     Some(&request_with_mapped.model),
                 )
                 .await;
+        }
+        // [Pipeline Auto-Heal] 503 过载 / 400 tool_choice 冲突 / 400 损坏图片：
+        // 三者均是对已转出的 Gemini 报文的原地修复，统一在同账号重试（换号只会重蹈覆车）。
+        if let Some(heal) = crate::proxy::pipeline::try_auto_heal(
+            &classification,
+            status_code,
+            &error_text,
+            &mut gemini_body,
+            &mut degraded_gemini_body,
+            &mut heal_flags,
+        ) {
+            force_rotate = false;
+            crate::proxy::stage_trace::StageTrace::alert_current(
+                "self_heal",
+                format!(
+                    "protocol=claude kind={} status={} account={}",
+                    heal.kind, status_code, email
+                ),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(heal.delay_ms)).await;
+            continue;
         }
 
         // 4. 处理 400 错误（Thinking 签名失效 / 块顺序错误）
@@ -3281,7 +2980,7 @@ pub async fn handle_messages(
         );
 
         if http_plan.abandon_sticky_account {
-            token_manager.abandon_session_lease(&mut session_lease);
+            token_manager.abandon_session(&affinity_key, &account_id);
             debug!(
                 "[{}] Unbound session {} from account {} due to status {}",
                 trace_id, affinity_key, email, status_code
@@ -3311,7 +3010,6 @@ pub async fn handle_messages(
                         email.clone(),
                         account_id.clone(),
                         0,
-                        session_lease.clone(),
                     ));
                 }
                 crate::proxy::pipeline::TerminalNextStep::Rotate => {
@@ -3328,7 +3026,7 @@ pub async fn handle_messages(
         } else {
             // 不可重试的错误，直接返回双轨制友好报文
             if classification.abandons_sticky_account() {
-                token_manager.abandon_session_lease(&mut session_lease);
+                token_manager.abandon_session(&affinity_key, &account_id);
                 tracing::debug!(
                     "[Claude] Unbound session {} from account {} due to non-retryable error (status {})",
                     affinity_key, email, status_code
@@ -3365,19 +3063,14 @@ pub async fn handle_messages(
         &last_error,
     );
     let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
-    let mut dual_err = crate::proxy::handlers::common::build_dual_track_error(
+    let dual_err = crate::proxy::handlers::common::build_dual_track_error(
         "claude",
         response_status.as_u16(),
         model_str,
         &last_error,
     );
 
-    crate::proxy::pipeline::stream_error::attach_error_usage(
-        &mut dual_err,
-        "claude",
-        terminal_stream_usage.as_ref(),
-    );
-    retry_state.finish_error_response((response_status, headers, Json(dual_err)).into_response())
+    (response_status, headers, Json(dual_err)).into_response()
 }
 
 /// 列出可用模型

@@ -248,8 +248,6 @@ impl ProxyRequestLog {
 
 #[derive(Default)]
 pub(crate) struct UpstreamCapture {
-    attempt_diagnostics: crate::proxy::pipeline::attempt_diagnostics::AttemptDiagnostics,
-    usage_diagnostics: crate::proxy::pipeline::usage_diagnostics::UsageDiagnostics,
     body: Option<String>,
     headers: Option<String>,
     attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
@@ -263,41 +261,6 @@ tokio::task_local! {
 }
 
 impl UpstreamRequestBodyHolder {
-    pub(crate) fn record_attempt_diagnostic(
-        &self,
-        attempt: &crate::proxy::upstream::client::FallbackAttemptLog,
-    ) {
-        if let Ok(mut capture) = self.0.lock() {
-            capture.attempt_diagnostics.record(attempt);
-        }
-    }
-
-    pub(crate) fn attempt_diagnostics_snapshot(&self) -> Option<serde_json::Value> {
-        self.0.lock().ok()?.attempt_diagnostics.snapshot()
-    }
-
-    /// Capture before spawning or returning a lazy response stream.
-    pub fn current() -> Option<Self> {
-        CURRENT_UPSTREAM_CAPTURE.try_with(Clone::clone).ok()
-    }
-
-    pub fn begin_usage_attempt(
-        &self,
-        model: &str,
-        account_id: &str,
-        source: &str,
-    ) -> Option<crate::proxy::pipeline::usage_diagnostics::UsageAttempt> {
-        self.0
-            .lock()
-            .ok()?
-            .usage_diagnostics
-            .begin(model, account_id, source)
-    }
-
-    pub fn usage_snapshot(&self) -> Option<serde_json::Value> {
-        self.0.lock().ok()?.usage_diagnostics.snapshot()
-    }
-
     pub fn new() -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(
             UpstreamCapture::default(),

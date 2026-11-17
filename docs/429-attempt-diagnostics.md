@@ -1,5 +1,7 @@
 # 429 attempt diagnostics
 
+> Historical fork behavior, superseded by the [beta14 migration](testing/upstream_v5.0.4-beta.14_migration.md).
+
 The shared upstream transport records observed HTTP responses and send failures
 before protocol handlers decide whether to retry or return. The monitor attaches
 these diagnostics to its local log copy, including pure error responses. This does

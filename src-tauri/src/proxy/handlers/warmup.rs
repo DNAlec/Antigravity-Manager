@@ -358,17 +358,14 @@ pub async fn handle_warmup(
             })
         };
 
-        match wrap_request(
+        wrap_request(
             &base_request,
             &project_id,
             &mapped_model,
             None,
             Some(&session_id),
             None,
-        ) {
-            Ok(body) => body,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        }
+        ) // [FIX] Added None for token param
     };
 
     // ===== 步骤 3: 调用 UpstreamClient =====

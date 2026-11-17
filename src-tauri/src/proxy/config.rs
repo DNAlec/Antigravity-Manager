@@ -475,6 +475,24 @@ impl Default for GlobalSystemPromptConfig {
     }
 }
 
+/// 提示词与工具清洗规则的作用范围
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRewriteScope {
+    /// 全域生效：同时作用于系统提示词与工具描述（默认）
+    All,
+    /// 仅系统提示词生效
+    Prompt,
+    /// 仅工具声明描述生效
+    Tools,
+}
+
+impl Default for PromptRewriteScope {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
 /// 风控提示词清理规则（行式：匹配内容 → 替换为）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptRewriteRule {
@@ -487,6 +505,9 @@ pub struct PromptRewriteRule {
     /// 替换内容：留空表示删除匹配内容；支持 `\n` / `\t` / `\\` 转义
     #[serde(default)]
     pub replacement: String,
+    /// 规则作用范围：All (全部) | Prompt (仅提示词) | Tools (仅工具描述)
+    #[serde(default)]
+    pub scope: PromptRewriteScope,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -502,8 +523,43 @@ impl PromptRewriteRule {
             id: id.into(),
             pattern: pattern.into(),
             replacement: replacement.into(),
+            scope: PromptRewriteScope::All,
             enabled,
         }
+    }
+
+    pub fn with_scope(
+        id: impl Into<String>,
+        pattern: impl Into<String>,
+        replacement: impl Into<String>,
+        scope: PromptRewriteScope,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+            scope,
+            enabled,
+        }
+    }
+}
+
+/// 系统提示词隐身侧载模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSideloadMode {
+    /// 自动智能探测：包含第三方框架特征或超长指令时自动执行首轮侧载（默认且推荐）
+    Auto,
+    /// 始终开启：所有非空系统提示词一律通过首轮 User 权威上下文侧载
+    Always,
+    /// 关闭：直出传统 systemInstruction
+    Off,
+}
+
+impl Default for PromptSideloadMode {
+    fn default() -> Self {
+        Self::Auto
     }
 }
 
@@ -515,6 +571,12 @@ pub struct PromptRewriteConfig {
     /// 是否启用内置身份归一化（默认 true）。关闭后保留客户端原始身份句，只执行用户自定义规则。
     #[serde(default = "default_true")]
     pub normalize_identity: bool,
+    /// 系统提示词隐身侧载模式（默认 Auto）
+    #[serde(default)]
+    pub sideload_mode: PromptSideloadMode,
+    /// 是否对工具描述 (tools[].functionDeclarations[].description) 同步执行清洗与自定义规则替换 (默认 true)
+    #[serde(default = "default_true")]
+    pub sanitize_tools_description: bool,
     #[serde(default = "PromptRewriteConfig::recommended_preset_rules")]
     pub rules: Vec<PromptRewriteRule>,
 }
@@ -523,41 +585,88 @@ impl PromptRewriteConfig {
     /// 官方推荐的内置风控预设规则集（经过生产环境与 WAF 实测验证）
     pub fn recommended_preset_rules() -> Vec<PromptRewriteRule> {
         vec![
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
                 "preset-opencode",
                 "You are an AI agent running in OpenCode*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
                 "preset-claude-code-agent",
-                "You are an interactive agent that helps users with software engineering tasks.",
+                "You are an interactive agent that helps users with software engineering tasks*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
+                "preset-opencode-session-move",
+                "*tools.opencode.session*move*",
+                "tools.opencode.session_relocate",
+                PromptRewriteScope::All,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
                 "preset-dsh-identity",
                 "You are an AI agent powered by DeepSeek Harness*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
                 "preset-dsh-model",
                 "You are a coding agent powered by *gemini*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
-            PromptRewriteRule::new("preset-workbuddy", "*WorkBuddy*", "", true),
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
+                "preset-dsh-browser-context",
+                "*The browser provides no implicit DOM, route, or screenshot context*",
+                "The browser exposes no DOM tree, route list, or page screenshot context",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-workbuddy",
+                "*WorkBuddy*",
+                "",
+                PromptRewriteScope::All,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-workbuddy-powered-by",
+                "*This conversation is powered by *",
+                "Selected model: ",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-codex-desktop-context",
+                "*# Codex desktop context*",
+                "# Desktop application context",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-codex-as-role",
+                "*as Codex:*",
+                "as an assistant:",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
                 "preset-codex-intro",
                 "*the codex cli is an open*source project*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
-            PromptRewriteRule::new(
+            PromptRewriteRule::with_scope(
                 "preset-anthropic-billing",
                 "*x-anthropic-billing-header:*",
                 "",
+                PromptRewriteScope::Prompt,
                 true,
             ),
         ]
@@ -569,6 +678,8 @@ impl Default for PromptRewriteConfig {
         Self {
             enabled: true,
             normalize_identity: true,
+            sideload_mode: PromptSideloadMode::default(),
+            sanitize_tools_description: true,
             rules: Self::recommended_preset_rules(),
         }
     }
@@ -973,8 +1084,7 @@ pub struct UploadTimeoutConfig {
     #[serde(default = "default_extra_wait_ratio")]
     pub extra_wait_ratio: f64,
 
-    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断。
-    /// 上传软预算不截断仍有进展的传输；全链路剩余预算仍可提前终止请求。
+    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断；若最大等待时间更短则取较短者
     #[serde(default = "default_upload_stall_secs")]
     pub stall_secs: u64,
 
@@ -1281,10 +1391,6 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
 
-    /// 实例级 QoS 阈值、恢复探针和冷却阶梯（支持热更新）
-    #[serde(default)]
-    pub qos: crate::proxy::qos_config::QoSConfig,
-
     /// 实验性功能配置
     #[serde(default)]
     pub experimental: ExperimentalConfig,
@@ -1501,7 +1607,6 @@ impl Default for ProxyConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
-            qos: crate::proxy::qos_config::QoSConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式
@@ -1615,22 +1720,6 @@ pub enum ProxySelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_proxy_config_without_qos_uses_existing_policy() {
-        let mut value = serde_json::to_value(ProxyConfig::default()).unwrap();
-        value.as_object_mut().unwrap().remove("qos");
-        let config: ProxyConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(config.qos, crate::proxy::qos_config::QoSConfig::default());
-    }
-
-    #[test]
-    fn proxy_config_rejects_invalid_nested_qos() {
-        let mut value = serde_json::to_value(ProxyConfig::default()).unwrap();
-        value["qos"] = serde_json::json!({"probe_timeout_secs": 0});
-        let error = serde_json::from_value::<ProxyConfig>(value).unwrap_err();
-        assert!(error.to_string().contains("proxy.qos.probe_timeout_secs"));
-    }
 
     #[test]
     fn test_normalize_proxy_url() {

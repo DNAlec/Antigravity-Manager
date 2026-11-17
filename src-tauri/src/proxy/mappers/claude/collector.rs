@@ -279,16 +279,6 @@ where
             "error" => {
                 // 错误事件
                 let error_data = event.data.get("error").unwrap_or(&event.data);
-                if crate::proxy::pipeline::stream_error::is_partial_response_error(error_data) {
-                    if let Some(usage) = event.data.get("usage") {
-                        if let Ok(usage) = serde_json::from_value(usage.clone()) {
-                            response.usage = usage;
-                        }
-                    }
-                    let mut partial = serde_json::to_value(&response).unwrap_or_default();
-                    partial["stop_reason"] = Value::Null;
-                    return Err(json!({"error":error_data, "partial_response":partial}).to_string());
-                }
                 let message = error_data
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -302,11 +292,8 @@ where
         }
     }
 
-    // Preserve the legacy empty-answer fallback, but an output limit or refusal
-    // must not invent assistant text that the provider never generated.
-    if response.content.is_empty()
-        && !matches!(response.stop_reason.as_str(), "max_tokens" | "refusal")
-    {
+    // [FIX #3359] Guarantee at least one content block if upstream returned empty
+    if response.content.is_empty() {
         response.content.push(ContentBlock::Text {
             text: ".".to_string(),
         });
@@ -319,32 +306,6 @@ where
 mod tests {
     use super::*;
     use futures::stream;
-
-    #[tokio::test]
-    async fn empty_output_limit_or_refusal_does_not_invent_text() {
-        for stop_reason in ["max_tokens", "refusal"] {
-            let events = [
-                json!({"type":"message_start","message":{
-                    "id":"empty_terminal","type":"message","role":"assistant",
-                    "model":"gemini-flash","content":[],"stop_reason":null,
-                    "usage":{"input_tokens":10,"output_tokens":0}
-                }}),
-                json!({"type":"message_delta","delta":{"stop_reason":stop_reason},
-                    "usage":{"input_tokens":10,"output_tokens":8}}),
-                json!({"type":"message_stop"}),
-            ];
-            let source = stream::iter(events.into_iter().map(|event| {
-                Ok::<_, io::Error>(Bytes::from(format!(
-                    "event: {}\ndata: {event}\n\n",
-                    event["type"].as_str().unwrap()
-                )))
-            }));
-            let response = collect_stream_to_json(source).await.unwrap();
-            assert_eq!(response.stop_reason, stop_reason);
-            assert!(response.content.is_empty());
-            assert_eq!(response.usage.output_tokens, 8);
-        }
-    }
 
     #[tokio::test]
     async fn test_collect_simple_text_response() {

@@ -60,16 +60,13 @@ fn should_preserve_tool_output(tool_name: &str, output: &str) -> bool {
         || output.contains("Expected update hunk")
 }
 
-pub(crate) fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String {
+fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String {
     let child = child_name.trim();
     let ns = namespace_name.trim();
     if child.is_empty() || ns.is_empty() || child.starts_with("mcp__") {
         return child.to_string();
     }
-    if child
-        .strip_prefix(ns)
-        .is_some_and(|rest| ns.ends_with("__") || rest.starts_with("__"))
-    {
+    if child.starts_with(ns) {
         return child.to_string();
     }
     if ns.ends_with("__") {
@@ -78,199 +75,44 @@ pub(crate) fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str
     format!("{}__{}", ns, child)
 }
 
-fn tool_name(tool: &Value) -> Option<&str> {
-    tool["function"]["name"]
-        .as_str()
-        .or_else(|| tool["custom"]["name"].as_str())
-        .or_else(|| tool["name"].as_str())
-}
-
-fn collect_tool_leaves<'a>(
-    tools: &'a [Value],
-    path: &mut Vec<String>,
-    leaves: &mut Vec<(Vec<String>, &'a Value)>,
-) {
+fn flatten_tools(tools: &[Value]) -> Vec<Value> {
+    let mut flat = Vec::new();
     for tool in tools {
-        if tool["type"] == "namespace" {
-            if let (Some(ns), Some(children)) = (tool["name"].as_str(), tool["tools"].as_array()) {
-                path.push(ns.to_owned());
-                collect_tool_leaves(children, path, leaves);
-                path.pop();
+        let t = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if t == "namespace" {
+            let namespace_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(sub_tools) = tool.get("tools").and_then(|v| v.as_array()) {
+                let sub_flat = flatten_tools(sub_tools);
+                for mut sub_tool in sub_flat {
+                    if let Some(obj) = sub_tool.as_object_mut() {
+                        let mut name = String::new();
+                        if let Some(n) = obj.get("name").and_then(|v| v.as_str()) {
+                            name = n.to_string();
+                        } else if let Some(func) = obj.get("function") {
+                            if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
+                                name = n.to_string();
+                            }
+                        }
+                        if !name.is_empty() {
+                            let qualified = qualify_namespace_tool_name(namespace_name, &name);
+                            if obj.contains_key("name") {
+                                obj.insert("name".to_string(), json!(qualified));
+                            }
+                            if let Some(func) = obj.get_mut("function") {
+                                if let Some(func_obj) = func.as_object_mut() {
+                                    func_obj.insert("name".to_string(), json!(qualified));
+                                }
+                            }
+                        }
+                    }
+                    flat.push(sub_tool);
+                }
             }
         } else {
-            leaves.push((path.clone(), tool));
+            flat.push(tool.clone());
         }
     }
-}
-
-fn namespace_path_name(path: &[String]) -> Option<String> {
-    path.iter()
-        .rev()
-        .cloned()
-        .reduce(|child, ns| qualify_namespace_tool_name(&ns, &child))
-}
-
-fn flatten_tools(tools: &[Value]) -> Vec<Value> {
-    let kinds = ResponsesToolKinds::from_tools(Some(tools));
-    let mut leaves = Vec::new();
-    collect_tool_leaves(tools, &mut Vec::new(), &mut leaves);
-    leaves
-        .into_iter()
-        .map(|(path, tool)| {
-            let mut tool = tool.clone();
-            if let Some(name) = tool_name(&tool) {
-                let namespace = namespace_path_name(&path);
-                let name = kinds.backend_name(name, namespace.as_deref());
-                let body = if tool["function"].is_object() {
-                    &mut tool["function"]
-                } else if tool["custom"].is_object() {
-                    &mut tool["custom"]
-                } else {
-                    &mut tool
-                };
-                body["name"] = json!(name);
-            }
-            tool
-        })
-        .collect()
-}
-
-/// One request-scoped identity table is used by declarations, selectors,
-/// history replay and response conversion. Literal delimiters are not identity.
-#[derive(Clone, Default)]
-pub struct ResponsesToolKinds {
-    declarations_present: bool,
-    declarations: std::collections::HashMap<String, (String, Option<String>, bool)>,
-    backend_names: std::collections::HashMap<(String, Option<String>), String>,
-    namespace_members: std::collections::HashMap<String, Vec<String>>,
-}
-
-impl ResponsesToolKinds {
-    pub(crate) fn qualified_names_in_namespace(&self, namespace: &str) -> Vec<&str> {
-        self.namespace_members
-            .get(namespace)
-            .into_iter()
-            .flatten()
-            .map(String::as_str)
-            .collect()
-    }
-
-    pub(crate) fn backend_name(&self, name: &str, namespace: Option<&str>) -> String {
-        self.backend_names
-            .get(&(name.to_owned(), namespace.map(str::to_owned)))
-            .cloned()
-            .unwrap_or_else(|| {
-                namespace.map_or_else(
-                    || name.to_owned(),
-                    |ns| qualify_namespace_tool_name(ns, name),
-                )
-            })
-    }
-
-    pub fn from_tools(tools: Option<&[Value]>) -> Self {
-        use sha2::{Digest, Sha256};
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        let tools = tools.unwrap_or_default();
-        let mut result = Self {
-            declarations_present: !tools.is_empty(),
-            ..Self::default()
-        };
-        let mut leaves = Vec::new();
-        collect_tool_leaves(tools, &mut Vec::new(), &mut leaves);
-        let mut entries = BTreeMap::new();
-        for (path, tool) in leaves {
-            if let Some(name) = tool_name(tool) {
-                entries.insert((path, name.to_owned()), tool["type"] == "custom");
-            }
-        }
-        let preferred = |path: &[String], name: &str| {
-            path.iter().rev().fold(name.to_owned(), |child, ns| {
-                qualify_namespace_tool_name(ns, &child)
-            })
-        };
-        let mut counts = HashMap::<String, usize>::new();
-        for (path, name) in entries.keys() {
-            *counts.entry(preferred(path, name)).or_default() += 1;
-        }
-        // Reserve even names that will be remapped so a generated alias cannot
-        // steal the identity of a client-declared literal name.
-        let mut used: HashSet<String> = counts.keys().cloned().collect();
-        for ((path, name), custom) in entries {
-            let mut backend = preferred(&path, &name);
-            if counts.get(&backend).copied().unwrap_or_default() > 1 || backend.len() > 64 {
-                let mut hash = Sha256::new();
-                for component in path.iter().chain(std::iter::once(&name)) {
-                    hash.update((component.len() as u64).to_be_bytes());
-                    hash.update(component.as_bytes());
-                }
-                let digest = format!("{:x}", hash.finalize());
-                let base = format!("am_tool_{}", &digest[..40]);
-                backend = base.clone();
-                let mut suffix = 0u64;
-                while !used.insert(backend.clone()) {
-                    suffix += 1;
-                    backend = format!("{base}_{suffix}");
-                }
-            }
-            let namespace = namespace_path_name(&path);
-            for depth in 1..=path.len() {
-                if let Some(ns) = namespace_path_name(&path[..depth]) {
-                    result
-                        .namespace_members
-                        .entry(ns)
-                        .or_default()
-                        .push(backend.clone());
-                }
-            }
-            result
-                .backend_names
-                .insert((name.clone(), namespace.clone()), backend.clone());
-            result
-                .declarations
-                .insert(backend, (name, namespace, custom));
-        }
-        result
-    }
-
-    pub(crate) fn wire_identity(&self, name: &str) -> Option<(String, Option<String>, bool)> {
-        self.declarations_present.then(|| {
-            self.declarations
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| (name.to_owned(), None, false))
-        })
-    }
-}
-
-// Responses free-form custom tool input is represented in Gemini by one
-// required string. Preserve its grammar as instructions, never as structured
-// business arguments or persisted wire data.
-fn gemini_custom_tool_declaration(tool: &Value) -> Option<Value> {
-    if tool["type"] != "custom" {
-        return None;
-    }
-    let tool = tool.get("custom").unwrap_or(tool);
-    let name = tool.get("name")?.as_str()?;
-    let mut decl = json!({"name":name,"parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}});
-    let description = tool["description"].as_str().unwrap_or_default();
-    if let Some(definition) = tool
-        .pointer("/format/definition")
-        .or_else(|| tool.pointer("/format/grammar/definition"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        let syntax = tool
-            .pointer("/format/syntax")
-            .or_else(|| tool.pointer("/format/grammar/syntax"))
-            .and_then(Value::as_str)
-            .unwrap_or("custom");
-        decl["description"] = json!(format!(
-            "{description}\nFree-form input must follow this {syntax} grammar:\n{definition}"
-        ));
-    } else if !description.is_empty() {
-        decl["description"] = json!(description);
-    }
-    Some(decl)
+    flat
 }
 
 pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections::HashSet<String> {
@@ -279,16 +121,10 @@ pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections
         let flat_tools = flatten_tools(tools_list);
         for tool in flat_tools {
             let name_opt = tool
-                .get("custom")
+                .get("function")
                 .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    tool.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
                 .or_else(|| {
                     tool.get("name")
                         .and_then(|v| v.as_str())
@@ -312,7 +148,7 @@ pub fn transform_openai_request(
     project_id: &str,
     mapped_model: &str,
     token: Option<&ProxyToken>,
-) -> Result<(Value, String, usize, String), String> {
+) -> (Value, String, usize, String) {
     let session_id =
         crate::proxy::session_manager::SessionManager::extract_openai_session_id(request);
     transform_openai_request_with_session(
@@ -327,31 +163,6 @@ pub fn transform_openai_request(
     )
 }
 
-// Responses reasoning summaries are protocol metadata. A non-thinking target
-// must never see a summary as part of the visible assistant answer. Preserve
-// the older Chat fallback for clients that intentionally rely on it.
-fn openai_history_reasoning_part(
-    msg: &OpenAIMessage,
-    thinking: bool,
-    responses: bool,
-) -> Option<Value> {
-    let text = msg.reasoning_content.as_deref()?.trim();
-    if text.is_empty() || crate::proxy::thinking_store::is_placeholder_thought(text) {
-        return None;
-    }
-    if thinking {
-        let mut part = json!({"text":text,"thought":true});
-        if let Some(signature) = &msg.signature {
-            part["thoughtSignature"] = json!(signature);
-        }
-        Some(part)
-    } else if responses {
-        None
-    } else {
-        Some(json!({"text":text}))
-    }
-}
-
 pub fn transform_openai_request_with_session(
     request: &OpenAIRequest,
     project_id: &str,
@@ -359,9 +170,9 @@ pub fn transform_openai_request_with_session(
     token: Option<&ProxyToken>,
     routing_session_id: &str,
     signature_read_key: Option<&str>,
-    is_responses_api: bool,
+    _is_responses_api: bool,
     is_retry: bool,
-) -> Result<(Value, String, usize, String), String> {
+) -> (Value, String, usize, String) {
     let remember_cwd =
         |text: &str| crate::proxy::adapters::apply_patch_preflight::remember_cwd_from_text(text);
     let found_cwd = request.instructions.as_deref().is_some_and(remember_cwd);
@@ -527,15 +338,6 @@ pub fn transform_openai_request_with_session(
         !key.is_empty() && seen_system_instruction_keys.insert(key.to_string())
     });
 
-    let tool_kinds = ResponsesToolKinds::from_tools(request.tools.as_deref());
-    let tool_ids = crate::proxy::common::utils::ToolIdNormalizer::new(
-        request
-            .messages
-            .iter()
-            .filter_map(|message| message.tool_calls.as_ref())
-            .flatten()
-            .map(|call| call.id.as_str()),
-    );
     // Pre-scan to map tool_call_id to function name (for Codex)
     let mut tool_id_to_name = std::collections::HashMap::new();
     for msg in &request.messages {
@@ -543,21 +345,18 @@ pub fn transform_openai_request_with_session(
             for call in tool_calls {
                 let name = if let Some(func) = &call.function {
                     func.name.clone()
-                } else if let Some(custom) = &call.custom {
-                    custom.name.clone()
                 } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
                     "apply_patch".to_string()
                 } else {
                     continue;
                 };
-                let name = tool_kinds.backend_name(&name, None);
                 let final_name = if name == "local_shell_call" {
                     "shell"
                 } else {
                     &name
                 };
                 tool_id_to_name.insert(call.id.clone(), final_name.to_string());
-                let norm_id = tool_ids.normalize(&call.id);
+                let norm_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
                 if norm_id.as_ref() != call.id {
                     tool_id_to_name.insert(norm_id.into_owned(), final_name.to_string());
                 }
@@ -626,16 +425,35 @@ pub fn transform_openai_request_with_session(
 
             let mut parts = Vec::new();
 
+            let client_reasoning = msg
+                .reasoning_content
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
             if role == "model" {
-                if let Some(part) =
-                    openai_history_reasoning_part(msg, actual_include_thinking, is_responses_api)
-                {
-                    parts.push(part);
-                }
-                // A refusal is readable assistant history even when the Chat
-                // response has no ordinary content. Keep it in the next turn.
-                if let Some(refusal) = msg.refusal.as_deref().filter(|s| !s.trim().is_empty()) {
-                    parts.push(json!({"text": refusal}));
+                // [2026-09-27] 占位/缺失 reasoning 不再写 "..." 思考块。
+                // 官方样本 9/24 轮是「无思考块 + 锚点带签名」，空/占位思考不出站；
+                // 签名归位由流水线终审 place_turn_signature 按锚点规则处理。
+                if actual_include_thinking {
+                    if let Some(rc) = client_reasoning {
+                        if !crate::proxy::thinking_store::is_placeholder_thought(rc) {
+                            // 纯净线缆透传：客户端若自带签名则无损透传；缺失签名全权委托流水线统一对齐与回填
+                            let mut thought_part = json!({
+                                "text": rc,
+                                "thought": true,
+                            });
+                            if let Some(ref sig) = msg.signature {
+                                thought_part["thoughtSignature"] = json!(sig);
+                            }
+                            parts.push(thought_part);
+                        }
+                    }
+                } else if let Some(rc) = client_reasoning {
+                    // 思考关闭时，非占位思考降级为普通文本；占位/空直接跳过
+                    if !crate::proxy::thinking_store::is_placeholder_thought(rc) {
+                        parts.push(json!({ "text": rc }));
+                    }
                 }
             }
 
@@ -684,11 +502,6 @@ pub fn transform_openai_request_with_session(
                                             parts.extend(crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text));
                                         }
                                     }
-                                OpenAIContentBlock::Refusal { refusal } => {
-                                    if !refusal.is_empty() {
-                                        parts.push(json!({"text":refusal}));
-                                    }
-                                }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(",") {
@@ -704,11 +517,10 @@ pub fn transform_openai_request_with_session(
                                         } else {
                                             parts.push(json!({"text": "[Image: invalid data URL omitted]"}));
                                         }
-                                    } else if image_url.url.starts_with("http") || image_url.url.starts_with("gs://") {
-                                        let part = crate::proxy::mappers::common_utils::create_gemini_file_part(
-                                            &image_url.url, None, "image/jpeg",
-                                        ).unwrap_or_else(|_| json!({"text": format!("[Image: {}]", image_url.url)}));
-                                        parts.push(part);
+                                    } else if image_url.url.starts_with("http") {
+                                        parts.push(json!({
+                                            "fileData": { "fileUri": &image_url.url, "mimeType": "image/jpeg" }
+                                        }));
                                     } else {
                                         // [NEW] 处理本地文件路径 (file:// 或 Windows/Unix 路径)
                                         let file_path = if image_url.url.starts_with("file://") {
@@ -748,11 +560,6 @@ pub fn transform_openai_request_with_session(
                                         } else {
                                             tracing::debug!("[OpenAI-Request] Failed to read local image: {}", file_path);
                                         }
-                                    }
-                                }
-                                OpenAIContentBlock::File { file } => {
-                                    if let Some(part) = file.to_gemini_part() {
-                                        parts.push(part);
                                     }
                                 }
                                 OpenAIContentBlock::AudioUrl { audio_url } => {
@@ -821,15 +628,12 @@ pub fn transform_openai_request_with_session(
 
                     let (func_name, args_str) = if let Some(func) = &tc.function {
                         (func.name.clone(), func.arguments.clone())
-                    } else if let Some(custom) = &tc.custom {
-                        (custom.name.clone(), json!({"input":custom.input}).to_string())
                     } else if let Some(op) = &tc.operation {
                         ("apply_patch".to_string(), serde_json::to_string(op).unwrap_or_else(|_| "{}".to_string()))
                     } else {
                         continue;
                     };
 
-                    let func_name = tool_kinds.backend_name(&func_name, None);
                     let mut args = serde_json::from_str::<Value>(&args_str).unwrap_or(json!({}));
 
                     // [New] 利用通用引擎修正参数类型 (替代以前硬编码的 shell 工具修复逻辑)
@@ -859,25 +663,24 @@ pub fn transform_openai_request_with_session(
                 let name = msg.name.as_deref().unwrap_or("");
                 // 优先从前置 assistant 消息中查找匹配该 tool_call_id 的工具名称 (精准杜绝长会话 ID 碰撞时全局 Map 覆盖错误)
                 let matched_preceding_name = if let Some(ref target_id) = msg.tool_call_id {
-                    let norm_target_id = tool_ids.normalize(target_id);
+                    let norm_target_id = crate::proxy::common::utils::normalize_tool_id(target_id);
                     let mut found = None;
                     for prev_idx in (0..msg_index).rev() {
                         if let Some(prev_msg) = request.messages.get(prev_idx) {
                             if prev_msg.role == "assistant" {
                                 if let Some(ref calls) = prev_msg.tool_calls {
-                                    // Exact IDs always win over compatibility aliases.
-                                    let matched = calls.iter().find(|call| call.id == *target_id)
-                                        .or_else(|| calls.iter().find(|call| tool_ids.normalize(&call.id) == norm_target_id));
-                                    if let Some(call) = matched {
+                                    for call in calls {
+                                        let norm_call_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
+                                        if call.id == *target_id || norm_call_id.as_ref() == norm_target_id.as_ref() {
                                             found = if let Some(ref func) = call.function {
                                                 Some(if func.name == "local_shell_call" { "shell".to_string() } else { func.name.clone() })
-                                            } else if let Some(ref custom) = call.custom {
-                                                Some(custom.name.clone())
                                             } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
                                                 Some("apply_patch".to_string())
                                             } else {
                                                 None
                                             };
+                                            break;
+                                        }
                                     }
                                 }
                                 if found.is_some() {
@@ -901,7 +704,7 @@ pub fn transform_openai_request_with_session(
                 } else if name == "local_shell_call" {
                     "shell"
                 } else if let Some(id) = &msg.tool_call_id {
-                    let norm_id = tool_ids.normalize(id);
+                    let norm_id = crate::proxy::common::utils::normalize_tool_id(id);
                     tool_id_to_name
                         .get(id)
                         .or_else(|| tool_id_to_name.get(norm_id.as_ref()))
@@ -930,8 +733,6 @@ pub fn transform_openai_request_with_session(
                     }
                 }
                 let final_name = fallback_inferred_name.as_deref().unwrap_or(final_name);
-                let mapped_tool_name = tool_kinds.backend_name(final_name, None);
-                let final_name = mapped_tool_name.as_str();
 
                 let mut extra_parts = Vec::new();
 
@@ -946,8 +747,7 @@ pub fn transform_openai_request_with_session(
                         let mut texts = Vec::new();
                         for block in blocks {
                             match block {
-                                OpenAIContentBlock::Text { text }
-                                | OpenAIContentBlock::Refusal { refusal: text } => texts.push(text.clone()),
+                                OpenAIContentBlock::Text { text } => texts.push(text.clone()),
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
                                         if let Some(pos) = image_url.url.find(',') {
@@ -962,17 +762,7 @@ pub fn transform_openai_request_with_session(
                                             ));
                                         }
                                     } else {
-                                        match crate::proxy::mappers::common_utils::create_gemini_file_part(
-                                            &image_url.url, None, "image/jpeg",
-                                        ) {
-                                            Ok(part) => extra_parts.push(part),
-                                            Err(_) => texts.push(format!("[Image: {}]", image_url.url)),
-                                        }
-                                    }
-                                }
-                                OpenAIContentBlock::File { file } => {
-                                    if let Some(part) = file.to_gemini_part() {
-                                        extra_parts.push(part);
+                                        texts.push("[image link]".to_string());
                                     }
                                 }
                                 OpenAIContentBlock::AudioUrl { audio_url } => {
@@ -1011,7 +801,7 @@ pub fn transform_openai_request_with_session(
                 };
 
                 // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉与 Gemini 400 校验异常
-                let mut final_content = if content_val.trim().is_empty() {
+                let final_content = if content_val.trim().is_empty() {
                     "Command executed successfully.".to_string()
                 } else {
                     content_val
@@ -1029,22 +819,11 @@ pub fn transform_openai_request_with_session(
                     obj.remove("thoughtSignature");
                     obj.remove("thought_signature");
                 }
-                // Retain ownership until the shared pipeline selects the target
-                // layout. Sibling media cannot distinguish parallel same-name calls.
-                extra_parts.retain(|part| {
-                    if let Some(notice) = part.get("text").and_then(Value::as_str) {
-                        final_content.push('\n');
-                        final_content.push_str(notice);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                fr_part["functionResponse"]["response"]["output"] = json!(final_content);
-                if !extra_parts.is_empty() {
-                    fr_part["functionResponse"]["parts"] = Value::Array(extra_parts);
-                }
                 parts.push(fr_part);
+
+                for extra in extra_parts {
+                    parts.push(extra);
+                }
             }
 
             // Ensure user role message is not dropped if parts is empty, preserving role rotation
@@ -1064,7 +843,7 @@ pub fn transform_openai_request_with_session(
     // 并不要求严格交替；实测（2026-09-26，`gemini-3.8-flash-tiered` @ daily）
     // 两种形态均 200 且上下文理解一致。
     let mut merged_contents = contents;
-    crate::proxy::pipeline::InboundThinkingPipeline::process_contents_deferred_text(
+    crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
         &mut merged_contents,
         mapped_model,
         actual_include_thinking,
@@ -1239,7 +1018,7 @@ pub fn transform_openai_request_with_session(
             gen_config["responseMimeType"] = json!("application/json");
             if let Some(js) = fmt.json_schema() {
                 if let Some(mut schema) = js.schema.clone() {
-                    crate::proxy::common::json_schema::clean_response_schema(&mut schema)?;
+                    crate::proxy::common::json_schema::clean_response_schema(&mut schema);
                     gen_config["responseSchema"] = schema;
                 }
             }
@@ -1291,7 +1070,7 @@ pub fn transform_openai_request_with_session(
         let raw_json = serde_json::to_string(original_tools).unwrap_or_default();
         if !raw_json.is_empty() {
             let key = crate::proxy::cache_manager::CacheManager::compute_tools_key(&format!(
-                "pure_tools_v4:{raw_json}"
+                "pure_tools_v3:{raw_json}"
             ));
             let cm = crate::proxy::cache_manager::global_cache_manager();
             if let Some(cached_json) = cm.lookup_tools(&key) {
@@ -1317,9 +1096,7 @@ pub fn transform_openai_request_with_session(
         if let Some(original_tools) = &request.tools {
             let tools = flatten_tools(original_tools);
             for tool in tools.iter() {
-                let mut gemini_func = if let Some(custom) = gemini_custom_tool_declaration(tool) {
-                    custom
-                } else if let Some(func) = tool.get("function") {
+                let mut gemini_func = if let Some(func) = tool.get("function") {
                     func.clone()
                 } else {
                     let mut func = tool.clone();
@@ -1374,7 +1151,7 @@ pub fn transform_openai_request_with_session(
 
                 if let Some(params) = gemini_func.get_mut("parameters") {
                     // [DEEP FIX] 统一调用公共库清洗：展开 $ref 并剔除所有层级的 format/definitions
-                    crate::proxy::common::json_schema::clean_json_schema(params)?;
+                    crate::proxy::common::json_schema::clean_json_schema(params);
 
                     // Gemini v1internal 要求：
                     // 1. type 必须是大写 (OBJECT, STRING 等)
@@ -1423,22 +1200,18 @@ pub fn transform_openai_request_with_session(
 
     // Removed auto-inject since we handle it above now if Codex passes it.
 
+    if !function_declarations.is_empty() {
+        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
+    }
+
     // [tool_choice] 客户端有就传，没有就不传：
     // 若客户端显式指定了 tool_choice，将其规范化映射为标准的 Gemini toolConfig
     if let Some(tool_choice) = &request.tool_choice {
         if let Some(gemini_tc) =
-            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(
-                tool_choice,
-                &mut function_declarations,
-                request.tools.as_deref().unwrap_or_default(),
-            )?
+            crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini(tool_choice)
         {
             inner_request["toolConfig"] = gemini_tc;
         }
-    }
-
-    if !function_declarations.is_empty() {
-        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
@@ -1500,7 +1273,7 @@ pub fn transform_openai_request_with_session(
         &mut inner_request,
         &config.final_model,
         None,
-    )?;
+    );
     let reordered_request = inner_request;
 
     // requestId：官方 5 段形态，三适配器共用（含 unixMs → 幂等隔离）。
@@ -1542,7 +1315,13 @@ pub fn transform_openai_request_with_session(
         final_body["requestType"] = json!("agent");
     }
 
-    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut final_body)?;
+    if let Some(tok) = token {
+        if tok.is_paygo() {
+            final_body["enabledCreditTypes"] = json!(["GOOGLE_ONE_AI"]);
+        }
+    }
+
+    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut final_body);
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -1572,7 +1351,7 @@ pub fn transform_openai_request_with_session(
         crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
     }
 
-    Ok((final_body, session_id, message_count, prefix_hash))
+    (final_body, session_id, message_count, prefix_hash)
 }
 
 pub fn enforce_uppercase_types(value: &mut Value) {
@@ -1592,11 +1371,6 @@ pub fn enforce_uppercase_types(value: &mut Value) {
         if let Some(items) = map.get_mut("items") {
             enforce_uppercase_types(items);
         }
-        for key in ["anyOf", "oneOf", "allOf"] {
-            if let Some(branches) = map.get_mut(key) {
-                enforce_uppercase_types(branches);
-            }
-        }
     } else if let Value::Array(arr) = value {
         for item in arr {
             enforce_uppercase_types(item);
@@ -1606,97 +1380,7 @@ pub fn enforce_uppercase_types(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn r19_parallel_chat_results_keep_media_owner() {
-        const PNG:&str="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-        for model in ["claude-sonnet-4-6", "gemini-2.5-flash", "gemini-3-pro"] {
-            for owner in ["a", "b"] {
-                let mut messages = vec![
-                    json!({"role":"user","content":"inspect"}),
-                    json!({"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"inspect","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"inspect","arguments":"{}"}}]}),
-                ];
-                for id in ["a", "b"] {
-                    let mut content = vec![json!({"type":"text","text":"done"})];
-                    if id == owner {
-                        content.push(json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}));
-                    }
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":content}));
-                }
-                let req: OpenAIRequest =
-                    serde_json::from_value(json!({"model":model,"messages":messages})).unwrap();
-                let (body, _, _, _) = transform_openai_request(&req, "p", model, None).unwrap();
-                let parts: Vec<_> = body["request"]["contents"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|t| t["parts"].as_array().unwrap())
-                    .collect();
-                let responses: Vec<_> = parts
-                    .iter()
-                    .filter_map(|p| p.get("functionResponse"))
-                    .collect();
-                assert_eq!(responses.len(), 2);
-                for result in responses {
-                    if crate::proxy::model_specs::is_gemini_v3_or_above(model) {
-                        assert_eq!(
-                            result["parts"][0]["inlineData"]["data"].as_str(),
-                            (result["id"] == owner).then_some(PNG)
-                        );
-                    } else {
-                        assert_eq!(
-                            result["response"].get("attached_media_positions").is_some(),
-                            result["id"] == owner
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     use super::*;
-
-    #[test]
-    fn declared_custom_tool_and_ordinary_shell_keep_distinct_gemini_schemas() {
-        let req:OpenAIRequest=serde_json::from_value(json!({
-            "model":"gemini-pro","messages":[{"role":"user","content":"Read"}],
-            "tools":[{"type":"namespace","name":"scope","tools":[{"type":"custom","name":"mytool","description":"Use this tool","format":{"type":"grammar","syntax":"lark","definition":"start: WORD"}}]},
-                {"type":"function","name":"shell","parameters":{"type":"object","properties":{"input":{"type":"integer"}},"required":["input"]}}]
-        })).unwrap();
-        let (body, _, _, _) = transform_openai_request_with_session(
-            &req,
-            "project",
-            "gemini-3-pro",
-            None,
-            "scope",
-            None,
-            true,
-            false,
-        )
-        .unwrap();
-        let tools: Vec<_> = body["request"]["tools"]
-            .as_array()
-            .expect("actual Gemini tools")
-            .iter()
-            .filter_map(|tool| tool["functionDeclarations"].as_array())
-            .flatten()
-            .collect();
-        let custom = &tools[0];
-        assert_eq!(custom["name"], "scope__mytool");
-        assert_eq!(
-            custom["parameters"]["properties"]["input"]["type"],
-            "STRING"
-        );
-        assert_eq!(custom["parameters"]["required"], json!(["input"]));
-        assert!(custom["description"]
-            .as_str()
-            .unwrap()
-            .contains("start: WORD"));
-        assert_eq!(tools[1]["name"], "shell");
-        assert_eq!(
-            tools[1]["parameters"]["properties"]["input"]["type"],
-            "INTEGER"
-        );
-    }
 
     #[test]
     fn test_openai_aliases_max_completion_tokens_and_reasoning_max_tokens() {
@@ -1761,8 +1445,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (body, _, _, _) =
-            transform_openai_request(&req2, "test-p", "gemini-3.7-flash", None).unwrap();
+        let (body, _, _, _) = transform_openai_request(&req2, "test-p", "gemini-3.7-flash", None);
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
@@ -1800,7 +1483,7 @@ mod tests {
 
             // 适配层收尾已跑过清洗节点；这里再显式跑一次，同时覆盖多次清洗幂等
             let (mut body, _, _, _) =
-                transform_openai_request(&req, "test-project", &req.model, None).unwrap();
+                transform_openai_request(&req, "test-project", &req.model, None);
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
             );
@@ -1835,9 +1518,7 @@ mod tests {
             raw["reasoning"] = json!({ "effort": effort });
         }
         let request: OpenAIRequest = serde_json::from_value(raw).unwrap();
-        transform_openai_request(&request, "test-project", model, None)
-            .unwrap()
-            .0
+        transform_openai_request(&request, "test-project", model, None).0
     }
 
     #[test]
@@ -1898,7 +1579,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_high, "test-p", "gemini-3.7-flash-high", None).unwrap();
+            transform_openai_request(&req_high, "test-p", "gemini-3.7-flash-high", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             -1
@@ -1912,7 +1593,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_high, "test-p", "gemini-3-flash", None).unwrap();
+            transform_openai_request(&req_flash_high, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1928,7 +1609,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_low, "test-p", "gemini-3-flash", None).unwrap();
+            transform_openai_request(&req_flash_low, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "LOW"
@@ -1941,7 +1622,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None).unwrap();
+            transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1954,8 +1635,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None)
-                .unwrap();
+            transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
             false
@@ -1973,8 +1653,7 @@ mod tests {
         }))
         .unwrap();
         let (body, _, _, _) =
-            transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None)
-                .unwrap();
+            transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -1995,8 +1674,7 @@ mod tests {
             "test-p",
             "gemini-3-flash",
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
@@ -2012,9 +1690,9 @@ mod tests {
         .unwrap();
 
         let (first, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
         let (second, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
         let first_id = first["requestId"].as_str().unwrap();
         let second_id = second["requestId"].as_str().unwrap();
 
@@ -2046,8 +1724,7 @@ mod tests {
             None,
             true,
             false,
-        )
-        .unwrap();
+        );
         let system_instruction = body["request"].get("systemInstruction");
 
         assert_eq!(session_id, "resp-routing-root");
@@ -2078,7 +1755,7 @@ mod tests {
         .unwrap();
 
         let (body, _, _, _) =
-            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
         let parts = body["request"]["systemInstruction"]["parts"]
             .as_array()
             .expect("systemInstruction.parts");
@@ -2115,7 +1792,6 @@ mod tests {
             messages: vec![OpenAIMessage {
                 role: "assistant".to_string(),
                 tool_calls: Some(vec![ToolCall {
-                    custom: None,
                     id: "call-parent".to_string(),
                     r#type: "function".to_string(),
                     function: Some(ToolFunction {
@@ -2138,8 +1814,7 @@ mod tests {
             Some(&previous_response_id),
             true,
             false,
-        )
-        .unwrap();
+        );
         let contents = body["request"]["contents"].as_array().unwrap();
         let model_msg = contents
             .iter()
@@ -2177,7 +1852,7 @@ mod tests {
 
         // Auto mode (default) should map gemini-3-pro thinking budget to 49152 per model_specs
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-3-pro", None).unwrap();
+            transform_openai_request(&req, "test-v", "gemini-3-pro", None);
         // 新规则：gemini-3-pro 交由服务端默认预算，不再显式下发 thinkingBudget
         let tc = &result["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], true);
@@ -2234,7 +1909,7 @@ mod tests {
 
         // 验证针对 Gemini 模型在 Custom 模式下注入自定义预算
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None).unwrap();
+            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
@@ -2243,7 +1918,7 @@ mod tests {
         // 验证非 Gemini 模型（如 Claude 原生路径，假设映射后名不含 gemini）则不应截断
         // 注意：这里的 transform_openai_request 第三个参数是 mapped_model
         let (result_claude, _, _, _) =
-            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None).unwrap();
+            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None);
         let _budget_claude = result_claude["request"]["generationConfig"]["thinkingConfig"]
             ["thinkingBudget"]
             .as_i64();
@@ -2284,7 +1959,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-1.5-flash", None).unwrap();
+            transform_openai_request(&req, "test-v", "gemini-1.5-flash", None);
         let parts = &result["request"]["contents"][0]["parts"];
         assert_eq!(parts.as_array().unwrap().len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "What is in this image?");
@@ -2318,7 +1993,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", "gemini-2.5-flash", None).unwrap();
+            transform_openai_request(&req, "test-v", "gemini-2.5-flash", None);
         let parts = &result["request"]["contents"][0]["parts"];
         assert_eq!(parts.as_array().unwrap().len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "Describe this video");
@@ -2378,7 +2053,7 @@ mod tests {
 
         // Pass explicit gemini-3-pro-preview which doesn't have "-thinking" suffix
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None).unwrap();
+            transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None);
         let gen_config = &result["request"]["generationConfig"];
 
         // Assert thinkingConfig is present (fix verification)
@@ -2407,7 +2082,7 @@ mod tests {
 
         // Pass gemini-3-pro-image which matches "gemini-3-pro" substring
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3-pro-image", None).unwrap();
+            transform_openai_request(&req, "test-p", "gemini-3-pro-image", None);
         let gen_config = &result["request"]["generationConfig"];
 
         // Assert thinkingConfig IS present (based on latest user feedback)
@@ -2450,7 +2125,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3.1-pro-high", None).unwrap();
+            transform_openai_request(&req, "test-p", "gemini-3.1-pro-high", None);
         let gen_config = &result["request"]["generationConfig"];
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
         // 官方物理硬顶 safe_limit = 65535
@@ -2501,8 +2176,7 @@ mod tests {
 
         // Test with Flash model
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None)
-                .unwrap();
+            transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None);
         let gen_config = &result["request"]["generationConfig"];
 
         // 默认自适应模式下，未收录的 exp 模型不显式下发固定 thinkingBudget
@@ -2520,7 +2194,6 @@ mod tests {
                 role: "assistant".to_string(),
                 reasoning_content: Some("Thinking...".to_string()),
                 tool_calls: Some(vec![ToolCall {
-                    custom: None,
                     id: "call_123".to_string(),
                     r#type: "function".to_string(),
                     function: Some(ToolFunction {
@@ -2539,7 +2212,7 @@ mod tests {
         let mapped_model = "projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash-thinking-exp";
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-v", mapped_model, None).unwrap();
+            transform_openai_request(&req, "test-v", mapped_model, None);
 
         // Extract the tool call part from contents (under request.contents)
         let contents = result["request"]["contents"].as_array().unwrap();
@@ -2571,7 +2244,6 @@ mod tests {
                 messages: vec![OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: "call_flash_test".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -2586,7 +2258,7 @@ mod tests {
             };
 
             let (result, _sid, _msg_count, _) =
-                transform_openai_request(&req, "test-proj", model, None).unwrap();
+                transform_openai_request(&req, "test-proj", model, None);
 
             let contents = result["request"]["contents"]
                 .as_array()
@@ -2643,7 +2315,7 @@ mod tests {
 
         // 2. Transform request
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3-pro-image", None);
 
         // 3. Verify thinkingConfig has includeThoughts: false
         let gen_config = result["request"]["generationConfig"]
@@ -2680,8 +2352,7 @@ mod tests {
         };
 
         // 使用 gemini-2.0-flash 模型执行转换
-        let (result, _, _, _) =
-            transform_openai_request(&req, "proj", "gemini-2.0-flash", None).unwrap();
+        let (result, _, _, _) = transform_openai_request(&req, "proj", "gemini-2.0-flash", None);
 
         let tools = result["request"]["tools"]
             .as_array()
@@ -2741,7 +2412,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _sid, _msg_count, _) =
-            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None).unwrap();
+            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
         let gen_config = &res_val["request"]["generationConfig"];
         assert_eq!(gen_config["responseMimeType"], "application/json");
         assert!(gen_config.get("responseSchema").is_some());
@@ -2783,7 +2454,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "claude-sonnet-4-6", None).unwrap();
+            transform_openai_request(&req, "test-proj", "claude-sonnet-4-6", None);
 
         let gen_config = &result["request"]["generationConfig"];
         assert!(
@@ -2861,7 +2532,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
 
         let thinking = &result["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(
@@ -2909,7 +2580,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gpt-4o", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gpt-4o", None);
         let gen_config = &result["request"]["generationConfig"];
         assert!(
             gen_config.get("thinkingConfig").is_none(),
@@ -2954,7 +2625,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None);
 
         let gen_config = result["request"]["generationConfig"]
             .as_object()
@@ -2997,8 +2668,7 @@ mod tests {
             ..Default::default()
         };
         let (res1, _, _, _) =
-            transform_openai_request(&req_default, "test-proj", "gemini-3.8-flash-tiered", None)
-                .unwrap();
+            transform_openai_request(&req_default, "test-proj", "gemini-3.8-flash-tiered", None);
         let tc1 = res1["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for default thinking");
@@ -3018,8 +2688,7 @@ mod tests {
             ..Default::default()
         };
         let (res2, _, _, _) =
-            transform_openai_request(&req_level, "test-proj", "gemini-3.8-flash-tiered", None)
-                .unwrap();
+            transform_openai_request(&req_level, "test-proj", "gemini-3.8-flash-tiered", None);
         let tc2 = res2["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for level");
@@ -3043,8 +2712,7 @@ mod tests {
             ..Default::default()
         };
         let (res3, _, _, _) =
-            transform_openai_request(&req_budget, "test-proj", "gemini-3.8-flash-tiered", None)
-                .unwrap();
+            transform_openai_request(&req_budget, "test-proj", "gemini-3.8-flash-tiered", None);
         let tc3 = res3["request"]["generationConfig"]["thinkingConfig"]
             .as_object()
             .expect("Should have thinkingConfig for budget");
@@ -3093,7 +2761,7 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-medium", None);
 
         let gen_config = result["request"]["generationConfig"]
             .as_object()
@@ -3142,7 +2810,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _sid, _msg_count, _) =
-            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None).unwrap();
+            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None);
         let contents = res_val["request"]["contents"]
             .as_array()
             .expect("contents must be an array");
@@ -3187,7 +2855,7 @@ mod tests {
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
         let (res_val, _, _, _) =
-            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None).unwrap();
+            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
         assert!(
             res_val.get("requestType").is_none(),
             "Plain text request should not have requestType: 'agent'"
@@ -3233,8 +2901,7 @@ mod tests {
             None,
             true,
             false,
-        )
-        .unwrap();
+        );
         let (chat_result, _, _, _) = transform_openai_request_with_session(
             &req,
             "test-proj",
@@ -3244,8 +2911,7 @@ mod tests {
             None,
             false,
             false,
-        )
-        .unwrap();
+        );
         let model_parts = |body: &serde_json::Value| {
             let contents = body["request"]["contents"].as_array().unwrap();
             let model_msg = contents.iter().find(|m| m["role"] == "model").unwrap();
@@ -3307,8 +2973,7 @@ mod tests {
             None,
             false,
             false,
-        )
-        .unwrap();
+        );
 
         let tools = result["request"]["tools"].as_array().unwrap();
         let func_decls = tools[0]["functionDeclarations"].as_array().unwrap();
@@ -3373,7 +3038,6 @@ mod tests {
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: call_1_id.clone(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3397,7 +3061,6 @@ mod tests {
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: call_2_id.clone(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3435,8 +3098,7 @@ mod tests {
             Some(&prev_resp_id),
             true, // is_responses_api
             false,
-        )
-        .unwrap();
+        );
 
         let contents = result["request"]["contents"].as_array().unwrap();
 
@@ -3475,7 +3137,6 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: "call_test_1".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3505,7 +3166,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 验证 assistant 的 functionCall.args 中的 command 绝对未被剔除
@@ -3539,7 +3200,6 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: "call_duplicate_1025976".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3562,7 +3222,6 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: "call_duplicate_1025976".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3587,7 +3246,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-high", None);
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 验证第 1 轮工具响应的名字为 edit_file，绝不能被后续同 ID 的 run_command 覆盖
@@ -3628,7 +3287,6 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: "call_shot_1".to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3650,7 +3308,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
         let contents = result["request"]["contents"].as_array().unwrap();
         let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
 
@@ -3696,7 +3354,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
         let tools = result["request"]["tools"].as_array().unwrap();
         let func_decls = tools[0]["functionDeclarations"].as_array().unwrap();
         let decl = &func_decls[0];
@@ -3734,7 +3392,6 @@ mod tests {
                 OpenAIMessage {
                     role: "assistant".to_string(),
                     tool_calls: Some(vec![ToolCall {
-                        custom: None,
                         id: tool_id.to_string(),
                         r#type: "function".to_string(),
                         function: Some(ToolFunction {
@@ -3757,7 +3414,7 @@ mod tests {
         };
 
         let (result, _, _, _) =
-            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-tiered", None).unwrap();
+            transform_openai_request(&req, "test-proj", "gemini-3.8-flash-tiered", None);
         let contents = result["request"]["contents"].as_array().unwrap();
 
         // 查找 model 轮次中的 functionCall 部件
@@ -3776,422 +3433,5 @@ mod tests {
             fc_part["thoughtSignature"], valid_gemini_sig,
             "OpenAI adapter and pipeline must recover real tool signature from SignatureCache"
         );
-    }
-}
-
-#[cfg(test)]
-mod responses_reasoning_replay_tests {
-    use super::*;
-    #[test]
-    fn remote_images_survive_user_and_tool_history_with_their_mime_type() {
-        const IMAGE_URL: &str = "https://images.example/result.PNG?download=1";
-        let image = json!({"type":"image_url", "image_url":{"url":IMAGE_URL}});
-        let histories = [
-            json!([{"role":"user", "content":[{"type":"text","text":"Describe the image."}, image]}]),
-            json!([
-                {"role":"user", "content":"Read the image."},
-                {"role":"assistant", "tool_calls":[{"id":"call-image", "type":"function", "function":{"name":"view_image","arguments":"{}"}}]},
-                {"role":"tool", "tool_call_id":"call-image", "content":[image]}
-            ]),
-        ];
-        for messages in histories {
-            let request: OpenAIRequest = serde_json::from_value(json!({
-                "model":"gemini-3.8-flash-tiered", "messages":messages,
-                "tools":[{"type":"function","function":{"name":"view_image","parameters":{"type":"object","properties":{}}}}]
-            })).unwrap();
-            let (body, _, _, _) =
-                transform_openai_request(&request, "test-project", "gemini-3.8-flash-tiered", None)
-                    .unwrap();
-            let wire = body["request"]["contents"].to_string();
-            assert_eq!(wire.matches(IMAGE_URL).count(), 1, "{wire}");
-            assert!(wire.contains("image/png"), "{wire}");
-        }
-    }
-
-    #[test]
-    fn assistant_refusal_survives_chat_history_conversion() {
-        for content in [Value::Null, json!("An alternative suggestion.")] {
-            let request: OpenAIRequest = serde_json::from_value(json!({
-                "model": "gemini-2.5-flash",
-                "messages": [
-                    {"role": "user", "content": "Previous request."},
-                    {"role": "assistant", "content": content,
-                     "refusal": "I cannot provide the requested private data."},
-                    {"role": "user", "content": "Explain that answer."}
-                ]
-            }))
-            .unwrap();
-            let (body, _, _, _) =
-                transform_openai_request(&request, "test-project", "gemini-2.5-flash", None)
-                    .unwrap();
-            let contents = body["request"]["contents"].as_array().unwrap();
-            let model_text: String = contents
-                .iter()
-                .filter(|message| message["role"] == "model")
-                .flat_map(|message| message["parts"].as_array().unwrap())
-                .filter_map(|part| part["text"].as_str())
-                .collect();
-            assert_eq!(
-                model_text
-                    .matches("I cannot provide the requested private data.")
-                    .count(),
-                1
-            );
-            if content.is_string() {
-                assert!(model_text.contains("An alternative suggestion."));
-            }
-        }
-    }
-
-    #[test]
-    fn separate_reasoning_is_never_downgraded_to_answer_text_on_responses() {
-        let msg: OpenAIMessage = serde_json::from_value(json!({"role":"assistant","content":"Visible answer","reasoning_content":"Distinct summary","thoughtSignature":"distinct-signature"})).unwrap();
-        assert_eq!(openai_history_reasoning_part(&msg, false, true), None);
-        assert_eq!(
-            openai_history_reasoning_part(&msg, true, true),
-            Some(
-                json!({"text":"Distinct summary","thought":true,"thoughtSignature":"distinct-signature"})
-            )
-        );
-        assert_eq!(
-            openai_history_reasoning_part(&msg, false, false),
-            Some(json!({"text":"Distinct summary"}))
-        );
-        assert_eq!(
-            serde_json::to_value(&msg).unwrap()["content"],
-            "Visible answer"
-        );
-    }
-}
-
-#[cfg(test)]
-mod r24_tool_choice_tests {
-    use super::*;
-
-    fn request(choice: Value) -> OpenAIRequest {
-        serde_json::from_value(json!({
-            "model":"gemini-2.5-flash", "messages":[{"role":"user","content":"Look up the answer"}],
-            "tools":[
-                {"type":"namespace","name":"fs","tools":[
-                    {"type":"function","name":"lookup","parameters":{"type":"object"}},
-                    {"type":"custom","name":"edit"}
-                ]},
-                {"type":"function","function":{"name":"delete","parameters":{"type":"object"}}}
-            ], "tool_choice":choice
-        }))
-        .unwrap()
-    }
-
-    fn mapped(choice: Value) -> Value {
-        transform_openai_request(&request(choice), "project", "gemini-2.5-flash", None)
-            .unwrap()
-            .0["request"]
-            .clone()
-    }
-
-    #[test]
-    fn r24_namespace_forced_choice_matches_final_declaration() {
-        for kind in ["function", "custom"] {
-            let name = if kind == "function" { "lookup" } else { "edit" };
-            let body = mapped(json!({"type":kind,"namespace":"fs","name":name}));
-            assert_eq!(
-                body["toolConfig"]["functionCallingConfig"],
-                json!({"mode":"ANY","allowedFunctionNames":[format!("fs__{name}")]})
-            );
-            let names: Vec<_> = body["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["functionDeclarations"][0]["name"].as_str().unwrap())
-                .collect();
-            assert!(names.contains(&format!("fs__{name}").as_str()));
-        }
-    }
-
-    #[test]
-    fn r24_allowed_tools_keep_required_auto_and_scope_on_cached_declarations() {
-        // Reuse the same tools to cover both cold and cached declaration paths.
-        for (mode, nested) in [("required", false), ("auto", true), ("required", true)] {
-            let policy =
-                json!({"mode":mode,"tools":[{"type":"function","namespace":"fs","name":"lookup"}]});
-            let choice = if nested {
-                json!({"type":"allowed_tools","allowed_tools":policy})
-            } else {
-                let mut choice = policy;
-                choice["type"] = json!("allowed_tools");
-                choice
-            };
-            let body = mapped(choice);
-            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                body["tools"][0]["functionDeclarations"][0]["name"],
-                "fs__lookup"
-            );
-            let config = &body["toolConfig"]["functionCallingConfig"];
-            assert_eq!(
-                config["mode"],
-                if mode == "required" { "ANY" } else { "AUTO" }
-            );
-            if mode == "required" {
-                assert_eq!(config["allowedFunctionNames"], json!(["fs__lookup"]));
-            } else {
-                assert!(config.get("allowedFunctionNames").is_none());
-            }
-        }
-        let body = mapped(json!("auto"));
-        assert_eq!(
-            body["tools"].as_array().unwrap().len(),
-            3,
-            "filtering must not poison cached tools"
-        );
-    }
-
-    #[test]
-    fn r24_invalid_selectors_never_generate_dangling_names() {
-        for choice in [
-            json!({"type":"function","namespace":"missing","name":"lookup"}),
-            json!({"type":"function","name":"lookup"}),
-            json!({"type":"allowed_tools","mode":"required","tools":[]}),
-            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"delete"},{"type":"function","name":"missing"}]}),
-            json!({"type":"unsupported_client_tool","name":"delete"}),
-        ] {
-            assert!(transform_openai_request(
-                &request(choice),
-                "project",
-                "gemini-2.5-flash",
-                None
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn r24_namespace_membership_keeps_mcp_names_and_excludes_prefixed_top_level_tools() {
-        let mut request = request(json!("auto"));
-        request.tools = Some(vec![
-            json!({"type":"namespace","name":"fs","tools":[{"type":"function","name":"mcp__read","parameters":{"type":"object"}}]}),
-            json!({"type":"function","name":"fs__delete","parameters":{"type":"object"}}),
-        ]);
-        for selector in [
-            json!({"type":"namespace","name":"fs"}),
-            json!({"type":"function","namespace":"fs","name":"mcp__read"}),
-        ] {
-            request.tool_choice =
-                Some(json!({"type":"allowed_tools","mode":"required","tools":[selector]}));
-            let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
-                .unwrap()
-                .0;
-            assert_eq!(body["request"]["tools"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                body["request"]["tools"][0]["functionDeclarations"][0]["name"],
-                "mcp__read"
-            );
-            assert_eq!(
-                body["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
-                json!(["mcp__read"])
-            );
-        }
-        request.tool_choice = Some(json!({"type":"function","namespace":"fs","name":"delete"}));
-        assert!(transform_openai_request(&request, "project", "gemini-2.5-flash", None).is_err());
-    }
-
-    #[test]
-    fn r24_builtin_selector_keeps_existing_usable_fallback() {
-        let mut request = request(json!({"type":"web_search_preview"}));
-        request.tools = Some(vec![json!({"type":"web_search_preview"})]);
-        let body = transform_openai_request(&request, "project", "gemini-2.5-flash", None)
-            .unwrap()
-            .0;
-        assert!(!body["request"]["contents"].as_array().unwrap().is_empty());
-        assert!(body["request"].get("toolConfig").is_none());
-    }
-
-    #[test]
-    fn r24_boolean_union_is_normalized_in_actual_tool_and_output_schemas() {
-        let schema = json!({"type":"object","properties":{"value":{"anyOf":[true,false,{"type":"integer"}]}}});
-        for field in [
-            json!({"tools":[{"type":"function","function":{"name":"accept","parameters":schema}}]}),
-            json!({"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}}),
-        ] {
-            let mut input =
-                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Answer"}]});
-            input
-                .as_object_mut()
-                .unwrap()
-                .extend(field.as_object().unwrap().clone());
-            let typed = serde_json::from_value(input).unwrap();
-            let body = transform_openai_request(&typed, "project", "gemini-2.5-flash", None)
-                .unwrap()
-                .0;
-            let schema = body
-                .pointer("/request/tools/0/functionDeclarations/0/parameters")
-                .or_else(|| body.pointer("/request/generationConfig/responseSchema"))
-                .unwrap();
-            let branches = schema["properties"]["value"]["anyOf"].as_array().unwrap();
-            assert_eq!(branches.len(), 2);
-            assert!(branches.iter().all(Value::is_object));
-        }
-    }
-}
-
-#[cfg(test)]
-mod r26_request_compat_tests {
-    use super::*;
-    use crate::proxy::mappers::{claude, gemini};
-
-    fn mapped(input: Value) -> Value {
-        let request: OpenAIRequest = serde_json::from_value(input).unwrap();
-        transform_openai_request(&request, "r26-project", "gemini-2.5-flash", None)
-            .unwrap()
-            .0
-    }
-    fn parts<'a>(body: &'a Value, key: &str) -> Vec<&'a Value> {
-        body["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|turn| turn["parts"].as_array().unwrap())
-            .filter_map(|part| part.get(key))
-            .collect()
-    }
-    fn declaration(name: &str) -> Value {
-        json!({"type":"function","function":{"name":name,"parameters":{"type":"object","properties":{"needle":{"type":"string"}},"required":["needle"]}}})
-    }
-
-    #[test]
-    fn r26_distinct_tool_ids_and_result_names_survive_the_complete_pipeline() {
-        for (first, second, expected_first) in [
-            ("call12", "call_12", "call12"),
-            ("call12", "call_13", "call_12"),
-            ("call_12", "call12", "call_12"),
-        ] {
-            let body = mapped(
-                json!({"model":"gemini-2.5-flash","tools":[declaration("read"),declaration("write")],"messages":[
-                    {"role":"user","content":"Perform both operations"},
-                    {"role":"assistant","tool_calls":[{"id":first,"type":"function","function":{"name":"read","arguments":"{\"needle\":\"READ_PATH\"}"}},{"id":second,"type":"function","function":{"name":"write","arguments":"{\"needle\":\"WRITE_PATH\"}"}}]},
-                    {"role":"tool","tool_call_id":first,"content":"READ_OUTPUT"},
-                    {"role":"tool","tool_call_id":second,"content":"WRITE_OUTPUT"},
-                    {"role":"user","content":"Summarize each operation"}
-                ]}),
-            );
-            let calls = parts(&body, "functionCall");
-            let results = parts(&body, "functionResponse");
-            assert_eq!(calls.len(), 2);
-            assert_eq!(results.len(), 2);
-            assert_eq!(calls[0]["id"], expected_first);
-            assert_ne!(calls[0]["id"], calls[1]["id"]);
-            for (index, name, output) in [(0, "read", "READ_OUTPUT"), (1, "write", "WRITE_OUTPUT")]
-            {
-                assert_eq!(results[index]["id"], calls[index]["id"]);
-                assert_eq!(results[index]["name"], name);
-                assert_eq!(results[index]["response"]["output"], output);
-            }
-        }
-    }
-
-    #[test]
-    fn r26_unambiguous_client_id_alias_still_pairs_its_result() {
-        let body = mapped(
-            json!({"model":"gemini-2.5-flash","tools":[declaration("read")],"messages":[
-                {"role":"user","content":"Read file"},
-                {"role":"assistant","tool_calls":[{"id":"call123","type":"function","function":{"name":"read","arguments":"{\"needle\":\"path\"}"}}]},
-                {"role":"tool","tool_call_id":"call_123","content":"OK"}
-            ]}),
-        );
-        assert_eq!(parts(&body, "functionCall")[0]["id"], "call_123");
-        assert_eq!(parts(&body, "functionResponse")[0]["id"], "call_123");
-        assert_eq!(parts(&body, "functionResponse")[0]["name"], "read");
-    }
-
-    #[test]
-    fn r26_literal_undefined_survives_all_request_adapters() {
-        for literal in ["[undefined]", "undefined"] {
-            let args = json!({"needle":literal});
-            let chat = mapped(
-                json!({"model":"gemini-2.5-flash","tools":[declaration("lookup")],"messages":[
-                    {"role":"user","content":literal},
-                    {"role":"assistant","tool_calls":[{"id":"call_literal","type":"function","function":{"name":"lookup","arguments":args.to_string()}}]},
-                    {"role":"tool","tool_call_id":"call_literal","content":literal}
-                ]}),
-            );
-            let native = gemini::wrapper::wrap_request(&json!({"contents":[
-                {"role":"user","parts":[{"text":literal}]},
-                {"role":"model","parts":[{"functionCall":{"id":"call_literal","name":"lookup","args":args}}]},
-                {"role":"user","parts":[{"functionResponse":{"id":"call_literal","name":"lookup","response":{"output":literal}}}]}
-            ]}), "r26-project", "gemini-2.5-flash", None, None, None).unwrap();
-            let claude_request: claude::models::ClaudeRequest = serde_json::from_value(json!({"model":"gemini-2.5-flash","max_tokens":64,"messages":[
-                {"role":"user","content":literal},
-                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_literal","name":"lookup","input":args}]},
-                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_literal","content":literal}]}
-            ]})).unwrap();
-            let anthropic = claude::transform_claude_request_in(
-                &claude_request,
-                "r26-project",
-                false,
-                None,
-                "r26-undefined",
-                None,
-            )
-            .unwrap();
-            for (route, body) in [("chat", chat), ("native", native), ("claude", anthropic)] {
-                assert_eq!(
-                    parts(&body, "functionCall")[0]["args"]["needle"],
-                    literal,
-                    "{route}: {body}"
-                );
-                assert_eq!(
-                    parts(&body, "functionResponse")[0]["response"]["output"],
-                    literal,
-                    "{route}: {body}"
-                );
-                assert!(
-                    parts(&body, "text")
-                        .iter()
-                        .any(|text| text.as_str() == Some(literal)),
-                    "{route}: {body}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn r26_legacy_declarations_choice_and_repeated_history_keep_the_tool_contract() {
-        let tool = declaration("lookup");
-        let legacy = mapped(
-            json!({"model":"gemini-2.5-flash","functions":[tool["function"]],"function_call":{"name":"lookup"},"messages":[
-                {"role":"user","content":"Look up both"},
-                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"FIRST_PATH\"}"}},
-                {"role":"function","name":"lookup","content":"FIRST_OUTPUT"},
-                {"role":"assistant","content":null,"function_call":{"name":"lookup","arguments":"{\"needle\":\"SECOND_PATH\"}"}},
-                {"role":"function","name":"lookup","content":"SECOND_OUTPUT"},
-                {"role":"user","content":"What did you find?"}
-            ]}),
-        );
-        let modern = mapped(
-            json!({"model":"gemini-2.5-flash","tools":[tool],"tool_choice":{"type":"function","function":{"name":"lookup"}},"messages":[{"role":"user","content":"Look up both"}]}),
-        );
-        assert_eq!(legacy["request"]["tools"], modern["request"]["tools"]);
-        assert_eq!(
-            legacy["request"]["toolConfig"],
-            modern["request"]["toolConfig"]
-        );
-        assert_eq!(
-            legacy["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
-            json!(["lookup"])
-        );
-        let calls = parts(&legacy, "functionCall");
-        let results = parts(&legacy, "functionResponse");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(results.len(), 2);
-        assert_ne!(calls[0]["id"], calls[1]["id"]);
-        for (index, needle, output) in [
-            (0, "FIRST_PATH", "FIRST_OUTPUT"),
-            (1, "SECOND_PATH", "SECOND_OUTPUT"),
-        ] {
-            assert_eq!(calls[index]["args"]["needle"], needle);
-            assert_eq!(results[index]["id"], calls[index]["id"]);
-            assert_eq!(results[index]["name"], "lookup");
-            assert_eq!(results[index]["response"]["output"], output);
-        }
     }
 }
