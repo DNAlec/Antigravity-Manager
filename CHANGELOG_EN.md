@@ -3,6 +3,12 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.12 (2026-11-18)**:
+        -   **[Quota accuracy] (upstream PR [#3988](https://github.com/lbjlaq/Antigravity-Manager/pull/3988), [#3989](https://github.com/lbjlaq/Antigravity-Manager/pull/3989), Ref #3987, Thanks to @vecyang1)**: Align quota polling with Daily/Sandbox inference hosts. Treat omitted remainingFraction with a valid reset time as 0%, avoiding exhausted accounts appearing fully available.
+        -   **[Prompt sanitization] (upstream PR [#3986](https://github.com/lbjlaq/Antigravity-Manager/pull/3986), Ref #3981/#3982/#3983/#3984, Thanks to @cubelikeplayDaniel, @lbjlaq)**: Sanitize the complete OpenAI payload, recognize short Codex identity declarations and improve test configuration isolation.
+        -   **[XHIGH auto-heal] (upstream PR [#3992](https://github.com/lbjlaq/Antigravity-Manager/pull/3992), Ref #3991, Thanks to @vecyang1)**: On explicit unsupported extended-thinking 400 errors, clamp to HIGH and retry once on the same account instead of incorrectly freezing the model family.
+        -   **[Integration] (Ref upstream PR #3986/#3988/#3989/#3992, Thanks to @DNAlec)**: Merge the full v5.0.4-beta.15 release, retaining Compose-only publishing and disabled upstream installation. No production configuration changes. Keep data/config backups; production 429 improvement remains unverified.
+
     *   **v5.0.11 (2026-11-17)**:
         -   **[Full upstream migration] (PR [#20](https://github.com/DNAlec/Antigravity-Manager/pull/20), Thanks to @DNAlec, @lbjlaq)**: Align application behavior with upstream v5.0.4-beta.14 (66bc8ba7); handle future client compatibility in sub2api. Retain Docker Compose publishing and disable upstream package installation.
         -   **[Prompt handling] (upstream #3981/#3982/#3983, PR #3976, Thanks to @muzisuisuisui, @cubelikeplayDaniel, @lbjlaq)**: Adopt Pi/WorkBuddy/Codex/DSH rewrites, system-prompt sideloading and rewrite scopes. Later PR #3976 changes absent from the release tag are not included.

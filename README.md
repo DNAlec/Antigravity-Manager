@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.11)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.12)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.11-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.12-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.11** (2026-11-17): Full upstream beta14 migration, prompt sideloading and account fixes (PR #20, upstream #3981/#3982/#3983). Back up configuration and data before upgrading; fork QoS/diagnostics are replaced. See [release notes](CHANGELOG_EN.md). Thanks to @DNAlec, @lbjlaq, @cubelikeplayDaniel, @muzisuisuisui, @ThermalEng, @Lucas-Qh-Lai.
+> Latest version **v5.0.12** (2026-11-18): Upstream beta15 quota accuracy, OpenAI sanitization timing and XHIGH same-account fallback fixes. PR #3986/#3988/#3989/#3992 (Thanks to @vecyang1, @cubelikeplayDaniel, @lbjlaq, @DNAlec). See [release notes](CHANGELOG_EN.md).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

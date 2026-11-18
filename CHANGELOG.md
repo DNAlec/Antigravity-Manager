@@ -3,6 +3,12 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.12 (2026-11-18)**:
+        -   **[配额准确性] (上游 PR [#3988](https://github.com/lbjlaq/Antigravity-Manager/pull/3988)、[#3989](https://github.com/lbjlaq/Antigravity-Manager/pull/3989), Ref #3987, Thanks to @vecyang1)**: 配额查询仅使用 Daily/Sandbox，与推理端点对齐；存在重置时间但省略 remainingFraction 的模型按 0% 处理，避免耗尽账号显示满额并继续被调度。
+        -   **[提示清洗] (上游 PR [#3986](https://github.com/lbjlaq/Antigravity-Manager/pull/3986), Ref #3981/#3982/#3983/#3984, Thanks to @cubelikeplayDaniel, @lbjlaq)**: 请求完整组装后再执行 OpenAI 提示词与工具描述清洗，补齐 Codex 简短身份声明匹配，并改进单测配置隔离。
+        -   **[XHIGH 自愈] (上游 PR [#3992](https://github.com/lbjlaq/Antigravity-Manager/pull/3992), Ref #3991, Thanks to @vecyang1)**: 对明确不支持扩展思考档位的 400，降至 HIGH 后同账号重试一次，避免错误冻结整个模型家族。
+        -   **[版本集成] (Ref 上游 PR #3986/#3988/#3989/#3992, Thanks to @DNAlec)**: 整版合入 v5.0.4-beta.15，保留 Compose-only 发布及禁用自动安装策略；没有改动生产配置。升级前保留数据和配置备份；真实 429 改善仍需生产验证。
+
     *   **v5.0.11 (2026-11-17)**:
         -   **[整版迁移] (PR [#20](https://github.com/DNAlec/Antigravity-Manager/pull/20), Thanks to @DNAlec, @lbjlaq)**: 应用实现对齐上游 v5.0.4-beta.14（66bc8ba7）；兼容适配后续由 sub2api 承担，保留 Docker Compose 发布和禁用上游自动安装更新的策略。
         -   **[提示词与风控] (上游 #3981/#3982/#3983、PR #3976, Thanks to @muzisuisuisui, @cubelikeplayDaniel, @lbjlaq)**: 引入 Pi/WorkBuddy/Codex/DSH 触发文本改写、系统提示侧载和规则作用范围；采用发布标签行为，不包含 #3976 尚未进入标签的后续改动。
