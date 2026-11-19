@@ -274,6 +274,7 @@ export interface StickySessionConfig {
     request_429_grace_ms?: number;
     max_spillover_accounts?: number;
     affinity_scope?: AffinityScope;
+    cache_settling_delay_ms?: number;
 }
 
 export interface ScheduledWarmupConfig {
@@ -421,5 +422,7 @@ export interface HubFingerprint {
     cl: string;
     user_agent: string;
     source: 'custom' | 'remote' | 'local' | 'baseline';
+    latest_remote_version?: string;
+    update_available?: boolean;
 }
 

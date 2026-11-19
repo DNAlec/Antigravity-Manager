@@ -3,6 +3,12 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.13 (2026-11-20)**:
+        -   **[Cache and scheduling] (Ref upstream #3994/#4000/#4002, Thanks to @lbjlaq)**: Merge beta16–18, fixing duplicate sideload injection and newline drift. Add a configurable settling window after large cold requests (default up to 1000ms; 0 disables). Prevent capacity-related high/medium oscillation and release CacheFirst bindings after exhausted retries to permit rotation.
+        -   **[Instructions and tools] (Ref upstream #3997/#4001/#3998, Thanks to @lbjlaq)**: Strengthen sideload instruction text, repair nested array schemas, update Hub baseline to 2.33.0 / CL 1023160026 and support co-calibrated local fingerprint detection.
+        -   **[Accounts and desktop] (Ref upstream #3995, PR [#3996](https://github.com/lbjlaq/Antigravity-Manager/pull/3996), Thanks to @lbjlaq, @koeria)**: Avoid account lockouts for unsupported-location errors; add manual 403 reset and appeal entry points; fix Windows lightweight-window restore deadlocks.
+        -   **[Integration and limits] (Ref upstream #4000/#4002, Thanks to @DNAlec)**: Retain Compose-only publishing and disabled upstream installation. Settling adds latency to some requests; account rotation can lose cache. No production configuration changes or automatic account unlocking. Back up data/config before upgrading; 429/cache improvements require production verification.
+
     *   **v5.0.12 (2026-11-18)**:
         -   **[Quota accuracy] (upstream PR [#3988](https://github.com/lbjlaq/Antigravity-Manager/pull/3988), [#3989](https://github.com/lbjlaq/Antigravity-Manager/pull/3989), Ref #3987, Thanks to @vecyang1)**: Align quota polling with Daily/Sandbox inference hosts. Treat omitted remainingFraction with a valid reset time as 0%, avoiding exhausted accounts appearing fully available.
         -   **[Prompt sanitization] (upstream PR [#3986](https://github.com/lbjlaq/Antigravity-Manager/pull/3986), Ref #3981/#3982/#3983/#3984, Thanks to @cubelikeplayDaniel, @lbjlaq)**: Sanitize the complete OpenAI payload, recognize short Codex identity declarations and improve test configuration isolation.

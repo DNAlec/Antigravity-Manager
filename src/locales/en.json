@@ -618,7 +618,17 @@
             "error_max_limit": "Maximum 8 tags allowed",
             "error_duplicate": "Tag already exists"
         },
-        "unfreeze_model_tooltip": "Click to unfreeze this model (clears 403 status)"
+        "unfreeze_model_tooltip": "Click to unfreeze this model (clears 403 status)",
+        "google_appeal_form": "Google Official Appeal Form",
+        "appeal_form_fallback_tip": "Upstream did not return a direct unblock link. You can submit an appeal via Google Cloud Code official appeal form for manual review.",
+        "clear_lock_title": "Restore Account to Pool (Clear False 403 / Re-probe)",
+        "clear_lock_desc": "If previously locked with 403 due to unsupported proxy location (Location not supported) or network issues, switch to a supported proxy and click to clear the lock.",
+        "clear_403_and_retry": "Clear 403 Lock & Re-probe",
+        "clearing_and_probing": "Clearing lock and probing account...",
+        "clear_forbidden_success": "403 lock cleared successfully, re-probing account...",
+        "warmup_success": "Account re-probe succeeded! Restored to active pool.",
+        "warmup_failed_warning": "Lock cleared, but probe did not fully pass. Please check your proxy node.",
+        "clear_forbidden_failed": "Failed to clear 403 status"
     },
     "settings": {
         "save": "Save Settings",
@@ -909,6 +919,8 @@
             "brew_error_brew_already_latest": "Already up to date, no upgrade needed",
             "brew_error_brew_not_supported": "Homebrew update is not supported on this platform",
             "brew_beta_notice": "Homebrew only supports stable releases. A beta release was detected, switched to native auto-updater.",
+            "brew_switch_to_native": "Switch to In-App Online Update",
+            "brew_switch_to_brew": "Switch to Homebrew Update",
             "update_check_failed": "Update check failed",
             "support_btn": "Support Author",
             "support_title": "Donation & Support",
@@ -1007,7 +1019,7 @@
             "request": {
                 "user_agent": "User-Agent Override",
                 "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",
-                "user_agent_hint": "Current Default: antigravity/hub/2.32.1 (aidev_client; os_type=windows; arch=amd64; cl=1021296516)",
+                "user_agent_hint": "Current Default: antigravity/hub/2.33.0 (aidev_client; os_type=windows; arch=amd64; cl=1023160026)",
                 "user_agent_placeholder": "Enter custom User-Agent string...",
                 "user_agent_risk_title": "Risk Warning",
                 "user_agent_risk_desc": "Custom User-Agent strings may break upstream protocol compatibility. Google Cloud Code upstream strictly enforces client fingerprint version gating on flagship reasoning models like Gemini 4 Argon. If a non-Hub signature format (such as legacy IDE antigravity/4.3.0) or an outdated version (below official latest baseline {{version}}) is configured, upstream will immediately reject requests with HTTP 404 (Requested entity was not found) and trigger a 15-minute protective circuit break for the entire account pool. If unfamiliar with upstream fingerprint requirements, please proceed with caution or keep default settings.",
@@ -1162,6 +1174,8 @@
                 "max_wait_tooltip": "Only used in 'Cache First' mode: wait instead of switching if the rate limit reset time is below this value.",
                 "request_429_grace_ms": "Request-level 429 grace wait",
                 "request_429_grace_ms_tooltip": "How long the first attempt waits in place on the current account for a request-level 429 without retryDelay; default 1500ms, range 200–10000ms.",
+                "cache_settling_delay_ms": "KV Cache Settling Delay",
+                "cache_settling_delay_ms_tooltip": "Settling grace window before sending back-to-back requests after an uncached heavy request builds a new KV cache; default 1000ms (0 to disable), range 0–5000ms.",
                 "max_spillover_accounts": "Spillover Account Cap",
                 "max_spillover_accounts_tooltip": "Maximum number of accounts allowed for concurrent traffic spillover when running multiple sub-agents or parallel sessions. Set to 0 for unlimited (all healthy accounts available); set to a positive integer (e.g. 2) to cap active accounts and prevent excessive spillover across accounts.",
                 "affinity_scope": "Affinity Scope",
@@ -1411,7 +1425,11 @@
                 "source_baseline": "Stable Baseline",
                 "detect_button": "Detect",
                 "detect_success": "Successfully detected and synced official Hub: v{{version}} (CL: {{cl}})",
+                "detect_success_local": "Successfully synced fingerprint from local official client: v{{version}} (CL: {{cl}})",
+                "detect_success_baseline": "Outbound fingerprint aligned with official stable baseline: v{{version}} (CL: {{cl}})",
+                "detect_success_newer_available": "Official Hub v{{latest}} is available (safely retaining v{{version}}; update local client and detect again to sync latest CL)",
                 "detect_failed": "Detection failed: {{error}}",
+                "banner_newer_available": "💡 Official Hub v{{latest}} is available. Update your local official client and click \"Detect\" to automatically sync the latest CL.",
                 "version_label": "Hub Version",
                 "cl_label": "Piper Build Number (CL)"
             }

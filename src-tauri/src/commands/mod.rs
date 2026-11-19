@@ -1350,11 +1350,20 @@ pub struct NativeUpdateMetadata {
     pub raw_json: serde_json::Value,
 }
 
-/// 检测 GitHub releases 更新
+/// 检测 GitHub releases 更新（支持可选显式指定更新通道）
 #[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-    modules::logger::log_info("收到前端触发的更新检查请求");
-    crate::modules::update_checker::check_for_updates().await
+pub async fn check_for_updates(
+    channel: Option<crate::modules::update_checker::UpdateChannel>,
+) -> Result<UpdateInfo, String> {
+    modules::logger::log_info(&format!(
+        "收到前端触发的更新检查请求 (channel={:?})",
+        channel
+    ));
+    if let Some(target_channel) = channel {
+        crate::modules::update_checker::check_for_updates_with_channel(target_channel).await
+    } else {
+        crate::modules::update_checker::check_for_updates().await
+    }
 }
 
 /// 基于动态通道和端点进行原生更新检查，支持预发布版 (Beta) 与正式版自动更新分离
@@ -1544,6 +1553,32 @@ pub async fn toggle_proxy_status(
     }
 
     // 5. 更新托盘菜单
+    crate::modules::tray::update_tray_menus(&app);
+
+    Ok(())
+}
+
+/// 清除账号的 403 系统锁及模型级冻结状态并同步内存池
+#[tauri::command]
+pub async fn clear_account_forbidden(
+    app: tauri::AppHandle,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<(), String> {
+    modules::logger::log_info(&format!("清除账号 403 锁定: {}", account_id));
+
+    // 1. 调用模块清除 403 系统锁
+    modules::account::clear_account_forbidden_lock(&account_id)?;
+
+    // 2. 同步清理内存池状态并重载
+    for tm in proxy_state.active_token_managers().await {
+        tm.prepare_manual_enable(&account_id);
+        tm.reload_account(&account_id)
+            .await
+            .map_err(|e| format!("同步账号失败: {}", e))?;
+    }
+
+    // 3. 更新托盘菜单
     crate::modules::tray::update_tray_menus(&app);
 
     Ok(())

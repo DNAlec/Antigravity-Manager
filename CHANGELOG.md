@@ -3,6 +3,12 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.13 (2026-11-20)**:
+        -   **[缓存与调度] (Ref 上游 #3994/#4000/#4002, Thanks to @lbjlaq)**: 整版合入 beta16–18，修复侧载重复注入及换行漂移；大型冷请求后默认增加最长 1000ms 缓存就绪等待（可配置为0关闭）；容量不足时避免 high/medium 反复切换，CacheFirst 原地重试耗尽后解绑并允许换号。
+        -   **[指令与工具] (Ref 上游 #3997/#4001/#3998, Thanks to @lbjlaq)**: 强化侧载指令提示，补全嵌套数组 Schema，Hub 基线更新到 2.33.0 / CL 1023160026，并支持同源本地指纹探测。
+        -   **[账户与桌面] (Ref 上游 #3995, PR [#3996](https://github.com/lbjlaq/Antigravity-Manager/pull/3996), Thanks to @lbjlaq, @koeria)**: 地域不支持错误不再误锁账号，加入手动清除403与申诉入口；修复 Windows 轻量模式恢复窗口死锁。
+        -   **[集成与边界] (Ref 上游 #4000/#4002, Thanks to @DNAlec)**: 保留 Compose-only 发布与禁用上游自动安装策略。缓存等待会增加部分请求延迟，换号可能损失缓存；没有改动生产配置或自动解锁账号。升级前备份数据与配置，429/缓存改善仍需生产验证。
+
     *   **v5.0.12 (2026-11-18)**:
         -   **[配额准确性] (上游 PR [#3988](https://github.com/lbjlaq/Antigravity-Manager/pull/3988)、[#3989](https://github.com/lbjlaq/Antigravity-Manager/pull/3989), Ref #3987, Thanks to @vecyang1)**: 配额查询仅使用 Daily/Sandbox，与推理端点对齐；存在重置时间但省略 remainingFraction 的模型按 0% 处理，避免耗尽账号显示满额并继续被调度。
         -   **[提示清洗] (上游 PR [#3986](https://github.com/lbjlaq/Antigravity-Manager/pull/3986), Ref #3981/#3982/#3983/#3984, Thanks to @cubelikeplayDaniel, @lbjlaq)**: 请求完整组装后再执行 OpenAI 提示词与工具描述清洗，补齐 Codex 简短身份声明匹配，并改进单测配置隔离。

@@ -529,7 +529,17 @@
         "fetching_project_id": "Obteniendo...",
         "auto_fetch_success": "Project ID obtenido con éxito: {{projectId}}",
         "auto_fetch_failed": "No se encontró ningún Project ID asociado en el origen",
-        "unfreeze_model_tooltip": "Haga clic para descongelar este modelo (elimina el estado 403)"
+        "unfreeze_model_tooltip": "Haga clic para descongelar este modelo (elimina el estado 403)",
+        "google_appeal_form": "Formulario oficial de apelación de Google",
+        "appeal_form_fallback_tip": "El upstream no devolvió un enlace directo. Puede solicitar una revisión manual a través del formulario oficial de Google Cloud Code.",
+        "clear_lock_title": "Restaurar cuenta al grupo (Limpiar falso 403 / Probar de nuevo)",
+        "clear_lock_desc": "Si se bloqueó por ubicación de proxy no admitida (Location not supported) o red, cambie a un proxy admitido y desbloquee.",
+        "clear_403_and_retry": "Limpiar bloqueo 403 y reprobar",
+        "clearing_and_probing": "Limpiando bloqueo y probando cuenta...",
+        "clear_forbidden_success": "Bloqueo 403 limpiado con éxito, probando cuenta...",
+        "warmup_success": "¡Reprueba de cuenta exitosa! Restaurada al grupo activo.",
+        "warmup_failed_warning": "Bloqueo eliminado, pero la prueba no pasó por completo. Verifique su proxy.",
+        "clear_forbidden_failed": "Error al limpiar el estado 403"
     },
     "settings": {
         "save": "Guardar Configuración",
@@ -1054,6 +1064,8 @@
                 "max_wait_tooltip": "Solo usado en modo 'Caché Primero': esperar en lugar de cambiar si el tiempo de reinicio del límite de tasa está por debajo de este valor.",
                 "request_429_grace_ms": "Espera de cortesía 429 a nivel de solicitud",
                 "request_429_grace_ms_tooltip": "Tiempo que espera el primer intento en la cuenta actual ante un 429 a nivel de solicitud sin retryDelay; por defecto 1500 ms, rango 200–10000 ms.",
+                "cache_settling_delay_ms": "Retraso anticolisión de escritura en caché KV",
+                "cache_settling_delay_ms_tooltip": "Ventana de gracia para permitir la persistencia de la caché KV del servidor upstream tras una petición pesada no almacenada; por defecto 1000 ms (0 para desactivar), rango 0–5000 ms.",
                 "max_spillover_accounts": "Límite de Cuentas de Desbordamiento",
                 "max_spillover_accounts_tooltip": "Número máximo de cuentas permitidas para desbordamiento de tráfico concurrente. 0 para ilimitado (todas las cuentas sanas); un entero positivo (ej. 2) para limitar las cuentas activas.",
                 "spillover_unlimited": "Ilimitado (Todas disponibles)",
