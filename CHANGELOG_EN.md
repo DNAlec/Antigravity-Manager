@@ -3,6 +3,11 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.14 (2026-11-20)**:
+        -   **[Thinking cache] (upstream PR [#4005](https://github.com/lbjlaq/Antigravity-Manager/pull/4005), Ref #3997, Thanks to @cubelikeplayDaniel)**: Reject degraded records without meaningful thought or tool calls; preserve existing meaningful thoughts during backfill and retain tool-only signatures.
+        -   **[Neon quota] (upstream PR #4005, Ref #3745, Thanks to @cubelikeplayDaniel)**: Add Neon model presets and quota display, retain Argon compatibility and update flagship capability detection.
+        -   **[Integration and limits] (Ref upstream PR #4005, Thanks to @DNAlec)**: Merge beta commit 17bb4a22, retaining Compose-only publishing and disabled upstream installation. Unmerged #4007 is excluded; production 429 improvement is unverified. Back up data/config before upgrading; no forced cache deletion.
+
     *   **v5.0.13 (2026-11-20)**:
         -   **[Cache and scheduling] (Ref upstream #3994/#4000/#4002, Thanks to @lbjlaq)**: Merge beta16–18, fixing duplicate sideload injection and newline drift. Add a configurable settling window after large cold requests (default up to 1000ms; 0 disables). Prevent capacity-related high/medium oscillation and release CacheFirst bindings after exhausted retries to permit rotation.
         -   **[Instructions and tools] (Ref upstream #3997/#4001/#3998, Thanks to @lbjlaq)**: Strengthen sideload instruction text, repair nested array schemas, update Hub baseline to 2.33.0 / CL 1023160026 and support co-calibrated local fingerprint detection.

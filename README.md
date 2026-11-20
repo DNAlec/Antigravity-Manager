@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v5.0.13)
+> Professional Account Management & Protocol Proxy System for AI Services (v5.0.14)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.13-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.14-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -529,7 +529,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v5.0.13** (2026-11-20): Upstream beta18 cache, capacity retry/failover, tool schema and Hub fingerprint fixes. Ref #3994/#3998/#4000/#4001/#4002, PR #3996 (Thanks to @lbjlaq, @koeria, @DNAlec). See [release notes](CHANGELOG_EN.md).
+> Latest version **v5.0.14** (2026-11-20): Merge upstream beta 17bb4a22: thinking cache protection and Neon quota support (PR #4005, Ref #3997/#3745; Thanks to @cubelikeplayDaniel, @DNAlec). See [release notes](CHANGELOG_EN.md).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

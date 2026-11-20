@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.13)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.14)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.13-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.14-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -530,7 +530,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.13**（2026-11-20）：合入上游 beta18，修复缓存、容量重试与换号、工具 Schema 及 Hub 指纹。Ref #3994/#3998/#4000/#4001/#4002，PR #3996（Thanks to @lbjlaq, @koeria, @DNAlec）。详见[发布说明](CHANGELOG.md)。
+> 最新版本 **v5.0.14**（2026-11-20）：合入上游 beta 17bb4a22，修复思考缓存污染并适配 Neon 配额（PR #4005，Ref #3997/#3745；Thanks to @cubelikeplayDaniel, @DNAlec）。详见[发布说明](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
