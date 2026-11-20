@@ -99,7 +99,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
     const modelCapabilities = useMemo(() => {
         const supported = Array.from(new Set(groupSummaries.flatMap(s => s.supportedModels || [])));
         const hasFlagship = hasAccountFlagshipCapability(account) || groupSummaries.some(s => s.key === 'argon') || supported.some(isFlagshipModel);
-        const flagshipCode = supported.map(extractGemini4Codename).find(Boolean) || (hasFlagship ? 'neon' : null);
+        const flagshipCode = supported.filter(isFlagshipModel).map(extractGemini4Codename).find(Boolean) || (hasFlagship ? 'neon' : null);
         const flagshipLabel = flagshipCode ? flagshipCode.charAt(0).toUpperCase() + flagshipCode.slice(1) : 'Neon';
         const hasClaude55 = supported.some(m => m.includes('5-5') || m.includes('5.5'));
         const hasClaude46 = supported.some(m => m.includes('4-6') || m.includes('4.6'));
