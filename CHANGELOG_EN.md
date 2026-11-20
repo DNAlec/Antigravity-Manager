@@ -7,6 +7,7 @@
         -   **[Thinking cache] (upstream PR [#4005](https://github.com/lbjlaq/Antigravity-Manager/pull/4005), Ref #3997, Thanks to @cubelikeplayDaniel)**: Reject degraded records without meaningful thought or tool calls; preserve existing meaningful thoughts during backfill and retain tool-only signatures.
         -   **[Neon quota] (upstream PR #4005, Ref #3745, Thanks to @cubelikeplayDaniel)**: Add Neon model presets and quota display, retain Argon compatibility and update flagship capability detection.
         -   **[Integration and limits] (Ref upstream PR #4005, Thanks to @DNAlec)**: Merge beta commit 17bb4a22, retaining Compose-only publishing and disabled upstream installation. Unmerged #4007 is excluded; production 429 improvement is unverified. Back up data/config before upgrading; no forced cache deletion.
+        -   **[Integration review fixes] (Ref upstream PR #4005 / #3997, Thanks to @DNAlec)**: Derive flagship badges only from flagship models, avoiding Carbon/Hydrogen labels; retain Claude-specific signature handling when preserving existing thoughts.
 
     *   **v5.0.13 (2026-11-20)**:
         -   **[Cache and scheduling] (Ref upstream #3994/#4000/#4002, Thanks to @lbjlaq)**: Merge beta16–18, fixing duplicate sideload injection and newline drift. Add a configurable settling window after large cold requests (default up to 1000ms; 0 disables). Prevent capacity-related high/medium oscillation and release CacheFirst bindings after exhausted retries to permit rotation.

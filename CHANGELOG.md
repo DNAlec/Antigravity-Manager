@@ -7,6 +7,7 @@
         -   **[思考缓存] (上游 PR [#4005](https://github.com/lbjlaq/Antigravity-Manager/pull/4005), Ref #3997, Thanks to @cubelikeplayDaniel)**: 过滤无实质思考且无工具调用的退化缓存记录；回填时保护已有有效思考，保留纯工具调用签名。
         -   **[Neon 配额] (上游 PR #4005, Ref #3745, Thanks to @cubelikeplayDaniel)**: 加入 Neon 模型预设和配额显示，兼容 Argon，更新旗舰模型能力判定。
         -   **[集成与边界] (Ref 上游 PR #4005, Thanks to @DNAlec)**: 合入 beta 分支 17bb4a22，保留 Compose-only 发布和禁止上游自动安装策略。未包含尚未合并的 #4007；未验证生产 429 改善。升级前备份数据与配置，无强制缓存清理。
+        -   **[集成复审修正] (Ref 上游 PR #4005 / #3997, Thanks to @DNAlec)**: 旗舰徽章仅从旗舰模型提取代号，避免误显示 Carbon/Hydrogen；保护已有思考的回填路径按目标模型保留 Claude 签名策略。
 
     *   **v5.0.13 (2026-11-20)**:
         -   **[缓存与调度] (Ref 上游 #3994/#4000/#4002, Thanks to @lbjlaq)**: 整版合入 beta16–18，修复侧载重复注入及换行漂移；大型冷请求后默认增加最长 1000ms 缓存就绪等待（可配置为0关闭）；容量不足时避免 high/medium 反复切换，CacheFirst 原地重试耗尽后解绑并允许换号。
