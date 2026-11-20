@@ -1045,6 +1045,9 @@ impl ThinkingStore {
 
             let existing_is_meaningful = is_meaningful_thought(&turn.existing_thought);
             let rec_is_meaningful = is_meaningful_thought(&rec.thought);
+            let is_claude_target = target_model
+                .map(|m| m.to_lowercase().contains("claude"))
+                .unwrap_or_else(|| store_key.to_lowercase().contains("claude"));
 
             // 1. 若本地记录既无实质思考又无工具调用，该记录无任何可回填内容，直接跳过
             if !rec_is_meaningful && !rec.has_tool_calls() {
@@ -1057,11 +1060,27 @@ impl ThinkingStore {
                     .iter()
                     .any(|p| p.get("functionCall").is_some() && !part_has_signature(p));
                 if has_unvalidated_function_call && rec.has_tool_calls() {
-                    let fallback = rec
-                        .signature
-                        .as_deref()
-                        .filter(|s| is_real_signature(s) && is_likely_gemini_signature(s));
-                    place_turn_signature_scoped(&mut *parts, fallback, true, Some(store_key));
+                    // Preserve the target model's signature format and anchor even
+                    // when retaining client-provided thinking (upstream PR #4005).
+                    if is_claude_target {
+                        let fallback = rec
+                            .signature
+                            .as_deref()
+                            .filter(|s| is_real_signature(s) && is_claude_signature(s));
+                        let wrapped = fallback.map(ensure_google_claude_thought_signature);
+                        place_turn_signature_scoped(
+                            &mut *parts,
+                            wrapped.as_deref(),
+                            false,
+                            Some(store_key),
+                        );
+                    } else {
+                        let fallback = rec
+                            .signature
+                            .as_deref()
+                            .filter(|s| is_real_signature(s) && is_likely_gemini_signature(s));
+                        place_turn_signature_scoped(&mut *parts, fallback, true, Some(store_key));
+                    }
                 }
                 continue;
             }
@@ -1084,10 +1103,6 @@ impl ThinkingStore {
             parts.retain(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true));
 
             let has_meaningful_thought = rec_is_meaningful;
-
-            let is_claude_target = target_model
-                .map(|m| m.to_lowercase().contains("claude"))
-                .unwrap_or_else(|| store_key.to_lowercase().contains("claude"));
 
             if has_meaningful_thought {
                 let thought_part = json!({
@@ -5857,6 +5872,57 @@ mod tests {
 
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
     }
+
+    #[test]
+    fn test_issue_3997_preserve_claude_signature_with_client_thought() {
+        use base64::Engine;
+
+        let raw_sig = base64::engine::general_purpose::STANDARD.encode(
+            b"\x12\xb2\x02\n\x92\x01\x08\x12\x10\x02\x18\x02*@claude-opus-4-6-signature-data",
+        );
+        let expected_sig = ensure_google_claude_thought_signature(&raw_sig);
+        let thought = "Client reasoning: inspect the file before deciding what to change.";
+        let store = ThinkingStore::new();
+        let key = "test_issue_3997_claude_client_thought";
+        store.record(
+            key,
+            ThinkingRecord {
+                fingerprint: "claude_fc_only".to_string(),
+                thought: String::new(),
+                signature: Some(raw_sig),
+                tool_ids: vec!["call_claude_3997".to_string()],
+                tool_names: vec!["read_file".to_string()],
+                visible: "Inspecting the file.".to_string(),
+                context_anchor: "call_claude_3997".to_string(),
+            },
+        );
+        let mut contents = vec![
+            json!({"role": "user", "parts": [{"text": "Inspect the file"}]}),
+            json!({"role": "model", "parts": [
+                {"thought": true, "text": thought},
+                {"text": "Inspecting the file."},
+                {"functionCall": {"name": "read_file", "id": "call_claude_3997", "args": {}}}
+            ]}),
+            json!({"role": "user", "parts": [
+                {"functionResponse": {"name": "read_file", "response": {"content": "hello"}}}
+            ]}),
+        ];
+
+        let restored = store.restore_gemini_contents_with_model(
+            key,
+            &mut contents,
+            Some("claude-opus-4-6-thinking"),
+        );
+
+        assert_eq!(restored, 0);
+        let parts = contents[1]["parts"].as_array().expect("model parts");
+        assert_eq!(parts[0]["text"], thought);
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], expected_sig);
+        assert!(parts[2].get("thoughtSignature").is_none());
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
+    }
 }
 
 /// 官方报文对齐回归测试：五种 part 排列下签名锚点必须与真机一致。
@@ -7009,7 +7075,7 @@ mod signature_placement_tests {
     }
 
     #[test]
-    fn test_consecutive_identical_plain_text_turns_preserve_own_signatures() {
+    fn test_consecutive_identical_visible_text_turns_preserve_own_signatures() {
         let store_key = format!("t:approval-plain-{}", uuid::Uuid::new_v4());
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&store_key);
         let store = ThinkingStore::new();
@@ -7028,6 +7094,12 @@ mod signature_placement_tests {
 
         for (anchor, sig) in [(&anchor1, &sig1), (&anchor2, &sig2), (&anchor3, &sig3)] {
             let mut acc = TurnAccumulator::with_anchor(anchor);
+            // PR #4005 excludes signature-only text records. Keep meaningful
+            // thinking while testing identical visible history and causal anchors.
+            acc.ingest_part(&json!({
+                "thought": true,
+                "text": "Review the requested execution before granting approval."
+            }));
             acc.ingest_part(&json!({
                 "text": r#"{"outcome":"allow"}"#,
                 "thoughtSignature": sig
@@ -7038,7 +7110,7 @@ mod signature_placement_tests {
         let stats = store.session_stats(&store_key).unwrap();
         assert_eq!(
             stats.0, 3,
-            "Three plain-text approval turns with identical text must not collide or overwrite"
+            "Three meaningful approval turns with identical visible text must not collide or overwrite"
         );
 
         let build_history = || {
@@ -7057,9 +7129,9 @@ mod signature_placement_tests {
         let mut warm_contents = build_history();
         let restored_warm = store.restore_gemini_contents(&store_key, &mut warm_contents);
         assert_eq!(restored_warm, 3);
-        assert_eq!(warm_contents[1]["parts"][0]["thoughtSignature"], sig1);
-        assert_eq!(warm_contents[3]["parts"][0]["thoughtSignature"], sig2);
-        assert_eq!(warm_contents[5]["parts"][0]["thoughtSignature"], sig3);
+        assert_eq!(warm_contents[1]["parts"][1]["thoughtSignature"], sig1);
+        assert_eq!(warm_contents[3]["parts"][1]["thoughtSignature"], sig2);
+        assert_eq!(warm_contents[5]["parts"][1]["thoughtSignature"], sig3);
 
         // 2. Cold L2 SQLite restore (if DB is initialized in test env)
         if crate::modules::proxy_db::load_thinking_records(&store_key)
@@ -7070,16 +7142,16 @@ mod signature_placement_tests {
             let mut cold_contents = build_history();
             let restored_cold = store.restore_gemini_contents(&store_key, &mut cold_contents);
             assert_eq!(restored_cold, 3);
-            assert_eq!(cold_contents[1]["parts"][0]["thoughtSignature"], sig1);
-            assert_eq!(cold_contents[3]["parts"][0]["thoughtSignature"], sig2);
-            assert_eq!(cold_contents[5]["parts"][0]["thoughtSignature"], sig3);
+            assert_eq!(cold_contents[1]["parts"][1]["thoughtSignature"], sig1);
+            assert_eq!(cold_contents[3]["parts"][1]["thoughtSignature"], sig2);
+            assert_eq!(cold_contents[5]["parts"][1]["thoughtSignature"], sig3);
         }
 
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&store_key);
     }
 
     #[test]
-    fn test_missing_early_identical_plain_text_turn_does_not_phase_shift_later_turns() {
+    fn test_missing_early_identical_visible_text_turn_does_not_phase_shift_later_turns() {
         let store_key = format!("t:approval-no-shift-{}", uuid::Uuid::new_v4());
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&store_key);
         let store = ThinkingStore::new();
@@ -7096,6 +7168,12 @@ mod signature_placement_tests {
         // Turn 1 was never stored; only Turn 2 and Turn 3 exist.
         for (anchor, sig) in [(&anchor2, &sig2), (&anchor3, &sig3)] {
             let mut acc = TurnAccumulator::with_anchor(anchor);
+            // PR #4005 excludes signature-only text records. Keep meaningful
+            // thinking while testing identical visible history and causal anchors.
+            acc.ingest_part(&json!({
+                "thought": true,
+                "text": "Review the requested execution before granting approval."
+            }));
             acc.ingest_part(&json!({
                 "text": r#"{"outcome":"allow"}"#,
                 "thoughtSignature": sig
@@ -7118,8 +7196,8 @@ mod signature_placement_tests {
             contents[1]["parts"][0].get("thoughtSignature").is_none(),
             "Turn 1 must not steal Turn 2's anchored signature"
         );
-        assert_eq!(contents[3]["parts"][0]["thoughtSignature"], sig2);
-        assert_eq!(contents[5]["parts"][0]["thoughtSignature"], sig3);
+        assert_eq!(contents[3]["parts"][1]["thoughtSignature"], sig2);
+        assert_eq!(contents[5]["parts"][1]["thoughtSignature"], sig3);
 
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(&store_key);
     }
