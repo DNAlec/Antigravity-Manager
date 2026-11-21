@@ -3103,9 +3103,21 @@ impl InboundThinkingPipeline {
         *body = Value::Object(reordered);
     }
 
+    /// 将标准 Gemini 请求封装为 Cloud Code 计数请求，使用路由解析后的最终模型。
+    /// 官方 Gemini CLI 将模型放在 request.model，而非顶层 model。
+    pub fn build_count_tokens_envelope(request: &Value, target_model: &str) -> Value {
+        let mut body = json!({ "request": request });
+        if let Some(request) = body.get_mut("request").and_then(Value::as_object_mut) {
+            let model = target_model.trim().trim_start_matches("models/");
+            request.insert("model".to_string(), json!(format!("models/{model}")));
+        }
+        Self::align_count_tokens_envelope(&mut body);
+        body
+    }
+
     /// 统一规范化出站 countTokens 顶层信封结构
     /// countTokens 与普通生成接口不同，Google v1internal:countTokens 顶层只允许 "request" 键，
-    /// 严禁注入 project / userAgent / model / requestId，否则上游 400 (Unknown name)
+    /// 模型必须保留在 request.model；顶层 project / userAgent / model / requestId 会被拒绝。
     pub fn align_count_tokens_envelope(body: &mut Value) {
         if let Some(inner) = body.get_mut("request") {
             if let Some(obj) = inner.as_object_mut() {
@@ -5485,6 +5497,87 @@ mod tests {
     }
 
     #[test]
+    fn test_build_count_tokens_envelope_uses_target_model() {
+        for request in [
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }] }),
+            json!({
+                "model": "models/gemini-3.8-flash-high",
+                "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+            }),
+        ] {
+            let body = InboundThinkingPipeline::build_count_tokens_envelope(
+                &request,
+                "gemini-4-argon-high",
+            );
+
+            assert_eq!(body.as_object().unwrap().len(), 1);
+            assert_eq!(body["request"]["model"], "models/gemini-4-argon-high");
+            assert_eq!(body["request"]["contents"], request["contents"]);
+        }
+    }
+
+    #[test]
+    fn test_build_count_tokens_envelope_normalizes_model_prefix() {
+        let request = json!({ "contents": [] });
+        for model in [
+            "gemini-4-argon-low",
+            "models/gemini-4-argon-low",
+            " models/models/gemini-4-argon-low ",
+        ] {
+            let body = InboundThinkingPipeline::build_count_tokens_envelope(&request, model);
+            assert_eq!(body["request"]["model"], "models/gemini-4-argon-low");
+        }
+    }
+
+    #[test]
+    fn test_build_count_tokens_envelope_preserves_multimodal_and_tool_content() {
+        let request = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Compare these images." },
+                        { "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfZ0AAAAASUVORK5CYII="
+                        } },
+                        { "fileData": {
+                            "mimeType": "image/jpeg",
+                            "fileUri": "gs://test-bucket/reference.jpg"
+                        } }
+                    ]
+                },
+                { "role": "model", "parts": [{ "functionCall": {
+                    "id": "call_lookup", "name": "lookup", "args": { "query": "图像" }
+                } }] },
+                { "role": "user", "parts": [{ "functionResponse": {
+                    "id": "call_lookup", "name": "lookup", "response": { "result": [1, 2, 3] }
+                } }] }
+            ],
+            "tools": [{ "functionDeclarations": [{
+                "name": "lookup", "parameters": { "type": "OBJECT" }
+            }] }],
+            "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } },
+            "systemInstruction": { "parts": [{ "text": "Preserve image detail." }] },
+            "generationConfig": { "thinkingConfig": { "thinkingLevel": "HIGH" } },
+            "safetySettings": [{ "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" }]
+        });
+        let original = request.clone();
+        let mut expected = request.clone();
+        expected.as_object_mut().unwrap().remove("safetySettings");
+        expected["model"] = json!("models/gemini-4-argon-high");
+
+        let mut body =
+            InboundThinkingPipeline::build_count_tokens_envelope(&request, "gemini-4-argon-high");
+        assert_eq!(body, json!({ "request": expected }));
+        assert_eq!(request, original);
+
+        // 上游传输层会再次执行信封约束，不能删除内层模型或修改内容。
+        InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
+        assert_eq!(body, json!({ "request": expected }));
+    }
+
+    #[test]
     fn test_align_count_tokens_envelope() {
         let mut body = json!({
             "project": "aicode-consumers",
@@ -5493,6 +5586,7 @@ mod tests {
             "requestId": "req_12345",
             "requestType": "agent",
             "request": {
+                "model": "models/gemini-4-argon-high",
                 "contents": [
                     {
                         "role": "user",
@@ -5519,6 +5613,7 @@ mod tests {
         // 内部 request 必须剔除 safetySettings
         let inner = body.get("request").unwrap();
         assert!(inner.get("safetySettings").is_none());
+        assert_eq!(inner["model"], "models/gemini-4-argon-high");
         assert!(inner.get("contents").is_some());
     }
 
