@@ -3,7 +3,13 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.16 (2026-11-21)**:
+        -   **[Argon image token counting] (Ref PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: Complete the v5.0.15 fix by counting `gemini-4-argon-high/medium/low` requests with the base `gemini-4-argon` resource, avoiding upstream counts equal to image file byte lengths. Generation tiers and account selection remain unchanged.
+        -   **[Compatibility and diagnostics] (Ref PR #24, Thanks to @DNAlec)**: Map only the three verified Argon tiers; preserve unknown models, other model families and unverified variants. Count responses report the actual counting model in `X-Upstream-Model`, while preserving images, history and tool content.
+        -   **Validation and upgrade**: Six focused regressions pass. Same-account direct upstream comparisons with one PNG returned 1120 for the base model and the 73294-byte file size for all three tier models; these numbers apply only to the test image. No configuration/database migration or cache cleanup is required.
+
     *   **v5.0.15 (2026-11-21)**:
+        -   **Follow-up validation**: This release did not fully fix counting for Argon tier models; v5.0.16 addresses the remaining model mapping.
         -   **[Image token counting] (PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: Include the routed model in the nested `request.model` of Gemini `countTokens`. Omitting it caused Cloud Code to return PNG file byte lengths as token counts, potentially blocking requests in clients with context limits.
         -   **[Models and content preservation] (PR #24, Thanks to @DNAlec)**: Share count-request construction, normalize the `models/` prefix and retain model aliases, thinking tiers, media and tool content. Both colon and slash count endpoints use the fix.
         -   **Validation and upgrade**: Five focused regressions pass. Same-account upstream comparisons of identical pixels with different PNG compression return 1120 after supplying the model; this is a result for the test image, not a universal estimate or billing measurement. No configuration/database migration or cache cleanup is required.

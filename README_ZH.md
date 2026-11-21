@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v5.0.15)
+> 专业级 AI 账号管理与协议代理系统 (v5.0.16)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.15-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-5.0.16-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -530,7 +530,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v5.0.15**（2026-11-21）：为 Gemini 计数请求补齐内层 `request.model`，修复图片被按文件字节数计数的问题，保留媒体和工具内容（PR #24；Thanks to @DNAlec）。详见[发布说明](CHANGELOG.md)。
+> 最新版本 **v5.0.16**（2026-11-21）：补齐 Argon 图片计数修复，将已验证的 high/medium/low 档位映射到基础计数资源，保留生成路由和请求内容（Ref PR #24；Thanks to @DNAlec）。详见[发布说明](CHANGELOG.md)。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
