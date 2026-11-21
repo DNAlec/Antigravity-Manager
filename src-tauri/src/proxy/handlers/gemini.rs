@@ -1575,17 +1575,11 @@ pub async fn execute_count_tokens(
         }
     };
 
-    // 3. 包装为 v1internal 格式
-    // [已验证] countTokens 与 generateContent 不同: 顶层只允许 "request" 键,
-    // 携带 model/project 会被上游 400 拒绝 (Unknown name "model"/"project");
-    // request 内的 safetySettings 同样不被接受 (对齐 CLIProxyAPI 的处理)
-    let mut inner_body = body.clone();
-    if let Some(obj) = inner_body.as_object_mut() {
-        obj.remove("safetySettings");
-    }
-    let wrapped_body = json!({
-        "request": inner_body,
-    });
+    // 3. 使用最终路由模型构造计数信封，模型位于 request.model。
+    let wrapped_body = crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
+        &body,
+        &config.final_model,
+    );
 
     // 4. 调用上游 v1internal:countTokens
     let call_result = match state
@@ -1673,4 +1667,57 @@ pub async fn execute_count_tokens(
         Json(json!({ "totalTokens": total_tokens })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod count_tokens_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_count_tokens_uses_final_model_after_alias_and_effort_routing() {
+        let custom_mapping = HashMap::from([
+            ("client-vision".to_string(), "gemini-4-argon".to_string()),
+            (
+                "client-vision-online".to_string(),
+                "gemini-4-argon-low-online".to_string(),
+            ),
+        ]);
+        let body = json!({
+            "model": "models/gemini-3.8-flash-high",
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+        });
+
+        for (model_name, effort, expected) in [
+            ("gemini-4-argon", None, "gemini-4-argon-high"),
+            ("client-vision", Some("low"), "gemini-4-argon-low"),
+            ("client-vision", Some("medium"), "gemini-4-argon-medium"),
+            ("client-vision", Some("high"), "gemini-4-argon-high"),
+            ("client-vision-online", None, "gemini-4-argon-low"),
+        ] {
+            let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
+                model_name,
+                &custom_mapping,
+                effort,
+            );
+            let config = crate::proxy::mappers::common_utils::resolve_request_config(
+                model_name,
+                &mapped_model,
+                &None,
+                None,
+                None,
+                None,
+                Some(&body),
+            );
+            assert_eq!(config.final_model, expected);
+
+            let wrapped =
+                crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
+                    &body,
+                    &config.final_model,
+                );
+            assert_eq!(wrapped["request"]["model"], format!("models/{expected}"));
+            assert_eq!(wrapped["request"]["contents"], body["contents"]);
+        }
+    }
 }

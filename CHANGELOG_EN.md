@@ -3,6 +3,11 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v5.0.15 (2026-11-21)**:
+        -   **[Image token counting] (PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: Include the routed model in the nested `request.model` of Gemini `countTokens`. Omitting it caused Cloud Code to return PNG file byte lengths as token counts, potentially blocking requests in clients with context limits.
+        -   **[Models and content preservation] (PR #24, Thanks to @DNAlec)**: Share count-request construction, normalize the `models/` prefix and retain model aliases, thinking tiers, media and tool content. Both colon and slash count endpoints use the fix.
+        -   **Validation and upgrade**: Five focused regressions pass. Same-account upstream comparisons of identical pixels with different PNG compression return 1120 after supplying the model; this is a result for the test image, not a universal estimate or billing measurement. No configuration/database migration or cache cleanup is required.
+
     *   **v5.0.14 (2026-11-20)**:
         -   **[Thinking cache] (upstream PR [#4005](https://github.com/lbjlaq/Antigravity-Manager/pull/4005), Ref #3997, Thanks to @cubelikeplayDaniel)**: Reject degraded records without meaningful thought or tool calls; preserve existing meaningful thoughts during backfill and retain tool-only signatures.
         -   **[Neon quota] (upstream PR #4005, Ref #3745, Thanks to @cubelikeplayDaniel)**: Add Neon model presets and quota display, retain Argon compatibility and update flagship capability detection.
