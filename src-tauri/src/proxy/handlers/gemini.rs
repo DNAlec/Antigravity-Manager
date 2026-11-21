@@ -1535,6 +1535,9 @@ pub async fn execute_count_tokens(
         None,
         Some(&body),
     );
+    let count_model = crate::proxy::pipeline::InboundThinkingPipeline::resolve_count_tokens_model(
+        &config.final_model,
+    );
 
     let anchor = SessionManager::gemini_content_anchor(&body);
     let session_scope = crate::proxy::thinking_store::SessionScope::resolve(
@@ -1567,7 +1570,7 @@ pub async fn execute_count_tokens(
                 [
                     ("X-Account-Email", "offline-estimate"),
                     ("X-Mapped-Model", mapped_model.as_str()),
-                    ("X-Upstream-Model", config.final_model.as_str()),
+                    ("X-Upstream-Model", count_model),
                 ],
                 Json(json!({ "totalTokens": local_tokens })),
             )
@@ -1575,7 +1578,7 @@ pub async fn execute_count_tokens(
         }
     };
 
-    // 3. 使用最终路由模型构造计数信封，模型位于 request.model。
+    // 3. 使用最终路由对应的计数模型构造信封，选号仍使用生成目标。
     let wrapped_body = crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
         &body,
         &config.final_model,
@@ -1606,7 +1609,7 @@ pub async fn execute_count_tokens(
                 [
                     ("X-Account-Email", email.as_str()),
                     ("X-Mapped-Model", mapped_model.as_str()),
-                    ("X-Upstream-Model", config.final_model.as_str()),
+                    ("X-Upstream-Model", count_model),
                 ],
                 Json(json!({ "totalTokens": local_tokens })),
             )
@@ -1630,7 +1633,7 @@ pub async fn execute_count_tokens(
             [
                 ("X-Account-Email", email.as_str()),
                 ("X-Mapped-Model", mapped_model.as_str()),
-                ("X-Upstream-Model", config.final_model.as_str()),
+                ("X-Upstream-Model", count_model),
             ],
             Json(json!({ "totalTokens": local_tokens })),
         )
@@ -1662,7 +1665,7 @@ pub async fn execute_count_tokens(
         [
             ("X-Account-Email", email.as_str()),
             ("X-Mapped-Model", mapped_model.as_str()),
-            ("X-Upstream-Model", config.final_model.as_str()),
+            ("X-Upstream-Model", count_model),
         ],
         Json(json!({ "totalTokens": total_tokens })),
     )
@@ -1675,25 +1678,52 @@ mod count_tokens_tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_count_tokens_uses_final_model_after_alias_and_effort_routing() {
+    fn test_count_tokens_maps_final_model_without_changing_generation_route() {
         let custom_mapping = HashMap::from([
             ("client-vision".to_string(), "gemini-4-argon".to_string()),
             (
                 "client-vision-online".to_string(),
                 "gemini-4-argon-low-online".to_string(),
             ),
+            ("client-custom".to_string(), "custom-high".to_string()),
         ]);
         let body = json!({
             "model": "models/gemini-3.8-flash-high",
             "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
         });
 
-        for (model_name, effort, expected) in [
-            ("gemini-4-argon", None, "gemini-4-argon-high"),
-            ("client-vision", Some("low"), "gemini-4-argon-low"),
-            ("client-vision", Some("medium"), "gemini-4-argon-medium"),
-            ("client-vision", Some("high"), "gemini-4-argon-high"),
-            ("client-vision-online", None, "gemini-4-argon-low"),
+        for (model_name, effort, expected_generation, expected_count) in [
+            (
+                "gemini-4-argon",
+                None,
+                "gemini-4-argon-high",
+                "gemini-4-argon",
+            ),
+            (
+                "client-vision",
+                Some("low"),
+                "gemini-4-argon-low",
+                "gemini-4-argon",
+            ),
+            (
+                "client-vision",
+                Some("medium"),
+                "gemini-4-argon-medium",
+                "gemini-4-argon",
+            ),
+            (
+                "client-vision",
+                Some("high"),
+                "gemini-4-argon-high",
+                "gemini-4-argon",
+            ),
+            (
+                "client-vision-online",
+                None,
+                "gemini-4-argon-low",
+                "gemini-4-argon",
+            ),
+            ("client-custom", None, "custom-high", "custom-high"),
         ] {
             let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
                 model_name,
@@ -1709,15 +1739,21 @@ mod count_tokens_tests {
                 None,
                 Some(&body),
             );
-            assert_eq!(config.final_model, expected);
+            assert_eq!(config.final_model, expected_generation);
+            let count_model =
+                crate::proxy::pipeline::InboundThinkingPipeline::resolve_count_tokens_model(
+                    &config.final_model,
+                );
+            assert_eq!(count_model, expected_count);
 
             let wrapped =
                 crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
                     &body,
                     &config.final_model,
                 );
-            assert_eq!(wrapped["request"]["model"], format!("models/{expected}"));
+            assert_eq!(wrapped["request"]["model"], format!("models/{count_model}"));
             assert_eq!(wrapped["request"]["contents"], body["contents"]);
+            assert_eq!(config.final_model, expected_generation);
         }
     }
 }
