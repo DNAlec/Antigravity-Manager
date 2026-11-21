@@ -3,7 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.16 (2026-11-21)**:
+        -   **[Argon 图片计数] (Ref PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: 补齐 v5.0.15 的计数模型映射：`gemini-4-argon-high/medium/low` 使用基础 `gemini-4-argon` 计数资源，避免上游仍将图片文件字节数返回为 token 数。生成档位和账号选择保持不变。
+        -   **[兼容边界与诊断] (Ref PR #24, Thanks to @DNAlec)**: 仅转换已实测的三个 Argon 档位，保留未知模型、其他模型家族及未验证变体；计数响应的 `X-Upstream-Model` 报告实际计数模型。图片、历史和工具内容保持完整。
+        -   **验证与升级**: 6 项定向回归通过。同账号、同 PNG 的直接上游对照显示基础模型计数为 1120，三个档位模型均为文件字节数 73294；该结果仅适用于测试图片。无配置或数据库迁移，无需清理缓存。
+
     *   **v5.0.15 (2026-11-21)**:
+        -   **后续验证说明**: 此版本尚未完整修复 Argon 档位模型的计数，相关遗漏由 v5.0.16 补齐。
         -   **[图片计数] (PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: Gemini `countTokens` 将路由后的目标模型写入内层 `request.model`，修复缺少模型时 Cloud Code 将 PNG 文件字节数返回为 token 数、导致客户端误判上下文超限的问题。
         -   **[模型与内容保留] (PR #24, Thanks to @DNAlec)**: 统一计数请求封装，规范 `models/` 前缀并保留模型别名、思考档位及多模态和工具内容；冒号与斜杠两个计数入口共用修复。
         -   **验证与升级**: 5 项定向回归通过。同账号、同像素不同压缩 PNG 的上游对照中，补齐模型后计数均为 1120；该结果仅适用于测试图片，不是通用固定估值或计费证明。无配置或数据库迁移，无需清理缓存。
