@@ -3,6 +3,11 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.15 (2026-11-21)**:
+        -   **[图片计数] (PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: Gemini `countTokens` 将路由后的目标模型写入内层 `request.model`，修复缺少模型时 Cloud Code 将 PNG 文件字节数返回为 token 数、导致客户端误判上下文超限的问题。
+        -   **[模型与内容保留] (PR #24, Thanks to @DNAlec)**: 统一计数请求封装，规范 `models/` 前缀并保留模型别名、思考档位及多模态和工具内容；冒号与斜杠两个计数入口共用修复。
+        -   **验证与升级**: 5 项定向回归通过。同账号、同像素不同压缩 PNG 的上游对照中，补齐模型后计数均为 1120；该结果仅适用于测试图片，不是通用固定估值或计费证明。无配置或数据库迁移，无需清理缓存。
+
     *   **v5.0.14 (2026-11-20)**:
         -   **[思考缓存] (上游 PR [#4005](https://github.com/lbjlaq/Antigravity-Manager/pull/4005), Ref #3997, Thanks to @cubelikeplayDaniel)**: 过滤无实质思考且无工具调用的退化缓存记录；回填时保护已有有效思考，保留纯工具调用签名。
         -   **[Neon 配额] (上游 PR #4005, Ref #3745, Thanks to @cubelikeplayDaniel)**: 加入 Neon 模型预设和配额显示，兼容 Argon，更新旗舰模型能力判定。
