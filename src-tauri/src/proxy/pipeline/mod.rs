@@ -9,6 +9,7 @@
 
 pub mod auto_heal;
 pub mod budget;
+pub mod count_tokens;
 pub mod errors;
 pub mod estimator;
 pub mod image;
