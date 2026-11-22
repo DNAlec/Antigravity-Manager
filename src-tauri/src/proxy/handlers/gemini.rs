@@ -1491,20 +1491,14 @@ pub async fn handle_count_tokens(
     .await
 }
 
-/// 核心 countTokens 实现：透明代理到上游 v1internal:countTokens
-///
-/// 获取有效 OAuth Token，将标准 Gemini 请求体包装为 v1internal 格式后转发，
-/// 返回真实的 token 计数，而不是硬编码的 0
+/// Gemini 协议入口；资源验证和计数统一由 pipeline 管理。
 pub async fn execute_count_tokens(
     state: AppState,
     headers: HeaderMap,
     tenant_id: Option<String>,
     model_name: String,
-    mut body: Value,
+    body: Value,
 ) -> Response {
-    // [DEFENSE] 净化 Gemini 原生请求体中的所有 inlineData (过滤或降级空数据/损坏图片)
-    crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
-
     // 1. 模型路由解析
     let thinking_cfg = body
         .get("request")
@@ -1535,10 +1529,6 @@ pub async fn execute_count_tokens(
         None,
         Some(&body),
     );
-    let count_model = crate::proxy::pipeline::InboundThinkingPipeline::resolve_count_tokens_model(
-        &config.final_model,
-    );
-
     let anchor = SessionManager::gemini_content_anchor(&body);
     let session_scope = crate::proxy::thinking_store::SessionScope::resolve(
         &headers,
@@ -1559,117 +1549,56 @@ pub async fn execute_count_tokens(
         .await
     {
         Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(
-                "[Gemini] Token acquisition failed for countTokens (error: {}), falling back to PipelineTokenEstimator",
-                e
-            );
-            let local_tokens = crate::proxy::pipeline::estimate_tokens(&body);
+        Err(_) => {
             return (
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", "offline-estimate"),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                    ("X-Upstream-Model", count_model),
-                ],
-                Json(json!({ "totalTokens": local_tokens })),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "code": 503,
+                    "status": "UNAVAILABLE",
+                    "message": "No account is available for token counting"
+                }})),
             )
                 .into_response();
         }
     };
 
-    // 3. 使用最终路由对应的计数模型构造信封，选号仍使用生成目标。
-    let wrapped_body = crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
-        &body,
-        &config.final_model,
-    );
-
-    // 4. 调用上游 v1internal:countTokens
-    let call_result = match state
+    match state
         .upstream
-        .call_v1_internal_with_headers(
-            "countTokens",
-            &access_token,
-            wrapped_body,
-            None,
-            std::collections::HashMap::new(),
-            Some(account_id.as_str()),
-        )
+        .count_tokens(&access_token, &account_id, &config.final_model, &body)
         .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                "[Gemini] Upstream call error for countTokens ({}), falling back to PipelineTokenEstimator",
-                e
-            );
-            let local_tokens = crate::proxy::pipeline::estimate_tokens(&body);
-            return (
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                    ("X-Upstream-Model", count_model),
-                ],
-                Json(json!({ "totalTokens": local_tokens })),
-            )
-                .into_response();
-        }
-    };
-
-    let response = call_result.response;
-    let status = response.status();
-
-    if !status.is_success() {
-        let err_text = response.text().await.unwrap_or_default();
-        tracing::warn!(
-            "[Gemini] Upstream countTokens error (status: {}, body: {}), falling back to PipelineTokenEstimator",
-            status,
-            err_text
-        );
-        let local_tokens = crate::proxy::pipeline::estimate_tokens(&body);
-        return (
+        Ok(result) => (
             StatusCode::OK,
             [
                 ("X-Account-Email", email.as_str()),
                 ("X-Mapped-Model", mapped_model.as_str()),
-                ("X-Upstream-Model", count_model),
+                ("X-Upstream-Model", result.model.as_str()),
+                ("X-Count-Tokens-Source", "upstream"),
+                (
+                    "X-Count-Tokens-Validation",
+                    if result.image_checked {
+                        "png-compression"
+                    } else {
+                        "response-schema"
+                    },
+                ),
             ],
-            Json(json!({ "totalTokens": local_tokens })),
+            Json(json!({ "totalTokens": result.tokens })),
         )
-            .into_response();
-    }
-
-    let gemini_resp: Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("Parse error: {}", e) })),
+            .into_response(),
+        Err(error) => {
+            let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_GATEWAY);
+            (
+                status,
+                Json(json!({"error": {
+                    "code": status.as_u16(),
+                    "status": "COUNT_TOKENS_UNAVAILABLE",
+                    "message": error.message()
+                }})),
             )
-                .into_response();
+                .into_response()
         }
-    };
-
-    // 5. 提取 totalTokens (兼容 wrapped / unwrapped 两种响应格式)
-    let total_tokens = gemini_resp
-        .get("response")
-        .and_then(|r| r.get("totalTokens"))
-        .or_else(|| gemini_resp.get("totalTokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    // 6. 返回标准 Gemini REST 响应
-    (
-        StatusCode::OK,
-        [
-            ("X-Account-Email", email.as_str()),
-            ("X-Mapped-Model", mapped_model.as_str()),
-            ("X-Upstream-Model", count_model),
-        ],
-        Json(json!({ "totalTokens": total_tokens })),
-    )
-        .into_response()
+    }
 }
 
 #[cfg(test)]
@@ -1678,7 +1607,7 @@ mod count_tokens_tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_count_tokens_maps_final_model_without_changing_generation_route() {
+    fn test_count_tokens_candidates_do_not_change_generation_route() {
         let custom_mapping = HashMap::from([
             ("client-vision".to_string(), "gemini-4-argon".to_string()),
             (
@@ -1740,18 +1669,19 @@ mod count_tokens_tests {
                 Some(&body),
             );
             assert_eq!(config.final_model, expected_generation);
-            let count_model =
-                crate::proxy::pipeline::InboundThinkingPipeline::resolve_count_tokens_model(
-                    &config.final_model,
-                );
-            assert_eq!(count_model, expected_count);
-
+            let candidates =
+                crate::proxy::pipeline::count_tokens::model_candidates(&config.final_model);
+            assert_eq!(candidates[0], config.final_model);
+            assert!(candidates.iter().any(|model| model == expected_count));
             let wrapped =
                 crate::proxy::pipeline::InboundThinkingPipeline::build_count_tokens_envelope(
                     &body,
                     &config.final_model,
                 );
-            assert_eq!(wrapped["request"]["model"], format!("models/{count_model}"));
+            assert_eq!(
+                wrapped["request"]["model"],
+                format!("models/{}", config.final_model)
+            );
             assert_eq!(wrapped["request"]["contents"], body["contents"]);
             assert_eq!(config.final_model, expected_generation);
         }

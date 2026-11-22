@@ -3150,24 +3150,13 @@ impl InboundThinkingPipeline {
         *body = Value::Object(reordered);
     }
 
-    /// 将生成路由目标转换为计数接口接受的模型；仅映射已验证的 Argon 档位。
-    /// Daily countTokens 对这些档位的图片返回文件字节数，基础模型则返回图像 token 数。
-    pub fn resolve_count_tokens_model(target_model: &str) -> &str {
-        let model = target_model.trim().trim_start_matches("models/");
-        match model {
-            "gemini-4-argon-high" | "gemini-4-argon-medium" | "gemini-4-argon-low" => {
-                "gemini-4-argon"
-            }
-            _ => model,
-        }
-    }
-
-    /// 将标准 Gemini 请求封装为 Cloud Code 计数请求，使用最终路由对应的计数模型。
+    /// 将标准或已包装的 Gemini 请求封装为 Cloud Code 计数请求。
+    /// 资源选择由共享 count_tokens 流程负责；封装层不做模型家族特判。
     /// 官方 Gemini CLI 将模型放在 request.model，而非顶层 model。
     pub fn build_count_tokens_envelope(request: &Value, target_model: &str) -> Value {
-        let mut body = json!({ "request": request });
+        let mut body = json!({ "request": request.get("request").unwrap_or(request) });
         if let Some(request) = body.get_mut("request").and_then(Value::as_object_mut) {
-            let model = Self::resolve_count_tokens_model(target_model);
+            let model = target_model.trim().trim_start_matches("models/");
             request.insert("model".to_string(), json!(format!("models/{model}")));
         }
         Self::align_count_tokens_envelope(&mut body);
@@ -5570,7 +5559,7 @@ mod tests {
             );
 
             assert_eq!(body.as_object().unwrap().len(), 1);
-            assert_eq!(body["request"]["model"], "models/gemini-4-argon");
+            assert_eq!(body["request"]["model"], "models/gemini-4-argon-high");
             assert_eq!(body["request"]["contents"], request["contents"]);
         }
     }
@@ -5584,40 +5573,18 @@ mod tests {
             " models/models/gemini-4-argon-low ",
         ] {
             let body = InboundThinkingPipeline::build_count_tokens_envelope(&request, model);
-            assert_eq!(body["request"]["model"], "models/gemini-4-argon");
+            assert_eq!(body["request"]["model"], "models/gemini-4-argon-low");
         }
     }
 
     #[test]
-    fn test_build_count_tokens_envelope_maps_only_verified_argon_tiers() {
-        let request = json!({ "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }] });
-        for model in [
-            "gemini-4-argon-high",
-            "gemini-4-argon-medium",
-            "gemini-4-argon-low",
-        ] {
-            let body = InboundThinkingPipeline::build_count_tokens_envelope(&request, model);
-            assert_eq!(body["request"]["model"], "models/gemini-4-argon");
-        }
-
-        for model in [
-            "gemini-4-argon",
-            "gemini-4-argon-xhigh",
-            "gemini-4-argon-tiered",
-            "gemini-4-argon-thinking",
-            "gemini-4-argon-high-preview",
-            "gemini-4-carbon-high",
-            "gemini-4-hydrogen-high",
-            "gemini-3.8-flash-high",
-            "gemini-3-pro-image",
-            "claude-opus-5-5-high",
-            "gpt-oss-120b-medium",
-            "custom-high",
-            "vendor/gemini-4-argon-high",
-        ] {
-            let body = InboundThinkingPipeline::build_count_tokens_envelope(&request, model);
-            assert_eq!(body["request"]["model"], format!("models/{model}"));
-        }
+    fn test_build_count_tokens_envelope_unwraps_without_changing_content() {
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]});
+        let nested = json!({"request": request, "model": "obsolete", "project": "unused"});
+        assert_eq!(
+            InboundThinkingPipeline::build_count_tokens_envelope(&nested, "future-model-high"),
+            InboundThinkingPipeline::build_count_tokens_envelope(&request, "future-model-high"),
+        );
     }
 
     #[test]
@@ -5656,7 +5623,7 @@ mod tests {
         let original = request.clone();
         let mut expected = request.clone();
         expected.as_object_mut().unwrap().remove("safetySettings");
-        expected["model"] = json!("models/gemini-4-argon");
+        expected["model"] = json!("models/gemini-4-argon-high");
 
         let mut body =
             InboundThinkingPipeline::build_count_tokens_envelope(&request, "gemini-4-argon-high");

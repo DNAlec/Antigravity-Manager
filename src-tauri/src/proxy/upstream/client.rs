@@ -730,6 +730,7 @@ pub struct UpstreamClient {
     client_cache: DashMap<String, Client>, // proxy_id -> Client
     user_agent_override: RwLock<Option<String>>,
     endpoint_health: EndpointHealthTracker,
+    count_capabilities: crate::proxy::pipeline::count_tokens::CountCapabilities,
 }
 
 impl UpstreamClient {
@@ -763,6 +764,7 @@ impl UpstreamClient {
             client_cache: DashMap::new(),
             user_agent_override: RwLock::new(None),
             endpoint_health: get_global_endpoint_health().clone(),
+            count_capabilities: Default::default(),
         }
     }
 
@@ -794,6 +796,7 @@ impl UpstreamClient {
         };
         let mut guard = self.default_client.write().await;
         *guard = new_client;
+        self.count_capabilities.clear();
         tracing::info!("UpstreamClient default_client rebuilt (upstream proxy hot-reloaded)");
     }
 
@@ -803,6 +806,7 @@ impl UpstreamClient {
     pub fn clear_client_cache(&self) {
         let size = self.client_cache.len();
         self.client_cache.clear();
+        self.count_capabilities.clear();
         if size > 0 {
             tracing::info!("UpstreamClient cleared {} cached per-proxy clients", size);
         }
@@ -2215,6 +2219,39 @@ impl UpstreamClient {
         }
     }
 
+    /// Count on one validated resource/endpoint pair. Probes and the real request
+    /// share the same account proxy and cannot silently fall through to a
+    /// different endpoint with an unverified counter.
+    pub async fn count_tokens(
+        &self,
+        access_token: &str,
+        account_id: &str,
+        target_model: &str,
+        request: &Value,
+    ) -> Result<
+        crate::proxy::pipeline::count_tokens::CountResult,
+        crate::proxy::pipeline::count_tokens::CountError,
+    > {
+        use crate::proxy::pipeline::{budget, count_tokens::CountError};
+        let deadline = budget::current_deadline().unwrap_or_else(budget::deadline_now);
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            let session = CountSession {
+                client: self.get_client(Some(account_id)).await,
+                access_token,
+                user_agent: self.get_user_agent().await,
+                deadline,
+            };
+            let endpoints = self
+                .endpoint_health
+                .get_ordered_endpoints(&V1_INTERNAL_BASE_URL_FALLBACKS);
+            self.count_capabilities
+                .count(&session, &endpoints, account_id, target_model, request)
+                .await
+        })
+        .await
+        .map_err(|_| CountError::Timeout)?
+    }
+
     /// 获取可用模型列表
     ///
     /// 获取远端模型列表，支持多端点自动 Fallback
@@ -2345,6 +2382,47 @@ impl UpstreamClient {
             "Auxiliary v1internal request failed across all endpoints (non-server fault)"
         );
         Err(final_err)
+    }
+}
+
+struct CountSession<'a> {
+    client: Client,
+    access_token: &'a str,
+    user_agent: String,
+    deadline: std::time::Instant,
+}
+
+impl crate::proxy::pipeline::count_tokens::CountTransport for CountSession<'_> {
+    async fn send(
+        &self,
+        endpoint: &str,
+        body: Value,
+    ) -> Result<Value, crate::proxy::pipeline::count_tokens::CountError> {
+        use crate::proxy::pipeline::count_tokens::CountError;
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CountError::Timeout);
+        }
+        let response = self
+            .client
+            .post(UpstreamClient::build_url(endpoint, "countTokens", None))
+            .bearer_auth(self.access_token)
+            .header("User-Agent", &self.user_agent)
+            .timeout(remaining)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| CountError::Transport)?;
+        if !response.status().is_success() {
+            // Do not expose upstream response bodies or authentication details.
+            return Err(CountError::Http(response.status().as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|_| CountError::InvalidResponse)
     }
 }
 
