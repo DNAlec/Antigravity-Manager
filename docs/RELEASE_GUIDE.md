@@ -4,6 +4,16 @@
 
 ## 本自用 fork 的发布流程（优先于下方上游说明）
 
+### 上游版本 + fork 修订号（2026-11-22 起）
+
+- 当前集成版本为 `5.0.4-beta.20-fork.1`，后续同基线修复使用 `npm run bump fork -- --skip-cargo-check`，得到 `...-fork.2`。切换上游基线必须先合并源码，再显式传入完整版本；`patch/minor/major/beta` 简写在 fork 版本下拒绝执行，避免悄悄丢失后缀。
+- 首次迁移使用 `npm run bump 5.0.4-beta.20-fork.1 -- --adopt-upstream-version --skip-cargo-check`；该选项仅允许旧独立版本进入 fork 体系，不能用于后续 fork 版本倒退。`--skip-cargo-check` 只跳过 bump 隐含的全量编译，定向验证及真正发版时的门禁仍按任务执行。
+- Fork 标签统一基于 `main`。含上游 `-beta.N` 的 fork 标签始终 `prerelease=true`，不更新任何 `latest`；基于正式上游版本的 `X.Y.Z-fork.N` 才走稳定产物。下方“所有带横线版本必须来自 beta”的规则仅适用于未带 fork 后缀的旧上游流程。
+- 旧 `5.0.16` 与新编号之间存在 SemVer 数值回退。Compose 部署必须显式指定新标签；本 fork 不发布桌面自动更新，也保留 Homebrew Cask 的上游来源。首个稳定 fork 产物将接管旧编号的 `latest`，之后重建旧编号不能覆盖 fork 产物。
+- `beta.N-fork.M` 的 beta 序号含在 SemVer 非数字标识符中，通用 SemVer 客户端跨 beta 位数比较可能不符合自然数顺序。版本工具显式比较 beta/fork 数字；预览部署始终指定完整标签，不依赖桌面自动更新排序。
+- 本次上游标签 `v5.0.4-beta.20` 指向 `9b6dfc10`（源码为 5.0.4），而 beta.20 发布说明的 PR #4014/#4015 在 `bef1b5d0`。本 fork 合并两者以匹配发布说明，未包含其后的 #4011/#4017/#4023。后续更新也必须核对标签对应的源码版本，不能仅依赖 Release 标题。
+
+
 - 自动发布仅包含 Linux AMD64 / ARM64 Docker 镜像和 Compose 附件，镜像地址为 `ghcr.io/dnalec/antigravity-manager`。两个架构均通过 Compose 启动与健康检查后，才生成版本 manifest 和 GitHub Release。
 - 发布准备、版本同步、双语说明和 main/beta 通道隔离仍遵循 AGENTS.md。推送 `v*` 标签触发 Release；手动运行时可指定已有标签，构建的代码严格来自该标签，版本必须匹配 package.json。
 - Actions 用 `GITHUB_TOKEN`（`packages: write`）推送 GHCR，不再依赖 Docker Hub secrets。私有镜像的生产拉取需 `read:packages` 凭据，或由仓库所有者将 GHCR 包设为公开。

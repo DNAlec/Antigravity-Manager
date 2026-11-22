@@ -84,8 +84,12 @@ if (!curSem) {
 // 2. 解析命令行参数
 const args = process.argv.slice(2);
 const isDryRun = args.includes('--dry-run') || process.env.npm_config_dry_run === 'true';
+const adoptUpstreamVersion = args.includes('--adopt-upstream-version');
+const skipCargoCheck = args.includes('--skip-cargo-check');
 const autoCommit = args.includes('--commit') || process.env.npm_config_commit === 'true';
 const targetArg = args.find(a => !a.startsWith('--'));
+const forkPattern = /^(?:beta\.(\d+)-)?fork\.(\d+)$/;
+const currentFork = curSem.prerelease?.match(forkPattern);
 
 if (!targetArg) {
     console.log(`
@@ -97,12 +101,15 @@ ${colors.bold}Antigravity Tools 一键打版与双版本发布工具${colors.res
   npm run bump patch           # 补丁递增 (例如 ${currentVersion} -> 正式补丁自增)
   npm run bump minor           # 次版本递增 (例如 ${currentVersion} -> X.Y.0)
   npm run bump major           # 主版本递增 (例如 ${currentVersion} -> X.0.0)
+  npm run bump fork            # 保持上游基线，仅递增 fork 修订号
   npm run bump beta            # 预发版本递增 (例如 ${currentVersion} -> X.Y.Z-beta.1)
   npm run bump <目标版本号>     # 指定任意合法版本 (支持双版本，例如 4.7.13-beta 或 4.7.13-cleaned)
 
 选项:
   --dry-run                    # 仅演练测试，不实际修改任何文件
   --commit                     # 自动执行 git commit 提交所有版本修改
+  --adopt-upstream-version     # 一次性从旧独立版本迁移至显式指定的上游+fork版本
+  --skip-cargo-check           # 仅同步版本；按任务需要另行执行定向验证
 `);
     process.exit(0);
 }
@@ -111,7 +118,18 @@ ${colors.bold}Antigravity Tools 一键打版与双版本发布工具${colors.res
 let nextSem = null;
 const normalizedTarget = targetArg.toLowerCase();
 
-if (normalizedTarget === 'patch') {
+if (currentFork && ['patch', 'minor', 'major', 'beta'].includes(normalizedTarget)) {
+    error('fork 版本请使用 bump fork；升级上游基线时请先合并对应源码，再显式指定完整版本号。');
+    process.exit(1);
+}
+
+if (normalizedTarget === 'fork') {
+    if (!currentFork) {
+        error('首次采用 fork 版本请显式指定目标版本号。');
+        process.exit(1);
+    }
+    nextSem = { ...curSem, prerelease: `${currentFork[1] ? `beta.${currentFork[1]}-` : ''}fork.${Number(currentFork[2]) + 1}` };
+} else if (normalizedTarget === 'patch') {
     if (curSem.prerelease) {
         // 当前是预发版，patch 操作默认转为同号正式版 (如 4.7.13-beta -> 4.7.13)
         nextSem = { major: curSem.major, minor: curSem.minor, patch: curSem.patch, prerelease: null };
@@ -147,7 +165,8 @@ const newVersion = nextSem.prerelease
 
 // 预发布 / 衍生版本（SemVer 2.0 预发布语义，Tag 含 '-'）仅在 CHANGELOG 留痕。
 // README 始终只反映最新正式版，详见 AGENTS.md -> Release Discipline。
-const isPrerelease = Boolean(nextSem.prerelease);
+const nextFork = nextSem.prerelease?.match(forkPattern);
+const isPrerelease = nextFork ? Boolean(nextFork[1]) : Boolean(nextSem.prerelease);
 
 // 4. 防呆校验逻辑 (支持双版本发布与预发布转正)
 function validateVersionUpgrade(next, cur) {
@@ -181,7 +200,21 @@ function validateVersionUpgrade(next, cur) {
     return { valid: false, reason: `防呆保护生效：目标版本 [${next.raw}] 不高于当前版本 [${cur.raw}]` };
 }
 
-const validation = validateVersionUpgrade({ ...nextSem, raw: newVersion }, curSem);
+if (adoptUpstreamVersion && (!nextFork || currentFork || normalizedTarget === 'fork')) {
+    error('--adopt-upstream-version 仅允许从旧版本一次性迁移到显式指定的 fork 版本。');
+    process.exit(1);
+}
+if (currentFork && nextFork && curSem.major === nextSem.major && curSem.minor === nextSem.minor && curSem.patch === nextSem.patch) {
+    const oldBeta = currentFork[1] === undefined ? Infinity : Number(currentFork[1]);
+    const newBeta = nextFork[1] === undefined ? Infinity : Number(nextFork[1]);
+    if (newBeta < oldBeta || (newBeta === oldBeta && Number(nextFork[2]) <= Number(currentFork[2]))) {
+        error('上游 beta 序号或 fork 修订号不得倒退。');
+        process.exit(1);
+    }
+}
+const validation = adoptUpstreamVersion
+    ? { valid: true, note: `显式迁移版本体系: ${currentVersion} -> ${newVersion}；旧客户端可能视作降级，部署需指定镜像标签` }
+    : validateVersionUpgrade({ ...nextSem, raw: newVersion }, curSem);
 if (!validation.valid) {
     error(`防呆保护生效: ${validation.reason}`);
     error('发版版本号绝不允许低于现有版本，防止版本回退导致更新检查死锁。');
@@ -199,7 +232,7 @@ try {
 } catch {}
 
 if (currentGitBranch) {
-    if (isPrerelease && currentGitBranch !== 'beta') {
+    if (isPrerelease && !nextFork && currentGitBranch !== 'beta') {
         warn(`当前处于分支 [${currentGitBranch}]。根据项目规程，预发布版本 (${newVersion}) 推荐在 'beta' 分支打版并发布，避免污染 'main' 分支。`);
     } else if (!isPrerelease && currentGitBranch !== 'main') {
         warn(`当前处于分支 [${currentGitBranch}]。根据项目规程，正式版本 (${newVersion}) 须在合并进入 'main' 分支后发布。`);
@@ -262,6 +295,7 @@ const TARGET_FILES = [
         ),
     },
     {
+        upstreamOnly: true,
         name: 'Casks/antigravity-tools.rb',
         relPath: 'Casks/antigravity-tools.rb',
         replace: (content) => content.replace(
@@ -346,6 +380,10 @@ const TARGET_FILES = [
 let updatedCount = 0;
 
 for (const target of TARGET_FILES) {
+    if (target.upstreamOnly && nextFork) {
+        log(`保留上游桌面安装来源: ${target.relPath} (fork 仅发布容器)`);
+        continue;
+    }
     if (target.stableOnly && isPrerelease) {
         log(`预发布版本 ${newVersion} 不写入 ${target.relPath} (README 仅反映最新正式版)。`);
         continue;
@@ -372,7 +410,7 @@ for (const target of TARGET_FILES) {
 }
 
 // 7. 若存在 cargo 环境，辅助执行 cargo check 确保依赖图完全一致
-if (!isDryRun && fs.existsSync(path.join(ROOT_DIR, 'src-tauri/Cargo.toml'))) {
+if (!isDryRun && !skipCargoCheck && fs.existsSync(path.join(ROOT_DIR, 'src-tauri/Cargo.toml'))) {
     try {
         execSync('cargo --version', { stdio: 'ignore' });
         log('执行 cargo check 校验 src-tauri/Cargo.lock 依赖图完整性...');
@@ -452,10 +490,10 @@ if (!isDryRun && autoCommit) {
 if (isPrerelease) {
     console.log(`
 ${colors.bold}${colors.green}🎉 预发布版本号已成功升级到 v${newVersion}！${colors.reset}
-${colors.cyan}【Beta 专属隔离通道】后续发版三步走:${colors.reset}
+${colors.cyan}【${nextFork ? 'Fork main 预览通道' : 'Beta 专属隔离通道'}】后续发版三步走:${colors.reset}
   1. 在 ${colors.cyan}CHANGELOG.md${colors.reset} 补充本次预发版的核心更新内容（外部贡献者以行内 (Thanks to @username) 标注）
   2. 提交发版准备: ${colors.cyan}git commit -am "chore(release): bump version to ${newVersion} and update changelog"${colors.reset}
-  3. 推送预发与标签: ${colors.cyan}git push origin beta && git tag v${newVersion} && git push origin v${newVersion}${colors.reset}
+  3. 推送预发与标签: ${colors.cyan}git push origin ${nextFork ? 'main' : 'beta'} && git tag v${newVersion} && git push origin v${newVersion}${colors.reset}
 
 ${colors.yellow}🛡️ 隔离说明: Beta 流水线构建将自动标记为 Pre-release，绝不打 Latest 标签，主用户完全不受影响。${colors.reset}
 `);

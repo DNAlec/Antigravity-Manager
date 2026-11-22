@@ -20,6 +20,8 @@
     - `npm run build` (when `src/` or frontend configs changed)
     - Rely on CI for full-app compilation (`tauri build`) and full test execution. Local pre-flight covers fmt + clippy + frontend build only. If the local host lacks the required dependencies or toolchains (e.g. MinGW windres on Windows, specific linkers, or platform libraries), skip the local check and delegate verification to the remote CI pipeline.
 - **Release Channels & Discipline**:
+  - **Fork Version Scheme (本 fork 优先规则)**: Use the upstream version plus `-fork.N`, e.g. `5.0.4-beta.20-fork.1`. Fork integration versions live on `main`; a beta upstream baseline is still a GitHub pre-release and never updates Docker/GitHub `latest`. Legacy unsuffixed stable and beta tags retain their existing channel rules below. Use `npm run bump fork` for local revisions; change the upstream baseline only after merging its source. The one-time move from the old `5.0.x` numbering uses `--adopt-upstream-version`, and deployment must use the explicit image tag because SemVer clients can consider it a downgrade.
+
   - **Release Channel Separation**:
     - **Stable Releases**: Exclusively on `main`. Deploys official production packages, updates Docker/GitHub `latest` tags, and services automatic update channels.
     - **Preview Releases (Beta)**: Exclusively on `beta`. Independently builds and publishes pre-releases (`makeLatest: false`, `prerelease: true`) without touching production update channels.

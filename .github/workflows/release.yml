@@ -49,13 +49,15 @@ jobs:
               tag="v$(jq -r .version package.json)"
             fi
           fi
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]] || { echo 'Invalid release tag'; exit 1; }
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?(-fork\.[0-9]+)?$ ]] || { echo 'Invalid release tag'; exit 1; }
           sha=$(git rev-parse --verify "refs/tags/$tag^{commit}")
           version=$(git show "$sha:package.json" | jq -r .version)
           [ "$tag" = "v$version" ] || { echo 'Tag/package version mismatch'; exit 1; }
           channel=main
           prerelease=false
           if [[ "$tag" == *-beta.* ]]; then channel=beta; prerelease=true; fi
+          # Fork integration releases live on main; upstream beta bases remain prereleases.
+          if [[ "$tag" == *-fork.* ]]; then channel=main; fi
           git merge-base --is-ancestor "$sha" "origin/$channel" || { echo "Tag is not on $channel"; exit 1; }
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           {
@@ -213,7 +215,13 @@ jobs:
                 exit 1
               fi
             fi
-            if [ -z "$latest" ] || [ "$(printf '%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -1)" = "$RELEASE_TAG" ]; then
+            # The explicit upstream+fork scheme supersedes legacy independent versions.
+            # Never let a rebuild from the legacy scheme replace a fork release.
+            if [[ "$RELEASE_TAG" == *-fork.* && "$latest" != *-fork.* ]]; then
+              make_latest=true
+            elif [[ "$latest" == *-fork.* && "$RELEASE_TAG" != *-fork.* ]]; then
+              make_latest=false
+            elif [ -z "$latest" ] || [ "$(printf '%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -1)" = "$RELEASE_TAG" ]; then
               make_latest=true
             fi
           fi
