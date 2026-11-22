@@ -9,7 +9,7 @@
         -   **[思考与统计] (PR [#4014](https://github.com/lbjlaq/Antigravity-Manager/pull/4014), [#4015](https://github.com/lbjlaq/Antigravity-Manager/pull/4015), Ref [#4012](https://github.com/lbjlaq/Antigravity-Manager/issues/4012), Thanks to @vecyang1, @cubelikeplayDaniel)**: 动态思考预算 -1 不再被当成关闭；合入缓存命中率、增量输入与成本显示修正。
         -   **[账号与 IDE] (PR [#4010](https://github.com/lbjlaq/Antigravity-Manager/pull/4010), Ref [#3995](https://github.com/lbjlaq/Antigravity-Manager/issues/3995), [#4009](https://github.com/lbjlaq/Antigravity-Manager/issues/4009), [#3842](https://github.com/lbjlaq/Antigravity-Manager/issues/3842), Thanks to @vecyang1, @lbjlaq)**: 403 恢复按钮权限与真实错误显示、手动预热确认、IDE 热切号和条款状态写入支持。
         -   **[Fork 版本体系] (Ref 上述上游 PR #4014/#4015)**: 从独立 5.0.x 迁移为上游版本加 -fork.N，同基线用 `npm run bump fork` 递增。Fork 从 main 集成，beta 基线保持预发布且不更新 latest；保留 Compose-only 发布、上游更新仅提示和已有 Argon 计数修复。旧 SemVer 客户端可能将新编号视为降级，部署必须显式指定镜像标签。
-        -   **验证与边界**: 84 项定向 Rust 测试、8 项账号状态测试、5 项版本/发布规则测试及 TypeScript 类型检查通过。未执行发版全量门禁或生产验证；IDE 跨平台热切号、真实统计口径及所有模型计数仍需运行环境验收。统一计数重构仍保留在独立功能分支，本次未并入。
+        -   **验证与边界**: 84 项定向 Rust 测试、8 项账号状态测试、5 项版本/发布规则测试及 TypeScript 类型检查通过。未进行生产验证；IDE 跨平台热切号、真实统计口径及所有模型计数仍需运行环境验收。统一计数重构仍保留在独立功能分支，本次未并入。
 
     *   **v5.0.16 (2026-11-21)**:
         -   **[Argon 图片计数] (Ref PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Thanks to @DNAlec)**: 补齐 v5.0.15 的计数模型映射：`gemini-4-argon-high/medium/low` 使用基础 `gemini-4-argon` 计数资源，避免上游仍将图片文件字节数返回为 token 数。生成档位和账号选择保持不变。
