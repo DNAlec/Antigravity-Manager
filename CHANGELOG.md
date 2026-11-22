@@ -3,6 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.4-beta.20-fork.2 (2026-11-22)**:
+        -   **[统一图片计数资源] (Ref PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Issue [#3294](https://github.com/lbjlaq/Antigravity-Manager/issues/3294), Thanks to @DNAlec)**: 合入 `codex/unified-counttokens`，移除 Argon 家族特判。Gemini 两种 countTokens 路由共用 pipeline，原模型优先，按通用档位语法生成候选资源；图片请求使用同像素、不同压缩的合成 PNG 对照后再发送完整历史，不改变生成模型或选号目标。
+        -   **[能力缓存与诊断] (Ref PR #24, Thanks to @DNAlec)**: 按账号、端点及资源缓存探测结果，限制并发、候选数和等待时间；响应头标明实际计数资源、上游来源及验证方式。完整保留图片、文件引用、工具及系统内容，支持嵌套请求信封。
+        -   **[错误语义] (Ref PR #24, Thanks to @DNAlec)**: 无可用账号、上游失败、非法计数字段或无可验证图片计数资源时返回明确错误，取消 Gemini countTokens 的静默本地估算兜底。客户端需要处理计数失败；首次图片计数可能增加探测延迟。纯文本走原模型资源；Claude 原生 count_tokens 估算器保持现状。
+        -   **验证边界**: 覆盖未来模型名、原资源优先、字节计数拒绝、缓存隔离与并发、过期、超时、限流和内容保留的定向回归；发版执行 Rust 格式检查、全目标 Clippy 与前端构建。压缩不变仅验证已知字节计数故障模式，不等同官方精确 tokenizer 基线。尚未重跑生产 43×3 矩阵或客户端端到端验收；不宣称所有模型已获官方准确计数支持。
+        -   **升级与回滚**: 无持久化配置或数据库迁移，不提示清理思考缓存；仍为 beta 预发布，不更新 latest。可回退至 `v5.0.4-beta.20-fork.1`，恢复原 Argon 局部映射与旧估算兜底。详情见 [计数设计与边界](docs/count-tokens.md)。
+
     *   **v5.0.4-beta.20-fork.1 (2026-11-22)**:
         -   **[上游基线] (PR [#4014](https://github.com/lbjlaq/Antigravity-Manager/pull/4014), [#4015](https://github.com/lbjlaq/Antigravity-Manager/pull/4015))**: 合并上游 beta.20 标签实际指向的 `9b6dfc10`，并补入 beta.20 发版提交 `bef1b5d0`。上游标签源码版本为 5.0.4，未包含发布说明中的这两项修复；本次保留两个来源的原始提交历史，未引入其后 #4011/#4017/#4023。
         -   **[协议与工具] (PR [#4007](https://github.com/lbjlaq/Antigravity-Manager/pull/4007), [#3878](https://github.com/lbjlaq/Antigravity-Manager/pull/3878), Ref [#4008](https://github.com/lbjlaq/Antigravity-Manager/issues/4008), Thanks to @cubelikeplayDaniel, @snailb1007, @lbjlaq)**: 合入截断语义与容量升档保护、纯思考空回复无假正文收尾、对象联合类型合并及自由字段保留。
