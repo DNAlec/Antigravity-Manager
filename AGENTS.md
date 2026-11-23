@@ -25,9 +25,9 @@
   - **Release Channel Separation**:
     - **Stable Releases**: Exclusively on `main`. Deploys official production packages, updates Docker/GitHub `latest` tags, and services automatic update channels.
     - **Preview Releases (Beta)**: Exclusively on `beta`. Independently builds and publishes pre-releases (`makeLatest: false`, `prerelease: true`) without touching production update channels.
-  - **Maintainer Staging Protocol**:
-    - When introducing new changes (features, major refactors, non-trivial fixes), prompt and confirm with maintainers whether to implement and test on `beta` branch first.
-    - Validate stability on `beta` (with optional independent preview builds) prior to merging into `main`.
+  - **Personal Project Development**:
+    - Start ordinary development branches from `origin/main`; beta staging is optional and does not require a separate confirmation.
+    - Follow an explicitly requested base when provided. Release channel rules still apply when publishing releases.
   - **Standard Release Workflow**:
     1. **Atomic Version Sync**: Run `npm run bump <patch|minor|beta|version>` to synchronize all project manifests and generate changelog skeletons.
     2. **Documentation & Attribution**:
@@ -44,7 +44,7 @@
     2. Set `SUGGESTION_TARGET_VERSION = '<version>'` (e.g. `'4.8.2'`).
     3. On upgrade, users with existing cache get a one-time prompt; action state persists in `gui_config.json`.
 - **Branch & History Hygiene**:
-  - Branch from remote bases (`origin/beta` for staged features, `origin/main` for direct hotfixes) rather than local branches to prevent untracked ancestor commits.
+  - Branch from remote bases (`origin/main` by default, or `origin/beta` when explicitly staging a preview) rather than local branches to prevent untracked ancestor commits.
   - Inspect in-flight PRs (`gh pr list --base main`) before rewriting published tips, avoiding force-pushes across shared branches.
   - Retain local rollback refs (`backup/*`) before history rewrites, confirming zero content drift via `git diff --stat <backup> HEAD`.
 - **PR Scope & Grouping**:
