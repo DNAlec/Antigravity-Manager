@@ -569,46 +569,18 @@ fn build_canonical_consolidated_response(
     timing_obj: serde_json::Map<String, Value>,
     usage_obj: Option<serde_json::Map<String, Value>>,
 ) -> Value {
-    // 权威网关签名回填：若当前签名为空，尝试通过工具调用ID或会话ID从网关状态机(内存 L1 / SQLite L2 DB 思考持久化)恢复
+    // Log rendering must not initiate persistence reads or wait for cache locks.
+    // Missing display-only enrichment must never compete with request hydration.
     if thinking_signature.is_empty() {
-        for tc in &tool_calls {
-            if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
-                if !call_id.is_empty() {
-                    if let Some(sig) = session_id.and_then(|sid| {
-                        crate::proxy::SignatureCache::global().get_tool_signature(sid, call_id)
-                    }) {
-                        thinking_signature = sig;
-                        break;
-                    }
-                }
-            }
-        }
-        if thinking_signature.is_empty() {
-            // 1. 优先按当前轮次的思考文本片段精准直捞专属签名
-            if !thinking_content.is_empty() {
-                let trimmed = thinking_content.trim();
-                let snippet = crate::proxy::mappers::common_utils::safe_truncate_str(trimmed, 32);
-                if let Some(sig) =
-                    crate::modules::proxy_db::lookup_signature_by_thought_snippet(snippet)
-                {
-                    thinking_signature = sig;
-                }
-            }
-
-            // 2. 兜底按会话状态机与会话数据库查找最新签名
-            if thinking_signature.is_empty() {
-                if let Some(sid) = session_id {
-                    if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_session_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    } else if let Some(sig) =
-                        crate::modules::proxy_db::lookup_latest_thinking_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    }
-                }
-            }
+        if let Some(sid) = session_id {
+            thinking_signature = crate::proxy::SignatureCache::global()
+                .peek_log_signature(
+                    sid,
+                    tool_calls
+                        .iter()
+                        .filter_map(|tc| tc.get("id").and_then(Value::as_str)),
+                )
+                .unwrap_or_default();
         }
     }
 
@@ -2127,6 +2099,57 @@ mod tests {
             .expect("forwarder did not stop after receiver closed")
             .expect("forwarder task panicked");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn log_summary_does_not_recover_a_signature_from_thinking_sqlite() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        crate::modules::proxy_db::save_thinking_record(
+            "tenant:log-summary-disk",
+            "log-fingerprint",
+            "same thought snippet",
+            Some(&"d".repeat(60)),
+            &[],
+            &[],
+            "visible",
+        )
+        .unwrap();
+        let summary = super::build_canonical_consolidated_response(
+            "same thought snippet".into(),
+            String::new(),
+            "answer".into(),
+            vec![],
+            Some("log-summary-disk"),
+            "log-test",
+            serde_json::Map::new(),
+            None,
+        );
+        assert!(summary.get("thinking_signature").is_none());
+        assert_eq!(summary["thinking"], "same thought snippet");
+        assert_eq!(summary["content"], "answer");
+    }
+
+    #[test]
+    fn log_summary_preserves_response_signature_and_cached_fallback() {
+        let sid = "log-summary-memory-only";
+        crate::proxy::SignatureCache::global().cache_session_signature(sid, "c".repeat(60), 1);
+        for (incoming, expected) in [
+            ("r".repeat(60), "r".repeat(60)),
+            (String::new(), "c".repeat(60)),
+        ] {
+            let summary = super::build_canonical_consolidated_response(
+                String::new(),
+                incoming,
+                "answer".into(),
+                vec![],
+                Some(sid),
+                "log-test",
+                serde_json::Map::new(),
+                None,
+            );
+            assert_eq!(summary["thinking_signature"], expected);
+        }
     }
 
     #[test]

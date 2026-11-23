@@ -805,6 +805,57 @@ impl SignatureCache {
         candidate_ids
     }
 
+    /// Best-effort display enrichment: never read SQLite, enqueue a touch, or wait
+    /// for a cache lock. Business resolution continues to use get_tool_signature.
+    pub fn peek_log_signature<'a>(
+        &self,
+        store_key: &str,
+        tool_use_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        use dashmap::try_result::TryResult;
+
+        if store_key.trim().is_empty() {
+            return None;
+        }
+        if let Some(pending) = PENDING_SESSION_DELETES.get() {
+            // Respect both exact and legacy suffix invalidation without waiting
+            // on a busy deletion shard. Unknown state is a display cache miss.
+            let mut key = store_key;
+            loop {
+                match pending.try_get(key) {
+                    TryResult::Present(count) if *count > 0 => return None,
+                    TryResult::Locked => return None,
+                    _ => {}
+                }
+                match key.split_once(':') {
+                    Some((_, tail)) => key = tail,
+                    None => break,
+                }
+            }
+        }
+        for tool_id in tool_use_ids {
+            for key in Self::candidate_tool_keys(store_key, tool_id) {
+                if let TryResult::Present(entry) = self.tool_signatures.try_get(&key) {
+                    if !entry.is_expired() {
+                        if let ToolSigCacheValue::Present(signature) = &entry.data {
+                            return Some(signature.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let sessions = self.session_signatures.try_lock().ok()?;
+        let entry = sessions.get(store_key)?;
+        if entry.is_expired() {
+            return None;
+        }
+        entry
+            .data
+            .values()
+            .max_by_key(|value| value.message_count)
+            .map(|value| value.signature.clone())
+    }
+
     /// Retrieve a signature for a tool_use_id inside one session store.
     pub fn get_tool_signature(&self, store_key: &str, tool_use_id: &str) -> Option<String> {
         let started = Instant::now();
@@ -1467,6 +1518,98 @@ pub fn flush_on_exit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_peek_keeps_disk_only_signatures_out_of_display_path() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let key = SignatureCache::scoped_tool_key("log-peek-disk", "call_disk").unwrap();
+        let signature = "d".repeat(60);
+        crate::modules::proxy_db::save_tool_signature(&key, &signature).unwrap();
+        let cache = SignatureCache::new();
+        assert_eq!(
+            cache.peek_log_signature("log-peek-disk", ["call_disk"]),
+            None
+        );
+        // The business resolver retains its persistent fallback.
+        assert_eq!(
+            cache.get_tool_signature("log-peek-disk", "call_disk"),
+            Some(signature.clone())
+        );
+        assert_eq!(
+            cache.peek_log_signature("log-peek-disk", ["call_disk"]),
+            Some(signature)
+        );
+    }
+
+    #[test]
+    fn log_peek_respects_session_scope_and_expiry() {
+        let cache = SignatureCache::with_persist_mode(PersistMode::MemoryOnly);
+        let signature = "m".repeat(60);
+        cache.cache_tool_signature("tenant-a:log-peek", "call_1", signature.clone());
+        cache.cache_session_signature("tenant-a:log-peek", "s".repeat(60), 1);
+        assert_eq!(
+            cache.peek_log_signature("tenant-a:log-peek", ["call_1"]),
+            Some(signature)
+        );
+        assert_eq!(
+            cache.peek_log_signature("tenant-b:log-peek", ["call_1"]),
+            None
+        );
+        assert_eq!(cache.peek_log_signature("log-peek", ["call_1"]), None);
+        let key = SignatureCache::scoped_tool_key("tenant-a:log-peek", "call_1").unwrap();
+        cache.tool_signatures.get_mut(&key).unwrap().timestamp =
+            SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        assert_eq!(
+            cache.peek_log_signature("tenant-a:log-peek", ["call_1"]),
+            Some("s".repeat(60))
+        );
+        cache
+            .session_signatures
+            .lock()
+            .unwrap()
+            .get_mut("tenant-a:log-peek")
+            .unwrap()
+            .timestamp = SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        assert_eq!(
+            cache.peek_log_signature("tenant-a:log-peek", ["call_1"]),
+            None
+        );
+    }
+
+    #[test]
+    fn log_peek_skips_pending_session_deletion() {
+        let cache = SignatureCache::with_persist_mode(PersistMode::MemoryOnly);
+        cache.cache_tool_signature("tenant:log-peek-delete", "call_1", "d".repeat(60));
+        cache.cache_session_signature("tenant:log-peek-delete", "s".repeat(60), 1);
+        mark_pending_session_delete("log-peek-delete");
+        let result = cache.peek_log_signature("tenant:log-peek-delete", ["call_1"]);
+        complete_pending_session_delete("log-peek-delete");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn log_peek_does_not_wait_for_occupied_cache_locks() {
+        let cache = SignatureCache::with_persist_mode(PersistMode::MemoryOnly);
+        cache.cache_tool_signature("log-peek-busy", "call_1", "b".repeat(60));
+        cache.cache_session_signature("log-peek-busy", "s".repeat(60), 1);
+        let key = SignatureCache::scoped_tool_key("log-peek-busy", "call_1").unwrap();
+        let tool_guard = cache.tool_signatures.get_mut(&key).unwrap();
+        let session_guard = cache.session_signatures.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(cache.peek_log_signature("log-peek-busy", ["call_1"]))
+                    .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(1));
+            // Release locks even on timeout, so a regression fails rather than hangs.
+            drop(session_guard);
+            drop(tool_guard);
+            result
+        });
+        assert_eq!(result.expect("log peek blocked on a cache lock"), None);
+    }
 
     #[test]
     fn test_tool_signature_cache() {
