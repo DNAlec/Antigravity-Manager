@@ -3,6 +3,13 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v5.0.4-beta.20-fork.3 (2026-11-23)**:
+        -   **[日志签名补全性能修复] (PR [#27](https://github.com/DNAlec/Antigravity-Manager/pull/27), Thanks to @DNAlec)**: 流式与非流式响应日志仅尝试同会话的非阻塞内存签名读取。移除展示专用的思考片段查询、会话后缀全表扫描及工具缓存未命中后的 SQLite 穿透，避免日志整理与业务思考恢复争用数据库锁。原始响应签名、正文、思考内容及业务持久化恢复保留。
+        -   **[行为代价与边界] (PR #27)**: 内存未命中、过期、正在删除或锁占用时跳过展示签名补全，因此冷启动后的部分日志摘要可能没有历史签名。日志仍正常保存，不关闭日志、不清缓存、不调整内存限额。此修复针对已确认的阻塞路径，不宣称解决全部内存/I/O 压力，也不将 countTokens 503 合并归因。
+        -   **[开发流程] (PR [#26](https://github.com/DNAlec/Antigravity-Manager/pull/26), Thanks to @DNAlec)**: 自用 fork 普通开发默认从 origin/main 新开分支，beta 暂存可选，不再重复确认；发布通道规则保留。
+        -   **验证与部署**: 6 项定向回归通过，涵盖内存/磁盘隔离、业务 SQLite 恢复、租户与过期、锁竞争、删除中、响应签名与内容保留；Hermes 独立静态复审无阻断问题。打标前执行 Rust 格式、全目标 Clippy 与前端构建；生产效果需部署后对比，真实模型生成与长期压力尚未验证。
+        -   **升级与回滚**: 无 schema/config 迁移，不提示清理思考缓存；main 上发布 beta fork 预览，不更新 latest。可回滚镜像至 v5.0.4-beta.20-fork.2，保留当前数据与新增写入；回滚会重新启用旧日志数据库补全路径。
+
     *   **v5.0.4-beta.20-fork.2 (2026-11-22)**:
         -   **[统一图片计数资源] (Ref PR [#24](https://github.com/DNAlec/Antigravity-Manager/pull/24), Issue [#3294](https://github.com/lbjlaq/Antigravity-Manager/issues/3294), Thanks to @DNAlec)**: 合入 `codex/unified-counttokens`，移除 Argon 家族特判。Gemini 两种 countTokens 路由共用 pipeline，原模型优先，按通用档位语法生成候选资源；图片请求使用同像素、不同压缩的合成 PNG 对照后再发送完整历史，不改变生成模型或选号目标。
         -   **[能力缓存与诊断] (Ref PR #24, Thanks to @DNAlec)**: 按账号、端点及资源缓存探测结果，限制并发、候选数和等待时间；响应头标明实际计数资源、上游来源及验证方式。完整保留图片、文件引用、工具及系统内容，支持嵌套请求信封。
