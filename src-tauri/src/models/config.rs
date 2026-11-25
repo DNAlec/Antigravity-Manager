@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Monotonic revision used to reject stale complete configuration snapshots.
+    #[serde(default)]
+    pub config_revision: u64,
     pub language: String,
     pub theme: String,
     pub auto_refresh: bool,
@@ -267,6 +270,7 @@ impl Default for CircuitBreakerConfig {
 impl AppConfig {
     pub fn new() -> Self {
         Self {
+            config_revision: 0,
             language: crate::modules::i18n::default_language(),
             theme: "system".to_string(),
             auto_refresh: true,

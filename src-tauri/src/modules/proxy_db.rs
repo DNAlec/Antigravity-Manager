@@ -2999,7 +2999,7 @@ mod retention_tests {
         );
         config.proxy.log_retention.max_disk_mb = 8;
         config.proxy.log_retention.max_storage_gb = 0.0;
-        crate::modules::config::save_app_config(&config).unwrap();
+        config = crate::modules::config::save_app_config_versioned(&config).unwrap();
         save_log(sample_log("old", 300_000)).unwrap();
         let conn = connect_db().unwrap();
         reclaim_space(&conn).unwrap();

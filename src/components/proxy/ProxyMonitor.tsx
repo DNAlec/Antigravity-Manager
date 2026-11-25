@@ -1,3 +1,6 @@
+import { useConfigDraft } from '../../hooks/useConfigDraft';
+import { showToast } from '../common/ToastContainer';
+import { useConfigStore } from '../../stores/useConfigStore';
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import ModalDialog from '../common/ModalDialog';
@@ -629,7 +632,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     // 日志存储与维护配置状态
     const [showLogSettings, setShowLogSettings] = useState(false);
-    const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+    const canonicalConfig = useConfigStore(state => state.config);
+    const [appConfig, setAppConfig, draftConflict, resetDraft] = useConfigDraft<AppConfig | null>(canonicalConfig, null);
     const [isSavingConfig, setIsSavingConfig] = useState(false);
     const [saveSuccess, setSaveSuccess] = useState(false);
     const [isClearCacheModalOpen, setIsClearCacheModalOpen] = useState(false);
@@ -727,17 +731,15 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             );
 
             const config = await Promise.race([
-                invoke<AppConfig>('load_config'),
+                useConfigStore.getState().loadConfig().then(() => useConfigStore.getState().config),
                 timeoutPromise
             ]) as AppConfig;
 
             if (config && config.proxy) {
-                setAppConfig(config);
                 setIsLoggingEnabled(config.proxy.enable_logging);
                 const healthLogsEnabled = !!config.proxy.capture_health_logs;
                 setCaptureHealthLogs(healthLogsEnabled);
-                await invoke('set_proxy_monitor_enabled', { enabled: config.proxy.enable_logging });
-                await invoke('set_proxy_capture_health_logs', { enabled: healthLogsEnabled });
+
             }
 
             const errorsOnly = searchFilter === '__ERROR__';
@@ -807,11 +809,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const toggleLogging = async () => {
         const newState = !isLoggingEnabled;
         try {
-            const config = await invoke<AppConfig>('load_config');
+            await useConfigStore.getState().loadConfig();
+            const config = useConfigStore.getState().config;
             if (config && config.proxy) {
-                config.proxy.enable_logging = newState;
-                await invoke('save_config', { config });
-                await invoke('set_proxy_monitor_enabled', { enabled: newState });
+                await useConfigStore.getState().updateConfig(current => ({ ...current, proxy: { ...current.proxy, enable_logging: newState } }));
                 setIsLoggingEnabled(newState);
             }
         } catch (e) {
@@ -822,11 +823,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const toggleCaptureHealthLogs = async () => {
         const newState = !captureHealthLogs;
         try {
-            const config = await invoke<AppConfig>('load_config');
+            await useConfigStore.getState().loadConfig();
+            const config = useConfigStore.getState().config;
             if (config && config.proxy) {
-                config.proxy.capture_health_logs = newState;
-                await invoke('save_config', { config });
-                await invoke('set_proxy_capture_health_logs', { enabled: newState });
+                await useConfigStore.getState().updateConfig(current => ({ ...current, proxy: { ...current.proxy, capture_health_logs: newState } }));
                 setCaptureHealthLogs(newState);
                 loadData(1, filter, accountFilter);
             }
@@ -1063,16 +1063,16 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     };
 
     const handleSaveLogSettings = async () => {
-        if (!appConfig) return;
+        if (!appConfig || draftConflict) return;
         setIsSavingConfig(true);
         try {
-            await invoke('save_config', { config: appConfig });
+            await useConfigStore.getState().saveConfig(appConfig);
             setSaveSuccess(true);
             fetchDbDiskSize();
             fetchErrorLogDiskSize();
             setTimeout(() => setSaveSuccess(false), 2000);
         } catch (e) {
-            console.error('Failed to save log settings', e);
+            showToast(`${t('common.error')}: ${e}`, 'error');
         } finally {
             setIsSavingConfig(false);
         }
@@ -1214,6 +1214,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             {/* 日志存储与维护展开配置面板 */}
             {showLogSettings && appConfig && (
                 <div className="bg-gray-50/90 dark:bg-base-200 border-b border-gray-200 dark:border-base-300 p-4 space-y-3.5 shadow-xs">
+                    {draftConflict && <div role="alert" className="text-sm text-error">
+                        <p>{t('settings.config_conflict', '配置已被其他操作修改，未保存的输入已保留。请重新加载后再编辑。')}</p>
+                        <button className="btn btn-sm" onClick={resetDraft}>{t('settings.discard_config_draft', '丢弃草稿并重新加载')}</button>
+                    </div>}
                     {/* Panel Header */}
                     <div className="flex items-center justify-between border-b border-gray-200/80 dark:border-base-200 pb-2.5">
                         <div className="flex items-center gap-2">
@@ -1228,7 +1232,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         <div className="flex items-center gap-2">
                             <button
                                 onClick={handleSaveLogSettings}
-                                disabled={isSavingConfig}
+                                disabled={isSavingConfig || !!draftConflict}
                                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-all text-white active:scale-95 ${
                                     saveSuccess
                                         ? 'bg-emerald-600 hover:bg-emerald-700'

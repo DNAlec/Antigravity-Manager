@@ -9,16 +9,7 @@ pub async fn bind_account_proxy(
     account_id: String,
     proxy_id: String,
 ) -> Result<(), String> {
-    let servers = state.active_axum_servers().await;
-    if servers.is_empty() {
-        return Err("Service not running".to_string());
-    }
-    for server in servers {
-        server
-            .proxy_pool_manager
-            .bind_account_to_proxy(account_id.clone(), proxy_id.clone())
-            .await?;
-    }
+    change_binding(&state, &account_id, Some(&proxy_id)).await?;
     Ok(())
 }
 
@@ -28,16 +19,7 @@ pub async fn unbind_account_proxy(
     state: State<'_, ProxyServiceState>,
     account_id: String,
 ) -> Result<(), String> {
-    let servers = state.active_axum_servers().await;
-    if servers.is_empty() {
-        return Err("Service not running".to_string());
-    }
-    for server in servers {
-        server
-            .proxy_pool_manager
-            .unbind_account_proxy(account_id.clone())
-            .await;
-    }
+    change_binding(&state, &account_id, None).await?;
     Ok(())
 }
 
@@ -66,4 +48,24 @@ pub async fn get_all_account_bindings(
     } else {
         Err("Service not running".to_string())
     }
+}
+
+async fn change_binding(
+    state: &ProxyServiceState,
+    account_id: &str,
+    proxy_id: Option<&str>,
+) -> Result<(), String> {
+    let _operation = crate::modules::config::lock_config_operation().await?;
+    let servers = state.active_axum_servers().await;
+    if servers.is_empty() {
+        return Err("Service not running".to_string());
+    }
+    let saved = crate::proxy::proxy_pool::persist_account_binding(account_id, proxy_id)?;
+    for server in servers {
+        server
+            .proxy_pool_manager
+            .replace_config(saved.proxy.proxy_pool.clone())
+            .await;
+    }
+    Ok(())
 }

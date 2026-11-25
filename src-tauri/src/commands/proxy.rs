@@ -119,26 +119,32 @@ pub async fn start_proxy_service(
     cf_state: State<'_, crate::commands::cloudflared::CloudflaredState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ProxyStatus, String> {
+    let _operation = crate::modules::config::lock_config_operation().await?;
+    let _ = config; // The persisted revision is authoritative, including other clients' edits.
+    let mut previous_auto_start = false;
+    let saved = crate::modules::config::update_app_config(|config| {
+        previous_auto_start = config.proxy.auto_start;
+        config.proxy.auto_start = true;
+        Ok(())
+    })?;
     let result = internal_start_proxy_service(
-        config,
+        saved.proxy,
         &state,
         crate::modules::integration::SystemManager::Desktop(app_handle),
         Arc::new(cf_state.inner().clone()),
     )
-    .await?;
-
-    // [FIX desktop] 对齐 Web/Docker admin_start_proxy_service (#1166):
-    // 持久化 auto_start = true，确保重启后自动拉起反代服务
-    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
-        app_config.proxy.auto_start = true;
-        if let Err(e) = crate::modules::config::save_app_config(&app_config) {
-            tracing::warn!("[Desktop] Failed to persist auto_start=true: {}", e);
-        } else {
-            tracing::info!("[Desktop] Persisted auto_start=true to gui_config.json");
+    .await;
+    match result {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            crate::modules::config::update_app_config(|config| {
+                config.proxy.auto_start = previous_auto_start;
+                Ok(())
+            })
+            .map_err(|rollback| format!("{error}; failed to restore auto-start: {rollback}"))?;
+            Err(error)
         }
     }
-
-    Ok(result)
 }
 
 struct StartingGuard(Arc<AtomicBool>);
@@ -241,7 +247,7 @@ pub async fn internal_start_proxy_service(
 
     // 3. 加載賬號（即使当前 0 个启用账号也完成反代状态与实例初始化，
     // 避免后续在管理界面启用/刷新账号时陷入 instance=None 的分裂状态）
-    let active_accounts = token_manager.load_accounts().await.unwrap_or(0);
+    let active_accounts = token_manager.load_accounts().await?;
 
     if active_accounts == 0 {
         tracing::warn!(
@@ -384,7 +390,25 @@ pub async fn ensure_admin_server(
 /// 停止反代服务
 #[tauri::command]
 pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(), String> {
+    let _operation = crate::modules::config::lock_config_operation().await?;
     let mut instance_lock = state.instance.write().await;
+
+    let admin_running = if instance_lock.is_none() {
+        let admin = state.admin_server.read().await;
+        match admin.as_ref() {
+            Some(admin) => *admin.axum_server.is_running.read().await,
+            None => false,
+        }
+    } else {
+        true
+    };
+    if !admin_running {
+        return Err("服务未运行".to_string());
+    }
+    crate::modules::config::update_app_config(|config| {
+        config.proxy.auto_start = false;
+        Ok(())
+    })?;
 
     // 停止 Axum 服务器 (仅逻辑停止，不杀死进程)
     if let Some(instance) = instance_lock.take() {
@@ -411,17 +435,6 @@ pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(
         };
         if !stopped_admin {
             return Err("服务未运行".to_string());
-        }
-    }
-
-    // [FIX desktop] 对齐 Web/Docker admin_stop_proxy_service (#1166):
-    // 持久化 auto_start = false，确保重启后不会自动拉起反代服务
-    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
-        app_config.proxy.auto_start = false;
-        if let Err(e) = crate::modules::config::save_app_config(&app_config) {
-            tracing::warn!("[Desktop] Failed to persist auto_start=false: {}", e);
-        } else {
-            tracing::info!("[Desktop] Persisted auto_start=false to gui_config.json");
         }
     }
 
@@ -719,18 +732,15 @@ pub async fn update_model_mapping(
     config: ProxyConfig,
     state: State<'_, ProxyServiceState>,
 ) -> Result<(), String> {
-    // 1. 如果服务正在运行，立即同步所有活跃服务器实例的内存映射
+    let _operation = crate::modules::config::lock_config_operation().await?;
+    let saved = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.custom_mapping = config.custom_mapping;
+        app_config.proxy.custom_mapping_expose = config.custom_mapping_expose;
+        Ok(())
+    })?;
     for server in state.active_axum_servers().await {
-        server.update_mapping(&config).await;
-        tracing::debug!("后端服务已接收全量模型映射配置");
+        server.update_mapping(&saved.proxy).await;
     }
-
-    // 2. 无论是否运行，都保存到全局配置持久化
-    let mut app_config = crate::modules::config::load_app_config().map_err(|e| e)?;
-    app_config.proxy.custom_mapping = config.custom_mapping;
-    app_config.proxy.custom_mapping_expose = config.custom_mapping_expose;
-    crate::modules::config::save_app_config(&app_config).map_err(|e| e)?;
-
     Ok(())
 }
 
@@ -752,12 +762,18 @@ pub async fn update_proxy_scheduling_config(
     state: State<'_, ProxyServiceState>,
     config: crate::proxy::sticky_config::StickySessionConfig,
 ) -> Result<(), String> {
+    let _operation = crate::modules::config::lock_config_operation().await?;
     let managers = state.active_token_managers().await;
     if managers.is_empty() {
         return Err("服务未运行，无法更新实时配置".to_string());
     }
+    let saved = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.scheduling = config;
+        Ok(())
+    })?;
     for tm in managers {
-        tm.update_sticky_config(config.clone()).await;
+        tm.update_sticky_config(saved.proxy.scheduling.clone())
+            .await;
     }
     Ok(())
 }
@@ -786,25 +802,20 @@ pub async fn set_preferred_account(
     state: State<'_, ProxyServiceState>,
     account_id: Option<String>,
 ) -> Result<(), String> {
+    let _operation = crate::modules::config::lock_config_operation().await?;
     let managers = state.active_token_managers().await;
     if managers.is_empty() {
         return Err("服务未运行".to_string());
     }
-
-    // 过滤空字符串为 None
     let cleaned_id = account_id.filter(|s| !s.trim().is_empty());
-
-    // 1. 更新内存状态
+    let saved = crate::modules::config::update_app_config(|config| {
+        config.proxy.preferred_account_id = cleaned_id.clone();
+        Ok(())
+    })?;
     for tm in managers {
-        tm.set_preferred_account(cleaned_id.clone()).await;
+        tm.set_preferred_account(saved.proxy.preferred_account_id.clone())
+            .await;
     }
-
-    // 2. 持久化到配置文件 (修复 Issue #820 自动关闭问题)
-    let mut app_config =
-        crate::modules::config::load_app_config().map_err(|e| format!("加载配置失败: {}", e))?;
-    app_config.proxy.preferred_account_id = cleaned_id.clone();
-    crate::modules::config::save_app_config(&app_config)
-        .map_err(|e| format!("保存配置失败: {}", e))?;
 
     if let Some(ref id) = cleaned_id {
         tracing::info!(

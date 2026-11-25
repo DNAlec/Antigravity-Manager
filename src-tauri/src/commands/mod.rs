@@ -533,7 +533,8 @@ pub async fn save_config(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     mut config: AppConfig,
-) -> Result<(), String> {
+) -> Result<AppConfig, String> {
+    let _operation = modules::config::lock_config_operation().await?;
     // 确保保存的 User-Agent 满足最低版本要求 (>= 4.3.0) 避免上游拒绝
     if let Some(ref ua) = config.proxy.user_agent_override {
         config.proxy.user_agent_override = Some(crate::constants::sanitize_egress_user_agent(ua));
@@ -542,7 +543,7 @@ pub async fn save_config(
         config.proxy.saved_user_agent = Some(crate::constants::sanitize_egress_user_agent(ua));
     }
 
-    modules::save_app_config(&config)?;
+    let config = modules::config::save_app_config_versioned(&config)?;
 
     crate::modules::logger::set_internal_error_log_budget_bytes(
         config.proxy.internal_error_log_retention.budget_bytes(),
@@ -593,6 +594,7 @@ pub async fn save_config(
     let monitor_lock = proxy_state.monitor.read().await;
     if let Some(monitor) = monitor_lock.as_ref() {
         monitor.set_capture_health_logs(config.proxy.capture_health_logs);
+        monitor.set_enabled(config.proxy.enable_logging);
     }
 
     // 热更新正在运行的服务
@@ -654,10 +656,7 @@ pub async fn save_config(
             .axum_server
             .update_qos_auto_jail(config.proxy.qos_auto_jail);
         // 更新熔断配置
-        instance
-            .token_manager
-            .update_circuit_breaker_config(config.circuit_breaker.clone())
-            .await;
+        instance.token_manager.apply_config(&config).await;
         tracing::debug!("已同步热更新反代服务配置");
     }
 
@@ -685,15 +684,11 @@ pub async fn save_config(
         admin
             .axum_server
             .update_qos_auto_jail(config.proxy.qos_auto_jail);
-        admin
-            .axum_server
-            .token_manager
-            .update_circuit_breaker_config(config.circuit_breaker.clone())
-            .await;
+        admin.axum_server.token_manager.apply_config(&config).await;
         tracing::debug!("已同步热更新管理服务器 (Admin Server) 配置");
     }
 
-    Ok(())
+    Ok(config)
 }
 
 // --- OAuth 命令 ---
@@ -1533,14 +1528,15 @@ pub async fn toggle_proxy_status(
         if !enable {
             let pref_id = tm.get_preferred_account().await;
             if pref_id.as_deref() == Some(&account_id) {
-                tm.set_preferred_account(None).await;
-
-                if let Ok(mut cfg) = crate::modules::config::load_app_config() {
+                let _operation = modules::config::lock_config_operation().await?;
+                let saved = modules::config::update_app_config(|cfg| {
                     if cfg.proxy.preferred_account_id.as_deref() == Some(&account_id) {
                         cfg.proxy.preferred_account_id = None;
-                        let _ = crate::modules::config::save_app_config(&cfg);
                     }
-                }
+                    Ok(())
+                })?;
+                tm.set_preferred_account(saved.proxy.preferred_account_id)
+                    .await;
             }
         } else {
             // 手动重新启用时，清理遗留 QoS 隔离/失败计数/模型临时熔断/内存限流锁定

@@ -20,6 +20,7 @@ interface TimeoutSettingsProps {
     uploadConfig?: UploadTimeoutConfig;
     onStreamChange: (config: StreamTimeoutConfig) => void;
     onUploadChange: (config: UploadTimeoutConfig) => void;
+    onReset: (stream: StreamTimeoutConfig, upload: UploadTimeoutConfig) => Promise<void>;
     onSave?: () => Promise<void> | void;
 }
 
@@ -67,6 +68,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
     onStreamChange,
     onUploadChange,
     onSave,
+    onReset,
 }) => {
     const { t } = useTranslation();
     const [isSaving, setIsSaving] = useState(false);
@@ -280,7 +282,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         return Math.round(transferSecs * currentExtraFactor());
     };
 
-    const handleResetDefaults = () => {
+    const handleResetDefaults = async () => {
         setUploadRaw({
             connect_secs: String(DEFAULT_UPLOAD.connect_secs),
             min_upload_mbps: String(DEFAULT_UPLOAD.min_upload_mbps),
@@ -294,9 +296,10 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             transition_secs: String(DEFAULT_STREAM.transition_secs),
             streaming_sliding_secs: String(DEFAULT_STREAM.streaming_sliding_secs),
         });
-        onUploadChange({ ...DEFAULT_UPLOAD });
-        onStreamChange({ ...DEFAULT_STREAM });
-        showToast(t("proxy.upload_timeouts.toast_reset", { defaultValue: "已恢复超时默认值" }), "info");
+        try {
+            await onReset({ ...DEFAULT_STREAM }, { ...DEFAULT_UPLOAD, header_wait_secs: uploadConfig?.header_wait_secs });
+            showToast(t("proxy.upload_timeouts.toast_reset", { defaultValue: "已恢复超时默认值" }), "info");
+        } catch (error) { showToast(String(error), 'error'); }
     };
 
     const handleSave = async () => {

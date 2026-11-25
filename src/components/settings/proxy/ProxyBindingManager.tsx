@@ -5,6 +5,7 @@ import { X, RefreshCw, Link2, Unlink } from 'lucide-react';
 import { request } from '../../../utils/request';
 import { showToast } from '../../common/ToastContainer';
 import { useAccountStore } from '../../../stores/useAccountStore';
+import { useConfigStore } from '../../../stores/useConfigStore';
 import { ProxyEntry } from '../../../types/config';
 
 interface ProxyBindingManagerProps {
@@ -16,9 +17,9 @@ interface ProxyBindingManagerProps {
 export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyBindingManagerProps) {
     const { t } = useTranslation();
     const { accounts, fetchAccounts } = useAccountStore();
-    const [bindings, setBindings] = useState<Record<string, string>>({});
+    const bindings = useConfigStore(state => state.config?.proxy.proxy_pool?.account_bindings) || {};
     const [isLoading, setIsLoading] = useState(false);
-    const [isSaving, setIsSaving] = useState<string | null>(null);
+    const [savingIds, setSavingIds] = useState<Set<string>>(new Set());
 
     // Filter enabled proxies for selection
     const availableProxies = proxies.filter(p => p.enabled);
@@ -33,8 +34,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
         setIsLoading(true);
         try {
             await fetchAccounts();
-            const currentBindings = await request<Record<string, string>>('get_all_account_bindings');
-            setBindings(currentBindings || {});
+            await useConfigStore.getState().loadConfig();
         } catch (error) {
             console.error('Failed to load bindings:', error);
             showToast(t('settings.proxy_pool.binding.load_failed', 'Failed to load bindings'), 'error');
@@ -44,26 +44,16 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
     };
 
     const handleBind = async (accountId: string, proxyId: string) => {
-        setIsSaving(accountId);
+        setSavingIds(ids => new Set(ids).add(accountId));
         try {
-            if (proxyId === '') {
-                // Unbind
-                await request('unbind_account_proxy', { accountId });
-                const newBindings = { ...bindings };
-                delete newBindings[accountId];
-                setBindings(newBindings);
-                showToast(t('settings.proxy_pool.binding.unbind_success', 'Unbound successfully'), 'success');
-            } else {
-                // Bind
-                await request('bind_account_proxy', { accountId, proxyId });
-                setBindings({ ...bindings, [accountId]: proxyId });
-                showToast(t('settings.proxy_pool.binding.bind_success', 'Bound successfully'), 'success');
-            }
+            await useConfigStore.getState().mutateConfig(() => proxyId
+                ? request('bind_account_proxy', { accountId, proxyId })
+                : request('unbind_account_proxy', { accountId }));
+            showToast(t(proxyId ? 'settings.proxy_pool.binding.bind_success' : 'settings.proxy_pool.binding.unbind_success'), 'success');
         } catch (error) {
-            console.error('Failed to update binding:', error);
-            showToast(t('settings.proxy_pool.binding.update_failed', 'Failed to update binding'), 'error');
+            showToast(`${t('settings.proxy_pool.binding.update_failed')}: ${error}`, 'error');
         } finally {
-            setIsSaving(null);
+            setSavingIds(ids => { const next = new Set(ids); next.delete(accountId); return next; });
         }
     };
 
@@ -121,7 +111,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                                             <select
                                                 value={currentProxyId}
                                                 onChange={(e) => handleBind(account.id, e.target.value)}
-                                                disabled={isSaving === account.id}
+                                                disabled={savingIds.has(account.id)}
                                                 className={`w-full appearance-none pl-3 pr-8 py-2 border rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white transition-colors
                                                     ${bindings[account.id]
                                                         ? 'border-blue-300 dark:border-blue-700 ring-1 ring-blue-100 dark:ring-blue-900/20'
@@ -138,7 +128,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                                                 </optgroup>
                                             </select>
                                             <div className="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none text-gray-500">
-                                                {isSaving === account.id ? (
+                                                {savingIds.has(account.id) ? (
                                                     <div className="animate-spin h-4 w-4 border-2 border-gray-500 border-t-transparent rounded-full" />
                                                 ) : (
                                                     bindings[account.id] ? <Link2 size={16} className="text-blue-500" /> : <Unlink size={16} className="opacity-50" />

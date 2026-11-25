@@ -38,13 +38,10 @@ pub async fn toggle_auto_launch(app: tauri::AppHandle, enable: bool) -> Result<(
         let _ = app;
     }
 
-    // 同步将开机自启状态持久化到 app_config，确保系统配置与自启项保持原子一致
-    if let Ok(mut config) = crate::modules::config::load_app_config() {
-        if config.auto_launch != enable {
-            config.auto_launch = enable;
-            let _ = crate::modules::config::save_app_config(&config);
-        }
-    }
+    crate::modules::config::update_app_config(|config| {
+        config.auto_launch = enable;
+        Ok(())
+    })?;
 
     Ok(())
 }

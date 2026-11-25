@@ -230,10 +230,7 @@ function App() {
         const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
         document.documentElement.classList.toggle('dark', isDark);
         document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
-        const current = useConfigStore.getState().config;
-        if (current) {
-          useConfigStore.setState({ config: { ...current, theme } });
-        }
+        void useConfigStore.getState().loadConfig();
       })
     );
 
@@ -245,10 +242,7 @@ function App() {
         const normalized = normalizeLanguageCode(lang);
         i18n.changeLanguage(normalized);
         document.documentElement.dir = normalized === 'ar' ? 'rtl' : 'ltr';
-        const current = useConfigStore.getState().config;
-        if (current) {
-          useConfigStore.setState({ config: { ...current, language: normalized } });
-        }
+        void useConfigStore.getState().loadConfig();
       })
     );
 

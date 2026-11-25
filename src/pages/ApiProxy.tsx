@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef, startTransition } from 're
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../utils/request';
 import { isTauri } from '../utils/env';
+import { useConfigStore } from '../stores/useConfigStore';
 import { copyToClipboard } from '../utils/clipboard';
 import { inferModelGroup } from '../config/modelConfig';
 import {
@@ -180,7 +181,7 @@ export default function ApiProxy() {
         active_accounts: 0,
     });
 
-    const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+    const appConfig = useConfigStore(state => state.config);
     const [activeMenuTab, setActiveMenuTab] = useState<'settings' | 'models' | 'guard' | 'cli' | 'protocols'>('settings');
     const [configLoading, setConfigLoading] = useState(true);
     const [configError, setConfigError] = useState<string | null>(null);
@@ -518,7 +519,7 @@ export default function ApiProxy() {
                             port: appConfig.proxy.port || 8045
                         }
                     };
-                    saveConfig(newConfig);
+                    await reportSave(useConfigStore.getState().updateConfig(current => ({ ...current, cloudflared: newConfig.cloudflared })));
                 }
             } else {
                 const status = await invoke<typeof cfStatus>('cloudflared_stop');
@@ -534,7 +535,7 @@ export default function ApiProxy() {
                             enabled: false
                         }
                     };
-                    saveConfig(newConfig);
+                    await reportSave(useConfigStore.getState().updateConfig(current => ({ ...current, cloudflared: newConfig.cloudflared })));
                 }
             }
         } catch (error) {
@@ -569,7 +570,7 @@ export default function ApiProxy() {
     const handleSetPreferredAccount = async (accountId: string | null) => {
         try {
             const wasEnabled = preferredAccountId !== null;
-            await invoke('set_preferred_account', { accountId });
+            await updateProxyConfig({ preferred_account_id: accountId ?? undefined });
             setPreferredAccountId(accountId);
 
             // Determine appropriate message
@@ -598,9 +599,10 @@ export default function ApiProxy() {
         setConfigLoading(true);
         setConfigError(null);
         try {
-            const config = await invoke<AppConfig>('load_config');
+            await useConfigStore.getState().loadConfig();
+            const { config, error } = useConfigStore.getState();
+            if (error) throw new Error(error);
             if (config && typeof config === 'object' && config.proxy) {
-                setAppConfig(config);
 
                 // 恢复 Cloudflared 持久化状态
                 if (config.cloudflared) {
@@ -635,30 +637,18 @@ export default function ApiProxy() {
     };
 
 
-    const saveConfig = async (newConfig: AppConfig) => {
-        // 1. 立即更新 UI 状态，确保流畅
-        setAppConfig(newConfig);
-        try {
-            await invoke('save_config', { config: newConfig });
-        } catch (error) {
-            console.error('保存配置失败:', error);
-            showToast(`${t('common.error')}: ${error}`, 'error');
-        }
+    const reportSave = (promise: Promise<void>): Promise<void> => {
+        void promise.catch(error => showToast(`${t('common.error')}: ${error}`, 'error'));
+        return promise;
     };
 
+    const saveConfig = (config: AppConfig) => reportSave(useConfigStore.getState().saveConfig(config));
+
     const handleSaveProxySettings = async () => {
-        if (!appConfig) return;
-        try {
-            await invoke('save_config', { config: appConfig });
-            const refreshed = await invoke<AppConfig>('load_config');
-            if (refreshed) {
-                setAppConfig(refreshed);
-            }
-            showToast(t('common.saved'), 'success');
-        } catch (error) {
-            console.error('保存配置失败:', error);
-            showToast(`${t('common.error')}: ${error}`, 'error');
-        }
+        const current = useConfigStore.getState().config;
+        if (!current) throw new Error('Configuration has not loaded');
+        await saveConfig(current);
+        showToast(t('common.saved'), 'success');
     };
 
     const handleRunUaSandboxTest = async (overrideUa?: string, modelToTest?: string) => {
@@ -667,25 +657,12 @@ export default function ApiProxy() {
         setUaSandboxTesting(true);
         setUaSandboxResult(null);
 
-        // 1. 如果传入了特定 UA，先热更新到配置并同步至服务端
-        if (appConfig && overrideUa !== undefined) {
-            updateProxyConfig({
-                user_agent_override: overrideUa,
-                saved_user_agent: overrideUa
-            });
+        if (overrideUa !== undefined) {
             try {
-                await invoke('save_config', {
-                    config: {
-                        ...appConfig,
-                        proxy: {
-                            ...appConfig.proxy,
-                            user_agent_override: overrideUa,
-                            saved_user_agent: overrideUa
-                        }
-                    }
-                });
-            } catch (e) {
-                console.error('Failed to sync UA config before test:', e);
+                await updateProxyConfig({ user_agent_override: overrideUa, saved_user_agent: overrideUa });
+            } catch {
+                setUaSandboxTesting(false);
+                return;
             }
         }
 
@@ -786,8 +763,7 @@ export default function ApiProxy() {
         newConfig.custom_mapping_expose = newExpose;
 
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateProxyConfig({ custom_mapping: newConfig.custom_mapping, custom_mapping_expose: newConfig.custom_mapping_expose });
             console.log('[DEBUG] Mapping updated successfully');
             showToast(t('common.saved'), 'success');
         } catch (error) {
@@ -813,8 +789,7 @@ export default function ApiProxy() {
         };
 
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateProxyConfig({ custom_mapping: newConfig.custom_mapping, custom_mapping_expose: newConfig.custom_mapping_expose });
             showToast(t('common.saved'), 'success');
         } catch (error) {
             console.error('Failed to toggle expose:', error);
@@ -851,8 +826,7 @@ export default function ApiProxy() {
         };
 
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateProxyConfig({ custom_mapping: newConfig.custom_mapping, custom_mapping_expose: newConfig.custom_mapping_expose });
             showToast(t('common.success'), 'success');
         } catch (error) {
             console.error('Failed to reset mapping:', error);
@@ -1010,22 +984,20 @@ export default function ApiProxy() {
         };
 
         // 备份旧配置用于回滚
-        const oldConfig = { ...appConfig };
 
         try {
             // 1. 乐观更新：立即更新 UI
-            setAppConfig({ ...appConfig, proxy: newConfig });
-            showToast(t('proxy.router.presets_applied') + ` (${selectedPresetData.name})`, 'success');
+
 
             // 2. 后台异步保存
-            await invoke('update_model_mapping', { config: newConfig });
+            await updateProxyConfig({ custom_mapping: newConfig.custom_mapping, custom_mapping_expose: newConfig.custom_mapping_expose });
+            showToast(t('proxy.router.presets_applied') + ` (${selectedPresetData.name})`, 'success');
 
             // 3. 重新加载配置以确保一致性
             await loadConfig();
         } catch (error) {
             console.error('Failed to apply presets:', error);
             // 3. 失败回滚
-            setAppConfig(oldConfig);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
@@ -1038,65 +1010,35 @@ export default function ApiProxy() {
         delete newExpose[key];
         const newConfig = { ...appConfig.proxy, custom_mapping: newCustom, custom_mapping_expose: newExpose };
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateProxyConfig({ custom_mapping: newConfig.custom_mapping, custom_mapping_expose: newConfig.custom_mapping_expose });
         } catch (error) {
             console.error('Failed to remove custom mapping:', error);
         }
     };
 
-    const updateProxyConfig = (updates: Partial<ProxyConfig>) => {
-        if (!appConfig) return;
-        const newConfig = {
-            ...appConfig,
-            proxy: {
-                ...appConfig.proxy,
-                ...updates
-            }
-        };
-        saveConfig(newConfig);
-    };
+    const updateProxyConfig = (updates: Partial<ProxyConfig>): Promise<void> =>
+        reportSave(useConfigStore.getState().updateConfig(current => ({
+            ...current, proxy: { ...current.proxy, ...updates },
+        })));
 
-    const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
-        if (!appConfig) return;
-        const currentScheduling = appConfig.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 };
-        const newScheduling = { ...currentScheduling, ...updates };
+    const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) =>
+        reportSave(useConfigStore.getState().updateConfig(current => ({
+            ...current,
+            proxy: { ...current.proxy, scheduling: {
+                ...(current.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 }), ...updates,
+            } },
+        })));
 
-        const newAppConfig = {
-            ...appConfig,
-            proxy: {
-                ...appConfig.proxy,
-                scheduling: newScheduling
-            }
-        };
-        saveConfig(newAppConfig);
-    };
+    const updateExperimentalConfig = (updates: Partial<ExperimentalConfig>) =>
+        reportSave(useConfigStore.getState().updateConfig(current => ({
+            ...current,
+            proxy: { ...current.proxy, experimental: {
+                ...(current.proxy.experimental || { enable_usage_scaling: false }), ...updates,
+            } },
+        })));
 
-    const updateExperimentalConfig = (updates: Partial<ExperimentalConfig>) => {
-        if (!appConfig) return;
-        const newConfig = {
-            ...appConfig,
-            proxy: {
-                ...appConfig.proxy,
-                experimental: {
-                    ...(appConfig.proxy.experimental || {
-                        enable_usage_scaling: false,
-                    }),
-                    ...updates
-                }
-            }
-        };
-        saveConfig(newConfig);
-    };
-
-    const updateCircuitBreakerConfig = (newBreakerConfig: CircuitBreakerConfig) => {
-        if (!appConfig) return;
-        const newConfig = {
-            ...appConfig,
-            circuit_breaker: newBreakerConfig
-        };
-        saveConfig(newConfig);
-    };
+    const updateCircuitBreakerConfig = (circuit_breaker: CircuitBreakerConfig) =>
+        reportSave(useConfigStore.getState().updateConfig(current => ({ ...current, circuit_breaker })));
 
     const handleClearSessionBindings = () => {
         setIsClearBindingsConfirmOpen(true);
@@ -1132,30 +1074,9 @@ export default function ApiProxy() {
         if (!appConfig) return;
         setLoading(true);
         try {
-            if (status.running) {
-                await invoke('stop_proxy_service');
-                const newConfig = {
-                    ...appConfig,
-                    proxy: {
-                        ...appConfig.proxy,
-                        auto_start: false
-                    }
-                };
-                setAppConfig(newConfig);
-                await invoke('save_config', { config: newConfig });
-            } else {
-                const newConfig = {
-                    ...appConfig,
-                    proxy: {
-                        ...appConfig.proxy,
-                        auto_start: true
-                    }
-                };
-                setAppConfig(newConfig);
-                await invoke('save_config', { config: newConfig });
-                // 使用当前的 appConfig.proxy 启动
-                await invoke('start_proxy_service', { config: newConfig.proxy });
-            }
+            await useConfigStore.getState().mutateConfig(() => status.running
+                ? invoke('stop_proxy_service')
+                : invoke('start_proxy_service', { config: useConfigStore.getState().config!.proxy }));
             await loadStatus();
         } catch (error: any) {
             showToast(t('proxy.dialog.operate_failed', { error: error.toString() }), 'error');
@@ -1172,7 +1093,7 @@ export default function ApiProxy() {
         setIsRegenerateKeyConfirmOpen(false);
         try {
             const newKey = await invoke<string>('generate_api_key');
-            updateProxyConfig({ api_key: newKey });
+            await updateProxyConfig({ api_key: newKey });
             showToast(t('common.success'), 'success');
         } catch (error: any) {
             console.error('生成 API Key 失败:', error);
@@ -1200,12 +1121,12 @@ export default function ApiProxy() {
         setIsEditingApiKey(true);
     };
 
-    const handleSaveApiKey = () => {
+    const handleSaveApiKey = async () => {
         if (!validateApiKey(tempApiKey)) {
             showToast(t('proxy.config.api_key_invalid'), 'error');
             return;
         }
-        updateProxyConfig({ api_key: tempApiKey });
+        try { await updateProxyConfig({ api_key: tempApiKey }); } catch { return; }
         setIsEditingApiKey(false);
         showToast(t('proxy.config.api_key_updated'), 'success');
     };
@@ -1221,13 +1142,13 @@ export default function ApiProxy() {
         setIsEditingAdminPassword(true);
     };
 
-    const handleSaveAdminPassword = () => {
+    const handleSaveAdminPassword = async () => {
         // Validation: can be empty (meaning fallback to api_key) or at least 4 chars
         if (tempAdminPassword && tempAdminPassword.length < 4) {
             showToast(t('proxy.config.admin_password_short', { defaultValue: 'Password is too short (min 4 chars)' }), 'error');
             return;
         }
-        updateProxyConfig({ admin_password: tempAdminPassword || undefined });
+        try { await updateProxyConfig({ admin_password: tempAdminPassword || undefined }); } catch { return; }
         setIsEditingAdminPassword(false);
         showToast(t('proxy.config.admin_password_updated', { defaultValue: 'Web UI password updated' }), 'success');
     };
@@ -3153,6 +3074,7 @@ print(response.choices[0].message.content)`;
                                         uploadConfig={appConfig.proxy.upload_timeouts}
                                         onStreamChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
                                         onUploadChange={(timeoutConfig) => updateProxyConfig({ upload_timeouts: timeoutConfig })}
+                                        onReset={(stream_timeouts, upload_timeouts) => updateProxyConfig({ stream_timeouts, upload_timeouts })}
                                         onSave={handleSaveProxySettings}
                                     />
                                 </CollapsibleCard>

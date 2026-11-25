@@ -220,12 +220,11 @@ pub async fn update_security_config(
     config: crate::proxy::config::SecurityMonitorConfig,
     app_state: State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<(), String> {
-    // 1. 同步保存到配置文件
-    let mut app_config = crate::modules::config::load_app_config()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
-    app_config.proxy.security_monitor = config.clone();
-    crate::modules::config::save_app_config(&app_config)
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+    let _operation = crate::modules::config::lock_config_operation().await?;
+    let app_config = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.security_monitor = config.clone();
+        Ok(())
+    })?;
 
     // 2. 更新内存中的配置 (如果服务正在运行，同步覆盖 instance 与 admin_server)
     {

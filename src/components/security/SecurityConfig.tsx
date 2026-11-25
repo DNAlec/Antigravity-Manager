@@ -1,3 +1,4 @@
+import { useConfigStore } from '../../stores/useConfigStore';
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
@@ -46,7 +47,7 @@ export const SecurityConfig: React.FC = () => {
         if (!config) return;
         setSaving(true);
         try {
-            await invoke('update_security_config', { config });
+            await useConfigStore.getState().mutateConfig(() => invoke('update_security_config', { config }));
             showToast(t('security.config.save_success'), 'success');
         } catch (e) {
             console.error('Failed to save security config', e);

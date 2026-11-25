@@ -5,6 +5,6 @@ export async function loadConfig(): Promise<AppConfig> {
     return await invoke('load_config');
 }
 
-export async function saveConfig(config: AppConfig): Promise<void> {
+export async function saveConfig(config: AppConfig): Promise<AppConfig> {
     return await invoke('save_config', { config });
 }

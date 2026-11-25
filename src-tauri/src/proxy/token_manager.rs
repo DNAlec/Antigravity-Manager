@@ -1005,21 +1005,42 @@ impl TokenManager {
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let accounts_dir = self.resolved_data_dir().join("accounts");
 
-        if !accounts_dir.exists() {
-            return Err(format!("账号目录不存在: {:?}", accounts_dir));
-        }
-
         // 读取 accounts.json 索引，过滤掉用户在索引中标记为 disabled 或 proxy_disabled 的账号，防止实体文件残留导致已停用账号渗入代理池
         let (valid_in_index, disabled_in_index) =
             Self::read_accounts_index_sets(&self.resolved_data_dir());
 
-        let entries =
-            std::fs::read_dir(&accounts_dir).map_err(|e| format!("读取账号目录失败: {}", e))?;
+        let entries = match std::fs::read_dir(&accounts_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A fresh installation need not have an accounts directory yet.
+                // A populated or unreadable index instead indicates lost data.
+                match std::fs::read_to_string(self.resolved_data_dir().join("accounts.json")) {
+                    Ok(content) => {
+                        let index: serde_json::Value = serde_json::from_str(&content)
+                            .map_err(|error| format!("读取账号索引失败: {}", error))?;
+                        if !index
+                            .get("accounts")
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|accounts| accounts.is_empty())
+                        {
+                            return Err(format!(
+                                "账号索引非空或无效，但账号目录不存在: {:?}",
+                                accounts_dir
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("读取账号索引失败: {}", error)),
+                }
+                None
+            }
+            Err(error) => return Err(format!("读取账号目录失败: {}", error)),
+        };
 
         // 阶段 1：在局部集合中加载新账号，严禁提前清空现有活跃池导致并发 503 宕机
         let mut new_tokens = std::collections::HashMap::new();
 
-        for entry in entries {
+        for entry in entries.into_iter().flatten() {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
             let path = entry.path();
 
@@ -7230,6 +7251,16 @@ impl TokenManager {
         self.sticky_config.read().await.clone()
     }
 
+    /// Keep Web and desktop configuration publication aligned.
+    pub async fn apply_config(&self, config: &crate::models::AppConfig) {
+        self.update_sticky_config(config.proxy.scheduling.clone())
+            .await;
+        self.update_circuit_breaker_config(config.circuit_breaker.clone())
+            .await;
+        self.set_preferred_account(config.proxy.preferred_account_id.clone())
+            .await;
+    }
+
     /// 更新调度配置
     pub async fn update_sticky_config(&self, new_config: StickySessionConfig) {
         crate::proxy::pipeline::rotation::set_request_429_grace_ms(
@@ -13040,6 +13071,35 @@ mod tests {
         assert!(!third.contains("model-a"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn load_accounts_directory_missing_on_fresh_install_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(dir.path().to_path_buf());
+        assert_eq!(manager.load_accounts().await.unwrap(), 0);
+        std::fs::write(dir.path().join("accounts.json"), r#"{"accounts":[]}"#).unwrap();
+        assert_eq!(manager.load_accounts().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn load_accounts_directory_missing_with_registered_accounts_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("accounts.json"),
+            r#"{"accounts":[{"id":"missing"}]}"#,
+        )
+        .unwrap();
+        let manager = TokenManager::new(dir.path().to_path_buf());
+        assert!(manager.load_accounts().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_accounts_directory_io_error_is_not_an_empty_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("accounts"), "not a directory").unwrap();
+        let manager = TokenManager::new(dir.path().to_path_buf());
+        assert!(manager.load_accounts().await.is_err());
     }
 
     #[tokio::test]
