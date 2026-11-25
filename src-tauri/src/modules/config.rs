@@ -1,46 +1,105 @@
 use serde_json;
-use std::fs;
+use std::{fs, path::Path, sync::Mutex};
 
 use super::account::get_data_dir;
 use crate::models::AppConfig;
 
 const CONFIG_FILE: &str = "gui_config.json";
 
-/// Load application configuration
+// Disk transactions are short and synchronous. Runtime publishers additionally hold
+// CONFIG_OPERATION_LOCK across persistence and their asynchronous hot updates.
+static CONFIG_FILE_LOCK: Mutex<()> = Mutex::new(());
+static CONFIG_OPERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub async fn lock_config_operation() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        CONFIG_OPERATION_LOCK.lock(),
+    )
+    .await
+    .map_err(|_| "Timed out waiting for configuration update".to_string())
+}
+
+pub fn is_config_conflict(error: &str) -> bool {
+    error.starts_with("CONFIG_CONFLICT:")
+}
+
+/// Load configuration under the same lock as read-modify-write transactions.
 pub fn load_app_config() -> Result<AppConfig, String> {
-    let data_dir = get_data_dir()?;
-    let config_path = data_dir.join(CONFIG_FILE);
+    let _guard = CONFIG_FILE_LOCK
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?;
+    load_at(&get_data_dir()?.join(CONFIG_FILE))
+}
 
-    if !config_path.exists() {
-        let config = AppConfig::new();
-        // [FIX #1460] Persist initial config to prevent new API Key on every refresh
-        if let Err(e) = save_app_config(&config) {
-            tracing::warn!(
-                "Failed to persist initial config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still missing.",
-                config_path.display(),
-                e
-            );
-        }
-        return Ok(config);
+fn load_at(path: &Path) -> Result<AppConfig, String> {
+    if !path.exists() {
+        return write_at(path, AppConfig::new());
     }
-
-    let content = fs::read_to_string(&config_path)
-        .map_err(|e| format!("failed_to_read_config_file: {}", e))?;
-
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed_to_read_config_file: {}", e))?;
     let (config, modified) = parse_and_migrate_config(&content)?;
-
-    // If migration occurred or empty config was generated, auto-save once to clean up the file
-    if modified {
-        if let Err(e) = save_app_config(&config) {
-            tracing::warn!(
-                "Failed to persist healed or migrated config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still empty.",
-                config_path.display(),
-                e
-            );
-        }
+    // Upgrade legacy files before exposing them to a UI. Uninitialized forms have
+    // revision zero and must never be accepted as a replacement for this config.
+    if modified || config.config_revision == 0 {
+        return write_at(path, config);
     }
-
     Ok(config)
+}
+
+fn write_at(path: &Path, config: AppConfig) -> Result<AppConfig, String> {
+    // Return exactly the normalized representation that subsequent reads expose.
+    let serialized = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    let (mut config, _) = parse_and_migrate_config(&serialized)?;
+    config.config_revision = config
+        .config_revision
+        .checked_add(1)
+        .ok_or("Configuration revision exhausted")?;
+    let content = serde_json::to_vec_pretty(&config)
+        .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
+    crate::utils::fs::write_atomic(path, &content)
+        .map_err(|e| format!("failed_to_save_config: {}", e))?;
+    Ok(config)
+}
+
+fn replace_at(path: &Path, config: &AppConfig) -> Result<AppConfig, String> {
+    let current = if path.exists() {
+        Some(load_at(path)?)
+    } else {
+        None
+    };
+    let revision = current.as_ref().map_or(0, |c| c.config_revision);
+    if revision != config.config_revision {
+        return Err("CONFIG_CONFLICT: Configuration changed; reload before saving".into());
+    }
+    write_at(path, config.clone())
+}
+
+/// Compare-and-swap for complete snapshots supplied by clients.
+pub fn save_app_config_versioned(config: &AppConfig) -> Result<AppConfig, String> {
+    let _guard = CONFIG_FILE_LOCK
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?;
+    replace_at(&get_data_dir()?.join(CONFIG_FILE), config)
+}
+
+/// Apply a narrow server-side mutation without releasing the disk transaction lock.
+pub fn update_app_config(
+    update: impl FnOnce(&mut AppConfig) -> Result<(), String>,
+) -> Result<AppConfig, String> {
+    update_at(&get_data_dir()?.join(CONFIG_FILE), update)
+}
+
+fn update_at(
+    path: &Path,
+    update: impl FnOnce(&mut AppConfig) -> Result<(), String>,
+) -> Result<AppConfig, String> {
+    let _guard = CONFIG_FILE_LOCK
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?;
+    let mut config = load_at(path)?;
+    update(&mut config)?;
+    write_at(path, config)
 }
 
 /// Parse, migrate and normalize raw configuration JSON string.
@@ -315,21 +374,100 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
     Ok((config, modified))
 }
 
-/// Save application configuration (atomic write)
+/// Compatibility entry point for internal full snapshots; stale writes still fail.
 pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
-    let data_dir = get_data_dir()?;
-    let config_path = data_dir.join(CONFIG_FILE);
-
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
-
-    crate::utils::fs::write_atomic(&config_path, content.as_bytes())
-        .map_err(|e| format!("failed_to_save_config: {}", e))
+    save_app_config_versioned(config).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_credentials_or_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let initial = load_at(&path).unwrap();
+        let mut changed = initial.clone();
+        changed.proxy.api_key = "synthetic-new-key".into();
+        changed
+            .proxy
+            .proxy_pool
+            .account_bindings
+            .insert("account".into(), "proxy".into());
+        let saved = replace_at(&path, &changed).unwrap();
+        let mut stale = initial;
+        stale.theme = "dark".into();
+        assert!(is_config_conflict(&replace_at(&path, &stale).unwrap_err()));
+        assert_eq!(load_at(&path).unwrap().proxy.api_key, saved.proxy.api_key);
+        assert_eq!(
+            load_at(&path)
+                .unwrap()
+                .proxy
+                .proxy_pool
+                .account_bindings
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_narrow_updates_preserve_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let initial = load_at(&path).unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    update_at(path, |config| {
+                        config
+                            .proxy
+                            .custom_mapping
+                            .insert(format!("test-{index}"), "model".into());
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let saved = load_at(&path).unwrap();
+        assert_eq!(saved.config_revision, initial.config_revision + 8);
+        for index in 0..8 {
+            assert!(saved
+                .proxy
+                .custom_mapping
+                .contains_key(&format!("test-{index}")));
+        }
+        assert_eq!(saved.proxy.api_key, initial.proxy.api_key);
+    }
+
+    #[test]
+    fn failed_update_keeps_disk_and_revision_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        load_at(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(update_at(&path, |config| {
+            config.proxy.api_key.clear();
+            Err("validation failed".into())
+        })
+        .is_err());
+        assert!(
+            fs::read(&path).unwrap() == before,
+            "failed transaction modified the file"
+        );
+    }
+
+    #[test]
+    fn legacy_configuration_gets_a_revision_before_exposure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let legacy = AppConfig::new();
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(load_at(&path).unwrap().config_revision > 0);
+        assert!(is_config_conflict(&replace_at(&path, &legacy).unwrap_err()));
+    }
 
     #[test]
     fn test_parse_and_migrate_empty_or_whitespace_config() {

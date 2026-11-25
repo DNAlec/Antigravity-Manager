@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request } from '../../utils/request';
 import { showToast } from '../common/ToastContainer';
@@ -12,7 +12,7 @@ import { useAccountStore } from '../../stores/useAccountStore';
 
 interface ProxyPoolSettingsProps {
     config: ProxyPoolConfig;
-    onChange: (config: ProxyPoolConfig, silent?: boolean) => void;
+    onChange: (update: (config: ProxyPoolConfig) => ProxyPoolConfig) => Promise<void>;
 }
 
 export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSettingsProps) {
@@ -22,69 +22,39 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
     const [isBatchImportOpen, setIsBatchImportOpen] = useState(false);
     const [isBindingManagerOpen, setIsBindingManagerOpen] = useState(false);
     const [isTesting, setIsTesting] = useState(false);
-    const [accountBindings, setAccountBindings] = useState<Record<string, string>>({});
+    const accountBindings = config.account_bindings || {};
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [health, setHealth] = useState<Record<string, ProxyEntry>>({});
+    const healthSequence = useRef(0);
+    const mounted = useRef(true);
 
-    // Fetch bindings and accounts on mount
     useEffect(() => {
-        fetchBindings();
+        mounted.current = true;
         fetchAccounts();
+        return () => { mounted.current = false; ++healthSequence.current; };
     }, []);
 
-    // Refresh bindings when manager closes
     useEffect(() => {
-        if (!isBindingManagerOpen) {
-            fetchBindings();
-        }
-    }, [isBindingManagerOpen]);
-
-    // [FIX] Polling for proxy pool status
-    // Now only updates volatile status (is_healthy, latency) to avoid race condition regressions
-    useEffect(() => {
-        let interval: any;
-        if (config.enabled) { // Only poll if proxy pool is enabled
-            interval = setInterval(async () => {
-                try {
-                    const liveConfig = await request<ProxyPoolConfig>('get_proxy_pool_config');
-                    if (liveConfig && liveConfig.proxies) {
-                        // Create a map for quick lookups
-                        const liveMap = new Map(liveConfig.proxies.map(p => [p.id, p]));
-
-                        // Check if any status actually changed
-                        let hasChanges = false;
-                        const updatedProxies = config.proxies.map(p => {
-                            const live = liveMap.get(p.id);
-                            if (live && (live.is_healthy !== p.is_healthy || live.latency !== p.latency || live.last_check_time !== p.last_check_time)) {
-                                hasChanges = true;
-                                return { ...p, is_healthy: live.is_healthy, latency: live.latency, last_check_time: live.last_check_time };
-                            }
-                            return p;
-                        });
-
-                        if (hasChanges) {
-                            // Only update volatile status, DO NOT trigger heavy onChange which saves to disk
-                            // This internal change will eventually be captured by next manual save or 
-                            // simply keep the UI fresh without risking rolling back user's structural changes (add/delete)
-                            onChange({ ...config, proxies: updatedProxies }, true); // Pass 'true' as silent flag if onChange supports it, or use a separate state
-                        }
-                    }
-                } catch (e) {
-                    // Ignore if service not running or other errors
-                    console.error('Failed to poll proxy pool config:', e);
+        if (!config.enabled) return;
+        let cancelled = false;
+        const interval = setInterval(async () => {
+            const sequence = ++healthSequence.current;
+            try {
+                const live = await request<ProxyPoolConfig>('get_proxy_pool_config');
+                if (!cancelled && sequence === healthSequence.current) {
+                    setHealth(Object.fromEntries((live.proxies || []).map(proxy => [proxy.id, proxy])));
                 }
-            }, 5000); // Poll every 5s
-        }
-        return () => clearInterval(interval);
-    }, [config.enabled, config.proxies]); // Depend on config.enabled and config.proxies to re-evaluate polling
+            } catch (error) { console.error('Failed to poll proxy health', error); }
+        }, 5000);
+        return () => { cancelled = true; clearInterval(interval); ++healthSequence.current; };
+    }, [config.enabled]);
 
-    const fetchBindings = async () => {
-        try {
-            const bindings = await request<Record<string, string>>('get_all_account_bindings');
-            if (bindings) setAccountBindings(bindings);
-        } catch (e) {
-            console.error('Fetch bindings failed:', e);
-        }
+    const persist = (update: (latest: ProxyPoolConfig) => ProxyPoolConfig): Promise<void> => {
+        const promise = onChange(update);
+        void promise.catch(error => showToast(`${t('common.error')}: ${error}`, 'error'));
+        return promise;
     };
+    const patch = (updates: Partial<ProxyPoolConfig>) => persist(latest => ({ ...latest, ...updates }));
 
     const safeConfig: ProxyPoolConfig = {
         enabled: config?.enabled ?? false,
@@ -95,79 +65,67 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
         account_bindings: config?.account_bindings ?? {},
     };
 
-    const handleUpdateProxies = (proxies: ProxyEntry[]) => {
-        onChange({ ...safeConfig, proxies });
-    };
+    const handleUpdateProxies = (update: (proxies: ProxyEntry[]) => ProxyEntry[]) => persist(latest => {
+        const proxies = update(latest.proxies);
+        const ids = new Set(proxies.map(proxy => proxy.id));
+        return { ...latest, proxies, account_bindings: Object.fromEntries(
+            Object.entries(latest.account_bindings || {}).filter(([, id]) => ids.has(id)),
+        ) };
+    });
 
-    const handleAddProxy = (entry: ProxyEntry) => {
-        onChange({
-            ...safeConfig,
-            proxies: [...safeConfig.proxies, entry]
-        });
-    };
+    const handleAddProxy = (entry: ProxyEntry) =>
+        persist(latest => ({ ...latest, proxies: [...latest.proxies, entry] }));
 
     const handleBatchImport = async (newProxies: ProxyEntry[]) => {
-        const updatedProxies = [...safeConfig.proxies, ...newProxies];
-        await onChange({
-            ...safeConfig,
-            proxies: updatedProxies
-        });
-
-        // Auto-trigger test after import is fully committed
-        handleTestAll();
+        await persist(latest => ({ ...latest, proxies: [...latest.proxies, ...newProxies] }));
+        await handleTestAll();
     };
 
-    const handleBatchDelete = () => {
-        if (selectedIds.size === 0) return;
-        if (confirm(t('settings.proxy_pool.confirm_batch_delete', 'Are you sure you want to delete selected proxies?'))) {
-            const newProxies = safeConfig.proxies.filter(p => !selectedIds.has(p.id));
-            onChange({ ...safeConfig, proxies: newProxies });
+    const handleBatchDelete = async () => {
+        if (!selectedIds.size || !confirm(t('settings.proxy_pool.confirm_batch_delete', 'Are you sure you want to delete selected proxies?'))) return;
+        try {
+            await persist(latest => ({
+                ...latest,
+                proxies: latest.proxies.filter(proxy => !selectedIds.has(proxy.id)),
+                account_bindings: Object.fromEntries(Object.entries(latest.account_bindings || {}).filter(([, id]) => !selectedIds.has(id))),
+            }));
             setSelectedIds(new Set());
             showToast(t('common.deleted', 'Deleted successfully'), 'success');
-        }
+        } catch { /* persist displays the failure */ }
     };
 
-    const handleBatchToggleEnabled = (enabled: boolean) => {
-        if (selectedIds.size === 0) return;
-        const newProxies = safeConfig.proxies.map(p =>
-            selectedIds.has(p.id) ? { ...p, enabled } : p
-        );
-        onChange({ ...safeConfig, proxies: newProxies });
-        showToast(t(enabled ? 'common.enabled' : 'common.disabled', enabled ? 'Enabled' : 'Disabled'), 'success');
+    const handleBatchToggleEnabled = async (enabled: boolean) => {
+        try {
+            await persist(latest => ({ ...latest, proxies: latest.proxies.map(proxy =>
+                selectedIds.has(proxy.id) ? { ...proxy, enabled } : proxy) }));
+            showToast(t(enabled ? 'common.enabled' : 'common.disabled'), 'success');
+        } catch { /* persist displays the failure */ }
     };
 
     const handleTestAll = async () => {
         setIsTesting(true);
+        const sequence = ++healthSequence.current;
         try {
-            const liveConfig = await request<ProxyPoolConfig>('check_proxy_health');
-            if (liveConfig && liveConfig.proxies) {
-                // [FIX] Use incremental merge to prevent race condition rollbacks
-                const liveMap = new Map(liveConfig.proxies.map(p => [p.id, p]));
-
-                const updatedProxies = config.proxies.map(p => {
-                    const live = liveMap.get(p.id);
-                    if (live) {
-                        return {
-                            ...p,
-                            is_healthy: live.is_healthy,
-                            latency: live.latency,
-                            last_check_time: live.last_check_time
-                        };
-                    }
-                    return p;
-                });
-
-                // Update local UI state silently (syncing health stats only)
-                onChange({ ...config, proxies: updatedProxies }, true);
+            const live = await request<ProxyPoolConfig>('check_proxy_health');
+            if (mounted.current && sequence === healthSequence.current) {
+                setHealth(Object.fromEntries((live.proxies || []).map(proxy => [proxy.id, proxy])));
             }
             showToast(t('settings.proxy_pool.test_completed', 'Health check completed'), 'success');
         } catch (error) {
-            console.error('Test all failed:', error);
-            showToast(t('settings.proxy_pool.test_failed', 'Health check failed'), 'error');
+            showToast(`${t('settings.proxy_pool.test_failed')}: ${error}`, 'error');
         } finally {
-            setIsTesting(false);
+            if (mounted.current) setIsTesting(false);
         }
     };
+
+    const displayedProxies = safeConfig.proxies.map(proxy => {
+        const live = health[proxy.id];
+        const sameEndpoint = live && live.url === proxy.url
+            && live.health_check_url === proxy.health_check_url
+            && live.auth?.username === proxy.auth?.username
+            && live.auth?.password === proxy.auth?.password;
+        return sameEndpoint ? { ...proxy, is_healthy: live.is_healthy, latency: live.latency, last_check_time: live.last_check_time } : proxy;
+    });
 
     return (
         <div className="space-y-3">
@@ -186,7 +144,7 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                             <input
                                 type="checkbox"
                                 checked={safeConfig.enabled}
-                                onChange={e => onChange({ ...safeConfig, enabled: e.target.checked })}
+                                onChange={e => patch({ enabled: e.target.checked })}
                                 className="sr-only peer"
                             />
                             <div className="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
@@ -200,7 +158,7 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                             <SlidersHorizontal size={12} className="text-gray-400 group-hover:text-blue-500 transition-colors" />
                             <select
                                 value={safeConfig.strategy}
-                                onChange={e => onChange({ ...safeConfig, strategy: e.target.value as any })}
+                                onChange={e => patch({ strategy: e.target.value as ProxyPoolConfig['strategy'] })}
                                 className="text-[10px] bg-transparent border-none p-0 pr-6 focus:ring-0 font-black uppercase tracking-tight text-gray-700 dark:text-gray-300 cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
                             >
                                 <option value="priority">{t('settings.proxy_pool.strategy_priority', 'Priority')}</option>
@@ -219,7 +177,7 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                                     onBlur={e => {
                                         const val = parseInt(e.target.value) || 60;
                                         if (val !== safeConfig.health_check_interval) {
-                                            onChange({ ...safeConfig, health_check_interval: val });
+                                            void patch({ health_check_interval: val });
                                         }
                                     }}
                                     className="w-10 text-[10px] bg-transparent border-none p-0 focus:ring-0 font-black text-gray-700 dark:text-gray-300 text-right group-hover:text-emerald-600 transition-colors"
@@ -320,7 +278,7 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                 )}
                 <div className={!safeConfig.enabled ? 'pt-6 opacity-60' : ''}>
                     <ProxyList
-                        proxies={safeConfig.proxies}
+                        proxies={displayedProxies}
                         onUpdate={handleUpdateProxies}
                         accountBindings={accountBindings}
                         accounts={accounts}

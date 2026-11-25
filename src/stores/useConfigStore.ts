@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { AppConfig } from '../types/config';
 import * as configService from '../services/configService';
 import i18n from '../i18n';
+import { ConfigCoordinator } from '../services/configCoordinator';
 
 // 规范化语言编码 (兼容方言与区域代码别名)
 export function normalizeLanguageCode(code: string): string {
@@ -17,51 +18,10 @@ export function normalizeLanguageCode(code: string): string {
     return code;
 }
 
-// 竞态隔离与尾随批处理锁：杜绝高频连续操作（如快速连续切换语言、主题或滑块）时后端 I/O 乱序回滚
-let activeSavePromise: Promise<void> | null = null;
-let queuedConfig: AppConfig | null = null;
-let queuedWaiters: Array<{ resolve: () => void; reject: (err: unknown) => void }> = [];
-let saveSequence = 0;
-
-async function flushPersist(config: AppConfig): Promise<void> {
-    await configService.saveConfig(config);
-    const { isTauri } = await import('../utils/env');
-    if (isTauri()) {
-        const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('set_window_theme', { theme: config.theme }).catch(() => {});
-    }
-}
-
-async function executeSaveQueue(config: AppConfig): Promise<void> {
-    if (activeSavePromise) {
-        queuedConfig = config;
-        return new Promise<void>((resolve, reject) => {
-            queuedWaiters.push({ resolve, reject });
-        });
-    }
-
-    activeSavePromise = (async () => {
-        try {
-            await flushPersist(config);
-        } finally {
-            while (queuedConfig) {
-                const nextConfig = queuedConfig;
-                const waiters = queuedWaiters;
-                queuedConfig = null;
-                queuedWaiters = [];
-                try {
-                    await flushPersist(nextConfig);
-                    waiters.forEach(w => w.resolve());
-                } catch (err) {
-                    waiters.forEach(w => w.reject(err));
-                }
-            }
-            activeSavePromise = null;
-        }
-    })();
-
-    return activeSavePromise;
-}
+const coordinator = new ConfigCoordinator(
+    { load: configService.loadConfig, save: configService.saveConfig },
+    config => useConfigStore.setState({ config }),
+);
 
 interface ConfigState {
     config: AppConfig | null;
@@ -71,6 +31,8 @@ interface ConfigState {
     // Actions
     loadConfig: () => Promise<void>;
     saveConfig: (config: AppConfig, silent?: boolean) => Promise<void>;
+    updateConfig: (update: (config: AppConfig) => AppConfig) => Promise<void>;
+    mutateConfig: (action: () => Promise<unknown>) => Promise<void>;
     updateTheme: (theme: string) => Promise<void>;
     updateLanguage: (language: string) => Promise<void>;
     toggleShowAllQuotas: () => void;
@@ -88,29 +50,42 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
     loadConfig: async () => {
         set({ loading: true, error: null });
         try {
-            const config = await configService.loadConfig();
-            set({ config, loading: false });
+            await coordinator.load();
         } catch (error) {
-            set({ error: String(error), loading: false });
+            set({ error: String(error) });
+        } finally {
+            set({ loading: false });
         }
     },
 
-    saveConfig: async (config: AppConfig, silent: boolean = false) => {
-        const currentSeq = ++saveSequence;
-        // 1. 同步立即乐观更新 Zustand store 状态
-        // 确保所有订阅组件与后续读操作即刻获取最新配置，彻底消灭渲染时差与闭包陈旧值
-        set({ config, loading: !silent, error: null });
-
+    saveConfig: async (config: AppConfig, silent = false) => {
+        set({ loading: !silent, error: null });
         try {
-            // 2. 串行/尾随有序持久化，杜绝连续点击触发并发写竞态
-            await executeSaveQueue(config);
-            if (currentSeq === saveSequence) {
-                set({ loading: false });
-            }
+            await coordinator.save(config);
         } catch (error) {
-            if (currentSeq === saveSequence) {
-                set({ error: String(error), loading: false });
-            }
+            set({ error: String(error) });
+            throw error;
+        } finally {
+            set({ loading: false });
+        }
+    },
+
+    updateConfig: async update => {
+        set({ error: null });
+        try {
+            await coordinator.update(update);
+        } catch (error) {
+            set({ error: String(error) });
+            throw error;
+        }
+    },
+
+    mutateConfig: async action => {
+        set({ error: null });
+        try {
+            await coordinator.mutate(action);
+        } catch (error) {
+            set({ error: String(error) });
             throw error;
         }
     },

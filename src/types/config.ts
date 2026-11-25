@@ -11,6 +11,7 @@ export interface ProxyConfig {
     api_key: string;
     admin_password?: string;
     auto_start: boolean;
+    preferred_account_id?: string;
     custom_mapping?: Record<string, string>;
     custom_mapping_expose?: Record<string, boolean>;
     builtin_mapping_version?: number;
@@ -318,6 +319,7 @@ export interface ClassicAutoSwitchConfig {
 }
 
 export interface AppConfig {
+    config_revision?: number;
     language: string;
     theme: string;
     auto_refresh: boolean;

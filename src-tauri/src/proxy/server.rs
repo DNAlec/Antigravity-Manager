@@ -484,12 +484,7 @@ impl AxumServer {
 
     /// 更新代理池配置
     pub async fn update_proxy_pool(&self, new_config: crate::proxy::config::ProxyPoolConfig) {
-        {
-            let mut pool = self.proxy_pool_state.write().await;
-            *pool = new_config;
-        }
-        // [HOT-RELOAD] Re-sync in-memory account↔proxy bindings from the new config
-        self.proxy_pool_manager.sync_bindings_from_config().await;
+        self.proxy_pool_manager.replace_config(new_config).await;
         // [HOT-RELOAD] Drop cached per-proxy HTTP clients so they rebuild with new URLs/credentials
         self.upstream.clear_client_cache();
         tracing::info!("Proxy pool config hot-reloaded");
@@ -2049,18 +2044,25 @@ struct SaveConfigWrapper {
     config: AppConfig,
 }
 
+fn config_http_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if config::is_config_conflict(&error) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, Json(ErrorResponse { error }))
+}
+
 async fn admin_save_config(
     State(state): State<AppState>,
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let new_config = payload.config;
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
     // 1. 持久化
-    config::save_app_config(&new_config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let new_config =
+        config::save_app_config_versioned(&payload.config).map_err(config_http_error)?;
 
     // 2. 热更新内存状态
     // 这里我们直接复用内部组件的 update 方法
@@ -2114,11 +2116,10 @@ async fn admin_save_config(
     }
 
     // 更新代理池配置（Web/Docker 保存配置时热更新）
-    {
-        let mut pool = state.proxy_pool_state.write().await;
-        *pool = new_config.clone().proxy.proxy_pool;
-    }
-    state.proxy_pool_manager.sync_bindings_from_config().await;
+    state
+        .proxy_pool_manager
+        .replace_config(new_config.proxy.proxy_pool.clone())
+        .await;
 
     // 更新 User-Agent 配置
     state
@@ -2161,7 +2162,9 @@ async fn admin_save_config(
         Some(new_config.proxy.experimental.enable_global_compaction_strip),
     );
 
-    Ok(StatusCode::OK)
+    state.token_manager.apply_config(&new_config).await;
+    state.monitor.set_enabled(new_config.proxy.enable_logging);
+    Ok(Json(new_config))
 }
 
 // [FIX Web Mode] Get proxy pool config
@@ -2219,7 +2222,8 @@ async fn admin_unbind_account_proxy(
     state
         .proxy_pool_manager
         .unbind_account_proxy(payload.account_id)
-        .await;
+        .await
+        .map_err(config_http_error)?;
     Ok(StatusCode::OK)
 }
 
@@ -2267,22 +2271,25 @@ async fn admin_get_proxy_status(
     })))
 }
 
-async fn admin_start_proxy_service(State(state): State<AppState>) -> impl IntoResponse {
-    // 1. 持久化配置 (修复 #1166)
-    if let Ok(mut config) = crate::modules::config::load_app_config() {
+async fn admin_start_proxy_service(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
+    state
+        .token_manager
+        .load_accounts()
+        .await
+        .map_err(config_http_error)?;
+    let saved = config::update_app_config(|config| {
         config.proxy.auto_start = true;
-        let _ = crate::modules::config::save_app_config(&config);
-    }
-
-    // 2. 确保账号已加载 (如果是第一次启动)
-    if let Err(e) = state.token_manager.load_accounts().await {
-        logger::log_error(&format!("[API] 启用服务并加载账号失败: {}", e));
-    }
-
-    let mut running = state.is_running.write().await;
-    *running = true;
-    logger::log_info("[API] 反代服务功能已启用 (持久化已同步)");
-    StatusCode::OK
+        Ok(())
+    })
+    .map_err(config_http_error)?;
+    *state.is_running.write().await = true;
+    logger::log_info("[API] Proxy enabled and auto-start persisted");
+    Ok(Json(saved))
 }
 
 async fn admin_set_proxy_capture_health_logs(
@@ -2302,17 +2309,20 @@ async fn admin_set_proxy_capture_health_logs(
     StatusCode::OK
 }
 
-async fn admin_stop_proxy_service(State(state): State<AppState>) -> impl IntoResponse {
-    // 1. 持久化配置 (修复 #1166)
-    if let Ok(mut config) = crate::modules::config::load_app_config() {
+async fn admin_stop_proxy_service(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
+    let saved = config::update_app_config(|config| {
         config.proxy.auto_start = false;
-        let _ = crate::modules::config::save_app_config(&config);
-    }
-
-    let mut running = state.is_running.write().await;
-    *running = false;
-    logger::log_info("[API] 反代服务功能已禁用 (Axum 模式 / 持久化已同步)");
-    StatusCode::OK
+        Ok(())
+    })
+    .map_err(config_http_error)?;
+    *state.is_running.write().await = false;
+    logger::log_info("[API] Proxy disabled and auto-start persisted");
+    Ok(Json(saved))
 }
 
 #[derive(Deserialize)]
@@ -2325,35 +2335,17 @@ async fn admin_update_model_mapping(
     State(state): State<AppState>,
     Json(payload): Json<UpdateMappingWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let config = payload.config;
-
-    // 1. 更新内存状态 (热更新)
-    {
-        let mut mapping = state.custom_mapping.write().await;
-        *mapping = config.custom_mapping.clone();
-    }
-
-    // 2. 持久化到硬盘 (修复 #1149)
-    // 加载当前配置，更新 mapping，然后保存
-    let mut app_config = crate::modules::config::load_app_config().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    app_config.proxy.custom_mapping = config.custom_mapping;
-    app_config.proxy.custom_mapping_expose = config.custom_mapping_expose;
-
-    crate::modules::config::save_app_config(&app_config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    logger::log_info("[API] 模型映射已通过 API 热更新并保存");
-    Ok(StatusCode::OK)
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
+    let saved = config::update_app_config(|config| {
+        config.proxy.custom_mapping = payload.config.custom_mapping;
+        config.proxy.custom_mapping_expose = payload.config.custom_mapping_expose;
+        Ok(())
+    })
+    .map_err(config_http_error)?;
+    *state.custom_mapping.write().await = saved.proxy.custom_mapping.clone();
+    Ok(Json(saved))
 }
 
 async fn admin_generate_api_key() -> impl IntoResponse {
@@ -2400,12 +2392,20 @@ struct SetPreferredAccountRequest {
 async fn admin_set_preferred_account(
     State(state): State<AppState>,
     Json(payload): Json<SetPreferredAccountRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
+    let saved = config::update_app_config(|config| {
+        config.proxy.preferred_account_id = payload.account_id.filter(|id| !id.trim().is_empty());
+        Ok(())
+    })
+    .map_err(config_http_error)?;
     state
         .token_manager
-        .set_preferred_account(payload.account_id)
+        .set_preferred_account(saved.proxy.preferred_account_id.clone())
         .await;
-    StatusCode::OK
+    Ok(Json(saved))
 }
 
 async fn admin_set_proxy_monitor_enabled(
@@ -3682,13 +3682,20 @@ async fn admin_toggle_proxy_status(
     if !payload.enable {
         let pref_id = state.token_manager.get_preferred_account().await;
         if pref_id.as_deref() == Some(&account_id) {
-            state.token_manager.set_preferred_account(None).await;
-            if let Ok(mut cfg) = crate::modules::config::load_app_config() {
+            let _operation = config::lock_config_operation()
+                .await
+                .map_err(config_http_error)?;
+            let saved = config::update_app_config(|cfg| {
                 if cfg.proxy.preferred_account_id.as_deref() == Some(&account_id) {
                     cfg.proxy.preferred_account_id = None;
-                    let _ = crate::modules::config::save_app_config(&cfg);
                 }
-            }
+                Ok(())
+            })
+            .map_err(config_http_error)?;
+            state
+                .token_manager
+                .set_preferred_account(saved.proxy.preferred_account_id)
+                .await;
         }
     } else {
         state.token_manager.prepare_manual_enable(&account_id);
@@ -4862,34 +4869,17 @@ async fn admin_update_security_config(
     State(state): State<AppState>,
     Json(payload): Json<UpdateSecurityConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let config = payload.config;
-    let mut app_config = crate::modules::config::load_app_config().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    app_config.proxy.security_monitor = config.clone();
-
-    crate::modules::config::save_app_config(&app_config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    {
-        let mut sec = state.security.write().await;
-        *sec = crate::proxy::ProxySecurityConfig::from_proxy_config(&app_config.proxy);
-        tracing::info!("[Security] Runtime security config hot-reloaded via Web API");
-    }
-
-    Ok(StatusCode::OK)
+    let _operation = config::lock_config_operation()
+        .await
+        .map_err(config_http_error)?;
+    let saved = config::update_app_config(|config| {
+        config.proxy.security_monitor = payload.config;
+        Ok(())
+    })
+    .map_err(config_http_error)?;
+    *state.security.write().await =
+        crate::proxy::ProxySecurityConfig::from_proxy_config(&saved.proxy);
+    Ok(Json(saved))
 }
 
 // --- Debug Console Handlers ---

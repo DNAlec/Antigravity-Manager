@@ -1,3 +1,4 @@
+import { showToast } from '../../common/ToastContainer';
 
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
@@ -9,7 +10,7 @@ import { generateUUID } from '../../../utils/uuid';
 interface ProxyEditModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onSave: (entry: ProxyEntry) => void;
+    onSave: (entry: ProxyEntry) => Promise<void>;
     initialData?: ProxyEntry;
     isEditing: boolean;
 }
@@ -33,6 +34,7 @@ export default function ProxyEditModal({ isOpen, onClose, onSave, initialData, i
     });
 
     const [tagInput, setTagInput] = useState('');
+    const [saving, setSaving] = useState(false);
 
     useEffect(() => {
         if (isOpen) {
@@ -55,7 +57,8 @@ export default function ProxyEditModal({ isOpen, onClose, onSave, initialData, i
         }
     }, [isOpen, initialData, isEditing]);
 
-    const handleSave = () => {
+    const handleSave = async () => {
+        if (saving) return;
         if (!formData.name || !formData.url) {
             // Basic validation
             return;
@@ -65,8 +68,10 @@ export default function ProxyEditModal({ isOpen, onClose, onSave, initialData, i
         if (!entryToSave.auth?.username && !entryToSave.auth?.password) {
             entryToSave.auth = undefined;
         }
-        onSave(entryToSave);
-        onClose();
+        setSaving(true);
+        try { await onSave(entryToSave); onClose(); }
+        catch (error) { showToast(String(error), 'error'); }
+        finally { setSaving(false); }
     };
 
     const addTag = () => {
@@ -238,6 +243,7 @@ export default function ProxyEditModal({ isOpen, onClose, onSave, initialData, i
                     </button>
                     <button
                         onClick={handleSave}
+                        disabled={saving}
                         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors flex items-center gap-2"
                     >
                         <Save size={18} />

@@ -41,7 +41,7 @@ pub struct ProxyPoolManager {
     usage_counter: Arc<DashMap<String, usize>>,
 
     /// 账号到代理的绑定 (account_id -> proxy_id)
-    account_bindings: Arc<DashMap<String, String>>,
+    account_bindings: Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
 
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
@@ -50,13 +50,15 @@ pub struct ProxyPoolManager {
 impl ProxyPoolManager {
     pub fn new(config: Arc<RwLock<ProxyPoolConfig>>) -> Self {
         // 从配置中加载已保存的绑定关系
-        let account_bindings = Arc::new(DashMap::new());
+        let account_bindings = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
         // 使用 blocking 方式读取配置（因为 new 不是 async）
         // 注意：这里使用 try_read 避免死锁
         if let Ok(cfg) = config.try_read() {
             for (account_id, proxy_id) in &cfg.account_bindings {
-                account_bindings.insert(account_id.clone(), proxy_id.clone());
+                account_bindings
+                    .write()
+                    .insert(account_id.clone(), proxy_id.clone());
             }
             if !cfg.account_bindings.is_empty() {
                 tracing::info!(
@@ -245,8 +247,9 @@ impl ProxyPoolManager {
         account_id: &str,
         config: &ProxyPoolConfig,
     ) -> Result<Option<PoolProxyConfig>, String> {
-        if let Some(proxy_id) = self.account_bindings.get(account_id) {
-            if let Some(entry) = config.proxies.iter().find(|p| p.id == *proxy_id.value()) {
+        let binding = self.get_account_binding(account_id);
+        if let Some(proxy_id) = binding {
+            if let Some(entry) = config.proxies.iter().find(|p| p.id == proxy_id) {
                 if entry.enabled {
                     // 1. 若代理健康，直接使用专属绑定代理
                     if entry.is_healthy {
@@ -286,11 +289,8 @@ impl ProxyPoolManager {
         config: &ProxyPoolConfig,
     ) -> Result<Option<PoolProxyConfig>, String> {
         // [FIX] 专属隔离逻辑：剔除所有已被绑定的代理，保护专属 IP 账号的安全
-        let bound_ids: std::collections::HashSet<String> = self
-            .account_bindings
-            .iter()
-            .map(|kv| kv.value().clone())
-            .collect();
+        let bound_ids: std::collections::HashSet<String> =
+            self.account_bindings.read().values().cloned().collect();
 
         let healthy_proxies: Vec<_> = config
             .proxies
@@ -441,113 +441,58 @@ impl ProxyPoolManager {
         account_id: String,
         proxy_id: String,
     ) -> Result<(), String> {
-        // 检查代理是否存在
-        {
-            let config = self.config.read().await;
-            if !config.proxies.iter().any(|p| p.id == proxy_id) {
-                return Err(format!("Proxy {} not found", proxy_id));
-            }
+        self.change_binding(account_id, Some(proxy_id)).await
+    }
 
-            // 检查代理最大账号数限制
-            if let Some(entry) = config.proxies.iter().find(|p| p.id == proxy_id) {
-                if let Some(max) = entry.max_accounts {
-                    if max > 0 {
-                        let current_count = self
-                            .account_bindings
-                            .iter()
-                            .filter(|kv| *kv.value() == proxy_id)
-                            .count();
-                        if current_count >= max {
-                            return Err(format!(
-                                "Proxy {} has reached max accounts limit",
-                                proxy_id
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+    pub async fn unbind_account_proxy(&self, account_id: String) -> Result<(), String> {
+        self.change_binding(account_id, None).await
+    }
 
-        // 更新内存中的绑定
-        self.account_bindings
-            .insert(account_id.clone(), proxy_id.clone());
-
-        // 持久化到配置文件
-        self.persist_bindings().await;
-
-        tracing::info!(
-            "[ProxyPool] Bound account {} to proxy {}",
-            account_id,
-            proxy_id
-        );
+    async fn change_binding(
+        &self,
+        account_id: String,
+        proxy_id: Option<String>,
+    ) -> Result<(), String> {
+        let _operation = crate::modules::config::lock_config_operation().await?;
+        // Validate and commit before changing either in-memory copy. Disk failure
+        // leaves the previous routing intact and is returned to the caller.
+        let saved = persist_account_binding(&account_id, proxy_id.as_deref())?;
+        self.config.write().await.account_bindings = saved.proxy.proxy_pool.account_bindings;
+        self.sync_bindings_from_config().await;
         Ok(())
     }
 
-    /// 解绑账号代理
-    pub async fn unbind_account_proxy(&self, account_id: String) {
-        self.account_bindings.remove(&account_id);
-
-        // 持久化到配置文件
-        self.persist_bindings().await;
-
-        tracing::info!("[ProxyPool] Unbound account {}", account_id);
-    }
-
-    /// 获取账号当前绑定的代理ID
     pub fn get_account_binding(&self, account_id: &str) -> Option<String> {
-        self.account_bindings
-            .get(account_id)
-            .map(|v| v.value().clone())
+        self.account_bindings.read().get(account_id).cloned()
     }
 
-    /// 获取所有绑定关系的快照
     pub fn get_all_bindings_snapshot(&self) -> std::collections::HashMap<String, String> {
-        self.account_bindings
-            .iter()
-            .map(|kv| (kv.key().clone(), kv.value().clone()))
-            .collect()
+        self.account_bindings.read().clone()
     }
 
-    /// [HOT-RELOAD] Re-sync the in-memory DashMap from `config.account_bindings`.
-    /// Called after `update_proxy_pool` so that a wholesale ProxyPoolConfig
-    /// replacement (e.g. via `save_config`) does not leave the in-memory
-    /// bindings stale or empty.
-    pub async fn sync_bindings_from_config(&self) {
-        let config = self.config.read().await;
-        let snapshot = config.account_bindings.clone();
-        drop(config);
-
-        // Reset the DashMap: clear old entries, then insert fresh ones.
-        self.account_bindings.clear();
-        for (account_id, proxy_id) in &snapshot {
-            self.account_bindings
-                .insert(account_id.clone(), proxy_id.clone());
-        }
-        tracing::info!(
-            "[ProxyPool] Re-synced {} account bindings from config (hot-reload)",
-            snapshot.len()
-        );
-    }
-
-    /// 持久化绑定关系到配置文件
-    async fn persist_bindings(&self) {
-        // 获取当前绑定快照
-        let bindings = self.get_all_bindings_snapshot();
-
-        // 更新配置中的绑定关系
-        {
-            let mut config = self.config.write().await;
-            config.account_bindings = bindings;
-        }
-
-        // 保存到磁盘
-        if let Ok(mut app_config) = crate::modules::config::load_app_config() {
-            let config = self.config.read().await;
-            app_config.proxy.proxy_pool = config.clone();
-            if let Err(e) = crate::modules::config::save_app_config(&app_config) {
-                tracing::error!("[ProxyPool] Failed to persist bindings: {}", e);
+    pub async fn replace_config(&self, mut next: ProxyPoolConfig) {
+        let mut current = self.config.write().await;
+        // Health is runtime data, not part of an unrelated settings edit.
+        for proxy in &mut next.proxies {
+            if let Some(old) = current
+                .proxies
+                .iter()
+                .find(|old| same_proxy_endpoint(old, proxy))
+            {
+                proxy.is_healthy = old.is_healthy;
+                proxy.latency = old.latency;
+                proxy.last_check_time = old.last_check_time;
             }
         }
+        *self.account_bindings.write() = next.account_bindings.clone();
+        *current = next;
+    }
+
+    /// Publish the entire binding table atomically so requests never observe a
+    /// transient empty table between clear and insert operations.
+    pub async fn sync_bindings_from_config(&self) {
+        let snapshot = self.config.read().await.account_bindings.clone();
+        *self.account_bindings.write() = snapshot;
     }
 
     /// 批量检查代理健康状态
@@ -581,23 +526,30 @@ impl ProxyPoolManager {
                     latency_msg
                 );
 
-                (proxy.id, is_healthy, latency)
+                (proxy, is_healthy, latency)
             })
             .buffer_unordered(concurrency_limit)
             .collect::<Vec<_>>()
             .await;
 
-        // 统一更新状态
+        self.apply_health_check_results(results).await;
+        Ok(())
+    }
+
+    async fn apply_health_check_results(&self, results: Vec<(ProxyEntry, bool, Option<u64>)>) {
         let mut config = self.config.write().await;
-        for (id, is_healthy, latency) in results {
-            if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == id) {
+        for (checked, is_healthy, latency) in results {
+            // An edit during the request invalidates the old endpoint's result.
+            if let Some(proxy) = config
+                .proxies
+                .iter_mut()
+                .find(|proxy| same_proxy_endpoint(proxy, &checked))
+            {
                 proxy.is_healthy = is_healthy;
                 proxy.latency = latency;
                 proxy.last_check_time = Some(chrono::Utc::now().timestamp());
             }
         }
-
-        Ok(())
     }
 
     /// 检查单个代理健康状态
@@ -898,5 +850,158 @@ mod tests {
         let proxy_opt = res.unwrap();
         assert!(proxy_opt.is_some());
         assert_eq!(proxy_opt.unwrap().entry_id, "pool_p2");
+    }
+}
+
+fn same_proxy_endpoint(left: &ProxyEntry, right: &ProxyEntry) -> bool {
+    left.id == right.id
+        && left.url == right.url
+        && left.health_check_url == right.health_check_url
+        && left
+            .auth
+            .as_ref()
+            .map(|auth| (&auth.username, &auth.password))
+            == right
+                .auth
+                .as_ref()
+                .map(|auth| (&auth.username, &auth.password))
+}
+
+/// Capacity checking and insertion run within the configuration transaction.
+fn update_binding(
+    config: &mut ProxyPoolConfig,
+    account_id: &str,
+    proxy_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(proxy_id) = proxy_id else {
+        config.account_bindings.remove(account_id);
+        return Ok(());
+    };
+    let entry = config
+        .proxies
+        .iter()
+        .find(|p| p.id == proxy_id)
+        .ok_or_else(|| format!("Proxy {} not found", proxy_id))?;
+    if config.account_bindings.get(account_id).map(String::as_str) == Some(proxy_id) {
+        return Ok(());
+    }
+    if let Some(max) = entry.max_accounts.filter(|max| *max > 0) {
+        let count = config
+            .account_bindings
+            .values()
+            .filter(|id| id.as_str() == proxy_id)
+            .count();
+        if count >= max {
+            return Err(format!("Proxy {} has reached max accounts limit", proxy_id));
+        }
+    }
+    config
+        .account_bindings
+        .insert(account_id.to_owned(), proxy_id.to_owned());
+    Ok(())
+}
+
+pub(crate) fn persist_account_binding(
+    account_id: &str,
+    proxy_id: Option<&str>,
+) -> Result<crate::models::AppConfig, String> {
+    crate::modules::config::update_app_config(|config| {
+        update_binding(&mut config.proxy.proxy_pool, account_id, proxy_id)
+    })
+}
+
+#[cfg(test)]
+mod binding_consistency_tests {
+    use super::*;
+
+    fn pool() -> ProxyPoolConfig {
+        let mut config = ProxyPoolConfig::default();
+        config.proxies.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "proxy", "name": "test", "url": "http://127.0.0.1:9", "enabled": true,
+                "priority": 1, "tags": [], "max_accounts": 1, "is_healthy": false,
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn existing_binding_is_idempotent_at_capacity() {
+        let mut config = pool();
+        update_binding(&mut config, "one", Some("proxy")).unwrap();
+        update_binding(&mut config, "one", Some("proxy")).unwrap();
+        assert!(update_binding(&mut config, "two", Some("proxy")).is_err());
+        assert_eq!(config.account_bindings.len(), 1);
+    }
+
+    #[test]
+    fn invalid_binding_does_not_remove_the_current_binding() {
+        let mut config = pool();
+        update_binding(&mut config, "one", Some("proxy")).unwrap();
+        assert!(update_binding(&mut config, "one", Some("missing")).is_err());
+        assert_eq!(
+            config.account_bindings.get("one").map(String::as_str),
+            Some("proxy")
+        );
+        update_binding(&mut config, "one", None).unwrap();
+        update_binding(&mut config, "two", Some("proxy")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publishing_unrelated_settings_preserves_health() {
+        let config = Arc::new(RwLock::new(pool()));
+        let manager = ProxyPoolManager::new(config.clone());
+        let mut next = pool();
+        next.proxies[0].is_healthy = true;
+        next.account_bindings.insert("one".into(), "proxy".into());
+        manager.replace_config(next).await;
+        assert!(!config.read().await.proxies[0].is_healthy);
+        assert_eq!(manager.get_account_binding("one").as_deref(), Some("proxy"));
+    }
+
+    #[tokio::test]
+    async fn old_health_check_results_do_not_apply_after_endpoint_edit() {
+        for changed_field in 0..4 {
+            let mut initial = pool();
+            initial.proxies[0].auth = Some(crate::proxy::config::ProxyAuth {
+                username: "test-user".into(),
+                password: "test-password".into(),
+            });
+            let checked = initial.proxies[0].clone();
+            let config = Arc::new(RwLock::new(initial.clone()));
+            let manager = ProxyPoolManager::new(config.clone());
+            let mut next = initial;
+            match changed_field {
+                0 => next.proxies[0].url = "http://127.0.0.1:10".into(),
+                1 => next.proxies[0].auth.as_mut().unwrap().username = "new-user".into(),
+                2 => next.proxies[0].auth.as_mut().unwrap().password = "new-password".into(),
+                _ => {
+                    next.proxies[0].health_check_url = Some("https://example.invalid/health".into())
+                }
+            }
+            manager.replace_config(next).await;
+            manager
+                .apply_health_check_results(vec![(checked, true, Some(7))])
+                .await;
+
+            let snapshot = config.read().await;
+            assert!(
+                !snapshot.proxies[0].is_healthy
+                    && snapshot.proxies[0].latency.is_none()
+                    && snapshot.proxies[0].last_check_time.is_none(),
+                "old health result applied after changing endpoint field {changed_field}"
+            );
+            let checked = snapshot.proxies[0].clone();
+            drop(snapshot);
+
+            manager
+                .apply_health_check_results(vec![(checked, true, Some(11))])
+                .await;
+            let snapshot = config.read().await;
+            assert!(snapshot.proxies[0].is_healthy);
+            assert_eq!(snapshot.proxies[0].latency, Some(11));
+            assert!(snapshot.proxies[0].last_check_time.is_some());
+        }
     }
 }

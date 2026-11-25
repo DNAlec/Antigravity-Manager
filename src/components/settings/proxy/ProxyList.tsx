@@ -8,7 +8,7 @@ import { Account } from '../../../types/account';
 
 interface ProxyListProps {
     proxies: ProxyEntry[];
-    onUpdate: (proxies: ProxyEntry[]) => void;
+    onUpdate: (update: (proxies: ProxyEntry[]) => ProxyEntry[]) => Promise<void>;
     accountBindings: Record<string, string>;
     accounts: Account[];
     selectedIds: Set<string>;
@@ -28,19 +28,19 @@ export default function ProxyList({ proxies, onUpdate, accountBindings, accounts
 
     const handleDelete = (id: string) => {
         if (confirm(t('settings.proxy_pool.confirm_delete', 'Are you sure you want to delete this proxy?'))) {
-            onUpdate(proxies.filter(p => p.id !== id));
+            void onUpdate(latest => latest.filter(p => p.id !== id));
         }
     };
 
-    const handleSaveProxy = (entry: ProxyEntry) => {
+    const handleSaveProxy = async (entry: ProxyEntry) => {
         if (editingProxy) {
-            onUpdate(proxies.map(p => p.id === entry.id ? entry : p));
+            await onUpdate(latest => latest.map(p => p.id === entry.id ? entry : p));
         }
         setEditingProxy(undefined);
     };
 
     const handleToggleEnabled = (id: string) => {
-        onUpdate(proxies.map(p => p.id === id ? { ...p, enabled: !p.enabled } : p));
+        void onUpdate(latest => latest.map(p => p.id === id ? { ...p, enabled: !p.enabled } : p));
     };
 
     const sortedProxies = [...proxies].sort((a, b) => a.priority - b.priority);

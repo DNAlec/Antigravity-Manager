@@ -8,12 +8,13 @@ import { generateUUID } from '../../../utils/uuid';
 interface BatchImportModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onImport: (proxies: ProxyEntry[]) => void;
+    onImport: (proxies: ProxyEntry[]) => Promise<void>;
 }
 
 export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImportModalProps) {
     const { t } = useTranslation();
     const [rawText, setRawText] = useState('');
+    const [isSaving, setIsSaving] = useState(false);
     const [preview, setPreview] = useState<ProxyEntry[]>([]);
     const [error, setError] = useState<string | null>(null);
 
@@ -101,13 +102,16 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
         parseProxies(text);
     };
 
-    const handleImport = () => {
-        if (preview.length > 0) {
-            onImport(preview);
+    const handleImport = async () => {
+        if (!preview.length || isSaving) return;
+        setIsSaving(true);
+        try {
+            await onImport(preview);
             onClose();
             setRawText('');
             setPreview([]);
-        }
+        } catch (error) { setError(String(error)); }
+        finally { setIsSaving(false); }
     };
 
     return createPortal(
@@ -192,7 +196,7 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
                     </button>
                     <button
                         onClick={handleImport}
-                        disabled={preview.length === 0}
+                        disabled={isSaving || preview.length === 0}
                         className="px-5 py-2.5 rounded-xl bg-blue-500 hover:bg-blue-600 active:scale-95 text-white font-medium shadow-sm shadow-blue-200 dark:shadow-none transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                     >
                         <CheckCircle2 size={18} />

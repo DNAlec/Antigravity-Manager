@@ -2,6 +2,7 @@ import { useState, useEffect, startTransition } from 'react';
 import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
+import { useConfigDraft } from '../hooks/useConfigDraft';
 import { useConfigStore } from '../stores/useConfigStore';
 import { AppConfig, HubFingerprint } from '../types/config';
 import ModalDialog from '../components/common/ModalDialog';
@@ -44,8 +45,8 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('5.0.4-beta.20-fork.3');
-    const [formData, setFormData] = useState<AppConfig>({
+    const [appVersion, setAppVersion] = useState<string>('5.0.4-beta.20-fork.4');
+    const [formData, setFormData, draftConflict, resetDraft] = useConfigDraft<AppConfig>(config, {
         language: 'zh',
         theme: 'system',
         auto_refresh: false,
@@ -195,15 +196,14 @@ function Settings() {
 
     }, [loadConfig]);
 
-    useEffect(() => {
-        if (config) {
-            setFormData(config);
-        }
-    }, [config]);
 
     // 删除自动启用调试控制台的逻辑 - 改为用户手动控制
 
     const handleSave = async () => {
+        if (!config || !formData.config_revision || draftConflict) {
+            showToast(t('common.error'), 'error');
+            return;
+        }
         try {
             // 校验：如果启用了上游代理但没有填写地址，给出提示
             const proxyEnabled = formData.proxy?.upstream_proxy?.enabled;
@@ -519,6 +519,11 @@ function Settings() {
         }
     };
 
+    if (!config || !formData.config_revision) return <div className="p-6 space-y-3">
+        <p>{useConfigStore.getState().error || t('common.loading')}</p>
+        <button className="btn btn-sm" onClick={() => loadConfig()}>{t('common.refresh')}</button>
+    </div>;
+
     return (
         <motion.div
             initial={{ opacity: 0, y: 10 }}
@@ -527,6 +532,10 @@ function Settings() {
             className="h-full w-full overflow-y-auto"
         >
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
+                {draftConflict && <div role="alert" className="text-sm text-error">
+                    <p>{t('settings.config_conflict', '配置已被其他操作修改，未保存的输入已保留。请重新加载后再编辑。')}</p>
+                    <button className="btn btn-sm" onClick={resetDraft}>{t('settings.discard_config_draft', '丢弃草稿并重新加载')}</button>
+                </div>}
                 {/* 顶部工具栏：Tab 导航和保存按钮 */}
                 <div className="flex justify-between items-center">
                     {/* Tab 导航 - 采用顶部导航栏样式：外层灰色容器 */}
@@ -590,6 +599,7 @@ function Settings() {
                     <button
                         className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-2 shadow-sm"
                         onClick={handleSave}
+                        disabled={!config || !formData.config_revision}
                     >
                         <Save className="w-4 h-4" />
                         {t('settings.save')}
@@ -693,8 +703,7 @@ function Settings() {
                                     onChange={async (e) => {
                                         const enabled = e.target.value === 'enabled';
                                         try {
-                                            await invoke('toggle_auto_launch', { enable: enabled });
-                                            setFormData({ ...formData, auto_launch: enabled });
+                                            await useConfigStore.getState().mutateConfig(() => invoke('toggle_auto_launch', { enable: enabled }));
                                             showToast(enabled ? t('settings.general.auto_launch_enabled') : t('settings.general.auto_launch_disabled'), 'success');
                                         } catch (error) {
                                             showToast(`${t('common.error')}: ${error}`, 'error');
@@ -890,26 +899,10 @@ function Settings() {
                                                     key={item.path}
                                                     onClick={async () => {
                                                         if (!isSettings) {
-                                                            const originalConfig = { ...formData };
-                                                            const hiddenItems = formData.hidden_menu_items || [];
-                                                            const newHiddenItems = isVisible
-                                                                ? [...hiddenItems, item.path]
-                                                                : hiddenItems.filter(p => p !== item.path);
-
-                                                            // 乐观更新 UI
-                                                            const newConfig = {
-                                                                ...formData,
-                                                                hidden_menu_items: newHiddenItems
-                                                            };
-                                                            setFormData(newConfig);
-
-                                                            // 尝试保存
                                                             try {
-                                                                await saveConfig(newConfig);
+                                                                await useConfigStore.getState().toggleMenuItem(item.path);
                                                             } catch (error) {
-                                                                // 保存失败，回滚到原始快照
-                                                                setFormData(originalConfig);
-                                                                showToast(`保存失败，已恢复设置: ${error}`, 'error');
+                                                                showToast(`${t('common.error')}: ${error}`, 'error');
                                                             }
                                                         }
                                                     }}
@@ -1666,37 +1659,20 @@ function Settings() {
                     {activeTab === 'proxy' && (
                         <div className="space-y-4 animate-in fade-in duration-300">
                             <ProxyPoolSettings
-                                config={formData.proxy?.proxy_pool || {
+                                config={config?.proxy?.proxy_pool || {
                                     enabled: false,
                                     proxies: [],
                                     health_check_interval: 300,
                                     auto_failover: true,
                                     strategy: 'priority'
                                 }}
-                                onChange={(newConfig, silent = false) => {
-                                    const updatedFormData = {
-                                        ...formData,
-                                        proxy: {
-                                            ...formData.proxy,
-                                            proxy_pool: newConfig
-                                        }
-                                    };
-                                    setFormData(updatedFormData);
-
-                                    // [FIX] Silent updates (like health polling) should NOT trigger saveConfig
-                                    // to prevent race conditions where old memory state rolls back new manual changes
-                                    if (silent) {
-                                        console.log('Proxy status sync (silent)');
-                                        return;
-                                    }
-
-                                    // Hot reload: save immediately for manual changes
-                                    saveConfig({ ...updatedFormData, auto_refresh: true })
-                                        .then(() => {
-                                            console.log('Proxy config saved');
-                                        })
-                                        .catch(err => console.error('Save failed:', err));
-                                }}
+                                onChange={update => useConfigStore.getState().updateConfig(current => ({
+                                    ...current,
+                                    proxy: { ...current.proxy, proxy_pool: update(current.proxy.proxy_pool || {
+                                        enabled: false, proxies: [], health_check_interval: 300,
+                                        auto_failover: true, strategy: 'priority', account_bindings: {},
+                                    }) },
+                                }))}
                             />
 
                             {/* [FIX #1701] 恢复全局上游代理设置 */}
@@ -1804,7 +1780,7 @@ function Settings() {
                                                     },
                                                 };
                                                 setFormData(updated);
-                                                saveConfig({ ...updated, auto_refresh: true })
+                                                saveConfig(updated)
                                                     .catch(err => console.error('Save failed:', err));
                                             }}
                                         />
